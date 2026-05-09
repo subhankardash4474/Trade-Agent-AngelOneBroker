@@ -4,6 +4,13 @@ Started 2026-05-09. Phases 0/A/B/C/F are complete and live on `main`; D and E
 are queued. This doc is the single source of truth for what's been done and
 what's pending.
 
+> **2026-05-09 update**: Phase E (single-package split of `trading_agent.py`)
+> has been **superseded** by the 3-pod architecture decided in
+> [`docs/cloud_pod_architecture.md`](cloud_pod_architecture.md). The new target
+> layout is `packages/{trader,research,ui,core,strategies}` rather than a flat
+> `trading_agent/` package. Phase D (`scripts/` reorg) below still applies as a
+> precursor since it cleans up `tools/` before the bigger code move.
+
 ## Completed (committed in git)
 
 | Phase | Commit | Description |
@@ -128,30 +135,37 @@ Mapped via grep on 2026-05-09; complete list:
 11. Commit as `Phase D: scripts/ reorganisation`.
 12. Re-enable scheduled task. Verify Monday 09:00 fires correctly.
 
-### Phase E — `trading_agent.py` package split
+### Phase E (SUPERSEDED) — see Phase 1 (pod split) below
 
-**Status: DEFERRED — multi-session refactor.**
+The original Phase E target was a flat `trading_agent/` Python package. This
+has been replaced by a **3-pod architecture** (one pod = one Python package
+under `packages/`). See [`docs/cloud_pod_architecture.md`](cloud_pod_architecture.md)
+for the full design, rationale, and migration timeline.
 
-`trading_agent.py` is **163 KB / 3,395 lines / one class** with 60+ methods.
-Splitting requires careful slicing along functional seams without breaking
-state ownership. Dry-run plan:
+The internal slicing of `trading_agent.py` (into `agent.py`, `cycle.py`,
+`exits.py`, `safety.py`, `carryover.py`, `continuity.py`, `alerts.py`,
+`health.py`) is preserved as the *internal* module layout of the new
+`packages/trader/` package — the slicing work is the same, only the parent
+namespace changes.
 
-```
-trading_agent/
-├── __init__.py
-├── agent.py          ← TradingAgent class core (constructor, run loop, lifecycle)
-├── cycle.py          ← _trading_cycle, _process_signal, signal funnel
-├── exits.py          ← _check_position_exits, _fast_exits_sleep, all exit paths
-├── safety.py         ← preflight, kill switches, strategy breaker, window cap
-├── carryover.py      ← carryover SL recompute, profit lock, EOD square-off
-├── continuity.py     ← state restore from DB, _resolve_continuity, daily resets
-├── alerts.py         ← _on_trade_closed, EOD summary, post-mortem hooks
-└── health.py         ← heartbeat, health.json, audit checkpoint
-```
+### Phase 1 — Logical pod split (`packages/{trader,research,ui,core,strategies}`)
 
-Estimated effort: 8-12 focused hours, with ~50 import sites to update across
-the codebase. Tests should remain 100% green at every commit.
+**Status: QUEUED — kicks off after the current backtest battery completes.**
 
-Recommendation: tackle this only after **first profitable live trading week**
-is in. Until then, the monolithic `trading_agent.py` is fine — splitting it
-prematurely just makes git diffs harder during fast-iteration debugging.
+Target layout, rationale, and step-by-step migration: see
+[`docs/cloud_pod_architecture.md`](cloud_pod_architecture.md).
+
+Summary of why the split is structured as 3 pods:
+
+| Pod | Why it gets to be its own pod |
+|---|---|
+| `trader` | Live decision loop, latency-sensitive, always-on, isolated failure domain |
+| `research` | 24x7 backtesting + diagnostics + training; spot-priceable; long-running CPU |
+| `ui` | Read-only dashboard; on-demand; different scaling profile |
+
+**Email is NOT a pod** — it's a stateless SDK call to a managed service. Stays as
+`packages/core/alerts.py`, imported by `trader` and `research`.
+
+The local-laptop sync mechanism (so Cursor keeps seeing cloud-research findings)
+is already stubbed at `tools/sync_from_cloud.py` — works against a local mirror
+today, swaps to S3 in Phase 2 with no caller changes.

@@ -108,5 +108,11 @@ desktop.ini
 audit_*.md
 checkpoint_*.md
 
+# ── Cloud sync (research-pod outputs mirrored to laptop) ───────
+# logs/cloud_sync/  files already caught by logs/**/* rules above,
+# but list the dir explicitly so it's discoverable.
+logs/cloud_sync/
+data/local_cloud_mirror/
+
 # ── Backtest one-off runs at root (legacy, will move to logs/archive) ──
 backtest_run_*/
