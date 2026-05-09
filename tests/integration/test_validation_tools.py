@@ -177,9 +177,14 @@ class TestGapDetector:
                                symbol=f"L{i}")
 
         monkeypatch.setenv("AGENT_DB_PATH", db_path)
-        # Reimport so the module-level DB_PATH picks up the new env var
-        if "research.analyze_day" in sys.modules:
-            del sys.modules["research.analyze_day"]
+        # Reimport so the module-level DB_PATH picks up the new env var.
+        # MUST also clear `research` (the package), not just the leaf —
+        # otherwise `from research import analyze_day` returns the cached
+        # attribute on the still-cached package object and AGENT_DB_PATH
+        # is never re-read. This caused intermittent pollution across the
+        # GapDetector test class on CI.
+        for mod in ("research.analyze_day", "research"):
+            sys.modules.pop(mod, None)
         from research import analyze_day
 
         trades = analyze_day.load_trades(
@@ -208,8 +213,8 @@ class TestGapDetector:
             self._insert_trade(db_path, pnl=5.0, symbol=f"OK{i}")
 
         monkeypatch.setenv("AGENT_DB_PATH", db_path)
-        if "research.analyze_day" in sys.modules:
-            del sys.modules["research.analyze_day"]
+        for mod in ("research.analyze_day", "research"):
+            sys.modules.pop(mod, None)
         from research import analyze_day
 
         trades = analyze_day.load_trades(
@@ -224,8 +229,8 @@ class TestGapDetector:
         db_path = str(tmp_path / "empty.db")
         Database(db_path)
         monkeypatch.setenv("AGENT_DB_PATH", db_path)
-        if "research.analyze_day" in sys.modules:
-            del sys.modules["research.analyze_day"]
+        for mod in ("research.analyze_day", "research"):
+            sys.modules.pop(mod, None)
         from research import analyze_day
         trades = analyze_day.load_trades("2020-01-01T00:00:00", "2020-01-02T00:00:00")
         stats = analyze_day.compute_stats(trades)

@@ -11,7 +11,17 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 import pandas as pd
+import pytz
 from loguru import logger
+
+# Trading session timezone. All event timestamps written to the DB are
+# timezone-aware IST so they compare correctly with `entry_time` values
+# written by Portfolio (which uses `datetime.now(IST)`). Naive timestamps
+# silently break `_restore_positions` cash resolution on a UTC host
+# (e.g. AWS Linux): on a Windows-IST laptop the naive ts is accidentally
+# correct; on Linux-UTC it's 5h30m behind, the comparison fails, and
+# the legacy `min(cash_after)` fallback ships a stale cash value.
+IST = pytz.timezone("Asia/Kolkata")
 
 
 # ── JSON serialization helpers (2026-05-06) ──────────────────────────
@@ -381,7 +391,10 @@ class Database:
     # ── Equity Curve ─────────────────────────────────────────
 
     def store_equity_point(self, equity: float, cash: float, positions: int):
-        ts = datetime.now().isoformat()
+        # Timezone-aware IST: must match the IST-aware `entry_time` values
+        # Portfolio writes via `datetime.now(IST)`, otherwise `_restore_positions`
+        # cash-source comparison breaks on UTC hosts. See module-level IST docstring.
+        ts = datetime.now(IST).isoformat()
         with self._conn() as conn:
             conn.execute(
                 "INSERT INTO equity_curve (timestamp, equity, cash, positions) VALUES (?,?,?,?)",
