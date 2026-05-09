@@ -45,8 +45,16 @@ import pandas as pd
 import yaml
 from loguru import logger
 
-ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(ROOT))
+# Phase 1 layout: this file lives at packages/research/battery.py
+#   parents[1] = packages/      (sys.path bootstrap)
+#   parents[2] = project root   (where logs/backtests/, config.yaml live)
+PKG_ROOT = Path(__file__).resolve().parents[1]
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(PKG_ROOT))
+# `ROOT` previously meant "project root" pre-Phase-1. The downstream code
+# below uses ROOT for `logs/backtests/` and `config.yaml`, both of which
+# live at the project root, so keep the alias pointing there.
+ROOT = PROJECT_ROOT
 
 from research.backtest_ensemble import BacktestConfig, EnsembleBacktester, export_result  # noqa: E402
 from core.data_handler import DataHandler  # noqa: E402

@@ -44,8 +44,12 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT))
+# Phase 1 layout: this file lives at packages/research/diagnostic.py
+#   parents[1] = packages/        (sys.path bootstrap so `core`, `strategies` resolve)
+#   parents[2] = project root     (where data/, logs/, config.yaml actually live)
+PKG_ROOT = Path(__file__).resolve().parents[1]
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(PKG_ROOT))
 
 try:
     sys.stdout.reconfigure(encoding="utf-8")
@@ -53,9 +57,13 @@ try:
 except Exception:
     pass
 
-DB_PATH = ROOT / "data" / "trading_agent.db"
-OUT_DIR = ROOT / "logs" / "diagnostics"
+DB_PATH = PROJECT_ROOT / "data" / "trading_agent.db"
+OUT_DIR = PROJECT_ROOT / "logs" / "diagnostics"
 OUT_DIR.mkdir(parents=True, exist_ok=True)
+# Back-compat alias: a few helpers downstream reference ROOT for relative
+# path display in the saved markdown report header. Point it at the
+# project root (the user-visible workspace), not packages/.
+ROOT = PROJECT_ROOT
 
 
 # ─────────────────────────────────────────────────────────────────────

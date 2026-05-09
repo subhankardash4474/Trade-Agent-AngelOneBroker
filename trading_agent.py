@@ -1673,6 +1673,19 @@ class TradingAgent:
             except Exception as e:
                 logger.error(f"Post-mortem email failed: {e}")
 
+            # Profit diagnostic (2026-05-09). Empirical edge analysis on
+            # the last 7 days of closed trades — outputs Profit Factor,
+            # Win Rate vs breakeven, Kelly fraction, and KILL/WATCH/KEEP/
+            # SCALE verdict per strategy. Powers the daily "are we still
+            # making money?" sanity check without manual re-runs. Same
+            # subprocess-isolation pattern as post-mortem so any failure
+            # is non-fatal. Loops 7d, not just today, because verdicts
+            # need a sample of >=10 trades to be statistically meaningful.
+            try:
+                self._send_profit_diagnostic_email(day_iso)
+            except Exception as e:
+                logger.error(f"Profit diagnostic email failed: {e}")
+
     def _send_postmortem_email(self, day_iso: str) -> None:
         """Run tools/trade_postmortem.py for `day_iso` and send the
         resulting markdown report as an email.
@@ -1714,6 +1727,88 @@ class TradingAgent:
             logger.info(f"Post-mortem email sent ({len(body)} chars)")
         except Exception as e:
             logger.error(f"Post-mortem email send failed: {e}")
+
+    def _send_profit_diagnostic_email(self, day_iso: str) -> None:
+        """Run packages/research/diagnostic.py and email the rolling-7d verdict.
+
+        Why 7 days, not 1?
+          - profit_diagnostic produces KILL / WATCH / KEEP / SCALE verdicts
+            using Profit Factor + Kelly fraction. Both are noisy on small
+            samples (1 day = 5-15 trades). 7 days = 30-100 trades is the
+            minimum sample where the verdict is statistically meaningful.
+          - This means the email surfaces a STRATEGY edge view, not a daily
+            P&L view (which the main EOD summary email already covers).
+            They're complementary: EOD = "what happened today",
+            profit-diagnostic = "is each strategy still earning its weight".
+
+        Why subprocess vs in-process call?
+          - Same isolation rationale as `_send_postmortem_email`: a numpy
+            crash, DB connection issue, or pandas exception in the
+            diagnostic must not poison the agent's main loop or block
+            the next-cycle scan. Subprocess gives us a hard wall.
+        """
+        import subprocess
+        from pathlib import Path
+
+        repo_root = Path(__file__).resolve().parent
+        diag_path = repo_root / "packages" / "research" / "diagnostic.py"
+        # Pin output path so we can predict where to read it back, instead
+        # of scanning logs/diagnostics/ for the newest file (race-free).
+        out_path = repo_root / "logs" / "diagnostics" / f"eod_{day_iso}.md"
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+
+        try:
+            subprocess.run(
+                [sys.executable, str(diag_path), "--days", "7",
+                 "--out", str(out_path)],
+                cwd=str(repo_root), check=False, capture_output=True, timeout=60,
+            )
+        except Exception as e:
+            logger.warning(f"Profit diagnostic subprocess failed: {e}")
+            return
+
+        if not out_path.exists():
+            logger.info(
+                f"No profit-diagnostic report at {out_path} "
+                f"(insufficient trades in last 7 days?)"
+            )
+            return
+
+        body = out_path.read_text(encoding="utf-8")
+        if len(body) > 50_000:
+            body = body[:50_000] + "\n\n... (truncated, see full report on disk)"
+
+        # Pull the headline verdict from the report so the email subject
+        # is actionable at a glance ("KILL/WATCH/SCALE detected" vs a
+        # generic "Profit Diagnostic" prefix that's easy to skim past).
+        verdict_tag = self._extract_verdict_tag(body)
+        subject = f"Profit Diagnostic {day_iso} {verdict_tag}".strip()
+
+        try:
+            self.alert_manager.send_alert(subject, body, level="info")
+            logger.info(f"Profit diagnostic email sent ({len(body)} chars){' ' + verdict_tag if verdict_tag else ''}")
+        except Exception as e:
+            logger.error(f"Profit diagnostic email send failed: {e}")
+
+    @staticmethod
+    def _extract_verdict_tag(report: str) -> str:
+        """Scan a profit_diagnostic markdown report for the worst verdict
+        present and return a short tag for the email subject.
+
+        Priority (worst-first): KILL > WATCH > SCALE > KEEP.
+        Returns "" when no verdict tokens are present (e.g. all strategies
+        are INSUFFICIENT_DATA, which is an action-needed but ambiguous
+        signal — the report body explains).
+
+        The diagnostic renders the verdict as a markdown table cell:
+          `| <strategy> | <trades> | <pf> | KILL | <pnl> |`
+        so we anchor on the leading `| ` + space + tag + space + `|`. That
+        avoids false matches on words like "KILL_FACTOR" anywhere in prose.
+        """
+        for tag in ("KILL", "WATCH", "SCALE", "KEEP"):
+            if f"| {tag} |" in report:
+                return f"[{tag}]"
+        return ""
 
     # ── Market Context ────────────────────────────────────────
 
