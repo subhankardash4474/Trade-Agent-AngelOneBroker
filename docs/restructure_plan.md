@@ -150,22 +150,76 @@ namespace changes.
 
 ### Phase 1 — Logical pod split (`packages/{trader,research,ui,core,strategies}`)
 
-**Status: QUEUED — kicks off after the current backtest battery completes.**
+**Status: PREP COMPLETE; EXECUTE queued for ~19:30 IST 2026-05-09 (after battery).**
 
-Target layout, rationale, and step-by-step migration: see
-[`docs/cloud_pod_architecture.md`](cloud_pod_architecture.md).
+#### Prep (committed, safe to do during battery)
 
-Summary of why the split is structured as 3 pods:
+- `packages/__init__.py`, `packages/{trader,research,ui}/__init__.py` — empty pod skeletons
+- `tools/_phase1_move.py` — automated mover with `--dry-run` / `--execute` / `--rollback`
+- `tests/unit/test_pod_boundaries.py` — 10 tests, skip-marked until execute lands
 
-| Pod | Why it gets to be its own pod |
+Run `python tools/_phase1_move.py --dry-run` to preview the exact plan at any time.
+
+#### Move plan (preserves all import paths via `packages/` on `sys.path`)
+
+| Source | Destination | Why |
+|---|---|---|
+| `core/` | `packages/core/` | Shared library (DB, charges, portfolio, secrets, ensemble, regime) |
+| `strategies/` | `packages/strategies/` | Shared library |
+| `brokers/` | `packages/brokers/` | Shared library (will move under core in a later phase) |
+| `monitoring/` | `packages/monitoring/` | Shared library (alerts; dashboard goes to ui later) |
+| `training/` | `packages/training/` | Shared library (model retraining) |
+| `backtest.py` | `packages/research/backtest.py` | POD 2 module |
+| `backtest_ensemble.py` | `packages/research/backtest_ensemble.py` | POD 2 module |
+| `analyze_day.py` | `packages/research/analyze_day.py` | POD 2 module |
+| `tools/overnight_backtest_battery.py` | `packages/research/battery.py` | POD 2 module |
+| `tools/profit_diagnostic.py` | `packages/research/diagnostic.py` | POD 2 module |
+
+`trading_agent.py` stays at root in Phase 1; its split into `packages/trader/{agent,cycle,exits,...}.py` is Phase 1.5 (multi-session refactor).
+
+#### Import-path discipline
+
+The directory moves **preserve names**. `from core.X import Y` keeps working
+unchanged because `packages/` joins `sys.path` via:
+
+- A new project-root `conftest.py` (for pytest)
+- A 4-line prelude prepended to `run_daemon.py`, `stop_daemon.py`, `main.py`
+
+Only **7 import statements across 3 files** require rewriting — the
+research-pod files that picked up new names (`backtest_ensemble` → `research.backtest_ensemble` etc.).
+Confirmed by latest dry-run: `main.py:99`, `tools/overnight_backtest_battery.py:51`, `tests/integration/test_validation_tools.py × 5`.
+
+#### Execute checklist (when battery completes)
+
+1. Verify last variant landed cleanly via `.\tools\battery_status.ps1`.
+2. Stop battery process: `Stop-Process -Id <PID> -Force`.
+3. Stop daemon if running: `Stop-Process -Name python -Force` (it's idle on weekend, but be safe).
+4. `git status --short` — confirm working tree clean (or only the auto-generated battery yamls; we'll commit those first).
+5. `python tools/_phase1_move.py --dry-run` — final preview, sanity check.
+6. `python tools/_phase1_move.py --execute` — performs all moves + sys.path bootstrap + import rewrites.
+7. `python -c "import core, strategies, brokers; print('imports OK')"` — smoke check.
+8. `python -m pytest tests/unit -q` — must stay 388 pass + 10 newly active boundary tests = 398 pass.
+9. `python -m pytest tests/integration -q` — sanity.
+10. `git add -A && git commit -m "Phase 1: pod split (packages/ layout)"`.
+11. `git push origin main`.
+
+If any step fails: `python tools/_phase1_move.py --rollback` returns to HEAD; investigate; retry.
+
+#### Why this is structured as 3 pods, not 4
+
+| Pod | Why it earns its own deploy |
 |---|---|
 | `trader` | Live decision loop, latency-sensitive, always-on, isolated failure domain |
 | `research` | 24x7 backtesting + diagnostics + training; spot-priceable; long-running CPU |
 | `ui` | Read-only dashboard; on-demand; different scaling profile |
 
-**Email is NOT a pod** — it's a stateless SDK call to a managed service. Stays as
-`packages/core/alerts.py`, imported by `trader` and `research`.
+**Email is NOT a pod** -- it's a stateless SDK call to a managed service. Stays as
+`packages/monitoring/alerts.py` (or `packages/core/alerts.py` post-1.5), imported
+by `trader` and `research`.
+
+Full architecture rationale + cost model + cloud migration roadmap:
+[`docs/cloud_pod_architecture.md`](cloud_pod_architecture.md).
 
 The local-laptop sync mechanism (so Cursor keeps seeing cloud-research findings)
-is already stubbed at `tools/sync_from_cloud.py` — works against a local mirror
-today, swaps to S3 in Phase 2 with no caller changes.
+is stubbed at `tools/sync_from_cloud.py` -- works against a local mirror today,
+swaps to S3 in Phase 2 with no caller changes.
