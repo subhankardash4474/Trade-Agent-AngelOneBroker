@@ -1,0 +1,112 @@
+# ------------------------------------------------------------------
+# Trading Agent — .gitignore
+# Goal: source-of-truth for code, but NEVER commit secrets, runtime
+# state, models, or large generated artefacts.
+# ------------------------------------------------------------------
+
+# ── Secrets & environment ────────────────────────────────────────
+.env
+.env.*
+!.env.example
+*.secret
+credentials.json
+*.pem
+*.key
+
+# ── Python ───────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg
+*.egg-info/
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+
+# ── Test / lint / type-check caches ──────────────────────────────
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.coverage
+.coverage.*
+htmlcov/
+.hypothesis/
+
+# ── Virtual environments ─────────────────────────────────────────
+venv/
+env/
+ENV/
+.venv/
+
+# ── Trading runtime state ────────────────────────────────────────
+# Database (contains trade history, can be regenerated from logs)
+data/*.db
+data/*.db-*
+data/*.sqlite
+data/*.sqlite3
+
+# Model artefacts (large, regenerate via training/)
+models/*.pkl
+models/*.pt
+models/*.joblib
+models/*.onnx
+
+# Backtest scratch state
+**/market_data.pkl
+**/cycle_state.pkl
+*.cache
+
+# ── Logs (all subdirs and roots) ────────────────────────────────
+logs/**/*.log
+logs/**/*.csv
+logs/**/*.md
+logs/**/*.json
+logs/**/*.txt
+logs/**/*.pkl
+# Keep folder structure so first clone has the empty dirs
+!logs/**/.gitkeep
+
+# Per-day daemon stdout/stderr captures
+daemon_*.log
+agent_*.log
+battery_*.log
+
+# ── PID and lock files ──────────────────────────────────────────
+*.pid
+*.lock
+*.daemon.lock
+emergency_stop
+STOP
+
+# ── IDE & OS noise ──────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*.bak
+*~
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ── Failed alert spool (auto-replays on boot) ──────────────────
+.failed_alerts/
+.alerts_spool/
+
+# ── Misc generated reports kept outside logs/ ──────────────────
+audit_*.md
+checkpoint_*.md
+
+# ── Backtest one-off runs at root (legacy, will move to logs/archive) ──
+backtest_run_*/

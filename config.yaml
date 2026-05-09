@@ -1,0 +1,558 @@
+broker:
+  # 2026-05-08: switched canonical broker from Kite -> AngelOne SmartAPI.
+  # All real credentials live in .env (see .env.example). The placeholders
+  # below are overlaid by core/secrets.py at startup.
+  name: angelone                        # angelone | paper
+  api_key: "YOUR_ANGELONE_API_KEY"      # SmartAPI → My Apps → API Key
+  api_secret: "YOUR_ANGELONE_API_SECRET"# SmartAPI → My Apps → API Secret
+  client_id: "YOUR_ANGELONE_CLIENT_ID"  # Your AngelOne login ID (e.g. AACH...)
+  password: null                        # 4-digit MPin (env: ANGELONE_PASSWORD)
+  totp_secret: null                     # base32 (env: ANGELONE_TOTP_SECRET)
+  feed_token: null                      # populated at runtime
+  mode: paper                           # paper | live  (start with paper)
+  # Live-mode safety: refuse to come up if cash < this. 0 = disabled.
+  min_required_cash: 0.0
+
+market:
+  exchange: NSE
+  segment: EQUITY
+  # No hardcoded instruments — the scanner picks stocks automatically.
+  # If you want to override, set scanner.enabled to false and add instruments here.
+  instruments: []
+  trading_hours:
+    start: "09:15"
+    end: "15:30"
+    pre_open: "09:00"
+  timezone: "Asia/Kolkata"
+
+capital:
+  # 2026-05-08: paper mode scaled 25k -> 100k for capacity-stress observation.
+  # Live (AngelOne) caps at Rs 30k for May 11 cutover; that limit is enforced
+  # by the broker funding amount, not this value. broker.mode=paper today.
+  initial_balance: 100000.0
+  currency: INR
+
+# Stock Scanner — automatically finds the best stocks to trade
+scanner:
+  enabled: true                     # true = auto-pick stocks, false = use market.instruments
+  top_n: 200                         # how many stocks to watch (picks best 100 from 300+)
+  # 2026-05-08: raised 2000 -> 5000 alongside Rs 100k paper capital. With 15%
+  # max_position_size_pct, a Rs 5k stock × ~20 qty = Rs 100k * 15% = Rs 15k.
+  # Unlocks RELIANCE / MARUTI / BAJAJ-AUTO etc. that were previously skipped.
+  max_price: 5000.0                 # ignore stocks above ₹5,000
+  min_price: 5.0                    # ignore penny stocks below ₹5
+  min_avg_volume: 500000            # minimum 5-lakh avg daily volume (liquidity)
+  min_atr_pct: 1.0                  # at least 1% daily range (enough movement to profit)
+  rescan_interval_minutes: 30       # re-scan every 30 min to rotate into new opportunities
+  universe: []                      # empty = tries live NSE Nifty 500, falls back to ~300 hardcoded
+  # 2026-05-04: Pre-market warm-up. Scanning 500 stocks takes ~3 min, so if
+  # we wait until 09:15 the opening drive is already half over by the time
+  # we have a watchlist. This kicks off the heavy scan N min before the bell
+  # so trading is hot at 09:15 sharp. Set to 0 to disable.
+  premarket_warmup_minutes: 5
+
+data_pipeline:
+  use_websocket: false  # true to enable live tick streaming
+  tick_intervals:
+    - 1min
+    - 5min
+    - 15min
+
+database:
+  path: "data/trading_agent.db"
+
+strategies:
+  # 2026-05-05 backtest verdict: moving_average_crossover disabled.
+  #   - Ensemble entry-vote share: 48 / 5,393 = 0.9 % (effectively silent)
+  #   - Per-strategy backtest: WR 20%, PF 0.28, Sharpe -10.79
+  #   - Live: 0 trades / 0 signals over 2-day audit
+  # Re-enable only after parameter re-tune + bull-regime backtest validation.
+  #
+  # 2026-05-06: xgboost_classifier ENABLED for the first time.
+  #   - Trained on 5min × 60d × 100 NSE symbols (99,490 samples, 50/50 split)
+  #   - Test AUC 0.6436, Accuracy 60.27 % (industry rule: AUC > 0.60 = real edge)
+  #   - Class-balanced (scale_pos_weight=1.0); time-of-day features dominate.
+  #   - Smoke test on RELIANCE last 200 bars: 9% high-conf firing rate
+  #     (15 BUY / 3 SELL / 182 HOLD) — selective, not biased.
+  #   - Ensemble weight intentionally REDUCED 2.0 → 1.0 (see ensemble.weights):
+  #     it has no LIVE track record yet, so it earns weight via the learning
+  #     system as it accumulates closed trades.
+  active:
+    # - moving_average_crossover  # DISABLED 2026-05-05 (no edge)
+    - rsi_momentum
+    - mean_reversion
+    - vwap_bounce
+    - opening_range_breakout
+    - supertrend_follow
+    - xgboost_classifier  # ENABLED 2026-05-06 (AUC 0.6436)
+    # Uncomment after training the LSTM model:
+    # - lstm_price_model
+
+  moving_average_crossover:
+    short_window: 9
+    long_window: 21
+    timeframe: 5min
+    signal_threshold: 0.03
+
+  rsi_momentum:
+    period: 14
+    overbought: 70
+    oversold: 30
+    timeframe: 5min
+    # 2026-05-08: trend filter @ 5% — added after ATHERENERG (+15% above 50d
+    # SMA) was shorted on RSI overbought reversal, fighting daily uptrend.
+    trend_filter_pct: 5.0
+
+  mean_reversion:
+    lookback_period: 20
+    # 2026-05-08: tightened 1.6 -> 1.8 from overnight battery (C6 vs C1).
+    # Battery: 30d / 10 mid-caps:
+    #   z=1.6 (baseline): -Rs 69, WR 37.9%, PF 0.93, MaxDD 5.01%
+    #   z=1.8 (C6)      : +Rs 107, WR 43.3%, PF 1.12, MaxDD 4.25%
+    #   z=2.0 (C7)      : +Rs 98,  WR 43.3%, PF 1.11, MaxDD 4.25%
+    # Sweet spot at 1.8 — fewer marginal entries without losing real signal.
+    entry_z_score: 1.8
+    exit_z_score: 0.5
+    timeframe: 5min
+
+  vwap_bounce:
+    vwap_proximity_pct: 0.3
+    volume_spike_ratio: 1.3
+    confirmation_bars: 1
+    timeframe: 5min
+    # 2026-05-08: trend filter @ 5% — parity with all other strategies.
+    trend_filter_pct: 5.0
+
+  opening_range_breakout:
+    range_minutes: 10
+    volume_confirm_ratio: 1.15
+    atr_stop_multiplier: 1.5
+    timeframe: 5min
+    # 2026-05-08: trend filter @ 5% — block ORB shorts into strong uptrends
+    # / longs into hard downtrends.
+    trend_filter_pct: 5.0
+
+  supertrend_follow:
+    period: 10
+    multiplier: 3.0
+    adx_threshold: 20
+    timeframe: 5min
+    # 2026-05-08: trend filter @ 5% — added after CAMS (+20% above 50d SMA)
+    # was shorted on intraday ST flip and lost Rs 112. Daily uptrend overrules
+    # intraday momentum reversals.
+    trend_filter_pct: 5.0
+
+  xgboost_classifier:
+    model_path: "models/xgboost_model.pkl"
+    confidence_threshold: 0.65
+    prediction_horizon: 3
+    timeframe: 5min
+    # 2026-05-08: trend filter ENABLED at 5% from overnight battery (C2 winner).
+    # Block BUYs when price > 5% under the 50d SMA (i.e. "buying the falling
+    # knife"); block SELLs when price > 5% above the 50d SMA (chasing strength).
+    # Battery: 30d / 10 mid-caps:
+    #   off (baseline)    : -Rs 69,  WR 37.9%, PF 0.93, MaxDD 5.01%
+    #   5% (C2 — winner) : +Rs 164, WR 45.2%, PF 1.19, MaxDD 2.73%
+    #   15% (C3 — too loose): -Rs 136, WR 35.7%, PF 0.86, MaxDD 5.65%
+    # Net swing: +Rs 233, drawdown halved. Single largest improvement found.
+    trend_filter_pct: 5.0
+
+  lstm_price_model:
+    model_path: "models/lstm_model.pt"
+    scaler_path: "models/lstm_scaler.pkl"
+    sequence_length: 30
+    confidence_threshold: 0.6
+    timeframe: 15min
+
+ensemble:
+  confidence_threshold: 0.55    # raised 0.50 -> 0.55 (2026-04-28 audit: filter marginal setups)
+  min_strategies_agree: 1
+  # Dynamic confidence threshold bounds (agent auto-nudges inside this range
+  # based on recent win rate to be stricter when losing, looser when winning).
+  min_dynamic_threshold: 0.45
+  max_dynamic_threshold: 0.75
+  weights:
+    # 2026-05-06: reduced 2.0 -> 1.0. The model has a healthy backtest AUC
+    # (0.6436) but ZERO live track record. Starting at parity with rsi_momentum
+    # (1.0) lets the per-regime learning system promote/demote it based on
+    # actual realized P&L over the next 1-2 weeks instead of letting an
+    # untested model dominate ensemble decisions on day one.
+    xgboost_classifier: 1.0
+    lstm_price_model: 1.8
+    supertrend_follow: 1.5
+    opening_range_breakout: 1.3
+    vwap_bounce: 1.2
+    moving_average_crossover: 1.0
+    rsi_momentum: 1.0
+    mean_reversion: 0.8
+
+# Self-Learning — agent learns from past trades and adapts strategy weights
+learning:
+  enabled: true
+  min_trades_to_learn: 10          # need at least 10 closed trades before adjusting weights
+  weight_update_interval: 10       # recalculate weights every 10 trades (was 20)
+  decay_factor: 0.95               # recent trades matter more than old ones
+  pattern_lookback: 50             # remember last 50 trades for pattern matching
+  max_weight: 5.0                  # no strategy weight exceeds 5x base
+  min_weight: 0.1                  # floor for weight tuning (still > 0)
+  pattern_similarity_threshold: 0.75  # how similar a setup must be to match a pattern
+
+  # Learning-freeze guardrail: pause weight escalation during bad regimes
+  freeze_rolling_window: 10        # rolling window of recent trades to evaluate
+  freeze_if_drawdown_pnl_below: -100.0  # if rolling PnL < Rs -100 ...
+  freeze_if_vix_above: 22.0        # ... AND VIX >= 22, freeze weight updates
+
+  # Kelly-lite sizing bounds (multiplier applied to position size)
+  kelly_min_multiplier: 0.5        # never shrink to < 50% of base size
+  kelly_max_multiplier: 1.5        # never exceed 150% of base size
+
+  # ── Auto-suppress losing strategies (2026-05-06) ──────────────────
+  # The min_weight floor (0.1) keeps a bleeding strategy alive in the
+  # ensemble, where it can still tip a marginal vote into a bad trade.
+  # When a strategy has accumulated ENOUGH evidence of losing money
+  # (profit_factor below pf_threshold over at least min_trades), set
+  # its weight to 0 — fully removing it from voting until it recovers.
+  #
+  # Recovery: weights are recalculated every `weight_update_interval`
+  # closed trades. As soon as the strategy's profit_factor climbs back
+  # above pf_threshold, normal weight tuning resumes. So suppression
+  # is automatic AND reversible — no manual intervention required.
+  #
+  # Tuning notes:
+  #   pf_threshold=0.7 — losing 30 % more than winning is a clear bleed
+  #   min_trades=8     — need a real sample, not 1-2 unlucky trades
+  #   This applies BOTH globally and per-regime (a strategy can be
+  #   suppressed in bear_high_vol while fine in bull_low_vol).
+  auto_suppress_enabled: true
+  auto_suppress_min_trades: 8
+  auto_suppress_pf_threshold: 0.7
+
+risk:
+  # Position sizing
+  # 2026-05-08: dropped 25 -> 15 alongside Rs 100k paper capital. 25% × Rs 100k
+  # = Rs 25k/position is over-concentrated; 15% × 100k = Rs 15k is healthier
+  # diversification. max_risk_per_trade_pct stays at 1% (Rs 1,000 risk now).
+  max_position_size_pct: 15.0    # up to 15% per position (allows 6+ concurrent)
+  max_risk_per_trade_pct: 1.0    # max 1% capital risk per trade
+
+  # Stop-loss / take-profit
+  # 2026-04-28 audit: 44% of trades stopped out (11/25) with only 1 win.
+  # Widened 1.5 -> 2.0 ATR to cut noise shakeouts. Risk per trade stays
+  # capped by max_risk_per_trade_pct, so position size auto-shrinks.
+  atr_stop_multiplier: 2.0       # SL = 2.0 x ATR(14) from entry
+  stop_loss_pct: 2.0             # fallback if no ATR available
+  take_profit_pct: 3.5           # wider TP to maintain R:R with wider SL
+
+  # Trailing stop (price-based, locks on small reversals)
+  trailing_activation_rr: 1.0    # activate trailing at 1:1 R:R
+  trailing_step_pct: 0.3         # 0.3% step
+
+  # Peak-giveback exit (P&L-based, catches drift-back from strong MFE)
+  # 2026-05-07: today's MEESHO trade hit MFE +Rs 276 and exited at +Rs 71
+  # via signal-flip — a 74% giveback the price-trail never caught. With
+  # these defaults the exit would have fired around 35% giveback,
+  # locking in ~+Rs 180. Set peak_giveback_enabled: false to disable.
+  peak_giveback_enabled: true
+  peak_giveback_arm_rr: 1.5      # only arm after position is up 1.5R
+  peak_giveback_pct: 35.0        # exit after 35% of peak R given back
+
+  # Per-strategy circuit breaker — suspends ONE strategy for the day
+  # after a bad run, while leaving the other strategies free to trade.
+  # 2026-05-07: insurance for tomorrow if a strategy goes bad in live
+  # without polluting the whole portfolio. Set to 0 to disable.
+  strategy_max_consec_losses: 3   # 3 consecutive losses on one strategy -> suspend
+  strategy_daily_loss_pct: 1.0    # OR -1% of capital from one strategy -> suspend
+
+  # Burst cap — max N entries opened in a rolling X-min window.
+  # Prevents correlated cluster risk (e.g. opening-bell pile-on or a
+  # whole-sector wave hitting in one minute). 0 = disabled.
+  # 2026-05-07: today saw IFCI + ICICIPRULI both opened at 13:45-13:46,
+  # both in the financials cluster. With max=3 over 5min those would
+  # have been allowed; tighter caps would have rejected the 2nd one.
+  # 2026-05-08: raised 4 -> 6 alongside Rs 100k paper capital — wider entry
+  # capacity for higher-conviction periods now that we can hold 12 concurrent.
+  max_opens_per_window: 6
+  opens_window_minutes: 5
+
+  # Daily limits
+  daily_loss_limit_pct: 3.0      # max 3% daily loss
+  # 2026-05-08: raised 15 -> 25 alongside Rs 100k paper capital — Rs 100k
+  # supports more activity headroom; 15 was a Rs 25k-era cap.
+  max_trades_per_day: 25         # raised from 15 for Rs 100k paper
+  # 2026-05-08: raised 10 -> 12 alongside Rs 100k paper capital.
+  max_open_positions: 12         # position sizing limits per-trade risk
+  max_consecutive_losses: 3      # cooldown after 3 consecutive losses
+
+  # Drawdown tiers
+  drawdown_reduce_pct: 10.0      # reduce size at 10% drawdown (tighter for small capital)
+  drawdown_halt_pct: 20.0        # HALT at 20% drawdown (protect capital)
+  max_drawdown_pct: 10.0
+
+  # Weekly limit
+  weekly_loss_limit_pct: 5.0
+
+  # Market regime filters
+  max_vix: 25.0                  # skip if India VIX > 25
+  require_nifty_above_200ema: false
+
+  # Intraday time exit
+  intraday_exit_time: "15:15"
+
+  # Opening-bar lockout (2026-05-07). Block NEW position opens during the
+  # first N minutes after market open. 30-day post-mortem showed disproportionate
+  # losses from 09:15-09:30 (no price discovery, gap-driven false signals).
+  # Existing positions can still EXIT (SL/TP/signal) during this window.
+  # Set to 0 to disable.
+  opening_lockout_minutes: 15
+
+  # Carryover profit-locking (2026-05-07). At the configured time, auto-close
+  # any position that:
+  #   * was opened on a previous trading session (carryover), AND
+  #   * is currently profitable by at least `carryover_lock_min_profit` rupees
+  # Reasoning: 2026-05-07 CROMPTON had +Rs 108 unrealized at 15:25 yesterday;
+  # we held overnight, gap-up cost Rs 166. Pure session-end take-profit on
+  # profitable carryovers would have saved Rs 274 on this single trade.
+  # Fires once per day. Set carryover_lock_time to "" to disable entirely.
+  carryover_lock_time: "15:10"
+  carryover_lock_min_profit: 0.0
+
+  # Expected-profit gate — skip trades where reward doesn't cover charges.
+  # 2026-04-28 audit: 7 of 10 wins were < Rs 15 net. Tightened minimums.
+  min_profit_to_charges_ratio: 2.5   # reward must be >= 2.5x round-trip charges
+  min_absolute_reward_rs: 20.0       # never take a trade targeting < Rs 20 reward
+
+  # Minimum per-trade notional — below this level round-trip commissions
+  # (~Rs 40 on MIS) eat too much of the reward, making tiny PnL wins
+  # indistinguishable from breakeven.
+  #
+  # 2026-04-30 13:49: lowered 6000 -> 2800 to fit the 30 % symbol-exposure
+  # cap on Rs 10k book (6k notional = 60 % of equity = hit concentration
+  # gate on every attempt). Break-even becomes ~1.4 %.
+  # 2026-05-04: raised 2800 -> 3000 now that cap-aware scaler respects the
+  # 30 % cap automatically. Slight reduction in commission drag.
+  # 2026-05-08: raised 3000 -> 5000 alongside Rs 100k paper capital. Higher
+  # notional = lower commission drag % (Rs 6 round-trip on Rs 5k = 0.12% vs
+  # 0.20% on Rs 3k). At Rs 100k cash, scratch trades below Rs 5k are not
+  # worth the slippage + commission combined.
+  min_trade_notional: 5000.0
+
+  # Minimum stop-loss distance as % of entry price. ATR-derived SLs on
+  # quiet stocks can come out < 1 %, which is inside normal intraday noise.
+  # Floor the SL to this value (or ATR*multiplier, whichever is wider).
+  min_stop_loss_pct: 1.2             # 1.2 % = 3x average bid-ask noise
+
+  # Take-profit ceiling — bound the TP so it remains reachable intraday.
+  # Hard cap as both (a) multiple of SL distance and (b) absolute % of entry.
+  max_tp_to_sl_multiple: 2.5         # cap TP at 2.5x SL distance
+  max_tp_pct: 2.5                    # and at 2.5 % of entry price
+
+  # Per-strategy RR floor for the expected-profit gate. Strategies with a
+  # higher win-rate profile (mean_reversion) need less RR; trend-followers
+  # (supertrend, ORB) need more. Falls back to 1.2 if not listed.
+  # 2026-04-30 audit: the flat 1.2x gate killed 20+ valid MR setups/day.
+  min_rr_by_strategy:
+    mean_reversion: 0.6
+    rsi_momentum: 1.0
+    vwap_bounce: 1.0
+    moving_average_crossover: 1.2
+    supertrend_follow: 1.3
+    opening_range_breakout: 1.3
+
+  # Exit fast-path threshold (2026-05-04): closing signals on existing
+  # positions bypass the ensemble's confidence_threshold + min_strategies_agree
+  # gates entirely — those gates exist to gate ENTRIES (we want conviction
+  # before deploying capital). For EXITS the position thesis was already
+  # validated; a single credible voice saying "thesis fulfilled" should
+  # close. mean_reversion EXIT signals fire at conf=0.45, so 0.40 is the
+  # natural floor (just below intentional design). Set <= 0.0 to disable.
+  signal_exit_min_conf: 0.40
+
+  # Signal-exit unrealized-PnL floor (2026-05-05 backtest finding).
+  # The exit fast-path correctly closes single-strategy "thesis fulfilled"
+  # signals — but on near-flat positions, round-trip MIS charges (~Rs 6)
+  # turn nominal "wins" into net losses. Live evidence: LODHA SELL closed
+  # -Rs 2.82, ITCHOTELS SELL closed +Rs 1.33 — both signal exits where
+  # charges ate the win. This floor blocks the fast-path when unrealized
+  # PnL hasn't yet covered ~1.5x round-trip charges; the trade then keeps
+  # running until SL/TP/trailing-stop fires. SL/TP exits remain
+  # unconditional (this only gates signal-driven fast-path exits).
+  # Set to 0.0 to disable.
+  min_holding_pnl_rs: 15.0
+
+  # Rejection cooldown (2026-05-04). Persistent gates (notional floor, safety
+  # gate, sector concentration, ATR gate, etc.) almost always re-reject the
+  # same (symbol, direction) every cycle until market conditions move enough
+  # to flip the gate — but the strategies keep firing the same signal every
+  # 60 s, producing audit-row noise + wasted compute. This knob silences
+  # re-evaluation of an already-rejected (symbol, direction) for N minutes.
+  # State-dependent reasons (already_open, blacklist, exit-cooldown,
+  # shorts_disabled) are explicitly excluded — they clear naturally when
+  # state changes, so caching a stale cooldown there would be wrong.
+  # Set to 0 to disable.
+  rejection_cooldown_minutes: 5
+
+  # Concentration / sector limits — avoid all eggs in one basket.
+  max_sector_exposure_pct: 40.0      # never let a single sector exceed 40% of portfolio
+  # 2026-05-04: reverted 35 -> 30 once cap-aware notional-floor logic
+  # shipped (notional scaler now respects this cap instead of fighting it).
+  max_symbol_exposure_pct: 30.0      # never let a single symbol exceed 30% of portfolio
+  # When true, symbols not in NSE_SECTOR_MAP get a per-symbol bucket (no
+  # artificial grouping into one giant UNKNOWN pool). 2026-04-30 audit:
+  # 28 rejects/day were a single UNKNOWN bucket blocking genuinely
+  # unrelated mid-caps (UNIONBANK, TTML, SUZLON etc.).
+  unknown_sector_per_symbol: true
+
+  # Circuit-limit guard — reject entries into stocks already moved too far intraday.
+  # NSE bands are typically 5/10/20%; near the band risk is asymmetric (freeze risk).
+  circuit_proximity_pct: 8.0         # reject if day-move >= 8% vs previous close
+
+# Robustness — unattended operation safeguards
+robustness:
+  reentry_cooldown_minutes: 30     # don't re-buy a stock within 30 min of being stopped out
+  max_losses_per_stock_per_day: 2  # blacklist a stock after 2 losses in a day
+  late_entry_cutoff: "14:30"       # no new positions after 2:30 PM (need time for SL/TP to work)
+  heartbeat_interval_cycles: 10    # log a health summary every 10 cycles
+  eod_summary_time: "15:20"        # auto-send daily P&L report at this time
+  max_cycle_errors: 5              # halt agent after 5 consecutive cycle errors
+
+  # Noon-lull filter — 2026-04-28 audit: 12:00-13:00 hour lost Rs 109.84
+  # across 8 trades (12.5% win rate, 56% of total daily losses).
+  # This block list skips NEW entries during these hours. Existing positions
+  # are managed normally (SL/TP/trailing still active).
+  #
+  # 2026-04-30: removed — 17 signals rejected today by the block and the
+  # 04-28 audit data is 2 days old. Re-enable after a fresh audit if the
+  # noon-lull pattern re-emerges.
+  dead_hour_blocks: []
+
+  # Minimum holding time — don't let a trade churn out within the first few
+  # minutes from noise. Only applies to signal-based exits; SL and TP are
+  # always honoured. Helps avoid 0-min whipsaw exits seen in audit.
+  min_holding_minutes: 3
+
+  # Minimum ATR% to enter — skip stocks that are too quiet to meaningfully
+  # reach TP targets within the trading day. Dead stocks produce small wins
+  # that get eaten by charges.
+  #
+  # Flat threshold (fallback if regime map not provided):
+  min_entry_atr_pct: 0.5
+  #
+  # Regime-aware thresholds (used when present; overrides the flat value).
+  # Rationale: when VIX is low (bull_low_vol), mid-caps legitimately move only
+  # 0.4-0.7% intraday — a 0.8% floor rejects 80% of signals. In high-vol
+  # regimes we can afford to be stricter because genuine moves are larger.
+  #   bull_high_vol: trending up, VIX>=16  → look for strong moves only
+  #   bull_low_vol:  trending up, VIX<16   → accept quieter setups
+  #   bear_high_vol: trending down, VIX>=16 → keep some standards
+  #   bear_low_vol:  trending down, VIX<16 → be cautious, skip the weakest
+  #   sideways:      chop → require solid volatility to avoid fake-outs
+  #   unknown:       pre-first-refresh   → fall back to flat value
+  min_entry_atr_pct_by_regime:
+    bull_high_vol: 0.7
+    bull_low_vol:  0.4
+    # 2026-05-04: reverted to 0.5 (was tactically dropped to 0.20 on 04-30
+    # which forced trades into pure-noise mid-caps and produced 3 straight
+    # stop-outs). Bear regimes are dangerous tapes — keep the gate strict.
+    bear_high_vol: 0.5
+    bear_low_vol:  0.5
+    sideways:      0.6
+
+execution:
+  order_type: LIMIT
+  product_type: INTRADAY
+  retry_attempts: 3
+  retry_delay_seconds: 2
+  slippage_tolerance_pct: 0.1
+  commission_pct: 0.03
+  # Shadow mode: when true, no orders are placed but signal intent is logged.
+  # Useful to validate a new config against live market data before going
+  # live for real. Works with any broker mode.
+  shadow_mode: false
+  paper_partial_fill_prob: 0.0
+  paper_partial_fill_min_ratio: 0.5
+
+  # ── Short-selling (intraday MIS only) ────────────────────────────────
+  # When enabled, ensemble SELL signals on symbols with no open position
+  # open a SHORT. All long-side gates apply symmetrically (cooldown,
+  # blacklist, late-cutoff, dead-hour, ATR gate, expected-profit, pre-trade
+  # safety). Short positions are auto-squared-off at intraday_exit_time
+  # just like longs. SL is above entry, TP is below entry.
+  #
+  # Regime guard: shorts only in the listed regimes. Fighting a trending
+  # bull market with shorts is a classic way to donate money — we default
+  # to bear and sideways regimes only.
+  # Enabled 2026-04-30 13:30 — 55 SELL signals silently dropped post-restart
+  # while regime=bear_high_vol (VIX 19.4, Nifty below 200-EMA). This is the
+  # textbook use case for the feature.
+  enable_short_selling: true
+  short_selling_regimes:
+    - bear_high_vol
+    - bear_low_vol
+    - sideways
+
+  # ── Long-entry regime guard (2026-05-05 backtest finding) ────────────
+  # Symmetric mirror of short_selling_regimes for the BUY side. Backtest
+  # over 30 days × 50 large-caps showed the long side has NO validated
+  # edge — most of the -11.38 % return came from BUY trades. Live, the
+  # regime guard quietly routes everything to shorts in the current bear
+  # tape, so longs haven't activated. When the regime flips to bullish,
+  # longs will fire for the first time on (potentially live) money.
+  # This guard ensures BUYs only fire in regimes where we have at least
+  # directional backing.
+  #
+  # Empty list (or omit the key entirely) = PERMISSIVE (legacy behaviour,
+  # no regime restriction on longs). Explicit list = restrict to the
+  # listed regimes.
+  long_entry_regimes:
+    - bull_low_vol
+    - bull_high_vol
+
+# ── Operational controls (2026-05-06) ─────────────────────────────
+# These are meta-settings that govern how the agent behaves outside
+# strategy/risk decisions: kill switches, watchdog-style behaviours,
+# self-healing knobs.
+operations:
+  # File-based emergency stop. When this file exists, the agent
+  # halts at the top of the next cycle, sends a critical alert, and
+  # exits cleanly via the normal _shutdown path (so EOD summary and
+  # state persistence still run). Does NOT auto-flatten unless
+  # `emergency_stop_flatten` is true. Default location keeps the
+  # control file co-located with logs for easy operator workflow:
+  #     touch logs/STOP   # halt
+  #     rm logs/STOP      # clear before restart
+  emergency_stop_path: "logs/STOP"
+  # If true, the kill switch will also square off all open positions
+  # at last-known LTP before exiting. Default false because intraday
+  # MIS positions auto-flatten at 15:15 anyway, and an operator
+  # killing the agent mid-session usually wants to inspect, not
+  # panic-close.
+  emergency_stop_flatten: false
+
+backtest:
+  start_date: "2023-01-01"
+  end_date: "2026-03-29"
+  initial_capital: 10000.0
+  commission_pct: 0.03
+  slippage_pct: 0.05
+
+monitoring:
+  dashboard_refresh_seconds: 5
+  alerts:
+    enabled: true
+    email:
+      enabled: true
+      provider: "resend"            # resend | smtp
+      resend_api_key: "YOUR_RESEND_API_KEY"   # override via RESEND_API_KEY env var (.env)
+      smtp_server: "smtp.gmail.com"
+      smtp_port: 587
+      sender: "Trading Agent <onboarding@resend.dev>"
+      password: "YOUR_APP_PASSWORD"
+      recipient: "shaan9815@gmail.com"
+
+logging:
+  level: INFO
+  console: true
+  file: true
+  log_dir: logs
+  max_file_size_mb: 10
+  backup_count: 5
