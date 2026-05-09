@@ -1,0 +1,78 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "trading-agent"
+version = "0.5.0"
+description = "Autonomous trading agent for the Indian stock market (NSE/BSE) with AngelOne broker integration."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Proprietary" }
+authors = [{ name = "subhanda" }]
+keywords = ["trading", "algotrading", "indian-stock-market", "angelone", "ml"]
+
+# Dependencies are mirrored in requirements.txt for now; pyproject is the
+# preferred install path going forward (`pip install -e .`).
+dependencies = [
+    "pandas>=2.2.0",
+    "numpy>=1.26.0",
+    "pyyaml>=6.0.1",
+    "requests>=2.31.0",
+    "python-dateutil>=2.8.2",
+    "pytz>=2024.1",
+    "smartapi-python>=1.3.0",
+    "pyotp>=2.9.0",
+    "websocket-client>=1.7.0",
+    "yfinance>=0.2.36",
+    "ta>=0.11.0",
+    "loguru>=0.7.2",
+    "rich>=13.7.0",
+    "tabulate>=0.9.0",
+    "psutil>=5.9.0",
+    "resend>=0.7.0",
+    "xgboost>=2.0.0",
+    "scikit-learn>=1.4.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-cov>=4.1.0",
+    "ruff>=0.4.0",
+    "mypy>=1.10.0",
+]
+
+# ── Tool configuration ──────────────────────────────────────────
+
+[tool.pytest.ini_options]
+minversion = "8.0"
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+markers = [
+    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+    "integration: marks tests requiring DB or full pipeline",
+    "live: marks tests that hit external APIs (off by default)",
+]
+filterwarnings = [
+    "ignore::DeprecationWarning:yfinance.*",
+    "ignore::urllib3.exceptions.InsecureRequestWarning",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+exclude = ["logs", "models", "data", "_archive", ".venv"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "N", "UP", "B", "C4", "SIM"]
+ignore = ["E501", "N802", "N803", "N806"]
+
+[tool.mypy]
+python_version = "3.11"
+strict_optional = true
+ignore_missing_imports = true
+warn_unused_ignores = true
+exclude = ["logs/", "models/", "tests/integration/"]

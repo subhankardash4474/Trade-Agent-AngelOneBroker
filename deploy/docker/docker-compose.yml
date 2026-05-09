@@ -1,0 +1,59 @@
+# docker-compose.yml — single-host deployment
+#
+# Usage:
+#   cd deploy/docker
+#   docker compose up -d                # start agent in background
+#   docker compose logs -f agent        # follow live logs
+#   docker compose down                 # graceful shutdown
+#
+# Prereqs:
+#   - .env at project root with broker credentials
+#   - config.yaml at project root
+#   - Empty volume dirs at project root: logs/, data/, models/
+#
+# IMPORTANT: This is a SINGLE-VM deployment; not k8s. The trading agent is
+# a modular monolith on purpose (latency-sensitive). Don't split into pods
+# without re-thinking the cycle latency budget — see docs/ARCHITECTURE.md.
+
+services:
+  agent:
+    build:
+      context: ../..              # build from project root so all code is in scope
+      dockerfile: deploy/docker/Dockerfile
+    image: trading-agent:latest
+    container_name: trading-agent
+    restart: unless-stopped       # auto-restart on crash, but not on docker stop
+
+    # The agent writes runtime state here; mount as bind-volumes so they
+    # survive container recreation.
+    volumes:
+      - ../../logs:/app/logs
+      - ../../data:/app/data
+      - ../../models:/app/models
+      - ../../config.yaml:/app/config.yaml:ro
+      - ../../.env:/app/.env:ro
+
+    environment:
+      TZ: Asia/Kolkata
+      PYTHONUNBUFFERED: "1"
+
+    # Resource caps (tune to your VM)
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 2G
+        reservations:
+          cpus: "0.5"
+          memory: 512M
+
+    # Stop signal — give the agent 30s to drain orders and flush logs
+    # cleanly before SIGKILL. Matches `_shutdown()` in trading_agent.py.
+    stop_grace_period: 30s
+
+    healthcheck:
+      test: ["CMD", "python", "tools/health_check.py"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 120s

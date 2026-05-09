@@ -31,13 +31,16 @@ psutil>=5.9.0
 pytest>=8.0.0
 pytest-cov>=4.1.0
 
-# Streamlit dashboard (optional: pip install streamlit)
+# Email alerts
+resend>=0.7.0
+
+# ML / training
+xgboost>=2.0.0
+scikit-learn>=1.4.0
+
+# Optional dashboards (uncomment if used)
 # streamlit>=1.30.0
-
-# ML models (optional: pip install xgboost torch scikit-learn)
-# xgboost>=2.0.0
 # torch>=2.1.0
-# scikit-learn>=1.4.0
 
-# Kite Connect
-kiteconnect>=5.0.0
+# NOTE: Kite Connect (kiteconnect) was deprecated 2026-05-08; AngelOne is the
+# canonical broker -- see docs/journal/engineering_journal_2026-05-08.md.
