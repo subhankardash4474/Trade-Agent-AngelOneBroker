@@ -1,0 +1,225 @@
+broker:
+  name: kite
+  api_key: YOUR_KITE_API_KEY
+  api_secret: YOUR_KITE_API_SECRET
+  client_id: TIF484
+  access_token: YOUR_ACCESS_TOKEN
+  password: null
+  totp_secret: null
+  feed_token: null
+  mode: paper
+market:
+  exchange: NSE
+  segment: EQUITY
+  instruments: []
+  trading_hours:
+    start: 09:15
+    end: '15:30'
+    pre_open: 09:00
+  timezone: Asia/Kolkata
+capital:
+  initial_balance: 25000.0
+  currency: INR
+scanner:
+  enabled: true
+  top_n: 200
+  max_price: 2000.0
+  min_price: 5.0
+  min_avg_volume: 500000
+  min_atr_pct: 1.0
+  rescan_interval_minutes: 30
+  universe: []
+  premarket_warmup_minutes: 5
+data_pipeline:
+  use_websocket: false
+  tick_intervals:
+  - 1min
+  - 5min
+  - 15min
+database:
+  path: data/trading_agent.db
+strategies:
+  active:
+  - rsi_momentum
+  - mean_reversion
+  - vwap_bounce
+  - opening_range_breakout
+  - supertrend_follow
+  - xgboost_classifier
+  moving_average_crossover:
+    short_window: 9
+    long_window: 21
+    timeframe: 5min
+    signal_threshold: 0.03
+  rsi_momentum:
+    period: 14
+    overbought: 70
+    oversold: 30
+    timeframe: 5min
+  mean_reversion:
+    lookback_period: 20
+    entry_z_score: 1.8
+    exit_z_score: 0.5
+    timeframe: 5min
+  vwap_bounce:
+    vwap_proximity_pct: 0.3
+    volume_spike_ratio: 1.3
+    confirmation_bars: 1
+    timeframe: 5min
+  opening_range_breakout:
+    range_minutes: 10
+    volume_confirm_ratio: 1.15
+    atr_stop_multiplier: 1.5
+    timeframe: 5min
+  supertrend_follow:
+    period: 10
+    multiplier: 3.0
+    adx_threshold: 20
+    timeframe: 5min
+  xgboost_classifier:
+    model_path: models/xgboost_model.pkl
+    confidence_threshold: 0.65
+    prediction_horizon: 3
+    timeframe: 5min
+  lstm_price_model:
+    model_path: models/lstm_model.pt
+    scaler_path: models/lstm_scaler.pkl
+    sequence_length: 30
+    confidence_threshold: 0.6
+    timeframe: 15min
+ensemble:
+  confidence_threshold: 0.55
+  min_strategies_agree: 1
+  min_dynamic_threshold: 0.45
+  max_dynamic_threshold: 0.75
+  weights:
+    xgboost_classifier: 1.0
+    lstm_price_model: 1.8
+    supertrend_follow: 1.5
+    opening_range_breakout: 1.3
+    vwap_bounce: 1.2
+    moving_average_crossover: 1.0
+    rsi_momentum: 1.0
+    mean_reversion: 0.8
+learning:
+  enabled: true
+  min_trades_to_learn: 10
+  weight_update_interval: 10
+  decay_factor: 0.95
+  pattern_lookback: 50
+  max_weight: 5.0
+  min_weight: 0.1
+  pattern_similarity_threshold: 0.75
+  freeze_rolling_window: 10
+  freeze_if_drawdown_pnl_below: -100.0
+  freeze_if_vix_above: 22.0
+  kelly_min_multiplier: 0.5
+  kelly_max_multiplier: 1.5
+  auto_suppress_enabled: true
+  auto_suppress_min_trades: 8
+  auto_suppress_pf_threshold: 0.7
+risk:
+  max_position_size_pct: 25.0
+  max_risk_per_trade_pct: 1.0
+  atr_stop_multiplier: 2.0
+  stop_loss_pct: 2.0
+  take_profit_pct: 3.5
+  trailing_activation_rr: 1.0
+  trailing_step_pct: 0.3
+  daily_loss_limit_pct: 3.0
+  max_trades_per_day: 15
+  max_open_positions: 10
+  max_consecutive_losses: 3
+  drawdown_reduce_pct: 10.0
+  drawdown_halt_pct: 20.0
+  max_drawdown_pct: 10.0
+  weekly_loss_limit_pct: 5.0
+  max_vix: 25.0
+  require_nifty_above_200ema: false
+  intraday_exit_time: '15:15'
+  opening_lockout_minutes: 15
+  carryover_lock_time: '15:10'
+  carryover_lock_min_profit: 0.0
+  min_profit_to_charges_ratio: 2.5
+  min_absolute_reward_rs: 20.0
+  min_trade_notional: 3000.0
+  min_stop_loss_pct: 1.2
+  max_tp_to_sl_multiple: 2.5
+  max_tp_pct: 2.5
+  min_rr_by_strategy:
+    mean_reversion: 0.6
+    rsi_momentum: 1.0
+    vwap_bounce: 1.0
+    moving_average_crossover: 1.2
+    supertrend_follow: 1.3
+    opening_range_breakout: 1.3
+  signal_exit_min_conf: 0.4
+  min_holding_pnl_rs: 15.0
+  rejection_cooldown_minutes: 5
+  max_sector_exposure_pct: 40.0
+  max_symbol_exposure_pct: 30.0
+  unknown_sector_per_symbol: true
+  circuit_proximity_pct: 8.0
+robustness:
+  reentry_cooldown_minutes: 30
+  max_losses_per_stock_per_day: 2
+  late_entry_cutoff: '14:30'
+  heartbeat_interval_cycles: 10
+  eod_summary_time: '15:20'
+  max_cycle_errors: 5
+  dead_hour_blocks: []
+  min_holding_minutes: 3
+  min_entry_atr_pct: 0.5
+  min_entry_atr_pct_by_regime:
+    bull_high_vol: 0.7
+    bull_low_vol: 0.4
+    bear_high_vol: 0.5
+    bear_low_vol: 0.5
+    sideways: 0.6
+execution:
+  order_type: LIMIT
+  product_type: INTRADAY
+  retry_attempts: 3
+  retry_delay_seconds: 2
+  slippage_tolerance_pct: 0.1
+  commission_pct: 0.03
+  shadow_mode: false
+  paper_partial_fill_prob: 0.0
+  paper_partial_fill_min_ratio: 0.5
+  enable_short_selling: true
+  short_selling_regimes:
+  - bear_high_vol
+  - bear_low_vol
+  - sideways
+  long_entry_regimes:
+  - bull_low_vol
+  - bull_high_vol
+operations:
+  emergency_stop_path: logs/STOP
+  emergency_stop_flatten: false
+backtest:
+  start_date: '2023-01-01'
+  end_date: '2026-03-29'
+  initial_capital: 10000.0
+  commission_pct: 0.03
+  slippage_pct: 0.05
+monitoring:
+  dashboard_refresh_seconds: 5
+  alerts:
+    enabled: true
+    email:
+      enabled: true
+      provider: resend
+      resend_api_key: YOUR_RESEND_API_KEY
+      smtp_server: smtp.gmail.com
+      smtp_port: 587
+      sender: Trading Agent <onboarding@resend.dev>
+      password: YOUR_APP_PASSWORD
+      recipient: shaan9815@gmail.com
+logging:
+  level: INFO
+  console: true
+  file: true
+  log_dir: logs
+  max_file_size_mb: 10
+  backup_count: 5
