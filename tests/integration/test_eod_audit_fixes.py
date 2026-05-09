@@ -26,7 +26,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parents[2]))
 
-from core.ensemble import EnsembleModel
+from strategies.ensemble import EnsembleModel
 from strategies.base_strategy import Signal, TradeSignal
 
 

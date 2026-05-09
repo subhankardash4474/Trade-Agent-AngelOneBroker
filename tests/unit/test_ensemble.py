@@ -6,7 +6,7 @@ Tests weighted voting, confidence thresholds, and signal aggregation.
 import pandas as pd
 import pytest
 
-from core.ensemble import EnsembleModel
+from strategies.ensemble import EnsembleModel
 from strategies.base_strategy import Signal, TradeSignal
 
 

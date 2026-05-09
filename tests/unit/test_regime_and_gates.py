@@ -6,7 +6,7 @@ gate, per-strategy attribution, and dynamic confidence threshold.
 import pandas as pd
 import pytest
 
-from core.ensemble import EnsembleModel
+from strategies.ensemble import EnsembleModel
 from core.regime import classify_regime, regime_multiplier
 from core.risk_manager import RiskManager
 from strategies.base_strategy import Signal, TradeSignal

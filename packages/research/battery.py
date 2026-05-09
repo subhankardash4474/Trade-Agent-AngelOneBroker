@@ -48,7 +48,7 @@ from loguru import logger
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from backtest_ensemble import BacktestConfig, EnsembleBacktester, export_result  # noqa: E402
+from research.backtest_ensemble import BacktestConfig, EnsembleBacktester, export_result  # noqa: E402
 from core.data_handler import DataHandler  # noqa: E402
 from core.features import FeatureEngine  # noqa: E402
 

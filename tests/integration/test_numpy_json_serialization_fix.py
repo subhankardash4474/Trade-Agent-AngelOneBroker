@@ -139,7 +139,7 @@ class TestEnsembleContribsAreNativeFloat(unittest.TestCase):
     future strategy emits np.float32 confidence."""
 
     def _make_ensemble(self):
-        from core.ensemble import EnsembleModel
+        from strategies.ensemble import EnsembleModel
         cfg = {
             "ensemble": {
                 "min_strategies_to_vote": 1,

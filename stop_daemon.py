@@ -28,6 +28,14 @@ Usage
 
 Portable — works on Windows, Linux, macOS.
 """
+
+# Phase 1 sys.path bootstrap -- packages/ is the new home for core, strategies, etc.
+import sys as _sys
+from pathlib import Path as _Path
+_pkg = _Path(__file__).resolve().parent / 'packages'
+if str(_pkg) not in _sys.path:
+    _sys.path.insert(0, str(_pkg))
+
 from __future__ import annotations
 
 import argparse

@@ -178,9 +178,9 @@ class TestGapDetector:
 
         monkeypatch.setenv("AGENT_DB_PATH", db_path)
         # Reimport so the module-level DB_PATH picks up the new env var
-        if "analyze_day" in sys.modules:
-            del sys.modules["analyze_day"]
-        import analyze_day
+        if "research.analyze_day" in sys.modules:
+            del sys.modules["research.analyze_day"]
+        from research import analyze_day
 
         trades = analyze_day.load_trades(
             "2026-04-28T00:00:00", "2026-04-29T00:00:00"
@@ -208,9 +208,9 @@ class TestGapDetector:
             self._insert_trade(db_path, pnl=5.0, symbol=f"OK{i}")
 
         monkeypatch.setenv("AGENT_DB_PATH", db_path)
-        if "analyze_day" in sys.modules:
-            del sys.modules["analyze_day"]
-        import analyze_day
+        if "research.analyze_day" in sys.modules:
+            del sys.modules["research.analyze_day"]
+        from research import analyze_day
 
         trades = analyze_day.load_trades(
             "2026-04-28T00:00:00", "2026-04-29T00:00:00"
@@ -224,9 +224,9 @@ class TestGapDetector:
         db_path = str(tmp_path / "empty.db")
         Database(db_path)
         monkeypatch.setenv("AGENT_DB_PATH", db_path)
-        if "analyze_day" in sys.modules:
-            del sys.modules["analyze_day"]
-        import analyze_day
+        if "research.analyze_day" in sys.modules:
+            del sys.modules["research.analyze_day"]
+        from research import analyze_day
         trades = analyze_day.load_trades("2020-01-01T00:00:00", "2020-01-02T00:00:00")
         stats = analyze_day.compute_stats(trades)
         suggestions = analyze_day.detect_gaps(trades, stats)
@@ -241,7 +241,7 @@ class TestGapDetector:
 
 class TestEnsembleBacktestScaffold:
     def test_config_defaults(self):
-        from backtest_ensemble import BacktestConfig
+        from research.backtest_ensemble import BacktestConfig
 
         cfg = BacktestConfig()
         assert cfg.initial_capital > 0
@@ -251,7 +251,7 @@ class TestEnsembleBacktestScaffold:
         assert cfg.apply_expected_profit_gate is True
 
     def test_gate_stats_serialization(self):
-        from backtest_ensemble import GateStats
+        from research.backtest_ensemble import GateStats
 
         g = GateStats(total_signals=10, executed=3, atr_too_low=5)
         d = g.as_dict()
@@ -260,7 +260,7 @@ class TestEnsembleBacktestScaffold:
         assert d["atr_too_low"] == 5
 
     def test_interval_alias_normalization(self):
-        from backtest_ensemble import EnsembleBacktester
+        from research.backtest_ensemble import EnsembleBacktester
 
         # Just test the alias dict directly; running a full backtest needs
         # network access so we keep this as a unit-level assertion.
@@ -269,7 +269,7 @@ class TestEnsembleBacktestScaffold:
         assert EnsembleBacktester._INTERVAL_ALIASES["1d"] == "1d"
 
     def test_dead_hour_detection(self):
-        from backtest_ensemble import EnsembleBacktester, BacktestConfig
+        from research.backtest_ensemble import EnsembleBacktester, BacktestConfig
 
         eng = EnsembleBacktester({}, BacktestConfig())
         t_noon = datetime(2026, 4, 28, 12, 30)
@@ -278,7 +278,7 @@ class TestEnsembleBacktestScaffold:
         assert eng._in_dead_hour(t_morn) is False
 
     def test_result_summary_empty(self):
-        from backtest_ensemble import EnsembleBacktester, BacktestConfig
+        from research.backtest_ensemble import EnsembleBacktester, BacktestConfig
 
         eng = EnsembleBacktester({}, BacktestConfig())
         res = eng._build_result([], [10000.0], type("G", (), {"__init__": lambda self: None})())

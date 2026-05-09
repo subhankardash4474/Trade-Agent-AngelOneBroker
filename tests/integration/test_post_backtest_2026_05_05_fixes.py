@@ -77,8 +77,12 @@ class TestMovingAverageCrossoverDisabled:
 
     def test_other_strategies_still_active(self, cfg):
         # Don't accidentally disable something else by collateral edit.
+        # NOTE: mean_reversion was deliberately disabled 2026-05-09 based on
+        # tools/profit_diagnostic.py verdict (PF 0.51, R:R 1:0.28). It is
+        # excluded from this guard intentionally; re-enable only after a
+        # backtest with revised TP/SL validates PF > 1.0.
         active = set(cfg["strategies"]["active"])
-        for s in ("rsi_momentum", "mean_reversion", "vwap_bounce",
+        for s in ("rsi_momentum", "vwap_bounce",
                   "opening_range_breakout", "supertrend_follow"):
             assert s in active, f"Strategy {s} must remain active"
 
@@ -432,7 +436,7 @@ class TestEnsembleWeightCleanRendering:
     """
 
     def _build(self):
-        from core.ensemble import EnsembleModel
+        from strategies.ensemble import EnsembleModel
         return EnsembleModel({"ensemble": {"confidence_threshold": 0.6}})
 
     def test_update_weights_casts_numpy_to_float(self):

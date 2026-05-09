@@ -244,7 +244,7 @@ class TestEdgeCases:
 class TestProductionSourceShape:
     def test_portfolio_persists_state_after_events(self):
         from pathlib import Path
-        src = (Path(__file__).parents[2] / "core" / "portfolio.py").read_text(encoding="utf-8")
+        src = (Path(__file__).parents[2] / "packages" / "core" / "portfolio.py").read_text(encoding="utf-8")
         assert "_persist_state_after_event" in src
         # Both open and close must call it.
         # Find the function definitions and check the body contains the call.

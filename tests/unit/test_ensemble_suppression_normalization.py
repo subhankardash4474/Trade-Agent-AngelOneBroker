@@ -30,7 +30,7 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
-from core.ensemble import EnsembleModel
+from strategies.ensemble import EnsembleModel
 from strategies.base_strategy import Signal, TradeSignal
 
 
@@ -227,7 +227,7 @@ class TestNormalizationContract:
 
 class TestProductionSourceShape:
     def test_aggregate_uses_unsuppressed_weight_for_normalization(self):
-        src = (Path(__file__).parents[2] / "core" / "ensemble.py").read_text(encoding="utf-8")
+        src = (Path(__file__).parents[2] / "packages" / "strategies" / "ensemble.py").read_text(encoding="utf-8")
         # The new code must call _unsuppressed_weight inside aggregate.
         assert "unsuppressed_per_signal" in src, (
             "aggregate() must snapshot unsuppressed weights for normalization."

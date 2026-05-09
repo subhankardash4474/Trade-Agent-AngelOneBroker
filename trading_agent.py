@@ -18,7 +18,7 @@ from loguru import logger
 
 from core.data_handler import DataHandler
 from core.database import Database
-from core.ensemble import EnsembleModel
+from strategies.ensemble import EnsembleModel
 from core.execution import ExecutionEngine
 from core.features import FeatureEngine
 from core.portfolio import Portfolio

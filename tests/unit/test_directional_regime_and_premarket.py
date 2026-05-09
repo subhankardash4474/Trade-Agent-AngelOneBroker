@@ -22,7 +22,7 @@ from pathlib import Path
 import pytest
 import yaml
 
-from core.ensemble import EnsembleModel
+from strategies.ensemble import EnsembleModel
 from core.regime import (
     STRATEGY_REGIME_PREF,
     STRATEGY_REGIME_PREF_DIRECTIONAL,

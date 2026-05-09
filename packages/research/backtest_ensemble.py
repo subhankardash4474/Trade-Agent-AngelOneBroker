@@ -40,7 +40,7 @@ except Exception:
 
 from core.charges import compute_round_trip
 from core.data_handler import DataHandler
-from core.ensemble import EnsembleModel
+from strategies.ensemble import EnsembleModel
 from core.features import FeatureEngine
 from core.portfolio import Portfolio
 from core.regime import classify_regime
