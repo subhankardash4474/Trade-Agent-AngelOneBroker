@@ -5,32 +5,34 @@ An autonomous, production-ready trading agent for NSE/BSE equities, built in Pyt
 ## Architecture
 
 ```
-trading_agent/
-├── main.py                  # Entry point (trade, backtest, status)
-├── trading_agent.py         # Main orchestrator
-├── backtest.py              # Backtesting engine
-├── config.yaml              # Configuration
-├── requirements.txt         # Dependencies
-├── core/
-│   ├── data_handler.py      # Market data (AngelOne + Yahoo Finance)
-│   ├── risk_manager.py      # Position sizing, stop-loss, drawdown protection
-│   ├── execution.py         # Order placement with retry logic
-│   └── portfolio.py         # Position tracking, P&L, performance metrics
-├── strategies/
-│   ├── base_strategy.py     # Abstract strategy interface
-│   ├── moving_average_crossover.py
-│   ├── rsi_momentum.py
-│   └── mean_reversion.py
-├── monitoring/
-│   ├── dashboard.py         # Real-time CLI dashboard (Rich)
-│   └── alerts.py            # Email notifications
+trading-agent/
+├── trading_agent.py         # Main orchestrator (loop, signal flow, exits)
+├── run_daemon.py            # Daemon entry point (with watchdog)
+├── main.py                  # CLI entry (trade, backtest, status)
+├── backtest.py              # Single-strategy backtest
+├── backtest_ensemble.py     # Full-fidelity ensemble backtest
+├── analyze_day.py           # Daily post-session analysis
+├── config.yaml, requirements.txt, .env.example
+│
+├── core/                    # Portfolio, risk, ensemble, DB, regime, execution
+├── strategies/              # 1 file per strategy (mean_reversion, xgboost, etc.)
+├── brokers/                 # Broker abstraction (AngelOne, paper)
+├── monitoring/              # Alerts (Resend, SMTP) with retry+spool
+├── data/                    # Data handlers, scanners, datasets
+├── training/                # ML training pipeline
+├── models/                  # Serialized ML artefacts (gitignored)
+│
+├── tools/                   # CLIs: now, postmortem, health_check, battery, etc.
+│
 ├── tests/
-│   ├── test_strategies.py
-│   ├── test_risk_manager.py
-│   ├── test_execution.py
-│   └── test_portfolio.py
-└── logs/                    # Trade logs & agent logs
+│   ├── unit/                # Pure logic, mock-heavy
+│   └── integration/         # DB persistence, full pipelines
+│
+├── docs/                    # ARCHITECTURE.md + journals + audits + postmortems
+└── logs/                    # Runtime artefacts (live agent, daemon, backtests)
 ```
+
+For deeper architecture, design decisions, and operational runbooks see [`docs/`](./docs/README.md).
 
 ## Setup
 
@@ -200,11 +202,17 @@ Configure email notifications in `config.yaml`:
 # Run all tests
 pytest tests/ -v
 
-# Run with coverage
+# Unit only (pure logic, fast)
+pytest tests/unit/ -v
+
+# Integration only (DB, full pipelines)
+pytest tests/integration/ -v
+
+# Coverage
 pytest tests/ --cov=core --cov=strategies -v
 
-# Run specific test module
-pytest tests/test_risk_manager.py -v
+# Specific module
+pytest tests/unit/test_risk_manager.py -v
 ```
 
 ## Logs

@@ -47,5 +47,5 @@ def get_broker(config: dict) -> Broker:
 
     raise ValueError(
         f"Unknown broker name '{name}'. Supported: angelone, paper. "
-        "Kite was deprecated 2026-05-08 — see /logs/engineering_journal*.md."
+        "Kite was deprecated 2026-05-08 -- see /docs/journal/engineering_journal_2026-05-08.md."
     )
