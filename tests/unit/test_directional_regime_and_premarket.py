@@ -299,7 +299,7 @@ class TestCapAwareNotionalFloor:
 class TestConfigReverts:
     @pytest.fixture(scope="class")
     def cfg(self):
-        path = Path(__file__).resolve().parent.parent / "config.yaml"
+        path = Path(__file__).resolve().parents[2] / "config.yaml"
         with open(path, "r") as f:
             return yaml.safe_load(f)
 

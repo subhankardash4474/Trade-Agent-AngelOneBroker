@@ -24,7 +24,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-sys.path.insert(0, str(Path(__file__).parent.parent))
+sys.path.insert(0, str(Path(__file__).parents[2]))
 
 from core.ensemble import EnsembleModel
 from strategies.base_strategy import Signal, TradeSignal
@@ -123,7 +123,7 @@ class TestEODDeduplication:
     def test_eod_summary_does_not_also_send_daily_report(self):
         """_maybe_send_eod_summary should call send_alert exactly once and
         NOT also call send_daily_report — those produced duplicate emails."""
-        agent_path = Path(__file__).parent.parent / "trading_agent.py"
+        agent_path = Path(__file__).parents[2] / "trading_agent.py"
         src = agent_path.read_text(encoding="utf-8")
         # Locate the _maybe_send_eod_summary method body
         marker = "def _maybe_send_eod_summary"
@@ -150,7 +150,7 @@ class TestEODDeduplication:
         """Source-level: _shutdown() must guard send_daily_report on the
         _eod_summary_sent flag so a daemon kill near intraday close doesn't
         produce a third near-identical email."""
-        agent_path = Path(__file__).parent.parent / "trading_agent.py"
+        agent_path = Path(__file__).parents[2] / "trading_agent.py"
         src = agent_path.read_text(encoding="utf-8")
         i = src.find("def _shutdown(self):")
         assert i >= 0

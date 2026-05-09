@@ -24,7 +24,7 @@ import pandas as pd
 import pytest
 import pytz
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 IST = pytz.timezone("Asia/Kolkata")
 

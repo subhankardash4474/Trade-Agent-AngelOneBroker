@@ -30,7 +30,7 @@ from pathlib import Path
 
 import pytest
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 
 # ─────────────────────────────────────────────────────────────
@@ -181,7 +181,7 @@ class TestEdgeCases:
 
 class TestProductionSourceShape:
     def test_trading_agent_uses_dual_tolerance(self):
-        src = (Path(__file__).parent.parent / "trading_agent.py").read_text(encoding="utf-8")
+        src = (Path(__file__).parents[2] / "trading_agent.py").read_text(encoding="utf-8")
         # The new code path must distinguish true cap-constrained from cash-trimmed.
         assert "cash_reduced_qty" in src, (
             "Production code must track whether cash trimmed quantity."

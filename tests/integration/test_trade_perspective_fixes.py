@@ -290,7 +290,7 @@ class TestConfigContract:
         import yaml
         from pathlib import Path
 
-        cfg_path = Path(__file__).parent.parent / "config.yaml"
+        cfg_path = Path(__file__).parents[2] / "config.yaml"
         with cfg_path.open("r", encoding="utf-8") as f:
             cfg = yaml.safe_load(f)
 

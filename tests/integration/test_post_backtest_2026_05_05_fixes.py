@@ -29,7 +29,7 @@ from unittest.mock import MagicMock
 import pytest
 import yaml
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 from strategies.base_strategy import Signal, TradeSignal
 
@@ -41,7 +41,7 @@ from strategies.base_strategy import Signal, TradeSignal
 
 @pytest.fixture(scope="module")
 def cfg():
-    path = Path(__file__).resolve().parent.parent / "config.yaml"
+    path = Path(__file__).resolve().parents[2] / "config.yaml"
     with open(path, "r") as f:
         return yaml.safe_load(f)
 

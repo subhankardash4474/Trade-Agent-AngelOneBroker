@@ -30,7 +30,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 
 # ─────────────────────────────────────────────────────────────
@@ -149,7 +149,7 @@ class TestMergeMatchesProductionCode:
         This is a structural test — it fails loudly if someone reverts
         the fix back to the buggy `for inst in self.instruments` loop.
         """
-        agent_src = Path(__file__).parent.parent / "trading_agent.py"
+        agent_src = Path(__file__).parents[2] / "trading_agent.py"
         src = agent_src.read_text(encoding="utf-8")
 
         # The fixed version iterates held_symbols directly.

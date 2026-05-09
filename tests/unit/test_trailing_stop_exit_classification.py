@@ -28,7 +28,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 from core.risk_manager import TrailingStop
 
@@ -210,7 +210,7 @@ class TestProductionSourceShape:
     """Structural test: ensure the fix is actually wired in production code."""
 
     def test_trading_agent_uses_actual_reason_and_pnl_level(self):
-        src = (Path(__file__).parent.parent / "trading_agent.py").read_text(encoding="utf-8")
+        src = (Path(__file__).parents[2] / "trading_agent.py").read_text(encoding="utf-8")
         # The new code path must classify the trigger before placing the order.
         assert "actual_reason = reason" in src, (
             "Production code must recompute exit reason from trailing-stop state."

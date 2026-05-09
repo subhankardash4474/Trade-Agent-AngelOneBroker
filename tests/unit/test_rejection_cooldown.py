@@ -34,7 +34,7 @@ from unittest.mock import MagicMock
 import pytest
 import yaml
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 import pytz
 
@@ -197,7 +197,7 @@ class TestDisableKnob:
 class TestConfigWiring:
     @pytest.fixture(scope="class")
     def cfg(self):
-        path = Path(__file__).parent.parent / "config.yaml"
+        path = Path(__file__).parents[2] / "config.yaml"
         with open(path, "r", encoding="utf-8") as f:
             return yaml.safe_load(f)
 
@@ -220,7 +220,7 @@ class TestConfigWiring:
 
 class TestProductionSourceShape:
     def test_trading_agent_wires_in_cooldown(self):
-        src = (Path(__file__).parent.parent / "trading_agent.py").read_text(encoding="utf-8")
+        src = (Path(__file__).parents[2] / "trading_agent.py").read_text(encoding="utf-8")
         assert "_rejection_cooldown_map" in src
         assert "_is_rejection_cooldown_active" in src
         assert "_reason_skips_cooldown" in src

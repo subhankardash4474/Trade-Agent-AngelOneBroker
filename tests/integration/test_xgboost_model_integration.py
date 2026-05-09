@@ -33,7 +33,7 @@ from strategies.base_strategy import Signal
 from strategies.xgboost_classifier import XGBoostClassifier
 
 
-MODEL_PATH = Path(__file__).resolve().parent.parent / "models" / "xgboost_model.pkl"
+MODEL_PATH = Path(__file__).resolve().parents[2] / "models" / "xgboost_model.pkl"
 
 
 def _fake_intraday_5min_bars(n: int = 250, seed: int = 42) -> pd.DataFrame:
@@ -183,7 +183,7 @@ def test_predictions_not_class_biased_on_real_test_set():
     legitimately lean one direction. The held-out test set is the
     proper distribution to evaluate against.
     """
-    test_csv = Path(__file__).resolve().parent.parent / "data" / "test_dataset.csv"
+    test_csv = Path(__file__).resolve().parents[2] / "data" / "test_dataset.csv"
     if not test_csv.exists():
         pytest.skip(f"Test set not found: {test_csv}")
 
@@ -240,7 +240,7 @@ def test_config_enables_xgboost_classifier():
     If the active list drops xgboost_classifier without an explicit
     revert decision, this test fires."""
     import yaml
-    cfg_path = Path(__file__).resolve().parent.parent / "config.yaml"
+    cfg_path = Path(__file__).resolve().parents[2] / "config.yaml"
     with open(cfg_path) as f:
         cfg = yaml.safe_load(f)
 
@@ -257,7 +257,7 @@ def test_xgboost_ensemble_weight_conservative():
     an untested model dominate ensemble decisions on day one. The
     learning system will adjust this upward as live trades close."""
     import yaml
-    cfg_path = Path(__file__).resolve().parent.parent / "config.yaml"
+    cfg_path = Path(__file__).resolve().parents[2] / "config.yaml"
     with open(cfg_path) as f:
         cfg = yaml.safe_load(f)
     weights = cfg.get("ensemble", {}).get("weights", {})

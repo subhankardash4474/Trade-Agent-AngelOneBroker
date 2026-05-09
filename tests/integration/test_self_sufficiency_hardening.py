@@ -29,7 +29,7 @@ from core.trade_analyzer import TradeAnalyzer
 
 
 IST = pytz.timezone("Asia/Kolkata")
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 MODEL_PATH = PROJECT_ROOT / "models" / "xgboost_model.pkl"
 
 

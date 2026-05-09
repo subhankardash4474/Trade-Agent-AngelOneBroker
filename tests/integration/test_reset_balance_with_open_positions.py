@@ -45,7 +45,7 @@ from datetime import datetime
 import pytest
 import pytz
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 from core.database import Database
 from core.portfolio import Portfolio
