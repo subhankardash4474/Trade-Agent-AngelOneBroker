@@ -80,7 +80,14 @@ strategies:
   active:
     # - moving_average_crossover  # DISABLED 2026-05-05 (no edge)
     - rsi_momentum
-    - mean_reversion
+    # - mean_reversion           # DISABLED 2026-05-09 (profit_diagnostic verdict: KILL)
+    #   Empirical: PF 0.51 / 22 trades all-time (-Rs 496) AND PF 0.57 / 15 trades
+    #   over last 7 days (-Rs 369) -- the z=1.8 tightening from 2026-05-08 did
+    #   NOT recover edge. Avg loss is 3.5x avg win (R:R = 1:0.28), 11/22 trades
+    #   stop out for total -Rs 979 vs only +Rs 261 from take-profits. Fundamental
+    #   R:R imbalance, not a tuning issue. Re-enable only after a wider TP /
+    #   tighter SL backtest validates PF > 1.0.
+    #   Diagnostic: logs/diagnostics/profit_diagnostic_*.md
     - vwap_bounce
     - opening_range_breakout
     - supertrend_follow

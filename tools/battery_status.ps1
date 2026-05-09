@@ -11,9 +11,22 @@ $proj = Split-Path -Parent $PSScriptRoot
 
 # 1. Is the battery process alive?
 Write-Host "== BATTERY PROCESS =================================" -ForegroundColor Cyan
-$bat = Get-CimInstance Win32_Process -Filter "Name='python.exe'" |
-       Where-Object { $_.CommandLine -match "overnight_backtest_battery" }
-if ($bat) {
+$bats = @(Get-CimInstance Win32_Process -Filter "Name='python.exe'" |
+          Where-Object { $_.CommandLine -match "overnight_backtest_battery" })
+
+if ($bats.Count -eq 0) {
+    Write-Host "  [NOT RUNNING]" -ForegroundColor Yellow
+} elseif ($bats.Count -gt 1) {
+    Write-Host "  [WARNING] $($bats.Count) battery processes detected -- DUPLICATES!" -ForegroundColor Red
+    Write-Host "  Race condition risk. Kill duplicates with:" -ForegroundColor Red
+    foreach ($b in $bats) {
+        $upMin = [math]::Round((New-TimeSpan -Start $b.CreationDate -End (Get-Date)).TotalMinutes, 1)
+        Write-Host ("    PID {0,-6} started {1}  up {2,7} min" -f $b.ProcessId, $b.CreationDate, $upMin) -ForegroundColor Red
+    }
+    $oldest = $bats | Sort-Object CreationDate | Select-Object -First 1
+    Write-Host "  Suggested: keep PID $($oldest.ProcessId) (oldest), kill the rest." -ForegroundColor Yellow
+} else {
+    $bat    = $bats[0]
     $upMin  = [math]::Round((New-TimeSpan -Start $bat.CreationDate -End (Get-Date)).TotalMinutes, 1)
     $ramMB  = [math]::Round($bat.WorkingSetSize / 1MB, 0)
     $cpuMin = [math]::Round($bat.UserModeTime / 600000000, 1)
@@ -22,8 +35,6 @@ if ($bat) {
     Write-Host "  Up      : $upMin min"
     Write-Host "  RAM     : $ramMB MB"
     Write-Host "  CPU     : $cpuMin min"
-} else {
-    Write-Host "  [NOT RUNNING]" -ForegroundColor Yellow
 }
 
 # 2. Find latest run dir
