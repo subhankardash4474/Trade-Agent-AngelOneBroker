@@ -435,6 +435,30 @@ def main() -> int:
     ap.add_argument("--resume", default=None,
                     help="Resume an existing run by run_id (YYYYMMDDTHHMMSS), "
                          "or pass 'auto' to pick the most recent incomplete run.")
+    ap.add_argument("--run-id", default=None,
+                    help="Pin a deterministic run_id instead of the "
+                         "auto-generated YYYYMMDDTHHMMSS timestamp. Useful for "
+                         "reproducible smoke tests, CI runs, and cross-machine "
+                         "comparison (so two machines running the same flags "
+                         "land in the same logs/backtests/<run_id>/ folder). "
+                         "Mutually exclusive with --resume.")
+    ap.add_argument("--train-window-days", type=int, default=None,
+                    help="Walk-forward TRAIN slice: keep only the FIRST N days "
+                         "of market_data for variant runs. Mutually exclusive "
+                         "with --holdout-window-days. Use case: select best "
+                         "variant on the train slice, then re-run with "
+                         "--holdout-window-days to validate on UNSEEN bars. "
+                         "Without train/holdout flags, the whole window is "
+                         "used (which trains and tests on the same data -- "
+                         "fine for relative comparisons, NOT for honest 'is "
+                         "this overfit?' validation).")
+    ap.add_argument("--holdout-window-days", type=int, default=None,
+                    help="Walk-forward HOLDOUT slice: keep only the LAST N "
+                         "days of market_data. Mutually exclusive with "
+                         "--train-window-days. If a variant wins on the train "
+                         "slice AND survives the holdout slice, it has real "
+                         "edge; if it crumbles on holdout, the train win was "
+                         "p-hacked.")
     ap.add_argument("--workers", type=int, default=1,
                     help="Number of parallel worker processes for variant "
                          "execution (default: 1 = serial, preserves legacy "
@@ -456,7 +480,18 @@ def main() -> int:
         print(f"[BATTERY] WARNING: --workers={args.workers} exceeds cpu_count={cpu}; "
               f"oversubscription is rarely a win for CPU-bound backtests.")
 
-    # ── Resolve run_id (fresh vs resume) ──
+    # ── Mutex checks for the new flags ──
+    if args.resume and args.run_id:
+        print("[ERROR] --resume and --run-id are mutually exclusive "
+              "(--resume already pins the run_id to the existing folder).")
+        return 6
+    if args.train_window_days and args.holdout_window_days:
+        print("[ERROR] --train-window-days and --holdout-window-days are "
+              "mutually exclusive. Run battery twice (once per slice) to get "
+              "both train and holdout numbers.")
+        return 7
+
+    # ── Resolve run_id (fresh vs resume vs pinned) ──
     resuming = False
     if args.resume:
         if args.resume == "auto":
@@ -466,12 +501,19 @@ def main() -> int:
                 resuming = True
                 print(f"[BATTERY] auto-resume: continuing run {run_id}")
             else:
-                run_id = datetime.now().strftime("%Y%m%dT%H%M%S")
+                run_id = args.run_id or datetime.now().strftime("%Y%m%dT%H%M%S")
                 print(f"[BATTERY] auto-resume: no incomplete run found, "
                       f"starting fresh as {run_id}")
         else:
             run_id = args.resume
             resuming = True
+
+    elif args.run_id:
+        # Pinned run_id: deterministic for reproducibility, but still create
+        # a fresh folder (won't accidentally overwrite an existing run unless
+        # the user explicitly reuses an ID, which is then their choice).
+        run_id = args.run_id
+        print(f"[BATTERY] using pinned run_id={run_id}")
 
     else:
         run_id = datetime.now().strftime("%Y%m%dT%H%M%S")
@@ -550,6 +592,44 @@ def main() -> int:
 
     total_bars = sum(len(df) for df in market_data.values())
     logger.info(f"[BATTERY] data ready: {len(market_data)} symbols, {total_bars} bars total")
+
+    # ── Walk-forward slice (optional) ──
+    # Keep this AFTER market_data is fully loaded/cached so that the cache
+    # always contains the FULL window. Subsequent --resume invocations can
+    # then re-slice differently without re-downloading from yfinance.
+    # Slicing by calendar days (not bar count) so weekends/holidays are
+    # handled correctly: 30 calendar days = ~22 trading days = ~1500 bars
+    # at 5m intervals in a normal NSE month.
+    if args.train_window_days or args.holdout_window_days:
+        n = args.train_window_days or args.holdout_window_days
+        keep = "first" if args.train_window_days else "last"
+        sliced_count = 0
+        for sym in list(market_data.keys()):
+            df = market_data[sym]
+            if df.empty:
+                continue
+            try:
+                if keep == "first":
+                    cutoff = df.index.min() + pd.Timedelta(days=n)
+                    market_data[sym] = df[df.index < cutoff]
+                else:
+                    cutoff = df.index.max() - pd.Timedelta(days=n)
+                    market_data[sym] = df[df.index >= cutoff]
+                sliced_count += 1
+            except (TypeError, AttributeError) as e:
+                # df.index isn't datetime-like -- can't time-slice. Skip but
+                # warn so the user knows this symbol's data is suspect.
+                logger.warning(f"[BATTERY] {sym}: cannot apply walk-forward "
+                               f"slice (non-datetime index): {e}")
+        sliced_total = sum(len(df) for df in market_data.values())
+        ratio = sliced_total / total_bars if total_bars else 0
+        logger.info(
+            f"[BATTERY] walk-forward slice ({keep} {n}d, applied to "
+            f"{sliced_count}/{len(market_data)} symbols): "
+            f"{sliced_total} bars (was {total_bars}, ratio {ratio:.1%})"
+        )
+        # Reload total_bars for downstream metadata so the slice is reflected.
+        total_bars = sliced_total
 
     # ── Step 2: run each variant ──
     # Hydrate `rows` from already-completed variants so comparison.md is
