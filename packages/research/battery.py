@@ -34,10 +34,12 @@ from __future__ import annotations
 import argparse
 import copy
 import json
+import os
 import pickle
 import sys
 import time
 import traceback
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -238,6 +240,73 @@ def _load_market_data_cache(out_root: Path) -> dict | None:
         return None
 
 
+def _run_variant_in_subprocess(
+    name: str,
+    overrides: list,
+    base_cfg: dict,
+    symbols: list,
+    interval: str,
+    days: int,
+    out_root_str: str,
+) -> tuple[str, dict]:
+    """Worker entry point for parallel battery execution.
+
+    Runs ONE variant inside a fresh ProcessPoolExecutor subprocess and
+    returns its result payload. Must be a top-level (importable) function
+    because Windows `spawn` pickles workers by qualified name.
+
+    Why workers reload market_data from disk instead of receiving it via
+    IPC: the pickled dict is ~300 MB at 200 stocks × 90 days. Sending it
+    through ProcessPoolExecutor's argument-pickle would pay that cost
+    once per task (18 tasks × 300 MB = 5.4 GB of IPC) on top of the
+    once-per-worker memory cost. Reading from disk is faster and the
+    market_data.pkl already exists for the resume mechanism, so no new
+    artifact is needed.
+
+    Per-task disk writes (configs/<name>.yaml, results/<name>.json) are
+    handled here in the worker so each task is fully self-contained — the
+    parent only needs to update comparison.md from the returned payload.
+    """
+    out_root = Path(out_root_str)
+    market_data = _load_market_data_cache(out_root)
+    if market_data is None:
+        raise RuntimeError(f"market_data.pkl missing in {out_root}")
+
+    cfg = _build_variant_config(base_cfg, overrides)
+    (out_root / "configs" / f"{name}.yaml").write_text(
+        yaml.safe_dump(cfg, sort_keys=False), encoding="utf-8"
+    )
+
+    bt_cfg = _bt_config(cfg)
+    bt = EnsembleBacktester(cfg, bt_cfg)
+    strategies = cfg.get("strategies", {}).get("active")
+
+    t0 = time.time()
+    result = bt.run(
+        symbols=symbols, interval=interval, days=days,
+        strategies=strategies, market_data=market_data,
+    )
+    elapsed = time.time() - t0
+
+    payload = {
+        "variant": name,
+        "overrides": overrides,
+        "elapsed_sec": round(elapsed, 1),
+        "summary": _summary_row(name, result),
+        "gate_stats": result.gate_stats.as_dict(),
+        "strategy_pnl": result.strategy_pnl,
+        "regime_pnl": result.regime_pnl,
+        "trades": result.trades,
+    }
+    # Persist per-variant result here so a worker crash mid-run still
+    # leaves a complete record (parent's comparison.md write is the only
+    # thing that becomes inconsistent, and that's a single-writer file).
+    (out_root / "results" / f"{name}.json").write_text(
+        json.dumps(payload, indent=2, default=str), encoding="utf-8"
+    )
+    return name, payload
+
+
 def _find_latest_incomplete_run() -> str | None:
     """Return the run_id of the most recent run that hasn't completed.
 
@@ -321,13 +390,38 @@ def main() -> int:
     ap.add_argument("--days", type=int, default=30)
     ap.add_argument("--interval", default="5m")
     ap.add_argument("--symbols", nargs="+", default=DEFAULT_SYMBOLS)
+    ap.add_argument("--universe-file", default=None,
+                    help="Path to a JSON file with shape {\"universe\": [\"RELIANCE\", ...]} "
+                         "(see tools/_freeze_battery_v2_universe.py). When provided, this "
+                         "overrides --symbols. Use for battery-v2 runs against a stable "
+                         "200-stock list — passing 200 symbols on the command line hits the "
+                         "shell argument-buffer limit on Windows.")
     ap.add_argument("--variants", nargs="+", default=None,
                     help="Subset of variant names to run (default: all)")
     ap.add_argument("--capital", type=float, default=None)
     ap.add_argument("--resume", default=None,
                     help="Resume an existing run by run_id (YYYYMMDDTHHMMSS), "
                          "or pass 'auto' to pick the most recent incomplete run.")
+    ap.add_argument("--workers", type=int, default=1,
+                    help="Number of parallel worker processes for variant "
+                         "execution (default: 1 = serial, preserves legacy "
+                         "behavior for CI/tests/debugging). Variants are "
+                         "embarrassingly parallel; battery-v2 (18 variants) "
+                         "wall-time at --workers 4 is ~3x faster than serial. "
+                         "Cap to (cpu_count - 1) and budget ~1.5 GB RAM/worker "
+                         "for a 200-stock universe.")
     args = ap.parse_args()
+
+    # Sanity-clamp workers: 0 or negative is nonsense; >cpu_count just wastes
+    # memory on context-switching. Still allow oversubscription if the user
+    # explicitly requests it (some I/O wait can hide behind extra processes),
+    # but warn so the caller knows it's intentional.
+    cpu = os.cpu_count() or 1
+    if args.workers < 1:
+        args.workers = 1
+    elif args.workers > cpu:
+        print(f"[BATTERY] WARNING: --workers={args.workers} exceeds cpu_count={cpu}; "
+              f"oversubscription is rarely a win for CPU-bound backtests.")
 
     # ── Resolve run_id (fresh vs resume) ──
     resuming = False
@@ -355,6 +449,22 @@ def main() -> int:
         return 2
     (out_root / "configs").mkdir(parents=True, exist_ok=True)
     (out_root / "results").mkdir(parents=True, exist_ok=True)
+
+    # Universe-file override: load a frozen universe JSON if specified.
+    # This must happen AFTER args parsing but BEFORE any code that reads
+    # `args.symbols` (currently the data-fetch and metadata sections below).
+    if args.universe_file:
+        uf_path = Path(args.universe_file)
+        if not uf_path.is_absolute():
+            uf_path = ROOT / uf_path
+        try:
+            payload = json.loads(uf_path.read_text(encoding="utf-8"))
+            args.symbols = list(payload["universe"])
+            print(f"[BATTERY] Loaded {len(args.symbols)} symbols from "
+                  f"{uf_path.relative_to(ROOT) if uf_path.is_relative_to(ROOT) else uf_path}")
+        except (FileNotFoundError, KeyError, json.JSONDecodeError) as e:
+            print(f"[ERROR] failed to load --universe-file {uf_path}: {e}")
+            return 3
 
     # Mirror loguru into a per-run log file (append on resume)
     logger.add(out_root / "log.txt", level="INFO")
@@ -442,51 +552,139 @@ def main() -> int:
         complete=False, failed=failed,
     )
 
-    for name, overrides in pending:
-        logger.info(f"\n{'=' * 70}\n[BATTERY] running variant: {name}\n{'=' * 70}")
+    if args.workers == 1:
+        # Serial path — unchanged (preserves CI/test behavior, easy debugging,
+        # and KeyboardInterrupt friendliness during interactive smoke runs).
+        for name, overrides in pending:
+            logger.info(f"\n{'=' * 70}\n[BATTERY] running variant: {name}\n{'=' * 70}")
+            try:
+                cfg = _build_variant_config(base_cfg, overrides)
+
+                (out_root / "configs" / f"{name}.yaml").write_text(
+                    yaml.safe_dump(cfg, sort_keys=False), encoding="utf-8"
+                )
+
+                bt_cfg = _bt_config(cfg)
+                bt = EnsembleBacktester(cfg, bt_cfg)
+                strategies = cfg.get("strategies", {}).get("active")
+                t0 = time.time()
+                result = bt.run(
+                    symbols=args.symbols,
+                    interval=args.interval,
+                    days=args.days,
+                    strategies=strategies,
+                    market_data=market_data,
+                )
+                elapsed = time.time() - t0
+                logger.info(
+                    f"[BATTERY] {name} done in {elapsed:.1f}s | "
+                    f"trades={result.total_trades}  pnl=Rs {result.total_pnl:+.2f}  "
+                    f"WR={result.win_rate:.1f}%  PF={result.profit_factor:.2f}"
+                )
+
+                payload = {
+                    "variant": name,
+                    "overrides": overrides,
+                    "elapsed_sec": round(elapsed, 1),
+                    "summary": _summary_row(name, result),
+                    "gate_stats": result.gate_stats.as_dict(),
+                    "strategy_pnl": result.strategy_pnl,
+                    "regime_pnl": result.regime_pnl,
+                    "trades": result.trades,
+                }
+                (out_root / "results" / f"{name}.json").write_text(
+                    json.dumps(payload, indent=2, default=str), encoding="utf-8"
+                )
+                rows.append(_summary_row(name, result))
+
+            except KeyboardInterrupt:
+                logger.warning(f"[BATTERY] interrupted during {name} — partial results saved. "
+                               f"Resume with: --resume {run_id}")
+                _write_comparison(
+                    sorted(rows, key=lambda r: r["variant"]),
+                    out_root / "comparison.md",
+                    _meta(datetime.now().isoformat(timespec="seconds")),
+                    complete=False, failed=failed,
+                )
+                return 130
+            except Exception as e:
+                tb = traceback.format_exc()
+                logger.error(f"[BATTERY] {name} CRASHED: {e}\n{tb}")
+                (out_root / "results" / f"{name}.failure.txt").write_text(
+                    f"{datetime.now().isoformat()}\n{e}\n\n{tb}", encoding="utf-8"
+                )
+                failed.append((name, str(e).splitlines()[0] if str(e) else type(e).__name__))
+
+            _write_comparison(
+                sorted(rows, key=lambda r: r["variant"]),
+                out_root / "comparison.md",
+                _meta(datetime.now().isoformat(timespec="seconds")),
+                complete=False, failed=failed,
+            )
+    else:
+        # Parallel path — spawn ProcessPoolExecutor and dispatch each pending
+        # variant as an independent task. Workers are subprocesses (not
+        # threads): the EnsembleBacktester is CPU-bound under the GIL, so
+        # only true parallelism gives speedup. Throughput target for v2:
+        # ~3x at --workers 4 vs. serial (the residual is process-startup
+        # cost + the shared market_data load each worker pays once).
+        logger.info(f"[BATTERY] PARALLEL mode: workers={args.workers}, tasks={len(pending)}")
+        if not (out_root / "market_data.pkl").exists():
+            # Workers reload market_data from this file. If we got here
+            # without saving it (e.g., resume path elided the save), we'd
+            # be sending bad data. Fail loudly rather than silently giving
+            # each worker a None.
+            logger.error("[BATTERY] market_data.pkl missing — cannot run parallel workers. "
+                         "(This shouldn't happen on a fresh run; if you're resuming an "
+                         "older run, re-run without --resume to regenerate the cache.)")
+            return 4
+
         try:
-            cfg = _build_variant_config(base_cfg, overrides)
+            with ProcessPoolExecutor(max_workers=args.workers) as pool:
+                futures = {
+                    pool.submit(
+                        _run_variant_in_subprocess,
+                        name, overrides, base_cfg,
+                        args.symbols, args.interval, args.days,
+                        str(out_root),
+                    ): name
+                    for name, overrides in pending
+                }
+                logger.info(f"[BATTERY] dispatched {len(futures)} variants to worker pool")
 
-            # Freeze config for reproducibility
-            (out_root / "configs" / f"{name}.yaml").write_text(
-                yaml.safe_dump(cfg, sort_keys=False), encoding="utf-8"
-            )
+                for fut in as_completed(futures):
+                    name = futures[fut]
+                    try:
+                        _, payload = fut.result()
+                        summary = payload["summary"]
+                        rows.append(summary)
+                        logger.info(
+                            f"[BATTERY] {name} done in {payload['elapsed_sec']}s | "
+                            f"trades={summary['trades']}  pnl=Rs {summary['pnl']:+.2f}  "
+                            f"WR={summary['win_rate']:.1f}%  PF={summary['profit_factor']:.2f}"
+                        )
+                    except Exception as e:
+                        # Capture per-variant failure — DO NOT kill the pool.
+                        # Other workers continue; we just record this one as
+                        # failed and still write the partial comparison.md.
+                        tb = traceback.format_exc()
+                        logger.error(f"[BATTERY] {name} CRASHED in worker: {e}\n{tb}")
+                        (out_root / "results" / f"{name}.failure.txt").write_text(
+                            f"{datetime.now().isoformat()}\n{e}\n\n{tb}", encoding="utf-8"
+                        )
+                        failed.append((name, str(e).splitlines()[0] if str(e) else type(e).__name__))
 
-            bt_cfg = _bt_config(cfg)
-            bt = EnsembleBacktester(cfg, bt_cfg)
-            strategies = cfg.get("strategies", {}).get("active")
-            t0 = time.time()
-            result = bt.run(
-                symbols=args.symbols,
-                interval=args.interval,
-                days=args.days,
-                strategies=strategies,
-                market_data=market_data,
-            )
-            elapsed = time.time() - t0
-            logger.info(
-                f"[BATTERY] {name} done in {elapsed:.1f}s | "
-                f"trades={result.total_trades}  pnl=Rs {result.total_pnl:+.2f}  "
-                f"WR={result.win_rate:.1f}%  PF={result.profit_factor:.2f}"
-            )
-
-            payload = {
-                "variant": name,
-                "overrides": overrides,
-                "elapsed_sec": round(elapsed, 1),
-                "summary": _summary_row(name, result),
-                "gate_stats": result.gate_stats.as_dict(),
-                "strategy_pnl": result.strategy_pnl,
-                "regime_pnl": result.regime_pnl,
-                "trades": result.trades,
-            }
-            (out_root / "results" / f"{name}.json").write_text(
-                json.dumps(payload, indent=2, default=str), encoding="utf-8"
-            )
-            rows.append(_summary_row(name, result))
-
+                    # Single-writer comparison.md update from the parent.
+                    # Workers never touch this file, so no lock needed.
+                    _write_comparison(
+                        sorted(rows, key=lambda r: r["variant"]),
+                        out_root / "comparison.md",
+                        _meta(datetime.now().isoformat(timespec="seconds")),
+                        complete=False, failed=failed,
+                    )
         except KeyboardInterrupt:
-            logger.warning(f"[BATTERY] interrupted during {name} — partial results saved. "
+            # Shutdown cleanly: with-block will cancel pending futures.
+            logger.warning(f"[BATTERY] interrupted — partial results saved. "
                            f"Resume with: --resume {run_id}")
             _write_comparison(
                 sorted(rows, key=lambda r: r["variant"]),
@@ -495,23 +693,6 @@ def main() -> int:
                 complete=False, failed=failed,
             )
             return 130
-        except Exception as e:
-            tb = traceback.format_exc()
-            logger.error(f"[BATTERY] {name} CRASHED: {e}\n{tb}")
-            (out_root / "results" / f"{name}.failure.txt").write_text(
-                f"{datetime.now().isoformat()}\n{e}\n\n{tb}", encoding="utf-8"
-            )
-            failed.append((name, str(e).splitlines()[0] if str(e) else type(e).__name__))
-            # Continue to the next variant; don't kill the whole battery.
-
-        # Rewrite comparison.md after every variant (success or failure) so
-        # the file is always usable mid-run.
-        _write_comparison(
-            sorted(rows, key=lambda r: r["variant"]),
-            out_root / "comparison.md",
-            _meta(datetime.now().isoformat(timespec="seconds")),
-            complete=False, failed=failed,
-        )
 
     # ── Step 3: final comparison report ──
     finished = datetime.now().isoformat(timespec="seconds")
