@@ -8,6 +8,11 @@ pytz>=2024.1
 
 # Broker APIs
 smartapi-python>=1.3.0
+# smartapi-python imports logzero at runtime but does not declare it in its
+# install_requires (upstream bug). Pin it explicitly so the test scripts and
+# the live trading path (main.connect_angelone -> SmartApi.SmartConnect) both
+# import cleanly inside a fresh container.
+logzero>=1.7.0
 pyotp>=2.9.0
 websocket-client>=1.7.0
 
