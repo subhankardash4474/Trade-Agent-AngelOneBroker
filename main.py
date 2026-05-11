@@ -21,21 +21,28 @@ import threading
 import yaml
 from loguru import logger
 
-# Corporate proxy / self-signed cert workaround (common on office networks)
-os.environ.setdefault("CURL_CA_BUNDLE", "")
-os.environ.setdefault("REQUESTS_CA_BUNDLE", "")
-try:
-    _default_ctx = ssl.create_default_context()
-    _default_ctx.check_hostname = False
-    _default_ctx.verify_mode = ssl.CERT_NONE
-    ssl._create_default_https_context = lambda: _default_ctx
-except Exception:
-    pass
-try:
-    import urllib3
-    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-except Exception:
-    pass
+# Corporate proxy / self-signed-cert workaround.
+#
+# DEFAULT = bypass ENABLED (matches historical behaviour, keeps corp-network
+# laptops working out of the box). To OPT INTO secure SSL verification --
+# strongly recommended for cloud VMs -- set TRADER_DISABLE_SSL_VERIFY=false
+# in the deployment .env.
+_ssl_bypass = os.environ.get("TRADER_DISABLE_SSL_VERIFY", "true").lower()
+if _ssl_bypass in ("1", "true", "yes"):
+    os.environ.setdefault("CURL_CA_BUNDLE", "")
+    os.environ.setdefault("REQUESTS_CA_BUNDLE", "")
+    try:
+        _default_ctx = ssl.create_default_context()
+        _default_ctx.check_hostname = False
+        _default_ctx.verify_mode = ssl.CERT_NONE
+        ssl._create_default_https_context = lambda: _default_ctx
+    except Exception:
+        pass
+    try:
+        import urllib3
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+    except Exception:
+        pass
 
 
 def connect_angelone(config: dict):

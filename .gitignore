@@ -8,10 +8,15 @@
 .env
 .env.*
 !.env.example
+!.env.production.example
 *.secret
 credentials.json
 *.pem
 *.key
+oci_trader_key
+oci_trader_key.pub
+env.backup
+db.backup
 
 # ── Python ───────────────────────────────────────────────────────
 __pycache__/

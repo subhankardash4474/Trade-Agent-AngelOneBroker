@@ -33,20 +33,31 @@ import pytz
 import yaml
 from loguru import logger
 
-os.environ.setdefault("CURL_CA_BUNDLE", "")
-os.environ.setdefault("REQUESTS_CA_BUNDLE", "")
-try:
-    _default_ctx = ssl.create_default_context()
-    _default_ctx.check_hostname = False
-    _default_ctx.verify_mode = ssl.CERT_NONE
-    ssl._create_default_https_context = lambda: _default_ctx
-except Exception:
-    pass
-try:
-    import urllib3
-    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-except Exception:
-    pass
+# Corporate proxy / self-signed-cert workaround.
+#
+# DEFAULT = bypass ENABLED (matches historical behaviour, keeps corp-network
+# laptops working out of the box). To OPT INTO secure SSL verification --
+# strongly recommended for cloud VMs (OCI / AWS / DigitalOcean / any public
+# host) -- set TRADER_DISABLE_SSL_VERIFY=false in the deployment .env.
+#
+# Silently trusting any cert on a public box is a real security regression;
+# the cloud .env.production.example flips this to "false" explicitly.
+_ssl_bypass = os.environ.get("TRADER_DISABLE_SSL_VERIFY", "true").lower()
+if _ssl_bypass in ("1", "true", "yes"):
+    os.environ.setdefault("CURL_CA_BUNDLE", "")
+    os.environ.setdefault("REQUESTS_CA_BUNDLE", "")
+    try:
+        _default_ctx = ssl.create_default_context()
+        _default_ctx.check_hostname = False
+        _default_ctx.verify_mode = ssl.CERT_NONE
+        ssl._create_default_https_context = lambda: _default_ctx
+    except Exception:
+        pass
+    try:
+        import urllib3
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+    except Exception:
+        pass
 
 IST = pytz.timezone("Asia/Kolkata")
 

@@ -1,0 +1,107 @@
+# =============================================================================
+# Files / dirs excluded from the Docker build context.
+# Keep this list tight -- everything sent to the build context counts against
+# image build time AND can leak secrets/large artefacts into the image cache.
+# =============================================================================
+
+# Version control
+.git/
+.gitignore
+.gitattributes
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*.bak
+*~
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Python build / cache artefacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.coverage
+.coverage.*
+htmlcov/
+.hypothesis/
+
+# Virtual envs (must be rebuilt inside container)
+venv/
+env/
+ENV/
+.venv/
+
+# Secrets -- the image must NEVER bake .env. Compose mounts it as a runtime
+# volume; SSH-pushed deploys scp it separately and chmod 600.
+.env
+.env.*
+!.env.example
+!.env.production.example
+*.secret
+credentials.json
+*.pem
+*.key
+
+# Runtime state (will be volume-mounted at runtime, not baked into image)
+data/*.db
+data/*.db-*
+data/*.sqlite
+data/*.sqlite3
+data/local_cloud_mirror/
+
+# Logs
+logs/
+
+# Model binaries -- mounted at runtime via volume. Image stays slim.
+models/*.pkl
+models/*.pt
+models/*.joblib
+models/*.onnx
+
+# Backtest scratch
+**/market_data.pkl
+**/cycle_state.pkl
+*.cache
+backtest_run_*/
+
+# Failed-alert spool
+.failed_alerts/
+.alerts_spool/
+
+# Per-day daemon stdout/stderr
+daemon_*.log
+agent_*.log
+battery_*.log
+
+# Docker artefacts themselves (avoid recursive bloat)
+docker-compose.override.yml
+.docker/
+
+# Test artefacts that we don't need at runtime
+tests/
+
+# Documentation (shipping the container with docs is wasteful)
+docs/
+README.md
+CHANGELOG.md
+*.md
+
+# Misc generated reports kept at root
+audit_*.md
+checkpoint_*.md
+
+# Cloud sync mirrors
+logs/cloud_sync/
+data/local_cloud_mirror/

@@ -1,0 +1,49 @@
+# =============================================================================
+# Optional systemd unit -- wraps `docker compose up -d` for boot-time start.
+#
+# Docker daemon already auto-starts the container (via restart=unless-stopped
+# in docker-compose.yml). This unit is OPTIONAL belt-and-suspenders for when
+# you want explicit systemd visibility:
+#   - `systemctl status trader.service`  -> "active"
+#   - `systemctl stop  trader.service`   -> brings the container down cleanly
+#   - `journalctl -u trader.service`     -> bootstrap-time logs
+#
+# Install:
+#   sudo cp tools/cloud/trader.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now trader.service
+#
+# Adjust WorkingDirectory if your TRADER_HOME differs from /opt/trading-agent.
+# =============================================================================
+
+[Unit]
+Description=Trading Agent Daemon (Docker-managed)
+Documentation=https://github.com/<owner>/<repo>/blob/main/docs/cloud_mvc_runbook.md
+After=docker.service network-online.target
+Requires=docker.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+User=trader
+Group=trader
+WorkingDirectory=/opt/trading-agent
+
+# Pull latest image + start in detached mode. `docker compose` will recreate
+# the container if anything in docker-compose.yml or the image changed.
+ExecStart=/usr/bin/docker compose up -d
+
+# Graceful shutdown: SIGTERM container -> 30s grace -> SIGKILL.
+ExecStop=/usr/bin/docker compose down --timeout 30
+
+# If the docker daemon restarts, the container's restart=unless-stopped
+# handles itself; we don't loop here.
+Restart=no
+
+# Allow plenty of time for docker compose to pull/build on first boot.
+TimeoutStartSec=600
+TimeoutStopSec=60
+
+[Install]
+WantedBy=multi-user.target
