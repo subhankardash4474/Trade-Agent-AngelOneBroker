@@ -201,11 +201,11 @@ Always run, even on green:
 
 ## 5. Open implementation gaps (must close before Stage 0)
 
-These are needed code/tooling pieces. Status as of 2026-05-10:
+These are needed code/tooling pieces. Status as of 2026-05-11:
 
 | Item | Status | Owner notes |
 |---|---|---|
-| `tools/test_angelone_auth.py` | TBD | Standalone script, calls login/getProfile/getMarketData/logout. No order code paths. |
+| `tools/test_angelone_auth.py` | **DONE** (2026-05-11) | 8-stage script: env -> import -> instantiate -> connect -> profile -> funds -> orders -> disconnect. Zero order mutations. `--dry-run` mode validates env without network. Dry-run 2/2 green; real run scheduled for tonight after market close. Diagnostics built in for AB1050 (IP whitelist) and AB1007 (TOTP drift). |
 | `core/broker/angelone.py:place_order` | Done in Phase 1 (verify) | Spot-check signature accepts AMO + LIMIT + lot=1. |
 | `core/broker/angelone.py:cancel_order` | TBD - verify | Required for Stage 1. |
 | `--max-loss-rs N` daemon flag | TBD | Probably 30 lines in `trading_agent.py`. |
