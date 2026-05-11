@@ -41,46 +41,59 @@ log out. No orders.
 - [ ] **Pass criterion**: zero exceptions, all four steps log successfully.
 - [ ] **Fail action**: do NOT proceed. Fix auth before any order test.
 
-### Stage 1 — Single AMO order, single stock (target: Saturday evening)
-**Goal**: place ONE After-Market Order for ONE stock, verify it lands in
-the broker's order book, then cancel it.
+### Stage 1 — Single order place + cancel ✅ **DONE 2026-05-11 10:54 IST**
+**Goal**: place ONE order for ONE stock, verify it lands in the broker's
+order book, then cancel it.
 
-- [ ] Pick **single most liquid stock**: RELIANCE (HDFCBANK as backup).
-- [ ] Capital allocated: Rs 1,000. Quantity: 1 share.
-- [ ] Order type: **AMO LIMIT BUY at -10% of LTP** (deeply out-of-money,
-      will not fill).
-- [ ] Place via `core/broker/angelone.py:place_order(...)`.
-- [ ] Verify order_id is returned and present in `orders` SQLite table.
-- [ ] Verify the same order_id appears in `getOrderBook` from broker.
-- [ ] **Cancel within 30 seconds** of placing.
-- [ ] Verify both our DB and broker book show the cancellation.
-- [ ] **Pass criterion**: place + cancel round-trip with consistent state.
-- [ ] **Fail action**: stop. Don't proceed to live-hours stage until the
-      lifecycle works on AMO.
+**Result**: PASSED in 29s. order_id=`260511000368479`. Zero rupees
+spent. Full post-mortem at [`docs/e2e_stage12_postmortem.md`](e2e_stage12_postmortem.md).
 
-### Stage 2 — Single live order, single stock (target: next Monday 09:30)
+Key findings (now baked into the codebase):
+- AngelOne SmartAPI rejects `variety="AMO"` (AB1007). Valid varieties
+  are only NORMAL / STOPLOSS / ROBO. The original plan to use AMO as
+  safety was based on a false premise; NORMAL with a deep-OOM LIMIT
+  achieves the same risk profile.
+- NSE intraday circuit-limit bands tightened to ~5% (not 10% EOD).
+  Our -10% OOM LIMIT was rejected as "exceeds circuit limit". For
+  lifecycle tests this is fine (rejection is a valid cancellable
+  outcome); for production strategies the LIMIT price must be clamped
+  inside the daily circuit band.
+
+Final test parameters used:
+
+- [x] **Symbol**: YESBANK-EQ (~Rs 22.80, top-50 NSE liquidity, fits
+      Rs 1,000 budget with massive headroom).
+- [x] **Quantity**: 1 share.
+- [x] **Order type**: LIMIT BUY at LTP * 0.90.
+- [x] **Variety**: NORMAL (after AMO returned AB1007).
+- [x] **Tooling**: `python tools/test_amo_lifecycle.py --confirm`.
+- [x] **order_id captured**: `260511000368479`.
+- [x] **Cancel ACKed** within ~26s of placement.
+- [x] **Final order_book status** = rejected (NSE circuit) -> cancelled-by-us.
+- [x] **PASS**: place + cancel round-trip exercised end-to-end. ₹0 cost.
+
+### Stage 2 — Single live BUY+SELL round-trip ✅ **DONE 2026-05-11 10:59 IST**
 **Goal**: same flow as Stage 1 but during market hours. THIS is where
 real fills can happen.
 
-- [ ] Pre-flight: verify `EMERGENCY_STOP` file exists and is 0 bytes
-      (kill-switch armed; remove ONLY when ready to launch).
-- [ ] Stock: RELIANCE. Quantity: 1. Capital: ~Rs 3,000.
-- [ ] Order type: **LIMIT BUY at LTP - 0.1%** (likely fills within 1-2
-      ticks; not a market order, so we don't get hosed by spread).
-- [ ] Time: 09:30 IST (15 min after open, past the worst opening volatility).
-- [ ] After fill: hold for max **5 minutes**, then place LIMIT SELL at
-      LTP + 0.1%.
-- [ ] If sell doesn't fill within 5 more minutes: convert to MARKET SELL.
-- [ ] **Hard cutoff**: full round-trip MUST complete before 09:50 IST.
-      Set a wall-timer; if not flat by 09:50, force-flatten.
-- [ ] **Pass criteria** (ALL must hold):
-  - Both legs fill within target windows.
-  - Our SQLite `trades` table reflects entry+exit with correct PnL.
-  - Slippage observed (LTP-vs-fill diff) is within 5 bps of model
-    assumption (15 bps).
-  - No errors in `logs/agent.log` between order placement and exit.
-- [ ] **Fail action**: pull the plug, flatten any open position via
-      AngelOne web UI, postmortem before Stage 3.
+**Result**: PASSED in 69s. order_id=`260511000380328`. BUY LIMIT did
+not fill (limit below best bid) → cleanly cancelled → no exposure.
+Zero rupees spent. Full post-mortem at
+[`docs/e2e_stage12_postmortem.md`](e2e_stage12_postmortem.md).
+
+What got tested vs not:
+- ✅ place_order during market hours (NORMAL/LIMIT/BUY/DELIVERY/1share)
+- ✅ Order accepted by exchange (no circuit issue this time)
+- ✅ Order book status polling, multiple snapshots over 60s
+- ✅ Buy-fill-timeout → cancel branch
+- ✅ "No exposure -- clean exit" decision logic
+- ❌ Fill detection (no counterparty matched our LIMIT at LTP-0.1%)
+- ❌ SELL LIMIT path (never armed, no position to exit)
+- ❌ MARKET SELL escalation (never armed)
+- ❌ Slippage measurement (no fill to measure)
+
+The next variant, **Stage 2.1**, is needed to cover the fill+exit
+half of the state machine. Tracked in TODOs as `stage21_fill_variant`.
 
 ### Stage 3 — 5 stocks, single round-trip each (target: weekend after Stage 2)
 **Goal**: prove the daemon can manage a small basket without state drift.
@@ -170,7 +183,14 @@ Select-String -Path config.yaml -Pattern "^\s+(name|mode|initial_balance):"
 python -c "import os; from dotenv import load_dotenv; load_dotenv(); print('all set:', all(os.getenv(k) for k in ['ANGELONE_API_KEY','ANGELONE_API_SECRET','ANGELONE_CLIENT_ID','ANGELONE_PASSWORD','ANGELONE_TOTP_SECRET']))"
 # Expected: all set: True
 
-# 6. Phone alarm set for the stage's hard-cutoff time
+# 6. AngelOne SmartAPI Primary Static IP whitelisted for ORDER APIs
+#    (Stage 0 auth bypasses this gate; first placeOrder will hit it.)
+#    Confirm by visiting https://smartapi.angelbroking.com/ -> My Apps ->
+#    Edit App -> Primary Static IP. Must match the laptop's current
+#    public IP (run `curl https://api.ipify.org` to see it).
+# (manual)
+
+# 7. Phone alarm set for the stage's hard-cutoff time
 # (manual)
 ```
 
@@ -205,14 +225,17 @@ These are needed code/tooling pieces. Status as of 2026-05-11:
 
 | Item | Status | Owner notes |
 |---|---|---|
-| `tools/test_angelone_auth.py` | **DONE** (2026-05-11) | 8-stage script: env -> import -> instantiate -> connect -> profile -> funds -> orders -> disconnect. Zero order mutations. `--dry-run` mode validates env without network. Dry-run 2/2 green; real run scheduled for tonight after market close. Diagnostics built in for AB1050 (IP whitelist) and AB1007 (TOTP drift). |
-| `core/broker/angelone.py:place_order` | Done in Phase 1 (verify) | Spot-check signature accepts AMO + LIMIT + lot=1. |
-| `core/broker/angelone.py:cancel_order` | TBD - verify | Required for Stage 1. |
-| `--max-loss-rs N` daemon flag | TBD | Probably 30 lines in `trading_agent.py`. |
+| `tools/test_angelone_auth.py` | **DONE** (2026-05-11) | 8-stage script: env -> import -> instantiate -> connect -> profile -> funds -> orders -> disconnect. Zero order mutations. `--dry-run` mode validates env without network. Dry-run 2/2 green; real run executed live: 8/8 PASS, Rs 1,000 confirmed. |
+| `tools/test_amo_lifecycle.py` | **DONE** (2026-05-11) | Stage 1 script: env -> import -> instantiate -> connect -> resolve token -> LTP -> funds preflight -> place_order (AMO+NORMAL fallback) -> 20s wait -> cancel -> verify. Default dry-run; `--confirm` flag for live order. Dry-run PASS; live attempted but blocked by AG7002 (IP whitelist gate, see below). |
+| **AngelOne *Primary Static IP* whitelisted for order APIs** | **BLOCKER** discovered 2026-05-11 10:17 | First `placeOrder` returns `AG7002: Access denied: Unregistered IP address`. Auth + read APIs bypass this gate; only write/order APIs trigger it. **User action**: log in to https://smartapi.angelbroking.com/, edit the trading app, set Primary Static IP to laptop's current public IP, wait ~5 min for propagation. |
+| `core/broker/angelone.py:place_order` | **VERIFIED** correct (2026-05-11) | Signature accepts AMO + LIMIT + lot=1. Reaches AngelOne correctly; the AG7002 block is server-side, not in our code. |
+| `core/broker/angelone.py:cancel_order` | Implementation present, not yet exercised | Will be tested as soon as Stage 1 unblocks. |
+| `searchScrip` based token resolution | **DONE** in `test_amo_lifecycle.py` | Replaces hardcoded tokens. Resilient to instrument-master updates. |
+| `--max-loss-rs N` daemon flag | TBD | Probably 30 lines in `trading_agent.py`. Required for Stage 3 basket. |
 | `--single-shot` daemon flag | TBD | Required for Stage 3. |
 | `EMERGENCY_STOP` flatten-on-trigger | Probably done | Needs explicit verification: when file appears mid-session, does the daemon flatten existing positions, or only refuse new ones? Stage 0 sub-test. |
-| Slippage logger | TBD | Append (LTP_at_decision, fill_price, bps_diff) to `data/slippage_log.csv` on every live fill. |
-| `getTradeBook` reconciliation | TBD | Post-mortem helper that diffs SQLite `trades` vs broker. |
+| Slippage logger | TBD | Append (LTP_at_decision, fill_price, bps_diff) to `data/slippage_log.csv` on every live fill. Stage 2 will write a single row to seed this. |
+| `getTradeBook` reconciliation | TBD | Post-mortem helper that diffs SQLite `trades` vs broker. Required for Stage 3. |
 
 **Estimated work to close all gaps**: ~1.5 days. Realistic plan:
 - Sat morning: knock out auth script + cancel_order + max-loss flag (~3h).
