@@ -350,21 +350,18 @@ def main() -> int:
     total_stages = 10 if args.confirm else 5
 
     # ── Stage 1: .env ──────────────────────────────────────────────────
-    try:
-        from dotenv import load_dotenv
-    except ImportError:
-        log.log(f"[1/{total_stages}] FAIL python-dotenv missing", "FAIL")
-        log.close()
-        return 1
+    # Use in-house stdlib-only loader so this works inside the Docker
+    # container (env_file injection means os.environ is pre-populated and
+    # /app/.env is not mounted -- python-dotenv path would falsely fail).
+    from core.secrets import load_dotenv  # noqa: E402
     env_path = ROOT / ".env"
-    if not env_path.exists():
-        log.log(f"[1/{total_stages}] FAIL .env not found at {env_path}", "FAIL")
-        log.close()
-        return 1
-    load_dotenv(env_path)
+    file_loaded = env_path.exists()
+    if file_loaded:
+        load_dotenv(str(env_path))
     missing = [k for k in REQUIRED_ENV_KEYS if not os.getenv(k)]
     if missing:
-        log.log(f"[1/{total_stages}] FAIL .env missing keys: {missing}", "FAIL")
+        src = ".env + os.environ" if file_loaded else "os.environ (no .env file)"
+        log.log(f"[1/{total_stages}] FAIL missing keys in {src}: {missing}", "FAIL")
         log.close()
         return 1
     log.log(f"[1/{total_stages}] OK   .env loaded, {len(REQUIRED_ENV_KEYS)} keys present")

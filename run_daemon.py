@@ -22,12 +22,14 @@ if str(_pkg) not in _sys.path:
 
 
 import argparse
+import json
 import os
 import signal
 import ssl
 import sys
 import time
 from datetime import datetime
+from pathlib import Path
 
 import pytz
 import yaml
@@ -82,13 +84,61 @@ def is_market_window() -> bool:
     return 8 <= hour < 16
 
 
+def _write_idle_heartbeat(config_path: str) -> None:
+    """Refresh `logs/health.json` while the daemon is idling off-market hours.
+
+    Without this, `TradingAgent._write_health_json` (the in-cycle heartbeat
+    writer) never runs during the overnight/pre-market sleep window, so the
+    Docker healthcheck reads a missing-or-stale file and flips the container
+    to `unhealthy`. We emit a minimal payload with `state=idle_off_hours`
+    that `tools/health_check.py` will see as fresh (recent `ts_unix`).
+    """
+    try:
+        with open(config_path, "r", encoding="utf-8") as f:
+            config = yaml.safe_load(f) or {}
+    except Exception:
+        config = {}
+
+    log_dir = Path(config.get("logging", {}).get("log_dir", "logs"))
+    try:
+        log_dir.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        return
+
+    now = datetime.now(IST)
+    payload = {
+        "ts": now.isoformat(timespec="seconds"),
+        "ts_unix": int(now.timestamp()),
+        "pid": os.getpid(),
+        "mode": (config.get("broker", {}) or {}).get("mode", "paper"),
+        "state": "idle_off_hours",
+        "cycle_count": 0,
+        "running": False,
+        "open_positions": [],
+        "open_position_count": 0,
+        "cash": float(config.get("initial_capital", 0.0)),
+        "daily_pnl": 0.0,
+        "daily_trades": 0,
+    }
+
+    tmp = log_dir / "health.json.tmp"
+    final = log_dir / "health.json"
+    try:
+        tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        tmp.replace(final)
+    except Exception as e:
+        logger.warning(f"Idle heartbeat write failed: {e}")
+
+
 def sleep_until_market(config_path: str):
     """Sleep until the next market window opens, checking every 5 minutes."""
     logger.info("Outside market hours — sleeping until next market window...")
+    _write_idle_heartbeat(config_path)
     while not is_market_window() and not _shutdown_requested:
         now = datetime.now(IST)
         logger.debug(f"Sleeping... {now.strftime('%H:%M')} IST (next check in 5 min)")
         time.sleep(300)
+        _write_idle_heartbeat(config_path)
 
 
 def run_once(config_path: str, paper: bool, interval: int, dashboard: bool,

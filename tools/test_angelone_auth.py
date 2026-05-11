@@ -97,26 +97,27 @@ def main() -> int:
     print()
 
     # ── Stage 1: .env present, all 5 keys non-empty ───────────────────
+    # We use the in-house core.secrets.load_dotenv (stdlib-only, gracefully
+    # no-ops if the file is missing) instead of python-dotenv so this script
+    # also works inside the Docker container, where docker-compose injects
+    # the .env values via env_file at startup but never mounts the file
+    # itself into /app. In that path the file-load is a no-op and we just
+    # read straight from os.environ.
     try:
-        try:
-            from dotenv import load_dotenv
-        except ImportError:
-            print(_row(1, total_stages, "FAIL", ".env loader",
-                       "python-dotenv missing. Run: pip install python-dotenv"))
-            return 1
+        from core.secrets import load_dotenv  # noqa: E402
         env_path = ROOT / ".env"
-        if not env_path.exists():
-            print(_row(1, total_stages, "FAIL", ".env file",
-                       f"not found at {env_path}"))
-            return 1
-        load_dotenv(env_path)
+        file_loaded = env_path.exists()
+        if file_loaded:
+            load_dotenv(str(env_path))
         missing = [k for k in REQUIRED_ENV_KEYS if not os.getenv(k)]
         if missing:
+            src = ".env + os.environ" if file_loaded else "os.environ (no .env file present)"
             print(_row(1, total_stages, "FAIL", ".env keys",
-                       f"missing or empty: {missing}"))
+                       f"missing or empty in {src}: {missing}"))
             return 1
+        src_note = ".env file" if file_loaded else "os.environ (docker env_file inject)"
         print(_row(1, total_stages, "OK", ".env loaded",
-                   f"{len(REQUIRED_ENV_KEYS)} ANGELONE_* keys present"))
+                   f"{len(REQUIRED_ENV_KEYS)} ANGELONE_* keys present (via {src_note})"))
         passed = 1
     except Exception as e:
         print(_row(1, total_stages, "FAIL", ".env stage", f"unexpected: {e!r}"))
