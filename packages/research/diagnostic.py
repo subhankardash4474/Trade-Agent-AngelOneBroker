@@ -391,6 +391,127 @@ def make_recommendations(stats: dict[str, StratStats], port: dict) -> list[str]:
 # ─────────────────────────────────────────────────────────────────────
 # Report builder
 # ─────────────────────────────────────────────────────────────────────
+def build_phase_a_rolling_section(
+    db_path: Path,
+    window_days: int,
+    target_pf: float,
+    floor_pf: float,
+) -> str:
+    """Phase-A validation tracker: PF day-by-day over the last N TRADING days.
+
+    "Trading days" = distinct ISO-date values in the trades table (so weekends
+    and holidays naturally fall out, no calendar gymnastics required).
+
+    Outputs a per-day table + a rolling-PF verdict line designed to make the
+    Friday EOD email's pass/fail call mechanical:
+
+      PASS:     rolling PF >= target_pf
+      INCONCLUSIVE: floor_pf <= rolling PF < target_pf  (extend Phase A by 1 wk)
+      FAIL:     rolling PF < floor_pf                   (stop, run postmortem)
+
+    The thresholds are passed in (default 1.5 / 1.0) so the same function is
+    reusable for a Phase-B re-check with stricter gates later.
+    """
+    if not db_path.exists():
+        return ""
+
+    conn = sqlite3.connect(str(db_path))
+    conn.row_factory = sqlite3.Row
+    # date(exit_time) gives ISO yyyy-mm-dd; SQLite handles this natively for
+    # ISO-format timestamps. Group by day, aggregate per-day stats.
+    # NOTE: strip the +05:30 offset before passing to date() -- SQLite
+    # converts IST timestamps to UTC otherwise, which is harmless during
+    # market hours (09:15-15:30 IST never crosses UTC midnight) but would
+    # silently bucket a 23:55 IST audit-time exit into the next day.
+    # substr(1, 10) keeps just "YYYY-MM-DD" which is what we want.
+    rows = conn.execute("""
+        SELECT substr(exit_time, 1, 10) AS day,
+               COUNT(*) AS trades,
+               SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END) AS wins,
+               SUM(CASE WHEN pnl > 0 THEN pnl ELSE 0 END) AS gross_win,
+               SUM(CASE WHEN pnl < 0 THEN -pnl ELSE 0 END) AS gross_loss,
+               SUM(pnl) AS net_pnl
+        FROM trades
+        WHERE exit_time IS NOT NULL
+        GROUP BY day
+        ORDER BY day DESC
+        LIMIT ?
+    """, (window_days,)).fetchall()
+    conn.close()
+
+    if not rows:
+        return "\n## Phase A — Rolling validation tracker\n\n_No closed trades yet to validate._\n"
+
+    # Reverse to chronological order for the table (oldest first), keeps the
+    # eye trained on trend rather than recency bias.
+    day_rows = list(reversed(rows))
+
+    lines = [
+        "",
+        f"## Phase A — Rolling {window_days}-day validation tracker",
+        "",
+        f"_Phase-A gate: rolling PF >= **{target_pf:.2f}** = PASS, "
+        f">= **{floor_pf:.2f}** = INCONCLUSIVE (extend), "
+        f"< {floor_pf:.2f} = FAIL (stop + postmortem)._",
+        "",
+        "| Day | Trades | Wins | Gross Win | Gross Loss | Day PF | Day PnL |",
+        "|---|---:|---:|---:|---:|---:|---:|",
+    ]
+    total_gw = 0.0
+    total_gl = 0.0
+    total_pnl = 0.0
+    total_trades = 0
+    for r in day_rows:
+        gw = float(r["gross_win"] or 0.0)
+        gl = float(r["gross_loss"] or 0.0)
+        net = float(r["net_pnl"] or 0.0)
+        day_pf = (gw / gl) if gl > 0 else (float("inf") if gw > 0 else 0.0)
+        day_pf_disp = f"{day_pf:.2f}" if day_pf != float("inf") else "INF"
+        lines.append(
+            f"| {r['day']} | {r['trades']} | {r['wins']} | "
+            f"Rs {gw:,.0f} | Rs {gl:,.0f} | {day_pf_disp} | Rs {net:+,.0f} |"
+        )
+        total_gw += gw
+        total_gl += gl
+        total_pnl += net
+        total_trades += int(r["trades"] or 0)
+
+    rolling_pf = (total_gw / total_gl) if total_gl > 0 else (
+        float("inf") if total_gw > 0 else 0.0
+    )
+    rolling_pf_disp = f"{rolling_pf:.2f}" if rolling_pf != float("inf") else "INF"
+
+    if rolling_pf >= target_pf:
+        verdict = "**PASS**"
+        action = (f"rolling PF {rolling_pf_disp} >= target {target_pf:.2f}. "
+                  f"Phase A confirmed -- proceed to Phase B (hourly blackouts "
+                  f"+ quarter-Kelly sizing).")
+    elif rolling_pf >= floor_pf:
+        verdict = "**INCONCLUSIVE**"
+        action = (f"rolling PF {rolling_pf_disp} is between floor ({floor_pf:.2f}) "
+                  f"and target ({target_pf:.2f}). Extend Phase A by another "
+                  f"{window_days} trading days before deciding.")
+    else:
+        verdict = "**FAIL**"
+        action = (f"rolling PF {rolling_pf_disp} < floor {floor_pf:.2f}. STOP. "
+                  f"Run profit_diagnostic.py --days {window_days * 2} for a "
+                  f"full postmortem before making any further changes.")
+
+    lines.extend([
+        "",
+        f"**Window totals:** {len(day_rows)} day(s) | "
+        f"{total_trades} trades | "
+        f"PnL Rs {total_pnl:+,.0f} | "
+        f"Rolling PF: **{rolling_pf_disp}**",
+        "",
+        f"### Verdict: {verdict}",
+        "",
+        action,
+        "",
+    ])
+    return "\n".join(lines)
+
+
 def build_report(trades: list[dict], stats: dict[str, StratStats],
                  port: dict, args: argparse.Namespace) -> str:
     when = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -411,6 +532,16 @@ def build_report(trades: list[dict], stats: dict[str, StratStats],
         f"- **Commission paid:** Rs {port['total_commission']:.0f}  "
         f"(= {port['commission_drag_pct_pnl']:.0f}% of |PnL|)",
         "",
+        # Phase-A rolling tracker -- only meaningful if the caller asked for
+        # a recent window (otherwise it duplicates the TL;DR). Always emit
+        # for short-window reports (days <= 30) so the daily EOD email leads
+        # with a clear pass/fail call.
+        (build_phase_a_rolling_section(
+            DB_PATH,
+            window_days=getattr(args, "phase_a_window", 5),
+            target_pf=getattr(args, "phase_a_target_pf", 1.5),
+            floor_pf=getattr(args, "phase_a_floor_pf", 1.0),
+         ) if (args.days is None or args.days <= 30) else ""),
         "## Per-strategy verdict",
         "",
         fmt_table(stats),
@@ -505,6 +636,17 @@ def main() -> int:
                     help="Path to also dump machine-readable JSON.")
     ap.add_argument("--out", default=None,
                     help="Override markdown output path.")
+    ap.add_argument("--phase-a-window", type=int, default=5,
+                    help="Phase-A rolling-validation window (number of "
+                         "trading days to roll over). Default: 5 = one "
+                         "full trading week.")
+    ap.add_argument("--phase-a-target-pf", type=float, default=1.5,
+                    help="Rolling PF threshold above which Phase A PASSES "
+                         "(default 1.5). Above this, proceed to Phase B.")
+    ap.add_argument("--phase-a-floor-pf", type=float, default=1.0,
+                    help="Rolling PF threshold below which Phase A FAILS "
+                         "(default 1.0). Between floor and target = "
+                         "INCONCLUSIVE -- extend Phase A by another window.")
     args = ap.parse_args()
 
     trades = load_trades(DB_PATH, days=args.days, strategy_filter=args.strategy)
