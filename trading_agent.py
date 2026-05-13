@@ -444,7 +444,19 @@ class TradingAgent:
         #   strategy_name -> {consec_losses, daily_pnl, suspended, suspended_reason, trades}
         self._strategy_state: Dict[str, Dict] = {}
         self._daily_tracker_date: Optional[datetime] = None
-        self._eod_summary_sent = False
+        # 2026-05-13: persist this across daemon restarts via a flag file
+        # under ``logs/.eod_sent_<YYYY-MM-DD>.flag``. In-memory only meant
+        # that a healthcheck-triggered restart between 15:20 (EOD time)
+        # and 15:30 (close) would replay EOD on every boot -- the
+        # incident where 11 identical EOD Summary emails went out in
+        # 30 minutes. ``_load_eod_sent_flag`` reads the file on init so
+        # the post-restart agent already knows EOD is done.
+        self._eod_summary_sent = self._load_eod_sent_flag()
+        if self._eod_summary_sent:
+            logger.info(
+                "EOD summary flag found on disk -- already sent for today; "
+                "skipping duplicate EOD work this session."
+            )
         self._consecutive_cycle_errors = 0
 
         # Market open / close times — agent gates pre-market and post-market
@@ -967,6 +979,18 @@ class TradingAgent:
             self._eod_summary_sent = False
             self._did_premarket_scan_today = False
             self._daily_tracker_date = today
+            # GC the previous day's EOD flag so logs/ doesn't accumulate
+            # one .flag file per calendar day forever. We deliberately
+            # don't touch today's flag here (it would only exist if the
+            # daemon restarted across midnight, which is a different
+            # situation we don't want to nuke).
+            try:
+                yesterday = (today - timedelta(days=1)).isoformat()
+                stale = self._eod_flag_path(yesterday)
+                if os.path.exists(stale):
+                    os.remove(stale)
+            except Exception as e:
+                logger.debug(f"Could not GC stale EOD flag: {e}")
             logger.info("Daily trackers reset for new trading day")
 
     def _preflight_checks(self) -> bool:
@@ -1646,6 +1670,46 @@ class TradingAgent:
         )
         return "\n".join(lines)
 
+    def _eod_flag_path(self, day_iso: Optional[str] = None) -> str:
+        """File-flag path used to make EOD-send idempotent across daemon
+        restarts. We deliberately use a hidden file under ``logs/`` so the
+        Cursor / VM log-puller doesn't accidentally surface it as audit
+        data, and a date-stamped name so the flag self-expires at the
+        next-day rollover.
+        """
+        if day_iso is None:
+            day_iso = datetime.now(IST).strftime("%Y-%m-%d")
+        log_dir = self.config.get("logging", {}).get("log_dir", "logs")
+        return os.path.join(log_dir, f".eod_sent_{day_iso}.flag")
+
+    def _load_eod_sent_flag(self) -> bool:
+        """Return True if today's EOD has already been sent (flag exists).
+        Returns False on any IO error -- erring on the side of "send
+        anyway" rather than "silently miss the EOD email"."""
+        try:
+            return os.path.exists(self._eod_flag_path())
+        except OSError:
+            return False
+
+    def _save_eod_sent_flag(self) -> None:
+        """Touch the flag file after a successful EOD send so a subsequent
+        daemon restart in the same calendar day finds it and short-circuits
+        ``_maybe_send_eod_summary``. Silent on error -- the in-memory
+        ``_eod_summary_sent`` flag is still set, so the current session is
+        protected even if the disk write fails (only a restart could
+        cause the duplicate, and that's a degraded-failure mode we accept
+        rather than aborting the EOD pipeline)."""
+        path = self._eod_flag_path()
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(datetime.now(IST).isoformat(timespec="seconds"))
+        except OSError as e:
+            logger.warning(
+                f"Could not persist EOD-sent flag at {path}: {e}. "
+                f"A daemon restart before midnight could resend EOD."
+            )
+
     def _maybe_send_eod_summary(self):
         """Auto-send end-of-day summary at the configured time."""
         if self._eod_summary_sent:
@@ -1654,6 +1718,7 @@ class TradingAgent:
         h, m = map(int, self._eod_summary_time.split(":"))
         if now.hour > h or (now.hour == h and now.minute >= m):
             self._eod_summary_sent = True
+            self._save_eod_sent_flag()
             summary = self.portfolio.get_summary()
             risk = self.risk_manager.get_risk_summary()
 

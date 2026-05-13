@@ -11,7 +11,9 @@ Network resilience:
   takes down DNS at EOD.
 """
 
+import hashlib
 import json
+import os
 import re
 import smtplib
 import time
@@ -27,6 +29,22 @@ import requests
 from loguru import logger
 
 IST = pytz.timezone("Asia/Kolkata")
+
+# Persistent dedup state file. Survives daemon restarts so a crash-loop
+# during EOD (the 2026-05-13 incident where 11 identical EOD Summary
+# emails went out in 30 minutes because the daemon kept getting
+# SIGTERM'd by Docker's healthcheck) cannot resend the same alert.
+# The file is a flat newline-separated list of "<unix_ts>:<hash>:<subject>".
+_DEDUP_STATE_FILE = Path("logs") / ".alert_dedup_state.json"
+
+# Default TTL window. Anything within this many minutes of a previous
+# send with the same content hash is dropped. 60 minutes is generous
+# enough to absorb a full Docker healthcheck crash-loop (180s grace +
+# restart * a few cycles) while still letting genuinely repeated alerts
+# (e.g. "trade rejected" multiple times in a day for different reasons,
+# which hash differently because the body changes) flow through. Tuned
+# down in unit tests via the config knob.
+_DEDUP_DEFAULT_TTL_MINUTES = 60
 
 # Network errors we should retry. Anything else (e.g. 401 invalid api key)
 # is a permanent failure and skipping retries saves time.
@@ -85,8 +103,96 @@ class AlertManager:
         self._email_cfg = mon_cfg.get("email", {})
         self._email_enabled = self._email_cfg.get("enabled", False) and self.enabled
 
+        # Persistent dedup window. Disabled by setting ttl_minutes <= 0 in
+        # config -- useful for tests / for the rare operator who actually
+        # WANTS every duplicate sent (e.g. live debugging a flapping
+        # service).
+        dedup_cfg = mon_cfg.get("dedup", {}) or {}
+        self._dedup_ttl_minutes: int = int(
+            dedup_cfg.get("ttl_minutes", _DEDUP_DEFAULT_TTL_MINUTES)
+        )
+        # Override state-file location (mostly for tests; production reads
+        # the module-level default which sits next to the daemon's other
+        # ephemeral state under ``logs/``).
+        state_path = dedup_cfg.get("state_path")
+        self._dedup_state_path: Path = Path(state_path) if state_path else _DEDUP_STATE_FILE
+
+    # ── Persistent dedup helpers ─────────────────────────────────
+    @staticmethod
+    def _alert_fingerprint(title: str, body: str) -> str:
+        """Stable hash of the alert payload. SHA1 hex (truncated) is plenty
+        for dedup -- collisions across distinct messages would have to be
+        deliberate, and our keyspace is tiny (~50 alert types in a day)."""
+        h = hashlib.sha1()
+        h.update(title.encode("utf-8", errors="replace"))
+        h.update(b"\x1f")  # unit separator -- can't appear in real text
+        h.update(body.encode("utf-8", errors="replace"))
+        return h.hexdigest()[:16]
+
+    def _load_dedup_state(self) -> dict:
+        """Return ``{fingerprint: unix_ts}`` of the most recent send for
+        each known alert. Missing/corrupt state file -> empty dict (we
+        prefer "send anyway" over "permanently swallow alerts" when the
+        state is unreadable, on the principle that an unexpected
+        duplicate is safer than a missed alert)."""
+        try:
+            if not self._dedup_state_path.exists():
+                return {}
+            raw = json.loads(self._dedup_state_path.read_text(encoding="utf-8"))
+            if not isinstance(raw, dict):
+                return {}
+            return {str(k): int(v) for k, v in raw.items() if isinstance(v, (int, float))}
+        except Exception as e:
+            logger.debug(f"[DEDUP] state load failed (treating as empty): {e}")
+            return {}
+
+    def _save_dedup_state(self, state: dict) -> None:
+        try:
+            self._dedup_state_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self._dedup_state_path.with_suffix(self._dedup_state_path.suffix + ".tmp")
+            tmp.write_text(json.dumps(state), encoding="utf-8")
+            os.replace(tmp, self._dedup_state_path)
+        except Exception as e:
+            logger.warning(f"[DEDUP] state save failed (alerts may re-fire on next restart): {e}")
+
+    def _is_recent_duplicate(self, fingerprint: str) -> Optional[int]:
+        """If this fingerprint was sent within the TTL window, return
+        the age in seconds. Otherwise return None.
+        """
+        if self._dedup_ttl_minutes <= 0:
+            return None
+        state = self._load_dedup_state()
+        prev_ts = state.get(fingerprint)
+        if prev_ts is None:
+            return None
+        age = int(time.time()) - int(prev_ts)
+        if age <= self._dedup_ttl_minutes * 60:
+            return age
+        return None
+
+    def _record_send(self, fingerprint: str, title: str) -> None:
+        """Stamp this fingerprint with `now` and GC expired entries.
+        We don't keep an unbounded log -- entries past 24h are dropped to
+        cap the file size (a busy day might emit 200 alerts)."""
+        if self._dedup_ttl_minutes <= 0:
+            return
+        state = self._load_dedup_state()
+        now = int(time.time())
+        cutoff = now - max(24 * 3600, self._dedup_ttl_minutes * 60 * 2)
+        state = {fp: ts for fp, ts in state.items() if ts >= cutoff}
+        state[fingerprint] = now
+        self._save_dedup_state(state)
+
     def send_alert(self, title: str, message: str, level: str = "info"):
-        """Send an alert to configured channels."""
+        """Send an alert to configured channels.
+
+        Persistent dedup: if the same (title, message) pair was already
+        sent within ``monitoring.alerts.dedup.ttl_minutes`` (default 60),
+        the duplicate is logged as a SUPPRESS and silently dropped. This
+        survives daemon restarts via ``logs/.alert_dedup_state.json``,
+        which is what prevents EOD-time crash loops from spraying the
+        operator with 11 identical emails (see 2026-05-13 incident).
+        """
         timestamp = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S IST")
         full_message = f"[{timestamp}] [{level.upper()}] {title}\n{message}"
 
@@ -96,8 +202,23 @@ class AlertManager:
         if not self.enabled:
             return
 
+        # Dedup on (title, message) -- intentionally NOT including the
+        # leading timestamp from full_message, otherwise every alert
+        # would have a unique fingerprint and the dedup would never fire.
+        fingerprint = self._alert_fingerprint(title, message)
+        recent_age = self._is_recent_duplicate(fingerprint)
+        if recent_age is not None:
+            logger.info(
+                f"[ALERT-SUPPRESSED] '{title}' is a duplicate of one sent "
+                f"{recent_age}s ago (ttl {self._dedup_ttl_minutes} min). "
+                f"Skipping email send."
+            )
+            return
+
         if self._email_enabled:
             self._send_email(title, full_message, level)
+
+        self._record_send(fingerprint, title)
 
     def send_trade_alert(
         self,

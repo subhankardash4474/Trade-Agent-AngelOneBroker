@@ -301,6 +301,44 @@ def main():
                      max_loss_rs=args.max_loss_rs,
                      single_shot=args.single_shot)
             logger.info("Agent exited cleanly")
+            # 2026-05-13: do NOT just `break` here.
+            #
+            # The agent has exactly one voluntary clean-exit path:
+            # ``TradingAgent._trading_cycle`` sets ``self._running = False``
+            # at >= 15:30 IST (post market_close). Until today, this branch
+            # broke out of the wrapper, the wrapper process exited, and
+            # Docker's ``restart: unless-stopped`` policy re-created the
+            # container -- which re-ran the agent, which re-ran the EOD
+            # work (postmortem + profit-diagnostic subprocesses, each
+            # capped at 60-120s of yfinance calls), and re-fired the EOD
+            # email. Repeat ~10 times until 16:00 IST flips
+            # ``is_market_window`` False. Operator received 11 identical
+            # EOD Summary emails on 2026-05-13.
+            #
+            # New behaviour: if the agent exited cleanly inside the
+            # market_hours_only window (i.e. it was a market-close exit,
+            # not a manual stop), transition directly to
+            # ``sleep_until_market`` instead of letting Docker burn a
+            # container restart cycle. ``sleep_until_market`` itself
+            # exits when 16:00 IST flips the window AND wakes for the
+            # emergency-stop file -- the two correct paths out of the
+            # idle window.
+            if args.market_hours_only:
+                now_ist = datetime.now(IST)
+                close_h, close_m = 15, 30
+                past_close = (now_ist.weekday() < 5 and
+                              (now_ist.hour > close_h or
+                               (now_ist.hour == close_h and
+                                now_ist.minute >= close_m)))
+                if past_close:
+                    logger.info(
+                        f"Agent self-exited at {now_ist.strftime('%H:%M:%S')} "
+                        f"IST -- skipping restart loop and sleeping until "
+                        f"the next market window."
+                    )
+                    backoff = 2
+                    crash_count = 0
+                    continue
             break
         except KeyboardInterrupt:
             logger.info("Daemon interrupted by user")
