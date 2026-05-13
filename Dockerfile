@@ -53,8 +53,22 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY --from=builder /install /usr/local
 
-RUN groupadd --system --gid 1001 trader \
-    && useradd  --system --uid 1001 --gid 1001 \
+# UID/GID are parameterised so the image's `trader` user can be made to
+# match the host's deploying user, which avoids the volume-mount
+# permission collision we hit on 2026-05-13:
+#   * host /opt/trading-agent was owned by UID 998 (host's `trader` user)
+#   * image's `trader` was hard-coded to UID 1001
+#   * after `chown -R trader:trader` on the host, the container couldn't
+#     write its own log files because container-UID 1001 != host-UID 998
+# Default (1001) preserves the legacy behaviour for fresh local builds.
+# Cloud builds set TRADER_UID/TRADER_GID in `.env` to match the host
+# user, so volume mounts are read/writable from both sides without
+# manual chown.
+ARG TRADER_UID=1001
+ARG TRADER_GID=1001
+
+RUN groupadd --system --gid ${TRADER_GID} trader \
+    && useradd  --system --uid ${TRADER_UID} --gid ${TRADER_GID} \
                 --home-dir /home/trader --create-home \
                 --shell /usr/sbin/nologin trader \
     && mkdir -p /app /app/data /app/logs /app/models \

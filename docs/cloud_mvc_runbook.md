@@ -223,6 +223,16 @@ ls -la /opt/trading-agent/models/
 sudo -u trader -i
 cd /opt/trading-agent
 
+# 2026-05-13: UID alignment. The Dockerfile accepts TRADER_UID/TRADER_GID
+# build args; we set them to match the host `trader` user so volume mounts
+# (/app/data, /app/logs) are writable from both sides. Without this, the
+# container writes a log file the host can't read, AND on every redeploy
+# `git reset --hard` fails because the host can't overwrite files the
+# container created. _deploy_inline.sh now sets these automatically; for
+# the first manual setup, do it once:
+grep -q '^TRADER_UID=' .env || echo "TRADER_UID=$(id -u)" >> .env
+grep -q '^TRADER_GID=' .env || echo "TRADER_GID=$(id -g)" >> .env
+
 # First build is slow (~4-7 min on ARM Mumbai region, includes wheel
 # download for pandas/xgboost/scikit-learn). Subsequent rebuilds reuse the
 # layer cache and finish in ~30s.

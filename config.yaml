@@ -154,6 +154,16 @@ strategies:
     confidence_threshold: 0.65
     prediction_horizon: 3
     timeframe: 5min
+    # 2026-05-13: direction-stability gate. Require N consecutive
+    # above-threshold same-side classifications on a symbol before the
+    # strategy emits a BUY/SELL to the ensemble. Surfaced after the
+    # BAJFINANCE 2026-05-13 loss: XGB went BUY @ 09:34 (prob_up=0.695)
+    # then SELL @ 09:52 (prob_down=0.725) -- 180-degree flip in 18 min,
+    # the ensemble took the second signal at 10:04, stopped at 10:31
+    # for -Rs 155.28. With signal_stability_bars=2, the SELL would have
+    # been buffered for one more cycle, giving us a chance to see if
+    # the flip was real or noise. Set to 1 to disable.
+    signal_stability_bars: 2
     # 2026-05-08: trend filter ENABLED at 5% from overnight battery (C2 winner).
     # Block BUYs when price > 5% under the 50d SMA (i.e. "buying the falling
     # knife"); block SELLs when price > 5% above the 50d SMA (chasing strength).

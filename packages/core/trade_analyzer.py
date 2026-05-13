@@ -112,6 +112,15 @@ class TradeAnalyzer:
                     "Restored learned weights: "
                     + ", ".join(f"{k}={v:.2f}" for k, v in self._learned_weights.items())
                 )
+            # Rebuild the underscore-prefixed accumulators (_gross_wins,
+            # _gross_losses, _pnl_list) from the trades table. The DB row
+            # only persists summary columns; the accumulators are not
+            # serialised, so after a daemon restart the next trade would
+            # write PF = 0 (loss-only) or PF = inf (win-only) and
+            # auto-suppress could fire on that corrupted value -- this is
+            # exactly what suppressed supertrend_follow (60 % WR, +Rs 96
+            # cumulative) to weight = 0 on 2026-05-13.
+            self._rehydrate_internal_accumulators()
             try:
                 regime_map = self._db.load_regime_weights()
                 for (strategy, regime), row in regime_map.items():
@@ -133,6 +142,131 @@ class TradeAnalyzer:
                 logger.debug(f"Regime stats not loaded: {e}")
         except Exception as e:
             logger.error(f"Failed to load learning state: {e}")
+
+    # ----------------------------------------------------------
+    # Accumulator rehydration (PF / Sharpe correctness after restart)
+    # ----------------------------------------------------------
+
+    def _rehydrate_internal_accumulators(self):
+        """Rebuild ``_gross_wins`` / ``_gross_losses`` / ``_pnl_list`` per
+        strategy by replaying the ``trades`` table.
+
+        Why this exists
+        ---------------
+        ``_update_profit_factor`` and ``_update_sharpe`` both read+write
+        accumulator state that is stored *inside* the in-memory stats dict
+        under underscore-prefixed keys (``_gross_wins``, ``_gross_losses``,
+        ``_pnl_list``). The DB persistence layer (``save_strategy_score``)
+        only saves the *public* columns (total_trades, wins, losses,
+        total_pnl, avg_pnl, win_rate, profit_factor, sharpe,
+        learned_weight). After a restart, ``_strategy_stats`` is reloaded
+        from the DB summary but the accumulators come back as ``None`` ->
+        the ``.get("_gross_wins", 0.0)`` fallback at the top of
+        ``_update_profit_factor`` zeroes them.
+
+        Consequences in the wild (2026-05-13 morning audit)
+        ---------------------------------------------------
+        Every strategy's DB row showed ``profit_factor = 0.0`` regardless
+        of actual edge. ``supertrend_follow`` (25 trades, 60 % WR,
+        cumulative +Rs 96) ended up with ``learned_weight = 0.0`` because
+        the auto-suppress threshold (PF < 0.7 over >= 8 trades) tripped on
+        the corrupted PF. Profitable strategy, silenced.
+
+        Fix
+        ---
+        Replay the ``trades`` table once on startup. For each historical
+        closed trade, attribute its PnL to the recorded ``strategy`` and
+        feed it back through the same ``_update_profit_factor`` /
+        ``_update_sharpe`` helpers used by ``record_trade``. The result is
+        accumulator state identical to what would have existed if the
+        daemon had never restarted. We also re-save each strategy's row so
+        the persisted PF/Sharpe values reflect the rebuilt state.
+
+        Phantom-row cleanup
+        -------------------
+        Any strategy that still has ``total_trades > 0`` in the DB but
+        does NOT appear in the actual ``trades`` table is a stale artifact
+        from an earlier refactor (e.g. the ``ensemble`` row left behind on
+        2026-05-06 when ensemble vote attribution moved to contributors).
+        Those rows are deleted -- their PF would forever stay at the
+        corrupted-default 0.0 because no trades flow into them.
+        """
+        try:
+            trades_df = self._db.load_trades()
+        except Exception as e:
+            logger.warning(
+                f"[LEARNING-REHYDRATE] Could not load trades for accumulator "
+                f"rehydrate: {e}"
+            )
+            return
+
+        if trades_df is None or len(trades_df) == 0:
+            return
+
+        # Reset only the underscore-prefixed accumulators on every loaded
+        # strategy so the rebuild is from-scratch and idempotent.
+        for stats in self._strategy_stats.values():
+            stats["_gross_wins"] = 0.0
+            stats["_gross_losses"] = 0.0
+            stats["_pnl_list"] = []
+
+        n_trades_replayed = 0
+        for _, row in trades_df.iterrows():
+            strategy = row.get("strategy") or "unknown"
+            try:
+                pnl = float(row.get("pnl") or 0.0)
+            except (TypeError, ValueError):
+                continue
+            stats = self._strategy_stats.setdefault(strategy, self._empty_stats())
+            # Feed the trade through the same helpers used at live runtime
+            # so the rebuilt state matches what record_trade would produce.
+            stats = self._update_profit_factor(stats, pnl)
+            stats = self._update_sharpe(stats, pnl)
+            self._strategy_stats[strategy] = stats
+            n_trades_replayed += 1
+
+        # Phantom-row detection: rows in DB that the trades table no
+        # longer mentions. Common after strategy renames or attribution
+        # refactors. Removing them stops them polluting log output and
+        # weight dicts (e.g. "ensemble=0.00" line).
+        trade_strategies = set()
+        if "strategy" in trades_df.columns:
+            trade_strategies = {
+                s for s in trades_df["strategy"].dropna().unique() if s
+            }
+        phantoms = [
+            s for s in list(self._strategy_stats.keys())
+            if self._strategy_stats[s].get("total_trades", 0) > 0
+            and s not in trade_strategies
+        ]
+        for ph in phantoms:
+            logger.warning(
+                f"[LEARNING-REHYDRATE] Removing phantom strategy row '{ph}' "
+                f"(present in strategy_scores but absent from trades table)"
+            )
+            self._strategy_stats.pop(ph, None)
+            try:
+                self._db.delete_strategy_score(ph)
+            except Exception as e:
+                logger.debug(f"Could not delete phantom row {ph}: {e}")
+
+        # Persist the rebuilt PF/Sharpe back to the DB so operator queries
+        # and future restarts see corrected values.
+        for strategy, stats in self._strategy_stats.items():
+            try:
+                self._db.save_strategy_score(strategy, stats)
+            except Exception as e:
+                logger.debug(
+                    f"Could not persist rehydrated stats for {strategy}: {e}"
+                )
+
+        if n_trades_replayed:
+            logger.info(
+                f"[LEARNING-REHYDRATE] Rebuilt PF/Sharpe accumulators from "
+                f"{n_trades_replayed} historical trades across "
+                f"{len(self._strategy_stats)} strategies. "
+                f"Phantoms removed: {len(phantoms)}"
+            )
 
     # ----------------------------------------------------------
     # Layer 1 + 4: Record trade (per-strategy + per-regime)

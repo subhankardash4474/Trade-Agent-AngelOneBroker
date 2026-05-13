@@ -60,6 +60,15 @@ class XGBoostClassifier(BaseStrategy):
             # SL = 1.5*ATR, TP = 2.0*ATR.
             "sl_atr_mult": 1.5,
             "tp_atr_mult": 2.0,
+            # 2026-05-13: Direction-stability gate. Require N consecutive
+            # above-threshold same-side classifications on a symbol before
+            # emitting a BUY/SELL. Filters out XGB flip-flops (live ev:
+            # BAJFINANCE went XGB-BUY @ 09:34 -> XGB-SELL @ 09:52 -> taken
+            # @ 10:04 -> stopped @ 10:31 for -Rs 155). HOLD signals (any
+            # reason) don't reset the counter -- only an opposite-side
+            # above-threshold signal does. Value 1 = legacy behaviour
+            # (no filtering); 2 is the recommended floor.
+            "signal_stability_bars": 2,
         }
         merged = {**defaults, **params}
         super().__init__(name="xgboost_classifier", params=merged)
@@ -74,6 +83,14 @@ class XGBoostClassifier(BaseStrategy):
         )
         self.sl_atr_mult: float = float(merged["sl_atr_mult"])
         self.tp_atr_mult: float = float(merged["tp_atr_mult"])
+        self.signal_stability_bars: int = max(
+            1, int(merged.get("signal_stability_bars", 2))
+        )
+        # Per-symbol direction-stability tracker for the flip-flop filter.
+        # Maps symbol -> (last_above_threshold_side, consecutive_count).
+        # Not persisted to disk -- after restart all symbols start fresh
+        # and the first 1-2 signals will be buffered as expected.
+        self._stability_state: Dict[str, tuple] = {}
         self._feature_engine = FeatureEngine()
         self._model = None
         # Health flags — set by _validate_model_contract(). When any of
@@ -85,6 +102,24 @@ class XGBoostClassifier(BaseStrategy):
         self._stale_warned: bool = False
         self._load_model()
         self._validate_model_contract()
+
+    def _record_stability(self, symbol: str, side: str) -> int:
+        """Update per-symbol direction-stability tracker; return current
+        consecutive same-side count.
+
+        Only called for ABOVE-threshold ``BUY``/``SELL`` classifications.
+        An opposite-side classification resets the counter to 1; same-side
+        increments it. HOLD signals must NOT call this (they neither
+        increment nor reset -- the counter persists until the model
+        disagrees).
+        """
+        last_side, consec = self._stability_state.get(symbol, (None, 0))
+        if last_side == side:
+            consec += 1
+        else:
+            consec = 1
+        self._stability_state[symbol] = (side, consec)
+        return consec
 
     @property
     def required_history_bars(self) -> int:
@@ -233,9 +268,30 @@ class XGBoostClassifier(BaseStrategy):
                     Signal.HOLD, symbol, df,
                     metadata={**metadata, "reason": "trend_filter_long"},
                 )
+            # Direction-stability gate. Resets on opposite-side flip. The
+            # counter advances only on consecutive above-threshold BUYs;
+            # below-threshold predictions (HOLD path below) leave it alone.
+            consec = self._record_stability(symbol, "BUY")
+            if consec < self.signal_stability_bars:
+                logger.info(
+                    f"[{self.name}] BUY {symbol} buffered "
+                    f"({consec}/{self.signal_stability_bars}) | "
+                    f"prob_up={prob_up:.3f}"
+                )
+                return self._make_signal(
+                    Signal.HOLD, symbol, df,
+                    metadata={
+                        **metadata,
+                        "reason": f"stability_pending_{consec}/{self.signal_stability_bars}",
+                        "pending_side": "BUY",
+                    },
+                )
             stop_loss = price - self.sl_atr_mult * atr
             take_profit = price + self.tp_atr_mult * atr
-            logger.info(f"[{self.name}] BUY {symbol} | prob_up={prob_up:.3f}")
+            logger.info(
+                f"[{self.name}] BUY {symbol} | prob_up={prob_up:.3f} | "
+                f"stability={consec}/{self.signal_stability_bars}"
+            )
             return self._make_signal(
                 Signal.BUY, symbol, df,
                 confidence=prob_up, stop_loss=stop_loss,
@@ -254,11 +310,29 @@ class XGBoostClassifier(BaseStrategy):
                     Signal.HOLD, symbol, df,
                     metadata={**metadata, "reason": "trend_filter_short"},
                 )
+            consec = self._record_stability(symbol, "SELL")
+            if consec < self.signal_stability_bars:
+                logger.info(
+                    f"[{self.name}] SELL {symbol} buffered "
+                    f"({consec}/{self.signal_stability_bars}) | "
+                    f"prob_down={prob_down:.3f}"
+                )
+                return self._make_signal(
+                    Signal.HOLD, symbol, df,
+                    metadata={
+                        **metadata,
+                        "reason": f"stability_pending_{consec}/{self.signal_stability_bars}",
+                        "pending_side": "SELL",
+                    },
+                )
             # Fix from 2026-05-07: SELL was missing SL/TP, fell back to
             # generic ensemble defaults. Now symmetric with BUY.
             stop_loss = price + self.sl_atr_mult * atr
             take_profit = price - self.tp_atr_mult * atr
-            logger.info(f"[{self.name}] SELL {symbol} | prob_down={prob_down:.3f}")
+            logger.info(
+                f"[{self.name}] SELL {symbol} | prob_down={prob_down:.3f} | "
+                f"stability={consec}/{self.signal_stability_bars}"
+            )
             return self._make_signal(
                 Signal.SELL, symbol, df,
                 confidence=prob_down, stop_loss=stop_loss,

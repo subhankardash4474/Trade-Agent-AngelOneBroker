@@ -160,6 +160,153 @@ class TestAdaptiveWeightTuner:
         assert w1.get("rsi_momentum") == w2.get("rsi_momentum")
 
 
+class TestAccumulatorRehydrate:
+    """The 2026-05-13 bug: ``_gross_wins`` / ``_gross_losses`` / ``_pnl_list``
+    are stored in-memory only. After daemon restart, the first trade
+    writes PF=0 (loss-only) or PF=inf (win-only) -- corrupting auto-suppress.
+
+    Fix: ``_rehydrate_internal_accumulators`` replays the trades table at
+    init time and rebuilds these from scratch, then re-saves corrected
+    PF/Sharpe to the DB.
+    """
+
+    @staticmethod
+    def _seed_trade(db, strategy, pnl, idx=0, regime="bull_low_vol"):
+        db.store_trade({
+            "symbol": f"SYM{idx}",
+            "side": "BUY",
+            "entry_price": 100.0,
+            "exit_price": 100.0 + pnl,
+            "quantity": 1,
+            "entry_time": f"2026-05-01T09:{30 + idx:02d}:00+05:30",
+            "exit_time":  f"2026-05-01T10:{30 + idx:02d}:00+05:30",
+            "pnl": pnl,
+            "pnl_pct": pnl / 100.0,
+            "strategy": strategy,
+            "exit_reason": "test",
+            "commission": 0.0,
+            "slippage": 0.0,
+            "market_context": "",
+        })
+
+    def test_rebuilds_pf_after_restart_for_profitable_strategy(self, config, db):
+        # Simulate a strategy with 3 wins (+100, +50, +30) and 2 losses (-40, -20)
+        # Gross wins = 180, gross losses = 60 -> PF = 3.0
+        a1 = TradeAnalyzer(config, db)
+        for i, pnl in enumerate([100.0, -40.0, 50.0, -20.0, 30.0]):
+            a1.record_trade(_make_trade_record("supertrend_follow", pnl=pnl, hour=10 + i))
+            self._seed_trade(db, "supertrend_follow", pnl, idx=i)
+        pf_pre_restart = a1.get_scorecard()["supertrend_follow"]["profit_factor"]
+        assert pf_pre_restart == pytest.approx(3.0, abs=0.01)
+
+        # Simulate a daemon restart by building a new analyzer over the same
+        # DB. WITHOUT the fix, the next record_trade would compute PF
+        # incorrectly because _gross_wins/_gross_losses were lost.
+        a2 = TradeAnalyzer(config, db)
+        pf_after_rehydrate = a2.get_scorecard()["supertrend_follow"]["profit_factor"]
+        assert pf_after_rehydrate == pytest.approx(3.0, abs=0.01), (
+            f"PF should rehydrate from trades history, got {pf_after_rehydrate}"
+        )
+
+    def test_loss_only_strategy_does_not_corrupt_to_zero(self, config, db):
+        """Reproduces the 2026-05-13 HCLTECH-after-restart pathology:
+        if accumulators reset and the next trade is a loss, the naive
+        ``_update_profit_factor`` writes PF=0 -- which trips auto-suppress
+        (PF < 0.7). The rehydrate must restore prior gross_wins so the
+        loss doesn't single-handedly zero out the strategy."""
+        a1 = TradeAnalyzer(config, db)
+        # 3 wins then 2 losses, profitable overall
+        for i, pnl in enumerate([200.0, 150.0, 100.0]):
+            a1.record_trade(_make_trade_record("supertrend_follow", pnl=pnl, hour=10 + i))
+            self._seed_trade(db, "supertrend_follow", pnl, idx=i)
+        pf_initial = a1.get_scorecard()["supertrend_follow"]["profit_factor"]
+        # 3 wins, no losses -> PF = inf, but auto-suppress check uses
+        # `pf < 0.7` so inf is safe.
+        assert pf_initial == float("inf")
+
+        # Restart
+        a2 = TradeAnalyzer(config, db)
+        # Now record one more loss. WITHOUT the fix the gross_wins
+        # accumulator starts at 0 (lost during restart) and adding a
+        # -50 PNL yields gross_losses=50, gross_wins=0 -> PF=0.
+        # WITH the fix, gross_wins was rehydrated to 450 (200+150+100),
+        # so PF stays high.
+        a2.record_trade(_make_trade_record("supertrend_follow", pnl=-50.0, hour=14))
+        pf_after_loss = a2.get_scorecard()["supertrend_follow"]["profit_factor"]
+        # 450 / 50 = 9.0
+        assert pf_after_loss == pytest.approx(9.0, abs=0.01), (
+            f"After restart+loss, PF should be 9.0 (450 wins / 50 losses); "
+            f"got {pf_after_loss}. If 0.0, the gross_wins accumulator was "
+            f"NOT rehydrated -- the original bug."
+        )
+
+    def test_rehydrate_is_idempotent(self, config, db):
+        a1 = TradeAnalyzer(config, db)
+        for i, pnl in enumerate([50.0, -20.0, 30.0]):
+            a1.record_trade(_make_trade_record("rsi_momentum", pnl=pnl, hour=10 + i))
+            self._seed_trade(db, "rsi_momentum", pnl, idx=i)
+
+        # Multiple restarts must converge on the same PF value.
+        pfs = []
+        for _ in range(3):
+            a = TradeAnalyzer(config, db)
+            pfs.append(a.get_scorecard()["rsi_momentum"]["profit_factor"])
+        assert len(set([round(x, 3) for x in pfs])) == 1, (
+            f"Rehydrate is not idempotent: {pfs}"
+        )
+
+    def test_phantom_row_is_removed(self, config, db):
+        # Plant a phantom: a strategy_scores row with total_trades > 0 but
+        # NO actual trades in the trades table for that strategy. Mimics
+        # the 2026-05-06 'ensemble' leftover.
+        db.save_strategy_score("ghost_strategy", {
+            "total_trades": 17, "wins": 6, "losses": 11,
+            "total_pnl": -143.46, "avg_pnl": -8.44,
+            "win_rate": 0.353, "profit_factor": 0.0, "sharpe": -21.7,
+            "learned_weight": 0.0,
+        })
+        # Real trades for a real strategy
+        self._seed_trade(db, "rsi_momentum", 50.0, idx=0)
+
+        a = TradeAnalyzer(config, db)
+        sc = a.get_scorecard()
+        assert "ghost_strategy" not in sc, (
+            "Phantom strategy row should have been removed by rehydrate"
+        )
+        # The valid strategy is preserved
+        assert "rsi_momentum" in sc
+
+        # The phantom is also removed from the DB so subsequent restarts
+        # don't have to clean up again.
+        assert "ghost_strategy" not in db.load_strategy_scores()
+
+    def test_empty_trades_table_is_noop(self, config, db):
+        """If trades table is empty (fresh DB), rehydrate must not crash
+        or remove anything; existing strategy_scores rows stay as-is."""
+        db.save_strategy_score("rsi_momentum", {
+            "total_trades": 0, "wins": 0, "losses": 0,
+            "total_pnl": 0.0, "avg_pnl": 0.0, "win_rate": 0.0,
+            "profit_factor": 0.0, "sharpe": 0.0, "learned_weight": 1.0,
+        })
+        a = TradeAnalyzer(config, db)
+        # Did not raise. Did not delete (because total_trades == 0).
+        assert "rsi_momentum" in db.load_strategy_scores()
+
+    def test_phantom_row_with_zero_trades_is_preserved(self, config, db):
+        """A row with total_trades=0 looks identical to a 'just-initialised'
+        strategy that hasn't traded yet. We must NOT delete those --
+        only rows with positive total_trades but no matching trade
+        history are phantoms."""
+        db.save_strategy_score("freshly_added_strategy", {
+            "total_trades": 0, "wins": 0, "losses": 0,
+            "total_pnl": 0.0, "avg_pnl": 0.0, "win_rate": 0.0,
+            "profit_factor": 0.0, "sharpe": 0.0, "learned_weight": 1.0,
+        })
+        self._seed_trade(db, "rsi_momentum", 50.0, idx=0)
+        a = TradeAnalyzer(config, db)
+        assert "freshly_added_strategy" in a.get_scorecard()
+
+
 class TestPatternMemory:
     def test_patterns_stored(self, analyzer, db):
         analyzer.record_trade(_make_trade_record("rsi_momentum", pnl=50.0))

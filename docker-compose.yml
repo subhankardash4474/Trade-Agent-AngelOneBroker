@@ -19,6 +19,15 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      # Match the in-container trader UID/GID to the host user that owns
+      # the bind-mounted directories (./data, ./logs). See Dockerfile
+      # comment on the ARG TRADER_UID block for the failure mode this
+      # prevents. Cloud `.env` sets these to 998 (matching OCI host user);
+      # local dev usually leaves them unset and the Dockerfile default
+      # (1001) takes over.
+      args:
+        TRADER_UID: "${TRADER_UID:-1001}"
+        TRADER_GID: "${TRADER_GID:-1001}"
     container_name: trader
     hostname: trader
     restart: unless-stopped

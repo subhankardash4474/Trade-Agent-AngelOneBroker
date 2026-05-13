@@ -552,6 +552,21 @@ class Database:
             rows = conn.execute("SELECT * FROM strategy_scores").fetchall()
         return {r["strategy"]: dict(r) for r in rows}
 
+    def delete_strategy_score(self, strategy: str) -> int:
+        """Remove a strategy row from strategy_scores.
+
+        Used by ``TradeAnalyzer._rehydrate_internal_accumulators`` to evict
+        phantom rows (strategy names that survived in the DB after a
+        refactor but no longer appear in the trades table -- the canonical
+        case is the ``ensemble`` row left behind when ensemble vote
+        attribution moved to per-strategy contributors on 2026-05-06).
+        Returns the number of rows deleted (0 or 1)."""
+        with self._conn() as conn:
+            cur = conn.execute(
+                "DELETE FROM strategy_scores WHERE strategy = ?", (strategy,)
+            )
+            return cur.rowcount
+
     def load_learned_weights(self) -> Dict[str, float]:
         with self._conn() as conn:
             rows = conn.execute(
