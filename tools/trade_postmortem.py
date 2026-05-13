@@ -45,6 +45,101 @@ sys.path.insert(0, str(ROOT))
 IST = pytz.timezone("Asia/Kolkata")
 DB_PATH = ROOT / "data" / "trading_agent.db"
 OUTPUT_DIR = ROOT / "logs" / "postmortem"
+SIGNAL_AUDIT_DIR = ROOT / "logs"
+
+# 2026-05-13: anything above this gets a [LATE-ENTRY] flag. Daemon polls
+# every 60s, so a healthy entry fires within the same or next cycle
+# (<=120s). 5 min means we saw the opportunity, signal was rejected at
+# least a few times, and only later did the ensemble flip to ACCEPTED --
+# usually a sign of cooldown / opening_lockout / threshold hesitation
+# eating away easy money. Surfacing it lets us tune the filters.
+LATE_ENTRY_THRESHOLD_MIN = 5.0
+
+
+def load_signal_audit(day_iso: str) -> Optional[pd.DataFrame]:
+    """Load the signal_audit CSV for ``day_iso``. Returns None if absent
+    (older days, or days predating the audit feature). The frame is
+    lightly normalised: timestamps as tz-aware IST datetimes, columns
+    we don't use stripped to keep memory low (~2k rows/day is typical
+    but we read it once per report rather than per trade)."""
+    path = SIGNAL_AUDIT_DIR / f"signal_audit_{day_iso}.csv"
+    if not path.exists():
+        return None
+    df = pd.read_csv(path, usecols=[
+        "timestamp", "symbol", "direction", "outcome", "reason",
+    ])
+    df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce", utc=True)
+    df = df.dropna(subset=["timestamp"])
+    df["timestamp"] = df["timestamp"].dt.tz_convert(IST)
+    return df
+
+
+def compute_entry_lag(symbol: str, side: str, entry_dt: datetime,
+                      audit_df: Optional[pd.DataFrame]) -> Optional[dict]:
+    """Return {first_signal_dt, lag_min, signals_seen_count, rejected_count}.
+
+    Semantics
+    ---------
+    The signal_audit logs every ensemble decision for a symbol+direction
+    with an ``outcome`` of ACCEPTED (we entered), REJECTED (filter blocked
+    us), or HOLD. We want to know: **how long was our system shouting
+    "trade this!" before we actually entered?**
+
+    Implementation note: an ACCEPTED row is logged at fill-confirmation
+    time (a few hundred ms *after* the actual entry_time stored in the
+    trades table), so we cannot use entry_dt < timestamp as a strict
+    cutoff -- the very signal that birthed the trade would be excluded.
+
+    Algorithm:
+      1. Filter audit to (symbol, side).
+      2. Find the *entry marker*: prefer the ACCEPTED row closest to
+         entry_dt (any of: just-before / same-second / just-after fill).
+         If absent (rare: restored position, manual entry, audit lost a
+         row), fall back to entry_dt itself as the marker.
+      3. lag_min = entry_marker - earliest matching signal of the day.
+      4. signals_seen_count = number of matching rows at-or-before the
+         marker. rejected_count = subset with outcome == REJECTED.
+
+    Instant fills (single ACCEPTED row, no rejection trail) produce
+    lag_min == 0.0 -- exactly what we want to display as "no late entry".
+    """
+    if audit_df is None or audit_df.empty:
+        return None
+
+    entry_aware = entry_dt if entry_dt.tzinfo else IST.localize(entry_dt)
+
+    matches = audit_df[
+        (audit_df["symbol"] == symbol) & (audit_df["direction"] == side)
+    ].sort_values("timestamp")
+    if matches.empty:
+        return None
+
+    accepted = matches[matches["outcome"] == "ACCEPTED"]
+    if not accepted.empty:
+        # Pick the ACCEPTED row closest in time to entry_dt -- handles the
+        # case of multiple ACCEPTED rows (rare: same-day re-entry after
+        # exit, e.g. CYIENT 13:30 + 13:50 on 2026-05-08).
+        deltas = (accepted["timestamp"] - entry_aware).abs()
+        entry_marker = accepted.loc[deltas.idxmin(), "timestamp"]
+    else:
+        entry_marker = entry_aware
+
+    pre_entry = matches[matches["timestamp"] <= entry_marker]
+    if pre_entry.empty:
+        return None
+
+    first_dt = pre_entry.iloc[0]["timestamp"].to_pydatetime()
+    entry_marker_dt = (entry_marker.to_pydatetime()
+                       if hasattr(entry_marker, "to_pydatetime")
+                       else entry_marker)
+    lag_min = (entry_marker_dt - first_dt).total_seconds() / 60.0
+    rejected = int((pre_entry["outcome"] == "REJECTED").sum())
+    return {
+        "first_signal_dt": first_dt,
+        "lag_min": max(0.0, lag_min),
+        "signals_seen_count": int(len(pre_entry)),
+        "rejected_count": rejected,
+    }
 
 
 def load_trades(day_iso: str) -> list[dict]:
@@ -121,8 +216,15 @@ def parse_dt(s: str) -> datetime:
     return datetime.strptime(s[:19], "%Y-%m-%d %H:%M:%S")
 
 
-def analyse_trade(trade: dict) -> dict:
-    """Returns enriched dict with MFE / MAE / flags."""
+def analyse_trade(trade: dict,
+                  audit_df: Optional[pd.DataFrame] = None) -> dict:
+    """Returns enriched dict with MFE / MAE / flags.
+
+    ``audit_df`` is the day's signal_audit DataFrame (already loaded once
+    at the caller level). When provided, we attach entry-lag stats and
+    raise a ``[LATE-ENTRY]`` flag when the lag exceeds
+    ``LATE_ENTRY_THRESHOLD_MIN``.
+    """
     entry_dt = parse_dt(trade["entry_time"])
     exit_dt = parse_dt(trade["exit_time"])
     qty = trade["quantity"]
@@ -133,12 +235,14 @@ def analyse_trade(trade: dict) -> dict:
 
     bars = fetch_intraday_bars(trade["symbol"], entry_dt, exit_dt)
     daily = fetch_daily_context(trade["symbol"])
+    entry_lag = compute_entry_lag(trade["symbol"], side, entry_dt, audit_df)
 
     result = dict(trade)
     result["entry_dt"] = entry_dt
     result["exit_dt"] = exit_dt
     result["holding_minutes"] = (exit_dt - entry_dt).total_seconds() / 60
     result["session_count"] = max(1, (exit_dt.date() - entry_dt.date()).days + 1)
+    result["entry_lag"] = entry_lag
 
     if bars is None or bars.empty:
         result["mfe"] = None
@@ -147,6 +251,8 @@ def analyse_trade(trade: dict) -> dict:
         result["best_bar_time"] = None
         result["worst_bar_time"] = None
         result["flags"] = ["[NO-BARS]"]
+        if entry_lag and entry_lag["lag_min"] > LATE_ENTRY_THRESHOLD_MIN:
+            result["flags"].append("[LATE-ENTRY]")
         result["daily"] = daily
         return result
 
@@ -171,6 +277,8 @@ def analyse_trade(trade: dict) -> dict:
     flags = []
     if mfe_value > 0 and capture_pct < 60:
         flags.append("[LATE-EXIT]")
+    if entry_lag and entry_lag["lag_min"] > LATE_ENTRY_THRESHOLD_MIN:
+        flags.append("[LATE-ENTRY]")
     if daily and daily.get("pct_vs_sma50") is not None:
         if side == "SELL" and daily["pct_vs_sma50"] > 5:
             flags.append("[TREND-MISMATCH-SHORT]")
@@ -210,16 +318,31 @@ def render_report(day_iso: str, analyses: list[dict]) -> str:
     total_table = sum(a["money_on_table"] for a in analyses if a.get("money_on_table") is not None)
     avg_capture = sum(a["capture_pct"] for a in analyses if a.get("capture_pct") is not None) / max(len([a for a in analyses if a.get("capture_pct") is not None]), 1)
 
+    lag_vals = [a["entry_lag"]["lag_min"] for a in analyses
+                if a.get("entry_lag")]
+    late_entry_count = sum(1 for a in analyses
+                           if "[LATE-ENTRY]" in a.get("flags", []))
     lines += [
         f"**Trades closed:** {len(analyses)}",
         f"**Realised PnL:**  Rs {total_pnl:+,.2f}",
         f"**Sum of MFE:**    Rs {total_mfe:+,.2f}  (theoretical max if perfect exits)",
         f"**Money on table:** Rs {total_table:+,.2f}  (MFE - actual gross PnL)",
         f"**Avg MFE capture:** {avg_capture:.1f}%",
-        "",
-        "---",
-        "",
     ]
+    if lag_vals:
+        lag_sorted = sorted(lag_vals)
+        median_lag = lag_sorted[len(lag_sorted) // 2]
+        max_lag = max(lag_vals)
+        lines.append(
+            f"**Entry lag:** median {median_lag:.1f} min, max {max_lag:.1f} min, "
+            f"[LATE-ENTRY] flags: {late_entry_count}/{len(analyses)} "
+            f"(threshold {LATE_ENTRY_THRESHOLD_MIN:.0f} min)"
+        )
+    elif any(a.get("entry_lag") is None for a in analyses):
+        lines.append(
+            "**Entry lag:** _no signal_audit data for these trades_"
+        )
+    lines += ["", "---", ""]
 
     for a in analyses:
         sym = a["symbol"]
@@ -233,6 +356,17 @@ def render_report(day_iso: str, analyses: list[dict]) -> str:
             f"- **Exit:**  {a['exit_price']:.2f} @ {a['exit_dt'].strftime('%Y-%m-%d %H:%M')}  ({a['holding_minutes']:.0f} min held, {a['session_count']} session{'s' if a['session_count']>1 else ''})",
             f"- **Realised:** Rs {a['pnl']:+,.2f} ({a['pnl_pct']:+.2f}%)  |  commission Rs {a['commission']:.2f}",
         ]
+        if a.get("entry_lag"):
+            el = a["entry_lag"]
+            first_str = el["first_signal_dt"].strftime("%H:%M")
+            extra = ""
+            if el["signals_seen_count"] > 1:
+                extra = (f"  ({el['signals_seen_count']} matching signals seen, "
+                         f"{el['rejected_count']} rejected before entry)")
+            lines.append(
+                f"- **Entry lag:** {el['lag_min']:.1f} min "
+                f"(first {a['side']} signal at {first_str}){extra}"
+            )
         if a.get("mfe") is not None:
             lines += [
                 f"- **MFE:** Rs {a['mfe']:+,.2f} at price {a['mfe_price']:.2f} @ {a['best_bar_time'].strftime('%H:%M')}",
@@ -290,11 +424,14 @@ def main() -> None:
         print(f"[{day}] {len(trades)} closed trade(s)")
         if not trades:
             continue
+        audit_df = load_signal_audit(day)
+        if audit_df is None:
+            print(f"  (no signal_audit_{day}.csv -> entry-lag stats disabled)")
         analyses = []
         for t in trades:
             print(f"  Analysing {t['symbol']} {t['side']}...", end=" ", flush=True)
             try:
-                analyses.append(analyse_trade(t))
+                analyses.append(analyse_trade(t, audit_df=audit_df))
                 print("OK")
             except Exception as e:
                 print(f"FAILED: {e}")

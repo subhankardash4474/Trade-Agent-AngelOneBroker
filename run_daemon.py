@@ -130,14 +130,59 @@ def _write_idle_heartbeat(config_path: str) -> None:
         logger.warning(f"Idle heartbeat write failed: {e}")
 
 
+def _emergency_stop_path_from_config(config_path: str) -> str:
+    """Resolve the emergency-stop file path *without* instantiating a full
+    ``TradingAgent`` (which would require a live broker session). Used by
+    the off-hours sleep loop so the kill switch works even when the
+    daemon is idling outside market hours.
+    """
+    try:
+        with open(config_path, "r", encoding="utf-8") as f:
+            cfg = yaml.safe_load(f) or {}
+    except Exception:
+        cfg = {}
+    ops = cfg.get("operations") or {}
+    log_dir = (cfg.get("logging") or {}).get("log_dir", "logs")
+    return ops.get("emergency_stop_path") or os.path.join(log_dir, "STOP")
+
+
 def sleep_until_market(config_path: str):
-    """Sleep until the next market window opens, checking every 5 minutes."""
+    """Sleep until the next market window opens.
+
+    Wakes every minute so the file-based emergency stop is honoured even
+    overnight / on weekends. Without this check, ``touch logs/STOP``
+    while the daemon was off-hours sleeping would sit unobserved for up
+    to 5 minutes and -- more importantly -- never trigger
+    ``TradingAgent._check_emergency_stop`` because the agent's run loop
+    is not yet active. Detecting it here lets the wrapper exit cleanly
+    instead.
+    """
     logger.info("Outside market hours — sleeping until next market window...")
     _write_idle_heartbeat(config_path)
+    stop_path = _emergency_stop_path_from_config(config_path)
+    global _shutdown_requested
     while not is_market_window() and not _shutdown_requested:
+        # 60s instead of the legacy 300s. The previous interval was set
+        # to save CPU on a free-tier micro-VM, but the actual cost of
+        # waking once a minute to stat() a single file is negligible
+        # (~microseconds) and gives operators a kill switch that
+        # responds in under a minute instead of "maybe in 5 minutes,
+        # maybe never if the daemon stays idle".
+        try:
+            if os.path.exists(stop_path):
+                logger.critical(
+                    f"[EMERGENCY-STOP] Stop file detected at {stop_path} "
+                    f"during off-hours sleep — exiting daemon wrapper."
+                )
+                _shutdown_requested = True
+                break
+        except OSError as e:
+            # Filesystem flakes shouldn't crash us — same posture as
+            # TradingAgent._check_emergency_stop.
+            logger.debug(f"emergency_stop FS check failed (ignored): {e}")
         now = datetime.now(IST)
-        logger.debug(f"Sleeping... {now.strftime('%H:%M')} IST (next check in 5 min)")
-        time.sleep(300)
+        logger.debug(f"Sleeping... {now.strftime('%H:%M')} IST (next check in 60s)")
+        time.sleep(60)
         _write_idle_heartbeat(config_path)
 
 

@@ -358,7 +358,17 @@ risk:
   # the 3.0x ratio guarantees ~Rs 12-18 of headroom above charges on a
   # Rs 5k minimum-notional trade. Expect this to reject ~15% more
   # marginal setups -- intentional, surfaces only higher-edge entries.
-  min_profit_to_charges_ratio: 3.0   # reward must be >= 3.0x round-trip charges
+  #
+  # 2026-05-13 EOD: bumped 3.0 -> 4.0. Five-day rolling Phase-A PASS
+  # delivered PF 1.55 / +Rs 438 net, but commission drag was 76% of
+  # absolute P&L (commissions Rs 333 on |P&L| Rs 438). 4.0x raises the
+  # minimum reward-to-charges floor so we stop taking the marginal 2-3x
+  # setups that win the entry filter but lose to friction. Expected
+  # impact: ~20% fewer trades, similar gross win-rate, sharply lower
+  # commission drag => better realized PF on the same workhorse
+  # strategies (supertrend_follow PF 2.18 should be untouched, but
+  # mean_reversion at PF 0.69 should bleed less).
+  min_profit_to_charges_ratio: 4.0   # reward must be >= 4.0x round-trip charges
   min_absolute_reward_rs: 20.0       # never take a trade targeting < Rs 20 reward
 
   # Minimum per-trade notional — below this level round-trip commissions
