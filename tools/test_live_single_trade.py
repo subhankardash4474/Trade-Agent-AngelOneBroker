@@ -223,6 +223,38 @@ def _order_fill_qty(order: dict) -> int:
     return 0
 
 
+def _order_avg_fill_price(order: dict) -> Optional[float]:
+    """Broker-reported average fill price for this order, or None if absent.
+
+    AngelOne returns it under ``averageprice`` in the orderBook payload
+    (verified in `logs/live_e2e/stage21_20260513T100136.log`). Some
+    brokers use ``averagePrice`` or ``avg_price`` -- check all variants.
+    """
+    for key in ("averageprice", "averagePrice", "avg_price", "avgprice"):
+        v = order.get(key)
+        if v not in (None, "", 0, 0.0, "0", "0.0"):
+            try:
+                return float(v)
+            except (TypeError, ValueError):
+                continue
+    return None
+
+
+def _fetch_fill_price(broker, order_id: str) -> Optional[float]:
+    """Re-pull the order book and extract the average fill price for
+    ``order_id``. Returns None on any lookup failure -- never raises,
+    because slippage logging is best-effort and must not block the
+    e2e flow on a transient broker hiccup."""
+    try:
+        book = broker.get_orders()
+    except Exception:
+        return None
+    order = _find_order_in_book(book, order_id) if book else None
+    if not order:
+        return None
+    return _order_avg_fill_price(order)
+
+
 def _wait_for_terminal(
     broker,
     order_id: str,
@@ -512,6 +544,21 @@ def main() -> int:
         if buy_final in COMPLETED_STATUSES:
             position_open = True
             log.log(f"[7/{total_stages}] OK   BUY filled")
+            # Best-effort: record slippage versus LTP-at-decision.
+            buy_fill_price = _fetch_fill_price(broker, buy_order_id)
+            if buy_fill_price:
+                try:
+                    from _slippage_logger import append_fill
+                    append_fill(
+                        symbol=args.symbol, side="BUY",
+                        limit_price=buy_price, ltp_at_decision=ltp,
+                        filled_price=buy_fill_price, quantity=args.quantity,
+                        source=log_tag,
+                    )
+                    log.log(f"[7/{total_stages}] slippage logged: "
+                            f"BUY filled @ Rs {buy_fill_price:.2f} vs LTP Rs {ltp:.2f}")
+                except Exception as _e:
+                    log.log(f"[7/{total_stages}] slippage log WARN: {_e}", "WARN")
         elif buy_final in CANCELLED_STATUSES:
             log.log(f"[7/{total_stages}] OK   BUY {buy_final} -- no exposure, exiting clean")
             return 0
@@ -588,6 +635,26 @@ def main() -> int:
             if sell_final in COMPLETED_STATUSES:
                 position_open = False
                 log.log(f"[9/{total_stages}] OK   SELL filled -- position FLAT")
+                # Best-effort: record SELL slippage versus the refreshed
+                # LTP that drove the SELL price decision (not the entry
+                # LTP -- the book has moved by the time we cross).
+                sell_fill_price = _fetch_fill_price(broker, sell_order_id)
+                if sell_fill_price:
+                    try:
+                        from _slippage_logger import append_fill
+                        # Use the LTP we actually based the SELL on. Falls
+                        # back to entry LTP if the refresh failed.
+                        sell_ltp = ltp_now if 'ltp_now' in locals() and ltp_now else ltp
+                        append_fill(
+                            symbol=args.symbol, side="SELL",
+                            limit_price=sell_price, ltp_at_decision=sell_ltp,
+                            filled_price=sell_fill_price, quantity=args.quantity,
+                            source=log_tag,
+                        )
+                        log.log(f"[9/{total_stages}] slippage logged: "
+                                f"SELL filled @ Rs {sell_fill_price:.2f} vs LTP Rs {sell_ltp:.2f}")
+                    except Exception as _e:
+                        log.log(f"[9/{total_stages}] slippage log WARN: {_e}", "WARN")
             else:
                 log.log(f"[9/{total_stages}] SELL not filled; cancelling and "
                         f"escalating to MARKET SELL", "WARN")

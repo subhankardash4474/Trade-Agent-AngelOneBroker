@@ -72,7 +72,7 @@ Final test parameters used:
 - [x] **Final order_book status** = rejected (NSE circuit) -> cancelled-by-us.
 - [x] **PASS**: place + cancel round-trip exercised end-to-end. ₹0 cost.
 
-### Stage 2 — Single live BUY+SELL round-trip ✅ **DONE 2026-05-11 10:59 IST**
+### Stage 2 — Single live BUY+SELL round-trip ✅ **DONE 2026-05-11 10:59 IST (laptop) + 2026-05-13 10:01 IST (cloud)**
 **Goal**: same flow as Stage 1 but during market hours. THIS is where
 real fills can happen.
 
@@ -81,7 +81,7 @@ not fill (limit below best bid) → cleanly cancelled → no exposure.
 Zero rupees spent. Full post-mortem at
 [`docs/e2e_stage12_postmortem.md`](e2e_stage12_postmortem.md).
 
-What got tested vs not:
+What got tested vs not (patient variant, laptop):
 - ✅ place_order during market hours (NORMAL/LIMIT/BUY/DELIVERY/1share)
 - ✅ Order accepted by exchange (no circuit issue this time)
 - ✅ Order book status polling, multiple snapshots over 60s
@@ -92,8 +92,31 @@ What got tested vs not:
 - ❌ MARKET SELL escalation (never armed)
 - ❌ Slippage measurement (no fill to measure)
 
-The next variant, **Stage 2.1**, is needed to cover the fill+exit
-half of the state machine. Tracked in TODOs as `stage21_fill_variant`.
+### Stage 2.1 — Aggressive variant, first real fill ✅ **DONE 2026-05-13 10:01 IST (cloud, FIRST EVER REAL FILL)**
+
+**Result**: PASSED in 9.1s. BUY filled at Rs 22.20, SELL filled at Rs 22.19.
+Net realised PnL **Rs −0.01** (one paisa) plus ~Rs 1-3 in regulatory
+charges (STT/exchange/GST/stamp). Full post-mortem at
+[`docs/e2e_stage21_postmortem.md`](e2e_stage21_postmortem.md).
+
+What this proved (and what's still open):
+- ✅ Fill detection (both legs filled <100ms after submission)
+- ✅ SELL LIMIT path (armed and filled in 0.1s)
+- ✅ Position reconciliation via `getPositions` (`netqty=0`)
+- ✅ Cloud-IP → AngelOne write path (no `AG7002` — whitelist already
+      updated to `80.225.251.79`)
+- ✅ Paper daemon coexists with e2e script in same container (no conflict)
+- ✅ Slippage measurement: **price improvement on both legs**
+      (−4.5 bps BUY, −9.0 bps SELL vs LTP). Opposite of paper-mode
+      assumption of 15 bps adverse. n=1 — need ≥20 samples to recalibrate.
+- ❌ MARKET SELL escalation (still never armed — would need a forced
+      timeout scenario)
+- ❌ Slippage logger (`data/slippage_log.csv`) auto-write — still TBD
+
+Key empirical learning: at tier-1 NSE liquidity (YESBANK), even
+aggressive LIMITs get matched at the inside book mid, not at the
+aggressive limit. Paper-mode `slippage_bps` is likely too conservative
+for liquid names — confirm after 20+ samples.
 
 ### Stage 3 — 5 stocks, single round-trip each (target: weekend after Stage 2)
 **Goal**: prove the daemon can manage a small basket without state drift.
@@ -142,9 +165,12 @@ live trading. Each one independently can stop trading.
    should exist with 0 bytes; remove right before "go", recreate the
    moment something feels off.
 2. **Per-trade max-loss**: existing `stop_loss_pct` config. Already wired.
-3. **Daily max-loss kill-switch**: `--max-loss-rs N` flag (TBD if not
-   already present). If realised+unrealised P&L drops below -Rs N for
-   the day, force-flatten and halt.
+3. **Daily max-loss kill-switch**: `--max-loss-rs N` flag (added
+   2026-05-13). If realised P&L drops below -Rs N for the day, the
+   risk manager refuses all new trades and surfaces the breaker reason
+   in the next checkpoint. Existing positions still receive SL/TP
+   management via `_check_position_exits` — the flag halts *new
+   entries*, it does not auto-flatten.
 4. **Hard wall-clock cutoff**: every stage above has a hard "flatten by"
    timestamp. Set a separate alarm on the user's phone for each one as
    redundancy with the daemon's own timer.
@@ -226,16 +252,16 @@ These are needed code/tooling pieces. Status as of 2026-05-11:
 | Item | Status | Owner notes |
 |---|---|---|
 | `tools/test_angelone_auth.py` | **DONE** (2026-05-11) | 8-stage script: env -> import -> instantiate -> connect -> profile -> funds -> orders -> disconnect. Zero order mutations. `--dry-run` mode validates env without network. Dry-run 2/2 green; real run executed live: 8/8 PASS, Rs 1,000 confirmed. |
-| `tools/test_amo_lifecycle.py` | **DONE** (2026-05-11) | Stage 1 script: env -> import -> instantiate -> connect -> resolve token -> LTP -> funds preflight -> place_order (AMO+NORMAL fallback) -> 20s wait -> cancel -> verify. Default dry-run; `--confirm` flag for live order. Dry-run PASS; live attempted but blocked by AG7002 (IP whitelist gate, see below). |
-| **AngelOne *Primary Static IP* whitelisted for order APIs** | **BLOCKER** discovered 2026-05-11 10:17 | First `placeOrder` returns `AG7002: Access denied: Unregistered IP address`. Auth + read APIs bypass this gate; only write/order APIs trigger it. **User action**: log in to https://smartapi.angelbroking.com/, edit the trading app, set Primary Static IP to laptop's current public IP, wait ~5 min for propagation. |
-| `core/broker/angelone.py:place_order` | **VERIFIED** correct (2026-05-11) | Signature accepts AMO + LIMIT + lot=1. Reaches AngelOne correctly; the AG7002 block is server-side, not in our code. |
-| `core/broker/angelone.py:cancel_order` | Implementation present, not yet exercised | Will be tested as soon as Stage 1 unblocks. |
+| `tools/test_amo_lifecycle.py` | **DONE** (2026-05-11 laptop + 2026-05-13 cloud) | Stage 1 script: env -> import -> instantiate -> connect -> resolve token -> LTP -> funds preflight -> place_order (AMO+NORMAL fallback) -> 20s wait -> cancel -> verify. Default dry-run; `--confirm` flag for live order. Cloud re-run 2026-05-13: PASS in 30s, order_id `260513000257131` cancelled cleanly. |
+| **AngelOne *Primary Static IP* whitelisted for order APIs** | **RESOLVED** (2026-05-13) | Previously blocked Stage 1 (2026-05-11 10:17) with `AG7002: Access denied: Unregistered IP address` for laptop IP `106.193.147.98`. Now updated to OCI Mumbai IP `80.225.251.79`; confirmed working by Stage 1 + Stage 2.1 cloud runs on 2026-05-13. |
+| `core/broker/angelone.py:place_order` | **VERIFIED** correct (2026-05-11 laptop + 2026-05-13 cloud) | Signature accepts AMO + LIMIT + lot=1. Filled BUY + SELL on cloud at 22.20 / 22.19 (Stage 2.1). |
+| `core/broker/angelone.py:cancel_order` | **VERIFIED** (2026-05-11 + 2026-05-13) | Stage 1 lifecycle exercised it cleanly both runs. |
 | `searchScrip` based token resolution | **DONE** in `test_amo_lifecycle.py` | Replaces hardcoded tokens. Resilient to instrument-master updates. |
-| `--max-loss-rs N` daemon flag | TBD | Probably 30 lines in `trading_agent.py`. Required for Stage 3 basket. |
-| `--single-shot` daemon flag | TBD | Required for Stage 3. |
+| `--max-loss-rs N` daemon flag | **DONE** (2026-05-13) | Added to `run_daemon.py` argparse + `RiskManager.can_trade()` checks an absolute floor in addition to the existing % check. Required for Stage 3 basket. |
+| `--single-shot` daemon flag | **DONE** (2026-05-13) | Added to `run_daemon.py` argparse; `TradingAgent` tracks per-symbol round-trips for the day and refuses re-entry once a symbol has closed. Required for Stage 3. |
 | `EMERGENCY_STOP` flatten-on-trigger | Probably done | Needs explicit verification: when file appears mid-session, does the daemon flatten existing positions, or only refuse new ones? Stage 0 sub-test. |
-| Slippage logger | TBD | Append (LTP_at_decision, fill_price, bps_diff) to `data/slippage_log.csv` on every live fill. Stage 2 will write a single row to seed this. |
-| `getTradeBook` reconciliation | TBD | Post-mortem helper that diffs SQLite `trades` vs broker. Required for Stage 3. |
+| Slippage logger | **DONE** (2026-05-13) | `data/slippage_log.csv` schema + `tools/_slippage_logger.py` helper; auto-writes from `tools/test_live_single_trade.py` on every fill. Seed: Stage 2.1 fills (n=2, both favourable −4.5 / −9.0 bps). |
+| `getTradeBook` reconciliation | **DONE** (2026-05-13) | `tools/reconcile_trade_book.py` diffs SQLite `trades` rows vs broker `getTradeBook` for any date. |
 
 **Estimated work to close all gaps**: ~1.5 days. Realistic plan:
 - Sat morning: knock out auth script + cancel_order + max-loss flag (~3h).

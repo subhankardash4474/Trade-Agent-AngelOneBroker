@@ -142,7 +142,9 @@ def sleep_until_market(config_path: str):
 
 
 def run_once(config_path: str, paper: bool, interval: int, dashboard: bool,
-             reset_balance: bool = False):
+             reset_balance: bool = False,
+             max_loss_rs: float | None = None,
+             single_shot: bool = False):
     """Single run of the trading agent. Returns when agent exits or crashes."""
     with open(config_path, "r") as f:
         config = yaml.safe_load(f)
@@ -161,6 +163,8 @@ def run_once(config_path: str, paper: bool, interval: int, dashboard: bool,
         config_path=config_path,
         smart_api=smart_api,
         reset_balance=reset_balance,
+        max_loss_rs=max_loss_rs,
+        single_shot=single_shot,
     )
 
     if dashboard:
@@ -188,6 +192,24 @@ def main():
              "Only applied on the FIRST launch of this daemon — subsequent "
              "auto-restarts within the same day continue normally.",
     )
+    parser.add_argument(
+        "--max-loss-rs", type=float, default=None, metavar="N",
+        help="Hard rupee floor on daily realised P&L. When the day's realised "
+             "P&L drops to <= -N, the risk manager refuses all new entries "
+             "(existing positions still receive SL/TP management). Independent "
+             "from `risk.daily_loss_limit_pct` in config -- whichever is "
+             "tighter fires first. Designed for Stage 3 live basket runs "
+             "where the percentage limit on a Rs 1L config is too lax "
+             "(e.g. `--max-loss-rs 500` for a Rs 5k experiment).",
+    )
+    parser.add_argument(
+        "--single-shot", action="store_true",
+        help="Stage 3 safety: once any symbol has completed a full round-trip "
+             "(entered + exited) within the day, refuse re-entry on that same "
+             "symbol until tomorrow. Caps maximum fills per symbol per day "
+             "at 2 (one entry, one exit). Existing position management is "
+             "unaffected.",
+    )
     args = parser.parse_args()
 
     signal.signal(signal.SIGINT, _signal_handler)
@@ -209,6 +231,10 @@ def main():
     logger.info(f"  Mode: {'PAPER' if args.paper else 'LIVE'}")
     logger.info(f"  Poll: {args.interval}s")
     logger.info(f"  Market hours only: {args.market_hours_only}")
+    if args.max_loss_rs is not None:
+        logger.warning(f"  [E2E] --max-loss-rs: Rs {args.max_loss_rs:,.2f} (hard rupee floor)")
+    if args.single_shot:
+        logger.warning("  [E2E] --single-shot: one round-trip per symbol per day")
     logger.info("=" * 60)
 
     while not _shutdown_requested:
@@ -226,7 +252,9 @@ def main():
             # after a crash don't wipe out the in-progress day's balance.
             reset_flag = args.reset_balance and crash_count == 0
             run_once(args.config, args.paper, args.interval, args.dashboard,
-                     reset_balance=reset_flag)
+                     reset_balance=reset_flag,
+                     max_loss_rs=args.max_loss_rs,
+                     single_shot=args.single_shot)
             logger.info("Agent exited cleanly")
             break
         except KeyboardInterrupt:

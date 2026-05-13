@@ -356,6 +356,25 @@ sudo -u trader crontab -e
 Test by stopping the container and waiting 5 min — you should receive
 an email titled `[trader] container DOWN on <hostname>`.
 
+### 6.1.b Pulling cloud logs to the laptop (stop-gap)
+
+Until §6.2 nightly rclone lands, the daily post-close ritual to make the
+cloud daemon's artefacts available to Cursor / the `trading-audit` skill
+is a single PowerShell command from the laptop:
+
+```powershell
+# one-time
+$env:TRADER_VM_HOST = "<oci-mumbai-ip>"
+# daily, after 16:05 IST (i.e. once the Profit Diagnostic email lands)
+.\tools\cloud\pull_logs.ps1
+```
+
+It SCP's today's audit checkpoints, signal-audit CSV, trades CSV, daemon
+log, post-mortem, EOD diagnostic, and `health.json` into the local repo.
+All targets are gitignored. Pass `-Date YYYY-MM-DD` for a historical day,
+`-IncludeDb` if you also need the SQLite DB, and `-DryRun` to inspect the
+exact commands without executing.
+
 ### 6.2 Nightly DB backup (OCI Object Storage)
 
 ```bash

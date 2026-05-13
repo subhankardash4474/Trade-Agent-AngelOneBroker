@@ -96,9 +96,33 @@ class TradingAgent:
     _DQ_WARN_AFTER = 5
 
     def __init__(self, config_path: str = "config.yaml", smart_api=None,
-                 reset_balance: bool = False):
+                 reset_balance: bool = False,
+                 max_loss_rs: Optional[float] = None,
+                 single_shot: bool = False):
+        """
+        Optional kwargs (driven by run_daemon.py CLI flags):
+            max_loss_rs: hard rupee floor on daily realised P&L (Stage 3 safety
+                net). When the day's P&L drops to <= -max_loss_rs, RiskManager
+                trips its circuit breaker and refuses new entries. None=disabled.
+            single_shot: if True, once any symbol has completed a full round-trip
+                (entered + exited) within the day it cannot be re-entered. Used
+                for Stage 3 live basket runs to bound the maximum number of
+                fills per symbol. Existing position management (SL/TP/trailing)
+                is unaffected.
+        """
         self.config = self._load_config(config_path)
         self._setup_logging()
+
+        # E2E / Stage 3 safety knobs. Stored before risk_manager build so
+        # we can pass max_loss_rs straight through.
+        self._single_shot_enabled: bool = bool(single_shot)
+        self._max_loss_rs: Optional[float] = (
+            float(max_loss_rs) if max_loss_rs is not None else None
+        )
+        # Set of symbols whose round-trip is complete for today. Reset at
+        # day boundary by `_reset_single_shot_state_if_new_day`.
+        self._symbols_done_today: set[str] = set()
+        self._single_shot_day: Optional[date] = datetime.now(IST).date()
 
         capital_cfg = self.config.get("capital", {})
         config_initial_balance = capital_cfg.get("initial_balance", 10000.0)
@@ -119,7 +143,20 @@ class TradingAgent:
             self.config,
             initial_balance=effective_balance,
             peak_balance=historical_peak,
+            absolute_daily_loss_floor_rs=self._max_loss_rs,
         )
+        if self._max_loss_rs is not None:
+            logger.warning(
+                f"[E2E] Stage 3 absolute daily-loss floor armed: "
+                f"-Rs {self._max_loss_rs:,.2f} (in addition to "
+                f"the {self.risk_manager.daily_loss_limit_pct:.1f}% "
+                f"percentage limit)"
+            )
+        if self._single_shot_enabled:
+            logger.warning(
+                "[E2E] Stage 3 single-shot mode armed: each symbol can "
+                "round-trip only once per day."
+            )
         # Replay today's already-closed trades into the risk counters so a
         # mid-session daemon restart preserves daily_pnl / daily_trades /
         # consecutive_losses. Without this, the EOD email reports Rs +0.00
@@ -129,6 +166,20 @@ class TradingAgent:
             today_iso = datetime.now(IST).date().isoformat()
             todays_trades = self.database.load_trades_for_day(today_iso)
             self.risk_manager.rehydrate_daily_state(todays_trades)
+            # Single-shot mode (Stage 3 e2e): rehydrate the per-symbol
+            # round-trip set from today's closed trades. Without this, a
+            # daemon restart at 14:00 would let already-round-tripped
+            # symbols re-enter -- defeating the kill-switch's purpose.
+            for t in todays_trades:
+                sym = t.get("symbol")
+                if sym:
+                    self._symbols_done_today.add(sym)
+            if self._single_shot_enabled and self._symbols_done_today:
+                logger.info(
+                    f"[SINGLE-SHOT] Rehydrated {len(self._symbols_done_today)} "
+                    f"symbols from today's closed trades: "
+                    f"{sorted(self._symbols_done_today)}"
+                )
         except Exception as e:
             logger.warning(f"Could not rehydrate daily risk state from DB: {e}")
 
@@ -2160,20 +2211,42 @@ class TradingAgent:
         """
         Adjust the ensemble confidence threshold based on recent performance.
 
-        Rolling window: last 10 trades from risk_manager.state.recent_trade_results.
-            * win_rate < 40%  → raise threshold by +0.05 (be stricter)
-            * win_rate > 60%  → lower threshold by -0.03 (be looser)
-        Clamped to [min_dynamic_threshold, max_dynamic_threshold] in ensemble.
+        Continuous mapping (replaces the per-cycle ratchet that used to
+        saturate to the bound within ~4 cycles, 2026-05-13 audit):
+
+            target = base + (0.5 - rolling_wr) * dynamic_span
+
+        where `dynamic_span` = `max_dynamic_threshold - min_dynamic_threshold`.
+        Examples (base=0.55, span=0.30):
+            wr=1.0  -> target=0.40 (clamped at min=0.45)
+            wr=0.65 -> target=0.505
+            wr=0.5  -> target=0.55  (neutral, no change)
+            wr=0.4  -> target=0.58
+            wr=0.0  -> target=0.70
+
+        Properties this gives us that the old ratchet didn't:
+            * Smooth: a 5%-point WR change moves threshold by 1.5%-points.
+            * Idempotent: running it every cycle with the same recent_results
+              keeps the threshold pinned, instead of bumping further.
+            * Mean-reverting: as soon as WR climbs back toward 0.5, the
+              threshold drifts back to `base`. The ratchet had no path home.
+
+        Window: last 10 trades from `risk_manager.state.recent_trade_results`.
+        Floor: requires >= 5 closed trades to act (avoid tuning on noise).
         """
         recent = list(self.risk_manager.state.recent_trade_results)[-10:]
         if len(recent) < 5:
             return
         wins = sum(1 for p in recent if p > 0)
         wr = wins / len(recent)
-        if wr < 0.4:
-            self.ensemble.set_runtime_threshold(self.ensemble.confidence_threshold + 0.05)
-        elif wr > 0.6:
-            self.ensemble.set_runtime_threshold(self.ensemble.confidence_threshold - 0.03)
+        base = self.ensemble._base_confidence_threshold
+        span = (self.ensemble._max_dynamic_threshold
+                - self.ensemble._min_dynamic_threshold)
+        # (0.5 - wr) * span gives:
+        #   wr=0  ->  +span/2  (max strictness above base)
+        #   wr=1  ->  -span/2  (max looseness below base)
+        target = base + (0.5 - wr) * span
+        self.ensemble.set_runtime_threshold(target)
 
     def _evaluate_strategy(self, strategy: BaseStrategy, symbol: str, token: str) -> Optional[TradeSignal]:
         try:
@@ -2656,6 +2729,20 @@ class TradingAgent:
         symbol = signal.symbol
         direction_label = "BUY" if side == "BUY" else "SELL"
 
+        # Single-shot enforcement (Stage 3 e2e safety, --single-shot flag).
+        # Once a symbol has had a full round-trip today, refuse re-entry. This
+        # caps the maximum number of fills per symbol per day at 2 (one entry,
+        # one exit) and prevents pyramiding / re-entering on the same name
+        # after a stop-out -- critical for Stage 3 live basket runs.
+        self._reset_single_shot_state_if_new_day()
+        if self._single_shot_enabled and symbol in self._symbols_done_today:
+            logger.info(
+                f"[SINGLE-SHOT] Refusing new {direction_label} on {symbol}: "
+                f"already round-tripped today."
+            )
+            self._audit_reject(signal, current_price, "single_shot:already_round_tripped")
+            return
+
         # Rejection-cooldown short-circuit (2026-05-04 part 4). If this same
         # (symbol, direction) tuple was rejected by a persistent gate within
         # the cooldown window, skip evaluation entirely. Saves CPU + audit-row
@@ -2763,7 +2850,17 @@ class TradingAgent:
 
         # Stop-loss / take-profit (side-aware)
         atr = self._get_latest_atr(symbol)
-        stop_loss = signal.stop_loss or self.risk_manager.get_stop_loss(current_price, side, atr)
+        # Strategy-supplied SLs MUST be routed through `enforce_sl_floor` --
+        # otherwise a sub-noise SL (e.g. supertrend's 3*ATR on a quiet stock)
+        # bypasses the `min_stop_loss_pct` floor and the position gets
+        # whipsawed out within minutes. 2026-05-13 HCLTECH bug: shorted at
+        # 1142.35 with a 0.75% SL, stopped at 1150.40 in 30 min for -Rs 148.
+        if signal.stop_loss:
+            stop_loss = self.risk_manager.enforce_sl_floor(
+                current_price, signal.stop_loss, side
+            )
+        else:
+            stop_loss = self.risk_manager.get_stop_loss(current_price, side, atr)
 
         # Trend-continuation only applies to LONG path: _consec_tp_today is
         # direction-agnostic so we'd otherwise inflate short TPs for a
@@ -2775,7 +2872,9 @@ class TradingAgent:
             regime=current_regime,
             trend_continuation=trend_continuation,
         )
-        quantity = self.risk_manager.calculate_position_size(current_price, stop_loss, atr, side=side)
+        quantity = self.risk_manager.calculate_position_size(
+            current_price, stop_loss, atr, side=side, regime=current_regime,
+        )
 
         if trend_continuation:
             logger.info(
@@ -3340,9 +3439,42 @@ class TradingAgent:
             pass
         return None
 
+    def _reset_single_shot_state_if_new_day(self) -> None:
+        """Reset the per-symbol round-trip set at day boundary.
+
+        Called from the entry path so the check is lazy and cheap; no
+        scheduled callback needed. Safe to call repeatedly.
+        """
+        today = datetime.now(IST).date()
+        if self._single_shot_day != today:
+            if self._symbols_done_today:
+                logger.info(
+                    f"[SINGLE-SHOT] New trading day -- clearing "
+                    f"{len(self._symbols_done_today)} symbols from done-list."
+                )
+            self._symbols_done_today.clear()
+            self._single_shot_day = today
+
     def _on_trade_closed(self, record):
         """Called after every trade close — persists, learns, and updates weights."""
         self._store_trade_to_db(record)
+
+        # Single-shot mode: a trade close == full round-trip; record this
+        # symbol as "done for today". Cheap no-op when the flag is off, so
+        # we always update the set (keeps behaviour observable in tests).
+        try:
+            symbol = getattr(record, "symbol", None)
+            if symbol:
+                self._reset_single_shot_state_if_new_day()
+                self._symbols_done_today.add(symbol)
+                if self._single_shot_enabled:
+                    logger.info(
+                        f"[SINGLE-SHOT] {symbol} marked done for today "
+                        f"(set size: {len(self._symbols_done_today)})"
+                    )
+        except Exception as e:
+            logger.warning(f"single-shot tracking update failed: {e}")
+
         try:
             self.trade_analyzer.record_trade(record, market_context=self._market_context)
             if self.trade_analyzer.has_enough_data():

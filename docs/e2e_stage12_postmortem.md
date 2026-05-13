@@ -127,14 +127,14 @@ updated below.
 | `tools/test_angelone_auth.py` | DONE | yes (done) |
 | `tools/test_amo_lifecycle.py` (Stage 1) | **DONE** | yes (done) |
 | `tools/test_live_single_trade.py` (Stage 2) | **DONE -- no-fill variant** | partly |
-| **Stage 2.1: actual-fill variant** (LIMIT BUY at LTP+0.1% so the fill+exit path is empirically tested) | **NEW TODO** | yes |
-| `core/broker/angelone.py:cancel_order` | VERIFIED in Stage 1+2 | done |
-| AngelOne *Primary Static IP* whitelisted (`106.193.147.98`) | DONE for current corp IP | yes |
-| `--max-loss-rs N` daemon flag | TBD | yes |
-| `--single-shot` daemon flag | TBD | yes |
+| **Stage 2.1: actual-fill variant** (LIMIT BUY at LTP+0.1% so the fill+exit path is empirically tested) | **DONE 2026-05-13** — cloud run, BUY+SELL filled in 9.1s, see `docs/e2e_stage21_postmortem.md` | yes (done) |
+| `core/broker/angelone.py:cancel_order` | VERIFIED in Stage 1+2 (laptop) + Stage 1 (cloud 2026-05-13) | done |
+| AngelOne *Primary Static IP* whitelisted | **DONE for cloud IP `80.225.251.79`** (was `106.193.147.98` for laptop) | yes (done) |
+| `--max-loss-rs N` daemon flag | **DONE 2026-05-13** — argparse + RiskManager integration | yes (done) |
+| `--single-shot` daemon flag | **DONE 2026-05-13** — per-symbol round-trip tracking | yes (done) |
 | `EMERGENCY_STOP` flatten-on-trigger verification | TBD | yes |
-| Slippage logger | TBD (cannot seed yet -- need a fill) | yes |
-| `getTradeBook` reconciliation | TBD | yes |
+| Slippage logger | **DONE 2026-05-13** — `data/slippage_log.csv` + `tools/_slippage_logger.py`, seeded with Stage 2.1 fills | yes (done) |
+| `getTradeBook` reconciliation | **DONE 2026-05-13** — `tools/reconcile_trade_book.py` | yes (done) |
 | **Circuit-band-aware LIMIT price clamping** | NEW TODO (from Stage 1 NSE rejection) | nice-to-have |
 
 ---

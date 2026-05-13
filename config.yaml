@@ -295,6 +295,23 @@ risk:
   drawdown_halt_pct: 20.0        # HALT at 20% drawdown (protect capital)
   max_drawdown_pct: 10.0
 
+  # Regime-aware position sizing (2026-05-13). Scales BOTH per-trade
+  # risk budget AND max-position-value cap by these multipliers, on top
+  # of drawdown-tier reduction. Tuned conservatively from live evidence:
+  #   * 2026-05-13 HCLTECH supertrend short -Rs 148 in bear_high_vol
+  #   * 2026-05-12 GODREJCP short -Rs 6 also in bear_high_vol
+  # both signal-confidence high, both stopped out. Reducing bear_high_vol
+  # exposure to 70% of baseline lets us stay engaged while bleeding
+  # less while we gather more samples. Expand to 120% in bull_low_vol
+  # (historically our strongest regime for trend-followers).
+  regime_size_multipliers:
+    bull_low_vol:  1.20
+    bull_high_vol: 1.00
+    sideways:      0.85
+    bear_low_vol:  0.85
+    bear_high_vol: 0.70
+    unknown:       1.00
+
   # Weekly limit
   weekly_loss_limit_pct: 5.0
 
@@ -325,7 +342,13 @@ risk:
 
   # Expected-profit gate — skip trades where reward doesn't cover charges.
   # 2026-04-28 audit: 7 of 10 wins were < Rs 15 net. Tightened minimums.
-  min_profit_to_charges_ratio: 2.5   # reward must be >= 2.5x round-trip charges
+  # 2026-05-13: tightened 2.5 -> 3.0 per Stage 3 spec. With paper-mode
+  # slippage assumed at 30 bps round-trip (we now have n=2 live samples
+  # showing 4.5 bps round-trip -- much lower -- so paper is conservative)
+  # the 3.0x ratio guarantees ~Rs 12-18 of headroom above charges on a
+  # Rs 5k minimum-notional trade. Expect this to reject ~15% more
+  # marginal setups -- intentional, surfaces only higher-edge entries.
+  min_profit_to_charges_ratio: 3.0   # reward must be >= 3.0x round-trip charges
   min_absolute_reward_rs: 20.0       # never take a trade targeting < Rs 20 reward
 
   # Minimum per-trade notional — below this level round-trip commissions

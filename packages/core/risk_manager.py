@@ -170,7 +170,8 @@ class RiskManager:
     """
 
     def __init__(self, config: dict, initial_balance: float,
-                 peak_balance: Optional[float] = None):
+                 peak_balance: Optional[float] = None,
+                 absolute_daily_loss_floor_rs: Optional[float] = None):
         """
         Args:
             initial_balance: Starting balance. If the portfolio was seeded from
@@ -178,6 +179,14 @@ class RiskManager:
                 in sync with portfolio state.
             peak_balance: Historical peak equity from DB. If provided, drawdown
                 is measured against the real peak (not today's balance).
+            absolute_daily_loss_floor_rs: Optional hard rupee floor on the
+                day's realised P&L. Independent from the existing
+                ``daily_loss_limit_pct`` (which is a percentage of capital).
+                When both are set, whichever is *tighter* fires first.
+                Set via ``run_daemon.py --max-loss-rs N`` for the e2e
+                Stage 3 live basket runs, where the percentage limit on
+                a Rs 1L config is too lax (Rs 3,000) for a Rs 5k basket
+                experiment.
         """
         risk_cfg = config.get("risk", {})
 
@@ -206,10 +215,41 @@ class RiskManager:
         self.max_open_positions: int = risk_cfg.get("max_open_positions", 2)
         self.max_consecutive_losses: int = risk_cfg.get("max_consecutive_losses", 2)
 
+        # Optional absolute-rupee daily-loss floor (Stage 3 e2e safety net).
+        # Distinct from the percentage-based limit: set both, whichever fires
+        # first wins. None = disabled. Constructor kwarg takes precedence over
+        # the config-file fallback so CLI overrides (--max-loss-rs) always win.
+        cfg_abs_floor = risk_cfg.get("absolute_daily_loss_floor_rs", None)
+        self.absolute_daily_loss_floor_rs: Optional[float] = (
+            float(absolute_daily_loss_floor_rs)
+            if absolute_daily_loss_floor_rs is not None
+            else (float(cfg_abs_floor) if cfg_abs_floor is not None else None)
+        )
+
         # Drawdown tiers
         self.drawdown_reduce_pct: float = risk_cfg.get("drawdown_reduce_pct", 15.0)
         self.drawdown_halt_pct: float = risk_cfg.get("drawdown_halt_pct", 30.0)
         self.max_drawdown_pct: float = risk_cfg.get("max_drawdown_pct", 10.0)
+
+        # Regime-aware position-size multipliers (2026-05-13). Sized risk
+        # already shrinks in DRAWDOWN tier; this adds REGIME-level scaling
+        # on top, so we under-trade in environments where our backtested
+        # edge is weakest. Empty dict / missing keys = no scaling (= 1.0).
+        #
+        # Default tuning is conservative -- cut in bear high-vol where we
+        # have empirically seen the worst losses (2026-05-13 HCLTECH
+        # supertrend short -Rs 148 in bear_high_vol; 2026-05-12 GODREJCP
+        # short -Rs 6 also bear_high_vol). Expand in bull_low_vol where
+        # long-side trend-followers historically perform best.
+        regime_size_cfg = risk_cfg.get("regime_size_multipliers") or {}
+        self.regime_size_multipliers: Dict[str, float] = {
+            "bull_low_vol":  float(regime_size_cfg.get("bull_low_vol", 1.20)),
+            "bull_high_vol": float(regime_size_cfg.get("bull_high_vol", 1.00)),
+            "sideways":      float(regime_size_cfg.get("sideways", 0.85)),
+            "bear_low_vol":  float(regime_size_cfg.get("bear_low_vol", 0.85)),
+            "bear_high_vol": float(regime_size_cfg.get("bear_high_vol", 0.70)),
+            "unknown":       float(regime_size_cfg.get("unknown", 1.00)),
+        }
 
         # Weekly limit
         self.weekly_loss_limit_pct: float = risk_cfg.get("weekly_loss_limit_pct", 5.0)
@@ -317,6 +357,18 @@ class RiskManager:
             self._activate_breaker(f"Daily loss limit hit: ₹{self.state.daily_pnl:.2f} (limit: -₹{daily_limit:.2f})")
             return False, self.state.breaker_reason
 
+        # Absolute-rupee daily-loss floor (e2e Stage 3 / --max-loss-rs flag).
+        # This is a hard floor independent of the percentage limit above. Used
+        # by the e2e basket runs where the percentage limit on a Rs 1L config
+        # is too lax for a small live experiment.
+        if (self.absolute_daily_loss_floor_rs is not None
+                and self.state.daily_pnl <= -self.absolute_daily_loss_floor_rs):
+            self._activate_breaker(
+                f"Absolute daily loss floor breached: "
+                f"₹{self.state.daily_pnl:.2f} <= -₹{self.absolute_daily_loss_floor_rs:.2f}"
+            )
+            return False, self.state.breaker_reason
+
         # Weekly loss limit
         weekly_limit = self._initial_balance * (self.weekly_loss_limit_pct / 100)
         if self.state.weekly_pnl <= -weekly_limit:
@@ -382,13 +434,44 @@ class RiskManager:
 
     # ── Position Sizing ──────────────────────────────────────
 
+    def regime_size_multiplier(self, regime: Optional[str]) -> float:
+        """Return the position-size multiplier configured for ``regime``.
+
+        Defaults to 1.0 if regime is None or unmapped. Looked up from the
+        ``risk.regime_size_multipliers`` config block. Empirical baseline
+        (2026-05-13):
+            bull_low_vol  1.20  -- expand in our strongest regime
+            bull_high_vol 1.00
+            sideways      0.85
+            bear_low_vol  0.85
+            bear_high_vol 0.70  -- shrink in our worst regime
+            unknown       1.00  -- pre-first-refresh default
+
+        These layer ON TOP of drawdown-tier reduction, the per-trade risk
+        budget, and the max_position_size cap -- the regime multiplier
+        affects ``risk_amount`` and ``max_position_value`` proportionally
+        so all downstream gates fire correctly.
+        """
+        if not regime:
+            return 1.0
+        return self.regime_size_multipliers.get(regime, 1.0)
+
     def calculate_position_size(self, price: float, stop_loss_price: Optional[float] = None,
-                                atr: Optional[float] = None, side: str = "BUY") -> int:
+                                atr: Optional[float] = None, side: str = "BUY",
+                                regime: Optional[str] = None) -> int:
         """
         Fixed-fractional position sizing (symmetric for long/short).
           risk_amount = balance * max_risk_per_trade_pct / 100
           shares = risk_amount / risk_per_share
-        Applies drawdown tier reduction if active.
+        Applies drawdown tier reduction if active, then regime multiplier
+        if a regime is provided.
+
+        Args:
+            regime: Optional market regime label (`bull_low_vol`,
+                `bear_high_vol`, etc.). When provided, scales BOTH the
+                risk budget and the max-position-value cap by
+                `regime_size_multiplier(regime)`. Passing None preserves
+                pre-2026-05-13 behaviour.
         """
         if price <= 0:
             return 0
@@ -402,8 +485,20 @@ class RiskManager:
             risk_pct *= 0.5
             logger.info(f"Drawdown tier active ({dd:.1f}%): risk reduced to {risk_pct}%")
 
+        # Regime-aware scaling. Multiply BOTH the risk budget and the
+        # max-position-value cap so the regime knob affects "how much
+        # capital we're willing to deploy" *and* "how much risk we're
+        # willing to take", proportionally.
+        regime_mult = self.regime_size_multiplier(regime)
+        if regime_mult != 1.0:
+            logger.info(
+                f"[REGIME-SIZING] regime={regime} multiplier={regime_mult:.2f} "
+                f"(risk {risk_pct:.2f}% -> {risk_pct * regime_mult:.2f}%)"
+            )
+            risk_pct *= regime_mult
+
         risk_amount = balance * (risk_pct / 100)
-        max_position_value = balance * (self.max_position_size_pct / 100)
+        max_position_value = balance * (self.max_position_size_pct / 100) * regime_mult
         max_shares_by_value = int(max_position_value / price)
 
         # ATR-based stop-loss if no explicit SL
@@ -429,6 +524,46 @@ class RiskManager:
             return round(entry_price - distance, 2)
         return round(entry_price + distance, 2)
 
+    def enforce_sl_floor(
+        self,
+        entry_price: float,
+        proposed_sl: float,
+        side: str = "BUY",
+    ) -> float:
+        """Widen ``proposed_sl`` outward if it sits inside ``min_stop_loss_pct``.
+
+        This is the canonical floor enforcer. ``get_stop_loss`` uses it
+        for its own ATR/percentage stops; callers that source the SL
+        elsewhere (e.g. strategy-provided ``signal.stop_loss``) MUST also
+        route through this helper before sizing the position.
+
+        Why this exists as a separate method
+        ------------------------------------
+        Before 2026-05-13 the floor lived inline at the bottom of
+        ``get_stop_loss``. A strategy that returned its own SL (e.g.
+        supertrend_follow at price ± 3 × ATR) bypassed the floor entirely
+        because trading_agent did ``signal.stop_loss or get_stop_loss()``.
+        On 2026-05-13 09:37, HCLTECH was sold short at 1142.35 with a
+        supertrend SL of ~1150.93 (0.75 %) -- inside the 1.2 % noise
+        floor -- and was stopped out at 1150.40 for -Rs 148.24 within
+        30 min. The floor-as-method fixes that class of bug.
+
+        Returns the floored SL (always rounded to 2 dp).
+        """
+        if self.min_stop_loss_pct <= 0 or entry_price <= 0:
+            return round(proposed_sl, 2)
+
+        min_distance = entry_price * self.min_stop_loss_pct / 100
+        if side == "BUY":
+            floor_sl = entry_price - min_distance
+            if proposed_sl > floor_sl:
+                return round(floor_sl, 2)
+        else:
+            floor_sl = entry_price + min_distance
+            if proposed_sl < floor_sl:
+                return round(floor_sl, 2)
+        return round(proposed_sl, 2)
+
     def get_stop_loss(self, entry_price: float, side: str = "BUY",
                       atr: Optional[float] = None) -> float:
         """Compute SL, enforcing a minimum distance floor when configured.
@@ -446,19 +581,7 @@ class RiskManager:
             else:
                 sl = round(entry_price * (1 + self.default_stop_loss_pct / 100), 2)
 
-        # Enforce minimum distance floor. Widen the stop if needed.
-        if self.min_stop_loss_pct > 0 and entry_price > 0:
-            min_distance = entry_price * self.min_stop_loss_pct / 100
-            if side == "BUY":
-                floor_sl = entry_price - min_distance
-                if sl > floor_sl:
-                    sl = round(floor_sl, 2)
-            else:
-                floor_sl = entry_price + min_distance
-                if sl < floor_sl:
-                    sl = round(floor_sl, 2)
-
-        return sl
+        return self.enforce_sl_floor(entry_price, sl, side)
 
     def get_take_profit(
         self,
