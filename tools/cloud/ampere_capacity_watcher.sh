@@ -89,6 +89,21 @@ log() {
 
 attempt_launch() {
     # Returns 0 on instance up; nonzero on any failure. stdout=API response.
+    # Metadata is built via python3.json.dumps so the SSH public key's
+    # trailing newline (and any future special chars) never break the
+    # JSON contract. Naively splicing $(cat pubkey) leaves the newline
+    # in and OCI fails the call with "Parameter 'metadata' must be in
+    # JSON format." (observed 2026-05-13 on attempt #1).
+    local metadata_json
+    metadata_json=$(python3 -c "
+import json, sys
+with open(sys.argv[1]) as f:
+    pubkey = f.read().strip()
+print(json.dumps({'ssh_authorized_keys': pubkey}))
+" "$SSH_PUBLIC_KEY_PATH")
+    # Also suppress the cosmetic "OCI_API_KEY label" warning so it
+    # doesn't make every failure log look scarier than it is.
+    export SUPPRESS_LABEL_WARNING=True
     set +e
     oci compute instance launch \
         --availability-domain "$AVAILABILITY_DOMAIN" \
@@ -98,7 +113,7 @@ attempt_launch() {
         --image-id           "$IMAGE_OCID" \
         --subnet-id          "$SUBNET_OCID" \
         --display-name       "$DISPLAY_NAME" \
-        --metadata           "{\"ssh_authorized_keys\": \"$(cat "$SSH_PUBLIC_KEY_PATH")\"}" \
+        --metadata           "$metadata_json" \
         --assign-public-ip   true \
         --wait-for-state     RUNNING \
         2>&1
