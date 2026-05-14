@@ -322,7 +322,47 @@ def get_sector(symbol: str) -> str:
     return NSE_SECTOR_MAP.get(symbol.upper(), "UNKNOWN")
 
 
-def _bucket_for(symbol: str, unknown_per_symbol: bool) -> str:
+# Supersector roll-up (2026-05-14). Fine-grained sectors that share a
+# single underlying risk factor are collapsed into one bucket for
+# concentration math. Live evidence (2026-05-14): a SHORT book held
+# CENTRALBK (Banks) + FEDERALBNK (Banks) + TATACAP (NBFC) + CHOLAFIN (NBFC)
+# simultaneously -- effectively 67% of the book in a single rate-cycle
+# factor. The flat per-sector 40% cap allowed it because each sub-bucket
+# (Banks, NBFC) was independently under 40%.
+#
+# When a sector isn't listed here, it stays in its own bucket (no roll-up).
+# Override at the config level via `risk.use_supersectors: false` to
+# disable entirely and revert to the legacy fine-grained behaviour.
+SUPERSECTOR_MAP: Dict[str, str] = {
+    "Banks": "Financials",
+    "NBFC": "Financials",
+    "Insurance": "Financials",
+    "AMC": "Financials",
+    "FinTech": "Financials",
+    "Energy": "EnergyPower",
+    "Power": "EnergyPower",
+    "Metals": "MetalsMining",
+    "Mining": "MetalsMining",
+    "Cement": "MetalsMining",
+    "Auto": "AutoAuxiliary",
+    # Note: cement is grouped with metals because both are commodity-cycle
+    # plays driven by infra capex and global steel/iron-ore prices.
+}
+
+
+def get_supersector(symbol: str) -> str:
+    """Coarser bucket: collapses Banks/NBFC/Insurance/AMC/FinTech into
+    ``Financials`` etc. Falls back to the fine-grained sector when no
+    roll-up exists, so behaviour is strictly broader-or-same."""
+    sector = get_sector(symbol)
+    return SUPERSECTOR_MAP.get(sector, sector)
+
+
+def _bucket_for(
+    symbol: str,
+    unknown_per_symbol: bool,
+    use_supersectors: bool = False,
+) -> str:
     """Sector bucket used for concentration math.
 
     When `unknown_per_symbol=True`, unmapped symbols get a private bucket
@@ -331,8 +371,13 @@ def _bucket_for(symbol: str, unknown_per_symbol: bool) -> str:
     mid-cap from blocking every other unclassified mid-cap — a real
     2026-04-30 pathology where 28 distinct signals were rejected against
     a single ``UNKNOWN`` bucket.
+
+    When ``use_supersectors=True`` (default once wired through config),
+    fine sectors are rolled up via ``SUPERSECTOR_MAP`` so e.g. a Banks +
+    NBFC + Insurance triple is correctly recognised as one Financials
+    concentration. UNKNOWN handling is unchanged.
     """
-    sector = get_sector(symbol)
+    sector = get_supersector(symbol) if use_supersectors else get_sector(symbol)
     if sector == "UNKNOWN" and unknown_per_symbol:
         return f"UNKNOWN:{symbol.upper()}"
     return sector
@@ -345,6 +390,7 @@ def check_sector_exposure(
     total_equity: float,
     max_sector_exposure_pct: float = 40.0,
     unknown_per_symbol: bool = False,
+    use_supersectors: bool = False,
 ) -> Tuple[bool, str]:
     """
     Returns (is_safe, reason). Rejects a new position if it would push the
@@ -358,14 +404,18 @@ def check_sector_exposure(
         max_sector_exposure_pct: Hard cap per sector (0-100).
         unknown_per_symbol: When True, unclassified symbols each get their
             own bucket (recommended — prevents the "UNKNOWN" logjam).
+        use_supersectors: When True, sectors are rolled up via
+            SUPERSECTOR_MAP so e.g. Banks/NBFC/Insurance share a single
+            Financials cap. Default off for backward compatibility; the
+            agent overlay flips it on at the config level.
     """
     if total_equity <= 0:
         return True, "no_equity_check"
 
-    bucket = _bucket_for(symbol, unknown_per_symbol)
+    bucket = _bucket_for(symbol, unknown_per_symbol, use_supersectors)
     existing_sector_value = sum(
         v for s, v in current_positions_by_symbol.items()
-        if _bucket_for(s, unknown_per_symbol) == bucket
+        if _bucket_for(s, unknown_per_symbol, use_supersectors) == bucket
     )
     new_sector_value = existing_sector_value + additional_cost
     sector_pct = new_sector_value / total_equity * 100

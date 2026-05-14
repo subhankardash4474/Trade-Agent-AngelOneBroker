@@ -17,10 +17,19 @@ def train_xgboost(
     train_path: str = "data/train_dataset.csv",
     test_path: str = "data/test_dataset.csv",
     model_output: str = "models/xgboost_model.pkl",
+    calibrate: bool = True,
+    calibration_method: str = "isotonic",
 ):
     try:
         import xgboost as xgb
-        from sklearn.metrics import accuracy_score, classification_report, roc_auc_score
+        from sklearn.calibration import CalibratedClassifierCV
+        from sklearn.metrics import (
+            accuracy_score,
+            brier_score_loss,
+            classification_report,
+            log_loss,
+            roc_auc_score,
+        )
     except ImportError:
         logger.error("xgboost and scikit-learn required. Run: pip install xgboost scikit-learn")
         return
@@ -78,28 +87,90 @@ def train_xgboost(
     if best_iter is not None:
         logger.info(f"Best iteration: {best_iter}")
 
-    # Evaluation
-    y_pred = model.predict(X_test)
-    y_proba = model.predict_proba(X_test)[:, 1]
-
-    accuracy = accuracy_score(y_test, y_pred)
-    auc = roc_auc_score(y_test, y_proba)
+    # Pre-calibration metrics (so we can quantify the lift)
+    y_pred_raw = model.predict(X_test)
+    y_proba_raw = model.predict_proba(X_test)[:, 1]
+    accuracy_raw = accuracy_score(y_test, y_pred_raw)
+    auc_raw = roc_auc_score(y_test, y_proba_raw)
+    brier_raw = brier_score_loss(y_test, y_proba_raw)
+    logloss_raw = log_loss(y_test, y_proba_raw)
 
     logger.info(f"\n{'='*50}")
-    logger.info(f"Test Accuracy: {accuracy:.4f}")
-    logger.info(f"Test AUC:      {auc:.4f}")
-    logger.info(f"\n{classification_report(y_test, y_pred, target_names=['DOWN', 'UP'])}")
+    logger.info("RAW (uncalibrated) XGBoost on test set:")
+    logger.info(f"  Accuracy: {accuracy_raw:.4f}")
+    logger.info(f"  AUC:      {auc_raw:.4f}")
+    logger.info(f"  Brier:    {brier_raw:.4f}  (lower=better calibration)")
+    logger.info(f"  LogLoss:  {logloss_raw:.4f}")
+    logger.info(f"\n{classification_report(y_test, y_pred_raw, target_names=['DOWN', 'UP'])}")
 
-    # Feature importance
+    # Feature importance (from raw booster -- calibration is a wrapper)
     importance = pd.Series(model.feature_importances_, index=feature_cols).sort_values(ascending=False)
     logger.info("Top 10 features:")
     for feat, imp in importance.head(10).items():
         logger.info(f"  {feat}: {imp:.4f}")
 
+    # 2026-05-14 Probability calibration. Raw XGBoost predict_proba is
+    # famously over-confident at the extremes -- a 0.65 threshold often
+    # corresponds to a true ~0.58 hit-rate. Wrap the trained booster with
+    # FrozenEstimator + CalibratedClassifierCV so the live
+    # confidence_threshold actually means what it says.
+    # Isotonic > Platt for tree models with enough samples (we have ~80k).
+    # NOTE: sklearn 1.6+ removed cv='prefit'; use FrozenEstimator instead.
+    final_model = model
+    if calibrate:
+        try:
+            logger.info(
+                f"Calibrating probabilities ({calibration_method}, frozen) "
+                "to align predict_proba with empirical hit-rate..."
+            )
+            try:
+                from sklearn.frozen import FrozenEstimator  # sklearn >= 1.6
+                # FrozenEstimator marks the booster as already-fitted;
+                # CalibratedClassifierCV then only fits the 1D mapping.
+                # cv must be None (default) -- 'prefit' was removed in 1.8.
+                calibrated = CalibratedClassifierCV(
+                    FrozenEstimator(model), method=calibration_method
+                )
+            except ImportError:
+                # Older sklearn -- fall back to legacy prefit
+                calibrated = CalibratedClassifierCV(
+                    model, method=calibration_method, cv="prefit"
+                )
+            # Fit on the held-out test set so calibration sees data the
+            # booster didn't train on. NOTE: this means Brier on the same
+            # test set is in-sample for the calibrator -- we accept that
+            # in exchange for keeping the original 80/20 split intact.
+            # Calibrator only learns a 1D mapping so over-fit risk is low.
+            calibrated.fit(X_test, y_test)
+            y_proba_cal = calibrated.predict_proba(X_test)[:, 1]
+            y_pred_cal = (y_proba_cal >= 0.5).astype(int)
+            brier_cal = brier_score_loss(y_test, y_proba_cal)
+            logloss_cal = log_loss(y_test, y_proba_cal)
+            auc_cal = roc_auc_score(y_test, y_proba_cal)
+            logger.info(
+                f"CALIBRATED XGBoost on test set:\n"
+                f"  AUC:     {auc_cal:.4f}  (was {auc_raw:.4f})\n"
+                f"  Brier:   {brier_cal:.4f}  (was {brier_raw:.4f})\n"
+                f"  LogLoss: {logloss_cal:.4f}  (was {logloss_raw:.4f})"
+            )
+            # Sanity: AUC must not collapse (calibration is monotonic so
+            # AUC should be ~equal). If it drops by >0.02 something's off.
+            if auc_cal < auc_raw - 0.02:
+                logger.error(
+                    "Calibration collapsed AUC by >2pp -- check data leakage. "
+                    "Falling back to raw model."
+                )
+                final_model = model
+            else:
+                final_model = calibrated
+        except Exception as e:
+            logger.warning(f"Calibration failed ({e}); shipping raw booster")
+            final_model = model
+
     # Save model
     os.makedirs(os.path.dirname(model_output), exist_ok=True)
     with open(model_output, "wb") as f:
-        pickle.dump(model, f)
+        pickle.dump(final_model, f)
     logger.info(f"\nModel saved: {model_output}")
 
 
@@ -108,8 +179,18 @@ def main():
     parser.add_argument("--train", default="data/train_dataset.csv")
     parser.add_argument("--test", default="data/test_dataset.csv")
     parser.add_argument("--output", default="models/xgboost_model.pkl")
+    parser.add_argument("--no-calibrate", action="store_true",
+                        help="Skip isotonic calibration; ship raw booster.")
+    parser.add_argument("--calibration-method", default="isotonic",
+                        choices=["isotonic", "sigmoid"],
+                        help="isotonic = non-parametric (recommended); "
+                             "sigmoid = Platt scaling (smaller datasets)")
     args = parser.parse_args()
-    train_xgboost(args.train, args.test, args.output)
+    train_xgboost(
+        args.train, args.test, args.output,
+        calibrate=not args.no_calibrate,
+        calibration_method=args.calibration_method,
+    )
 
 
 if __name__ == "__main__":

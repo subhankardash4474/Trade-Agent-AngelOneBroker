@@ -241,6 +241,32 @@ class TradingAgent:
         # Strategies
         self.strategies: List[BaseStrategy] = self._load_strategies()
 
+        # 2026-05-14 Event blackout calendar. Skip new entries on stocks
+        # within N trading days of a known catalyst (results, dividend
+        # ex-date, AGM, board meeting, buyback). Empty file = permissive
+        # legacy behaviour, so this is a strict-add (never blocks anything
+        # that wasn't blocked before).
+        from core.event_calendar import EventCalendar  # local import keeps cycle clean
+        ev_cfg = self.config.get("risk", {}).get("event_blackout", {}) or {}
+        self.event_calendar = EventCalendar(
+            path=ev_cfg.get("calendar_path", "data/event_calendar.csv"),
+            blackout_days_before=int(ev_cfg.get("days_before", 1)),
+            blackout_days_after=int(ev_cfg.get("days_after", 0)),
+            event_types=ev_cfg.get("event_types"),
+        )
+        self.event_calendar.force_reload()
+        self._event_blackout_enabled: bool = bool(ev_cfg.get("enabled", True))
+
+        # 2026-05-14 SELF-SUFFICIENCY TRACKER. Account-owner stated goal:
+        # "passive income that covers running costs" (Kite Connect API,
+        # cloud VM, CDSL/DP if delivery, Cursor, etc). The tracker
+        # persists cumulative realised P&L since deployment to a tiny
+        # JSON ledger and exposes a GREEN/YELLOW/RED status that the
+        # audit checkpoint surfaces. Disable by setting
+        # risk.self_sufficiency.enabled: false in config.yaml.
+        from core.self_sufficiency import SelfSufficiencyTracker
+        self.self_sufficiency = SelfSufficiencyTracker.from_config(self.config)
+
         # Stock scanner — auto-discovers what to trade
         self.scanner = StockScanner(self.config)
         scanner_cfg = self.config.get("scanner", {})
@@ -266,7 +292,17 @@ class TradingAgent:
             self.instruments: List[dict] = self.config.get("market", {}).get("instruments", [])
 
         # Market context (updated periodically via live data)
-        self._market_context: Dict = {"india_vix": 15.0, "nifty_trend": 1, "sector_momentum": 0.0}
+        self._market_context: Dict = {
+            "india_vix": 15.0, "nifty_trend": 1, "sector_momentum": 0.0,
+            # 2026-05-14 Intraday regime overlay -- updated each market-context
+            # refresh. ``classify_intraday_regime`` reads these to detect
+            # mid-session risk-on/risk-off shifts that the daily 200-EMA + VIX
+            # classification doesn't see. None on cold start (overlay = unknown
+            # = permissive); first refresh populates them.
+            "nifty_intraday_pct": None,
+            "vix_intraday_delta": None,
+            "vix_open": None,
+        }
         self._market_ctx_last_refresh: Optional[datetime] = None
         self._market_ctx_refresh_interval = timedelta(minutes=10)
 
@@ -276,6 +312,16 @@ class TradingAgent:
         self._max_losses_per_stock = robust_cfg.get("max_losses_per_stock_per_day", 2)
         self._late_entry_cutoff = robust_cfg.get("late_entry_cutoff", "14:30")
         self._heartbeat_interval = robust_cfg.get("heartbeat_interval_cycles", 10)
+        # 2026-05-14: wall-clock heartbeat. Cycle-count alone gave a 30-40 min
+        # cadence once a single cycle ballooned to 4 min (200-stock LTP scan),
+        # which made cloud liveness checks brittle. We now fire whenever EITHER
+        # gate trips — cycle-count (legacy) OR `heartbeat_interval_seconds`
+        # (new, default 300s). Set the seconds knob to 0 to disable wall-clock
+        # gating entirely.
+        self._heartbeat_interval_seconds: float = float(
+            robust_cfg.get("heartbeat_interval_seconds", 300)
+        )
+        self._last_heartbeat_ts: float = 0.0
         self._eod_summary_time = robust_cfg.get("eod_summary_time", "15:20")
         self._max_cycle_errors = robust_cfg.get("max_cycle_errors", 5)
 
@@ -325,6 +371,14 @@ class TradingAgent:
         self._long_entry_regimes: set = (
             set(long_regimes) if long_regimes else set()
         )
+        # 2026-05-14 Intraday-regime block on new longs. When true (default),
+        # `intraday_regime == "risk_off"` (Nifty -0.5% over last 60 min OR
+        # VIX spike +1.5) blocks new BUY entries even if the daily regime
+        # is bullish. Designed to catch mid-session flash-crash / reversal
+        # situations the daily 200-EMA + VIX classification can't see.
+        self._intraday_regime_block_longs: bool = bool(
+            exec_cfg.get("intraday_regime_block_longs", True)
+        )
 
         self._cooldown_map: Dict[str, datetime] = {}      # symbol → last losing exit time
         self._stock_loss_today: Dict[str, int] = {}        # symbol → loss count today
@@ -350,6 +404,16 @@ class TradingAgent:
         self._unknown_sector_per_symbol: bool = bool(
             risk_cfg_raw.get("unknown_sector_per_symbol", True)
         )
+        # 2026-05-14 Supersector roll-up: collapse Banks/NBFC/Insurance/AMC
+        # /FinTech into a single "Financials" bucket for the concentration
+        # cap. Live evidence (2026-05-14): the SHORT book held 4 of 6
+        # positions in financial-sector tickers (CENTRALBK + FEDERALBNK +
+        # TATACAP + CHOLAFIN) -- effectively 67% of book in one rate-cycle
+        # factor that the per-sector cap let through because each sub-bucket
+        # was independently below 40%.
+        self._use_supersectors: bool = bool(
+            risk_cfg_raw.get("use_supersectors", True)
+        )
         # Window cap (2026-05-07): cap how many positions can be opened
         # within a short rolling window so a burst of correlated signals
         # (e.g. opening-bell pile-on or a single sector wave) can't blow
@@ -364,6 +428,17 @@ class TradingAgent:
         # Pruned in `_pre_trade_safety_checks` so we never carry stale entries.
         from collections import deque as _deque
         self._recent_opens: _deque = _deque()
+        # 2026-05-14 STRATEGY-CONCURRENCY CAP --------------------------------
+        # Live evidence (2026-05-14): 8 SHORT signals fired in 37 min, ALL
+        # `supertrend_follow`, ALL in `bear_high_vol`. 4 of them stopped
+        # out for -Rs 730 in 40 minutes. The per-strategy circuit-breaker
+        # only fires AFTER N losses -- by which time the entries are
+        # already in. This cap blocks NEW entries once a single strategy
+        # already holds N positions, preventing single-strategy pile-on.
+        # 0 = disabled (legacy). Recommended: ceil(max_open_positions/2).
+        self._max_positions_per_strategy: int = int(
+            risk_cfg_raw.get("max_positions_per_strategy", 0)
+        )
         # Per-trade notional floor — commissions eat sub-Rs 6k wins alive.
         self._min_trade_notional: float = float(
             risk_cfg_raw.get("min_trade_notional", 0.0)
@@ -410,6 +485,16 @@ class TradingAgent:
         # exits). Set to 0.0 to disable.
         self._min_holding_pnl_rs: float = float(
             risk_cfg_raw.get("min_holding_pnl_rs", 0.0)
+        )
+        # 2026-05-14: scale the unrealized-PnL floor by position notional. A
+        # flat Rs 15 floor was right-sized for the Rs 5k min_trade_notional
+        # but lets a Rs 30k position fast-exit at +Rs 16 -- which doesn't
+        # cover the ~Rs 31 round-trip charges on that notional, turning the
+        # nominal "win" into a real loss. The runtime floor is now
+        # max(min_holding_pnl_rs, charges_multiple * actual_round_trip_charges).
+        # Set the multiple to 0 to revert to the flat absolute floor.
+        self._min_holding_charges_multiple: float = float(
+            risk_cfg_raw.get("min_holding_charges_multiple", 1.5)
         )
 
         # Rejection cooldown (2026-05-04 part 4). When a (symbol, direction)
@@ -491,7 +576,15 @@ class TradingAgent:
 
         self._running = False
         self._cycle_count = 0
-        self._use_websocket = self.config.get("data_pipeline", {}).get("use_websocket", False)
+        dp_cfg = self.config.get("data_pipeline", {})
+        self._use_websocket = dp_cfg.get("use_websocket", False)
+        # 2026-05-14: when True, the WS subscribes ONLY to currently-held
+        # symbols (resubscribed every position open/close). Lets us run
+        # tick-grade SL/TP enforcement without paying the full 200-stock
+        # firehose cost. When False (or use_websocket=False), legacy
+        # behaviour: subscribes to the full watchlist on start.
+        self._ws_held_only: bool = bool(dp_cfg.get("ws_held_only", True))
+        self._ws_subscribed_held: set = set()
 
         # Hourly audit checkpoint tracker. We fire on the first cycle whose
         # IST hour differs from the last checkpoint's hour, during 09:00-16:00.
@@ -807,9 +900,19 @@ class TradingAgent:
 
                 self._cycle_count += 1
 
-                # Heartbeat
-                if self._cycle_count % self._heartbeat_interval == 0:
+                # Heartbeat -- fire whenever EITHER cycle-count OR wall-clock
+                # gate trips. Wall-clock keeps cloud liveness fresh even when
+                # a single cycle runs long (200-stock LTP scan can be 3-4 min,
+                # which previously made cycle-count cadence ~40 min).
+                cycle_due = (self._cycle_count % self._heartbeat_interval == 0)
+                clock_due = (
+                    self._heartbeat_interval_seconds > 0
+                    and (time.monotonic() - self._last_heartbeat_ts)
+                        >= self._heartbeat_interval_seconds
+                )
+                if cycle_due or clock_due:
                     self._log_heartbeat()
+                    self._last_heartbeat_ts = time.monotonic()
 
                 # Auto EOD summary
                 self._maybe_send_eod_summary()
@@ -952,21 +1055,82 @@ class TradingAgent:
         self.ws_client.start()
 
     def _on_tick(self, tick: dict):
-        """Process a raw tick from WebSocket."""
-        symbol = tick["symbol"]
-        price = tick["ltp"]
-        volume = tick.get("volume", 0)
+        """Process a raw tick from WebSocket.
+
+        2026-05-14: tick stream now drives the *exit* path too, not just
+        trail-SL updates. Previously a tick only nudged the trailing SL
+        in memory; the actual SL/TP/peak-giveback check still ran on
+        the 15-second polling cadence, so a price spike that briefly
+        crossed the trail and reverted in <15s was invisible. Wiring
+        ticks into `_check_position_exits` closes that hole when WS is
+        on. Wrapped in try/except so a bad tick can't blow up the WS
+        background thread (which would silently kill all subsequent
+        ticks).
+        """
+        try:
+            symbol = tick["symbol"]
+            price = tick["ltp"]
+            volume = tick.get("volume", 0)
+        except KeyError:
+            return
 
         self.tick_aggregator.process_tick(symbol, price, volume)
-        self.database.store_tick(symbol, price, volume,
-                                 bid=tick.get("bid", 0), ask=tick.get("ask", 0))
+        try:
+            self.database.store_tick(symbol, price, volume,
+                                     bid=tick.get("bid", 0), ask=tick.get("ask", 0))
+        except Exception:
+            pass
 
-        # Update trailing stops
+        # Only act on ticks for symbols we actually hold -- saves CPU when
+        # the watchlist is wider than the position book.
+        if symbol not in self.portfolio.positions:
+            return
+
         ts = self.risk_manager.get_trailing_stop(symbol)
         if ts:
             new_sl = self.risk_manager.update_trailing_stop(symbol, price)
             if ts.trailing_active:
                 logger.debug(f"Trailing SL for {symbol}: \u20B9{new_sl:.2f}")
+
+        # Drive the exit check off this single-symbol price snapshot.
+        # `_check_position_exits` is idempotent and handles the fact that
+        # `to_close` may be empty.
+        try:
+            self._check_position_exits({symbol: price})
+        except Exception as e:
+            logger.warning(f"[WS-EXIT] check_position_exits({symbol}) failed: {e}")
+
+    def _ws_subscribed_held_set(self) -> set:
+        """Helper for the held-only WebSocket subscription strategy."""
+        return getattr(self, "_ws_subscribed_held", set())
+
+    def _resubscribe_ws_to_held(self) -> None:
+        """When `data_pipeline.ws_held_only` is true, keep the WebSocket
+        subscription tight to the symbols we actually hold. Reduces
+        message volume by 30-100x vs subscribing to the entire 200-stock
+        watchlist, and means we never miss a tick on a symbol we care
+        about because the broker rate-limited the firehose.
+
+        Best-effort: if the WS object doesn't expose a re-subscription
+        API, this is a no-op."""
+        if not self._use_websocket or not self._ws_held_only:
+            return
+        held = set(self.portfolio.positions.keys())
+        prev = self._ws_subscribed_held_set()
+        if held == prev:
+            return
+        held_instruments = [
+            {"symbol": s, "token": self._get_token(s)} for s in held if self._get_token(s)
+        ]
+        try:
+            self.ws_client.subscribe(held_instruments)
+            self._ws_subscribed_held = held
+            logger.info(
+                f"[WS] held-only resubscribe: {sorted(held)} "
+                f"(was {sorted(prev)})"
+            )
+        except Exception as e:
+            logger.warning(f"[WS] resubscribe failed: {e}")
 
     def _on_candle_close(self, symbol: str, interval: str, candle: dict):
         """Callback when a candle completes from tick aggregation."""
@@ -1375,6 +1539,41 @@ class TradingAgent:
                     f"[TP-STREAK] {symbol}: {self._consec_tp_today[symbol]} consecutive TPs today "
                     f"(no cooldown — letting trend continuation re-enter immediately)"
                 )
+
+    def _effective_signal_exit_floor(self, position, current_price: float) -> float:
+        """Notional-aware unrealized-PnL floor for the signal-exit fast-path.
+
+        Returns ``max(min_holding_pnl_rs, charges_multiple * round-trip-charges)``
+        so that small positions are protected by the absolute floor (Rs 15
+        avoids 1-rupee-win churn on the smallest trades) while large positions
+        are protected by the relative floor (a Rs 30k position needs ~Rs 47
+        unrealized to clear 1.5x its ~Rs 31 charges, not Rs 15).
+
+        Falls back gracefully:
+          - If charges module import fails, returns the absolute floor only.
+          - If `min_holding_charges_multiple` is 0, returns the absolute floor
+            (legacy behaviour).
+          - If `min_holding_pnl_rs` is 0, the gate is fully disabled.
+        """
+        absolute_floor = self._min_holding_pnl_rs
+        if absolute_floor <= 0:
+            return 0.0
+        if self._min_holding_charges_multiple <= 0:
+            return absolute_floor
+        try:
+            from core.charges import compute_round_trip
+            entry = float(position.entry_price)
+            qty = int(position.quantity)
+            if entry <= 0 or qty <= 0 or current_price <= 0:
+                return absolute_floor
+            # Use entry == exit for a charges-only round-trip estimate. This
+            # over-estimates STT marginally but never under-estimates -- safer
+            # for the floor we're computing.
+            charges = compute_round_trip(entry, current_price, qty, product="INTRADAY")
+            relative_floor = self._min_holding_charges_multiple * charges.total
+            return max(absolute_floor, relative_floor)
+        except Exception:
+            return absolute_floor
 
     def _log_heartbeat(self):
         """Periodic health summary for remote monitoring."""
@@ -1992,7 +2191,54 @@ class TradingAgent:
             elif nifty_closes:
                 self._market_context["nifty_trend"] = 1
 
+            # 2026-05-14 Intraday overlay -- pull a 1-min Nifty bar to compute
+            # ~60-min momentum, and snapshot VIX vs morning open. Best-effort:
+            # any failure leaves the overlay at "unknown" (permissive).
+            try:
+                intraday = _fetch_close("^NSEI", range_str="1d", interval="1m")
+                if intraday and len(intraday) >= 60:
+                    last = intraday[-1]
+                    sixty_back = intraday[-60]
+                    if sixty_back > 0:
+                        pct = (last - sixty_back) / sixty_back * 100.0
+                        self._market_context["nifty_intraday_pct"] = round(pct, 3)
+            except Exception:
+                pass
+            try:
+                vix_intraday = _fetch_close("^INDIAVIX", range_str="1d", interval="5m")
+                if vix_intraday and len(vix_intraday) >= 1:
+                    if self._market_context.get("vix_open") is None:
+                        # First refresh of the session captures the open print
+                        # so subsequent deltas are vs the morning baseline.
+                        self._market_context["vix_open"] = round(vix_intraday[0], 2)
+                    open_vix = self._market_context.get("vix_open") or vix_intraday[0]
+                    delta = vix_intraday[-1] - open_vix
+                    self._market_context["vix_intraday_delta"] = round(delta, 3)
+            except Exception:
+                pass
+
+            from core.regime import classify_intraday_regime
+            intraday_regime = classify_intraday_regime(self._market_context)
+            self._market_context["intraday_regime"] = intraday_regime
+            if intraday_regime in ("risk_on", "risk_off"):
+                logger.info(
+                    f"[INTRADAY-REGIME] {intraday_regime.upper()} | "
+                    f"nifty_60m={self._market_context.get('nifty_intraday_pct')}% | "
+                    f"vix_delta={self._market_context.get('vix_intraday_delta')}"
+                )
+
             self._market_ctx_last_refresh = now
+            # 2026-05-14 Push the freshly refreshed market context into any
+            # strategy that opted in (`set_market_context`). This is how
+            # the XGBoost classifier sees the live regime features that
+            # the training pipeline injected (nifty_trend, india_vix).
+            for strat in self.strategies:
+                setter = getattr(strat, "set_market_context", None)
+                if callable(setter):
+                    try:
+                        setter(self._market_context)
+                    except Exception:
+                        pass
         except Exception as e:
             logger.warning(f"Market context refresh failed: {e}")
 
@@ -2210,19 +2456,23 @@ class TradingAgent:
                     if best.confidence >= self._signal_exit_min_conf:
                         # Min unrealized-PnL gate (2026-05-05). Don't churn
                         # out near break-even on signal exits — round-trip
-                        # MIS charges (~Rs 6) turn nominal wins into net
-                        # losses. SL/TP exits remain unconditional (this
-                        # only gates signal-driven fast-path closes).
-                        if self._min_holding_pnl_rs > 0:
+                        # MIS charges turn nominal wins into net losses.
+                        # SL/TP exits remain unconditional (this only gates
+                        # signal-driven fast-path closes).
+                        # 2026-05-14: floor is now notional-aware. The flat
+                        # Rs 15 right-sized for Rs 5k notional under-protects
+                        # a Rs 30k position whose round-trip charges are ~Rs 31.
+                        floor_rs = self._effective_signal_exit_floor(held_pos, price)
+                        if floor_rs > 0:
                             unreal = held_pos.unrealized_pnl(price)
-                            if unreal < self._min_holding_pnl_rs:
+                            if unreal < floor_rs:
                                 logger.info(
                                     f"[EXIT-FAST-PATH-SKIP] {symbol} "
                                     f"{held_pos.side} qty={held_pos.quantity} "
                                     f"signal={best.strategy_name} "
                                     f"conf={best.confidence:.2f} but "
                                     f"unrealized=Rs {unreal:+.2f} < floor "
-                                    f"Rs {self._min_holding_pnl_rs:.2f} — "
+                                    f"Rs {floor_rs:.2f} — "
                                     f"keeping position open (SL/TP still active)"
                                 )
                                 continue
@@ -2456,12 +2706,18 @@ class TradingAgent:
 
     def _pre_trade_safety_checks(
         self, symbol: str, current_price: float, cost: float,
+        strategy: Optional[str] = None,
     ) -> Tuple[bool, str]:
         """
         Pre-trade guardrails before placing a new BUY:
           1. Circuit-limit proximity (avoid stocks near upper/lower daily band).
-          2. Sector concentration limit.
+          1b. Event blackout (earnings/AGM in horizon).
+          2. Sector concentration limit (with supersector roll-up).
           3. Single-symbol exposure limit.
+          4. Window cap (max N opens per rolling X minutes).
+          5. Strategy concurrency cap (2026-05-14): max N concurrent
+             positions from a single strategy, prevents single-strategy
+             pile-on like the 2026-05-14 supertrend_follow disaster.
 
         Returns (is_safe, reason). When unsafe, caller should skip the trade.
         """
@@ -2489,6 +2745,16 @@ class TradingAgent:
             if not safe:
                 return False, f"circuit_guard: {reason}"
 
+        # 1b. Event blackout (2026-05-14). Skip stocks with a known catalyst
+        # in the configured horizon -- earnings/dividend/AGM/board meeting
+        # /buyback. Empty calendar = no-op so this never tightens behaviour
+        # unless the operator populates data/event_calendar.csv.
+        # getattr() guard keeps `__new__`-built test stubs from crashing.
+        if getattr(self, "_event_blackout_enabled", False) and getattr(self, "event_calendar", None):
+            blackout, ev = self.event_calendar.is_blackout(symbol)
+            if blackout and ev is not None:
+                return False, f"event_blackout: {ev.to_display()}"
+
         # 2. Sector concentration
         total_equity = self.portfolio.get_total_value(
             {s: p.entry_price for s, p in self.portfolio.positions.items()}
@@ -2503,6 +2769,9 @@ class TradingAgent:
             total_equity=total_equity,
             max_sector_exposure_pct=self._max_sector_exposure_pct,
             unknown_per_symbol=self._unknown_sector_per_symbol,
+            # getattr() guard so test stubs built via __new__ (without
+            # full __init__) don't trip the new 2026-05-14 supersector flag.
+            use_supersectors=getattr(self, "_use_supersectors", True),
         )
         if not safe:
             return False, reason
@@ -2527,6 +2796,26 @@ class TradingAgent:
                 return False, (
                     f"window_cap: {len(self._recent_opens)} opens in last "
                     f"{self._opens_window_minutes}m >= {self._max_opens_per_window}"
+                )
+
+        # 5. Strategy-concurrency cap (2026-05-14). When the leading strategy
+        # is known and the cap is enabled, count current open positions
+        # tagged with the same strategy. Blocks the all-in-one-strategy
+        # pile-on (today's live evidence: 8 supertrend_follow shorts in
+        # 37 min, 4 stopped for -Rs 730).
+        cap = getattr(self, "_max_positions_per_strategy", 0)
+        if cap > 0 and strategy:
+            try:
+                count = sum(
+                    1 for p in self.portfolio.positions.values()
+                    if (p.strategy or "") == strategy
+                )
+            except Exception:
+                count = 0
+            if count >= cap:
+                return False, (
+                    f"strategy_concurrency: {count} '{strategy}' positions open "
+                    f">= cap {cap}"
                 )
 
         return True, "ok"
@@ -2702,6 +2991,24 @@ class TradingAgent:
                             signal, current_price, f"long_regime:{regime}"
                         )
                         return
+                # 2026-05-14 Intraday-regime overlay: even in a bull daily
+                # regime, block new longs during a clear risk-off intraday
+                # event (Nifty -0.5% in last 60min OR VIX spike +1.5).
+                # Catches flash-crash / mid-session reversal cases the
+                # daily regime can't see.
+                if self._intraday_regime_block_longs:
+                    intra = self._market_context.get("intraday_regime")
+                    if intra == "risk_off":
+                        logger.info(
+                            f"[INTRADAY-REGIME] Skipping BUY {symbol}: "
+                            f"intraday=risk_off "
+                            f"(nifty_60m={self._market_context.get('nifty_intraday_pct')}%, "
+                            f"vix_delta={self._market_context.get('vix_intraday_delta')})"
+                        )
+                        self._audit_reject(
+                            signal, current_price, "intraday_risk_off"
+                        )
+                        return
                 self._open_new_position(signal, token, current_price, side="BUY")
                 return
             if pos.side == "SELL":
@@ -2781,6 +3088,8 @@ class TradingAgent:
             filled_price = order.get("filled_price") or current_price
             record = self.portfolio.close_position(symbol, filled_price, exit_reason="signal")
             if record:
+                # 2026-05-14 LIVE-MODE SAFETY: cancel any orphaned broker SL.
+                self.execution.cancel_sl_order_for_symbol(symbol)
                 self.risk_manager.record_trade(record.pnl)
                 self.risk_manager.remove_trailing_stop(symbol)
                 self._record_exit(symbol, record.pnl, exit_reason="signal")
@@ -3095,10 +3404,15 @@ class TradingAgent:
                                stop_loss=stop_loss, take_profit=take_profit, quantity=quantity)
             return
 
-        # Pre-trade safety: circuit + sector + single-symbol exposure.
-        # Notional = price * qty regardless of side (used for concentration).
+        # Pre-trade safety: circuit + sector + single-symbol + window +
+        # strategy-concurrency. Notional = price * qty regardless of side
+        # (used for concentration). `strategy` enables the per-strategy
+        # cap added 2026-05-14.
         cost_notional = current_price * quantity
-        safe, reason = self._pre_trade_safety_checks(symbol, current_price, cost_notional)
+        lead_strat_for_safety = leading_strategy or signal.strategy_name
+        safe, reason = self._pre_trade_safety_checks(
+            symbol, current_price, cost_notional, strategy=lead_strat_for_safety,
+        )
         if not safe:
             logger.warning(
                 f"[SAFETY-GATE] Skipping {direction_label} {symbol}: {reason} "
@@ -3209,6 +3523,8 @@ class TradingAgent:
             if trend_continuation:
                 ts.trail_activation_rr = 0.5
                 ts.trail_step_pct = 0.6
+            # 2026-05-14: keep WS subscription tight to held symbols.
+            self._resubscribe_ws_to_held()
 
             # Track for window-cap (max N opens per X-min rolling window).
             self._record_position_open(symbol)
@@ -3376,6 +3692,7 @@ class TradingAgent:
                     symbol, filled, exit_reason="carryover_profit_lock"
                 )
                 if rec:
+                    self.execution.cancel_sl_order_for_symbol(symbol)
                     self.risk_manager.record_trade(rec.pnl)
                     self.risk_manager.remove_trailing_stop(symbol)
                     self._record_exit(symbol, rec.pnl,
@@ -3401,6 +3718,16 @@ class TradingAgent:
             # Update trailing stop (also tracks peak-giveback state)
             trailing_sl = self.risk_manager.update_trailing_stop(symbol, price)
             effective_sl = trailing_sl if trailing_sl else pos.stop_loss
+
+            # 2026-05-14 LIVE-MODE SAFETY: propagate the trail SL to the
+            # broker so the standing SL-M follows our in-memory trail. If
+            # the daemon dies, the broker still enforces a tight SL instead
+            # of the (much wider) original stop. Idempotent + cheap.
+            if trailing_sl is not None and trailing_sl != pos.stop_loss:
+                try:
+                    self.execution.update_sl_trigger_for_symbol(symbol, float(trailing_sl))
+                except Exception as e:
+                    logger.debug(f"[SL-PROPAGATE] {symbol} update failed (non-fatal): {e}")
 
             trigger = self.risk_manager.check_stop_loss_take_profit(
                 pos.entry_price, price, pos.side, effective_sl, pos.take_profit,
@@ -3452,6 +3779,8 @@ class TradingAgent:
                 filled_price = order.get("filled_price") or price
                 record = self.portfolio.close_position(symbol, filled_price, exit_reason=actual_reason)
                 if record:
+                    # 2026-05-14 LIVE-MODE SAFETY: cancel orphaned broker SL.
+                    self.execution.cancel_sl_order_for_symbol(symbol)
                     self.risk_manager.record_trade(record.pnl)
                     self.risk_manager.remove_trailing_stop(symbol)
                     self._record_exit(symbol, record.pnl, exit_reason=actual_reason)
@@ -3484,6 +3813,7 @@ class TradingAgent:
                 filled = order.get("filled_price") or price
                 record = self.portfolio.close_position(symbol, filled, exit_reason=reason)
                 if record:
+                    self.execution.cancel_sl_order_for_symbol(symbol)
                     self.risk_manager.record_trade(record.pnl)
                     self.risk_manager.remove_trailing_stop(symbol)
                     self._record_exit(symbol, record.pnl, exit_reason=reason)
@@ -3537,6 +3867,12 @@ class TradingAgent:
     def _on_trade_closed(self, record):
         """Called after every trade close — persists, learns, and updates weights."""
         self._store_trade_to_db(record)
+        # 2026-05-14: tighten WS subscription to remaining held symbols.
+        # Cheap no-op when WS is off or `ws_held_only` is false.
+        try:
+            self._resubscribe_ws_to_held()
+        except Exception:
+            pass
 
         # Single-shot mode: a trade close == full round-trip; record this
         # symbol as "done for today". Cheap no-op when the flag is off, so
@@ -3577,6 +3913,14 @@ class TradingAgent:
             self._update_strategy_breaker_state(record)
         except Exception as e:
             logger.warning(f"strategy breaker update failed: {e}")
+
+        # 2026-05-14: feed cumulative realised P&L into the self-sufficiency
+        # ledger. NET pnl already includes commissions (see Portfolio.close).
+        try:
+            pnl = float(getattr(record, "pnl", 0.0) or 0.0)
+            self.self_sufficiency.record_realised_pnl(pnl)
+        except Exception as e:
+            logger.warning(f"self-sufficiency ledger update failed: {e}")
 
     def _update_strategy_breaker_state(self, record) -> None:
         """Maintain per-strategy consec-loss + daily-PnL counters and flip

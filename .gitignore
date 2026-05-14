@@ -72,6 +72,15 @@ models/*.onnx
 **/cycle_state.pkl
 *.cache
 
+# 2026-05-14: self-sufficiency ledger is per-deployment runtime state,
+# not source. Each operator's cumulative realised P&L stays local.
+data/self_sufficiency.json
+
+# 2026-05-14: ad-hoc prepare_dataset CLI logs accidentally landed in
+# data/. Build logs belong under logs/, but keep this rule so a stray
+# write here can never be committed.
+data/prepare_dataset_*.log
+
 # ── Logs (all subdirs and roots) ────────────────────────────────
 logs/**/*.log
 logs/**/*.csv

@@ -92,6 +92,11 @@ class XGBoostClassifier(BaseStrategy):
         # and the first 1-2 signals will be buffered as expected.
         self._stability_state: Dict[str, tuple] = {}
         self._feature_engine = FeatureEngine()
+        # 2026-05-14: live market context (nifty_trend, india_vix, ...).
+        # Trading agent sets this each cycle via `set_market_context()`
+        # so the model sees the same regime features the training pipeline
+        # injected. None = neutral defaults (legacy behaviour).
+        self._live_market_context: Optional[Dict[str, Any]] = None
         self._model = None
         # Health flags — set by _validate_model_contract(). When any of
         # these is non-empty the strategy is in "safe HOLD" mode and will
@@ -102,6 +107,15 @@ class XGBoostClassifier(BaseStrategy):
         self._stale_warned: bool = False
         self._load_model()
         self._validate_model_contract()
+
+    def set_market_context(self, ctx: Optional[Dict[str, Any]]) -> None:
+        """Cache the latest market regime so feature computation stays in
+        sync with what the training pipeline injected into the dataset.
+
+        Called by trading_agent on every refresh of `_market_context`.
+        Safe to call with None (resets to legacy / neutral behaviour).
+        """
+        self._live_market_context = ctx
 
     def _record_stability(self, symbol: str, side: str) -> int:
         """Update per-symbol direction-stability tracker; return current
@@ -219,7 +233,7 @@ class XGBoostClassifier(BaseStrategy):
         if not self.is_data_sufficient(data):
             return self._make_signal(Signal.HOLD, symbol, data, metadata={"reason": "insufficient_data"})
 
-        df = self._feature_engine.compute_all(data)
+        df = self._feature_engine.compute_all(data, self._live_market_context)
         feature_cols = self._feature_engine.get_ml_feature_columns()
 
         # Get the latest row of features

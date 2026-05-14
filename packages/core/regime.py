@@ -205,6 +205,54 @@ def classify_regime(market_context: Optional[Dict]) -> str:
     return "sideways"
 
 
+def classify_intraday_regime(market_context: Optional[Dict]) -> str:
+    """
+    Classify the *current* intraday market regime overlay.
+
+    The daily-scale `classify_regime()` is computed from Nifty's position
+    vs its 200-EMA and VIX, both slow-moving signals. A 2026-05-14 audit
+    surfaced the gap: the agent treated a full bear_high_vol session
+    identically even when intraday Nifty momentum had clearly flipped
+    relief-rally, leaving the SHORT book defenseless against squeeze
+    risk in the afternoon.
+
+    The intraday overlay reads two extra fields from `market_context`:
+
+    * ``nifty_intraday_pct`` -- Nifty 50 percentage change over the last
+      ~60 min. Positive = up move, negative = down move.
+    * ``vix_intraday_delta`` -- absolute VIX change vs morning opening
+      print. Positive = vol expanding (risk-off proxy).
+
+    Mapping (asymmetric on purpose -- panic moves trigger faster than rally
+    moves because the cost of being long during a flash crash dwarfs the
+    cost of missing some upside in a relief bounce):
+
+    * `risk_off`  : nifty_intraday_pct <= -0.5%   OR   vix_intraday_delta >= +1.5
+    * `risk_on`   : nifty_intraday_pct >=  0.5%   AND  vix_intraday_delta <= +0.5
+    * `neutral`   : everything else
+    * `unknown`   : missing fields (legacy/permissive)
+
+    Designed so callers can apply a *tightening* on top of `classify_regime`
+    without inverting it -- a daily `bull_low_vol` + intraday `risk_off`
+    means "cooled bull session, be careful with new longs", not "bear".
+    """
+    if not market_context:
+        return "unknown"
+    nifty_intraday = market_context.get("nifty_intraday_pct")
+    vix_delta = market_context.get("vix_intraday_delta")
+    if nifty_intraday is None and vix_delta is None:
+        return "unknown"
+
+    nifty_intraday = float(nifty_intraday or 0.0)
+    vix_delta = float(vix_delta or 0.0)
+
+    if nifty_intraday <= -0.5 or vix_delta >= 1.5:
+        return "risk_off"
+    if nifty_intraday >= 0.5 and vix_delta <= 0.5:
+        return "risk_on"
+    return "neutral"
+
+
 def regime_multiplier(
     strategy_name: str,
     regime: str,

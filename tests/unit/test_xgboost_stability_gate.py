@@ -127,6 +127,10 @@ class TestGateInGenerateSignal:
         clf._stability_state = {}
         clf._unhealthy_reason = None
         clf._stale_warned = False
+        # 2026-05-14: ML feature pipeline now accepts an optional market
+        # context (nifty_trend, india_vix). Mirror the production default
+        # of None so generate_signal() can call compute_all(df, ctx).
+        clf._live_market_context = None
         clf._model = object()  # truthy non-None, predict_proba mocked below
 
         # Force is_healthy() to True
@@ -138,8 +142,10 @@ class TestGateInGenerateSignal:
         # Replace _feature_engine.compute_all with a passthrough and
         # get_ml_feature_columns with a single fake column.
         class _FeatureStub:
-            def compute_all(self, df):
+            def compute_all(self, df, market_context=None):
                 # Add the column the gate looks for so the .iloc path works.
+                # 2026-05-14: signature now accepts optional market_context
+                # to match the production FeatureEngine.
                 d = df.copy()
                 if "atr" not in d.columns:
                     d["atr"] = 1.0

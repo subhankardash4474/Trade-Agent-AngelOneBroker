@@ -84,7 +84,11 @@ class EnsembleModel:
     def update_regime_weights(self, regime: str, weights: Dict[str, float]):
         """Store learned weights for a specific regime."""
         self._regime_learned_weights[regime] = {k: float(v) for k, v in weights.items()}
-        logger.debug(f"[ENSEMBLE] Regime weights for {regime}: {self._regime_learned_weights[regime]}")
+        # 2026-05-14: surfaced from DEBUG -> INFO. Per-regime weights are
+        # what the runtime actually uses for confidence; hiding them at
+        # DEBUG made it look like a strategy was suppressed (global=0)
+        # while it was in fact firing 100% of accepts (regime weight > 0).
+        logger.info(f"[ENSEMBLE] Regime weights for {regime}: {self._regime_learned_weights[regime]}")
 
     def set_runtime_threshold(self, new_threshold: float):
         """Dynamically adjust the confidence threshold within configured bounds."""

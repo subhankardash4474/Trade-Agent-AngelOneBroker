@@ -79,6 +79,9 @@ class TrailingStop:
         peak_arm_rr: float = 1.5,
         peak_giveback_pct: float = 35.0,
         peak_giveback_enabled: bool = True,
+        breakeven_arm_rr: float = 0.5,
+        breakeven_buffer_pct: float = 0.10,
+        breakeven_enabled: bool = True,
     ):
         self.entry_price = entry_price
         self.current_sl = initial_sl
@@ -97,6 +100,21 @@ class TrailingStop:
         self.peak_unrealized_r: float = 0.0
         self.peak_giveback_armed: bool = False
         self.last_unrealized_r: float = 0.0
+
+        # 2026-05-14 Breakeven-stop guard ---------------------------------
+        # Plugs the "MFE between 0.5R and trail_activation_rr (1.0R) where
+        # the position drifts back to a loss" hole. The classic trail only
+        # arms at 1.0R; below that, a position that ran +0.8R then reversed
+        # would lose the entire initial-SL distance. Breakeven moves the SL
+        # to entry-plus-buffer once MFE crosses `breakeven_arm_rr`, so the
+        # worst case once we've reached half-R favorable is a scratch trade
+        # (small win on the buffer or small loss on the buffer overshooting
+        # back through entry). The buffer is in percent of entry to cover
+        # round-trip charges (~6 bps) plus a small slippage cushion.
+        self.breakeven_arm_rr = breakeven_arm_rr
+        self.breakeven_buffer_pct = breakeven_buffer_pct
+        self.breakeven_enabled = breakeven_enabled
+        self.breakeven_armed: bool = False
 
     def _current_unrealized_r(self, current_price: float) -> float:
         if self._initial_risk <= 0:
@@ -117,14 +135,33 @@ class TrailingStop:
         if self.peak_unrealized_r >= self.peak_arm_rr:
             self.peak_giveback_armed = True
 
+        # Breakeven arm (2026-05-14) -- monotonic, never disarms.
+        if (
+            self.breakeven_enabled
+            and not self.breakeven_armed
+            and self.peak_unrealized_r >= self.breakeven_arm_rr
+        ):
+            self.breakeven_armed = True
+
         if self.side == "BUY":
             self.highest_since_entry = max(self.highest_since_entry, current_price)
+            # Breakeven first (lower bar than trail). Sets a floor at
+            # entry + buffer; cannot move BELOW the existing SL (so a real
+            # initial-SL stop-out still wins).
+            if self.breakeven_armed:
+                be_sl = self.entry_price * (1 + self.breakeven_buffer_pct / 100)
+                self.current_sl = max(self.current_sl, be_sl)
             if unrealized_r >= self.trail_activation_rr:
                 self.trailing_active = True
                 new_sl = self.highest_since_entry * (1 - self.trail_step_pct / 100)
                 self.current_sl = max(self.current_sl, new_sl)
         else:
             self.lowest_since_entry = min(self.lowest_since_entry, current_price)
+            if self.breakeven_armed:
+                # SHORT: breakeven SL sits BELOW entry by buffer (price has
+                # to rise above entry-buffer to stop us out).
+                be_sl = self.entry_price * (1 - self.breakeven_buffer_pct / 100)
+                self.current_sl = min(self.current_sl, be_sl)
             if unrealized_r >= self.trail_activation_rr:
                 self.trailing_active = True
                 new_sl = self.lowest_since_entry * (1 + self.trail_step_pct / 100)
@@ -208,6 +245,15 @@ class RiskManager:
         self.peak_arm_rr: float = risk_cfg.get("peak_giveback_arm_rr", 1.5)
         self.peak_giveback_pct: float = risk_cfg.get("peak_giveback_pct", 35.0)
         self.peak_giveback_enabled: bool = risk_cfg.get("peak_giveback_enabled", True)
+
+        # 2026-05-14 Breakeven-stop guard: lifts SL to entry+buffer once MFE
+        # crosses `breakeven_arm_rr`. Plugs the dead zone between 0.5R and
+        # 1.0R (trail_activation_rr) where a +0.8R MFE could still finish at
+        # the initial SL. Buffer is in % of entry to cover round-trip charges
+        # (~6 bps) plus a small slippage cushion. Set enabled=False to revert.
+        self.breakeven_arm_rr: float = risk_cfg.get("breakeven_arm_rr", 0.5)
+        self.breakeven_buffer_pct: float = risk_cfg.get("breakeven_buffer_pct", 0.10)
+        self.breakeven_enabled: bool = risk_cfg.get("breakeven_enabled", True)
 
         # Daily limits
         self.daily_loss_limit_pct: float = risk_cfg.get("daily_loss_limit_pct", 3.0)
@@ -688,6 +734,9 @@ class RiskManager:
     def create_trailing_stop(self, symbol: str, entry_price: float,
                               initial_sl: float, side: str = "BUY") -> TrailingStop:
         ts = TrailingStop(
+            breakeven_arm_rr=self.breakeven_arm_rr,
+            breakeven_buffer_pct=self.breakeven_buffer_pct,
+            breakeven_enabled=self.breakeven_enabled,
             entry_price=entry_price,
             initial_sl=initial_sl,
             side=side,

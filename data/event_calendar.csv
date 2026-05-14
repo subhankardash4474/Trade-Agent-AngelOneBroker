@@ -1,0 +1,15 @@
+symbol,event_date,event_type,notes
+# Populate with upcoming earnings/dividend/AGM dates. Format:
+#   symbol  : NSE trading symbol (case insensitive)
+#   event_date : YYYY-MM-DD (IST)
+#   event_type : results | dividend | agm | board_meeting | buyback | stock_split
+#   notes      : free text (e.g. Q4_FY26, ex-date)
+#
+# Lines starting with # are NOT skipped by csv.DictReader; the loader
+# silently drops rows where symbol/event_date/event_type are blank, so
+# comment-style lines are tolerated.
+#
+# Example:
+#   HDFCBANK,2026-05-15,results,Q4_FY26
+#   TCS,2026-05-22,results,
+#   RELIANCE,2026-05-20,dividend,ex-date

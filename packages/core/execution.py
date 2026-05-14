@@ -58,6 +58,15 @@ class ExecutionEngine:
 
         self._order_log: list[dict] = []
         self._pending_orders: dict[str, dict] = {}
+        # 2026-05-14 LIVE-MODE SAFETY -----------------------------------
+        # Track per-symbol broker-side SL-M order id + last trigger price.
+        # Without this, every close path leaves the entry-time SL-M as an
+        # orphan on the broker -- if LTP later touches that trigger, an
+        # unintended reverse position opens. We cancel on every close and
+        # propagate trail-SL updates via `modify_stop_loss`.
+        # Schema:
+        #     {symbol: {"order_id": str, "trigger": float, "side": "BUY"|"SELL"}}
+        self._sl_orders_by_symbol: dict[str, dict] = {}
 
     def place_order(
         self,
@@ -360,10 +369,21 @@ class ExecutionEngine:
                     self._persist_order(result)
                     logger.info(f"[LIVE] Order placed: {response}")
 
-                    # Place SL order after entry (opposite side)
+                    # Place SL order after entry (opposite side). Track its
+                    # id by symbol so we can cancel/modify it on close/trail.
                     if stop_loss is not None:
                         sl_side = "SELL" if tx_type == "BUY" else "BUY"
-                        self._place_sl_order(symbol, token, quantity, stop_loss, sl_side)
+                        sl_id = self._place_sl_order(
+                            symbol, token, quantity, stop_loss, sl_side
+                        )
+                        if sl_id:
+                            self._sl_orders_by_symbol[symbol] = {
+                                "order_id": sl_id,
+                                "trigger": float(stop_loss),
+                                "side": sl_side,
+                                "quantity": quantity,
+                                "token": token,
+                            }
 
                     return result
 
@@ -378,7 +398,13 @@ class ExecutionEngine:
 
     def _place_sl_order(self, symbol: str, token: str, quantity: int,
                         trigger_price: float, tx_type: str) -> Optional[str]:
-        """Place a stop-loss market order as protection."""
+        """Place a stop-loss market order as protection.
+
+        Returns the broker-assigned order id (str) on success, or None.
+        Caller is responsible for storing the returned id so subsequent
+        trail-SL updates can call `modify_stop_loss` and close paths can
+        call `cancel_sl_order_for_symbol`.
+        """
         if self._api is None:
             return None
         try:
@@ -396,11 +422,84 @@ class ExecutionEngine:
             }
             sl_order_id = self._api.placeOrder(params)
             if sl_order_id:
-                logger.info(f"SL order placed: {sl_order_id} @ trigger ₹{trigger_price:.2f}")
+                logger.info(f"SL order placed: {sl_order_id} @ trigger \u20B9{trigger_price:.2f}")
                 return sl_order_id
         except Exception as e:
             logger.error(f"SL order failed: {e}")
         return None
+
+    # ── 2026-05-14 LIVE-MODE SL TRACKING API ─────────────────────────
+
+    def get_sl_order_for_symbol(self, symbol: str) -> Optional[dict]:
+        """Return the {order_id, trigger, side, quantity, token} dict for
+        the active broker-side SL-M tied to ``symbol``, or None."""
+        return self._sl_orders_by_symbol.get(symbol)
+
+    def update_sl_trigger_for_symbol(self, symbol: str, new_trigger: float) -> bool:
+        """Modify the broker-side SL trigger so it matches the trail SL.
+
+        Without this, the trail SL only existed in the agent's memory --
+        a daemon crash mid-trail would leave the broker enforcing the
+        original (much wider) SL. Idempotent: if the new trigger equals
+        the cached trigger, we don't bother the broker.
+
+        Returns True on success / no-op, False on broker rejection.
+        """
+        meta = self._sl_orders_by_symbol.get(symbol)
+        if not meta:
+            return False
+        # Idempotency: skip if the trigger hasn't actually moved.
+        try:
+            if abs(float(new_trigger) - float(meta.get("trigger", 0.0))) < 1e-6:
+                return True
+        except (TypeError, ValueError):
+            pass
+        ok = self.modify_stop_loss(meta["order_id"], float(new_trigger))
+        if ok:
+            meta["trigger"] = float(new_trigger)
+            self._sl_orders_by_symbol[symbol] = meta
+        return ok
+
+    def cancel_sl_order_for_symbol(self, symbol: str) -> bool:
+        """Cancel the active broker-side SL-M for ``symbol`` and forget it.
+
+        Called on every close path (signal-exit, trailing, peak-giveback,
+        carryover-lock, square-off-all) so an in-process close cannot leave
+        an orphaned SL-M that fires later and opens an unintended reverse
+        position. Cheap no-op when no SL is tracked (paper mode, or symbol
+        was never placed live).
+
+        Returns True on success / no-op, False on broker rejection.
+        """
+        meta = self._sl_orders_by_symbol.pop(symbol, None)
+        if not meta:
+            return True   # nothing to cancel
+        order_id = meta.get("order_id")
+        if not order_id:
+            return True
+        try:
+            ok = self.cancel_order(order_id, variety="NORMAL")
+            if not ok:
+                # Re-track so a later retry has the id; without this, a
+                # transient broker hiccup would silently abandon an active
+                # standing order.
+                self._sl_orders_by_symbol[symbol] = meta
+                logger.error(
+                    f"[SL-CANCEL] Broker refused cancel for {symbol} "
+                    f"(order {order_id}); re-tracking. Manual intervention may be needed."
+                )
+            else:
+                logger.info(f"[SL-CANCEL] {symbol} broker SL {order_id} cancelled")
+            return ok
+        except Exception as e:
+            self._sl_orders_by_symbol[symbol] = meta
+            logger.error(f"[SL-CANCEL] {symbol} failed: {e}")
+            return False
+
+    def list_tracked_sl_orders(self) -> dict:
+        """Defensive introspection. Used by the heartbeat / health check
+        to flag any SL we believe is active on the broker."""
+        return dict(self._sl_orders_by_symbol)
 
     def get_order_status(self, order_id: str) -> Optional[dict]:
         if self.mode == "paper":

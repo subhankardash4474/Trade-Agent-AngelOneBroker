@@ -52,7 +52,17 @@ scanner:
   premarket_warmup_minutes: 5
 
 data_pipeline:
-  use_websocket: false  # true to enable live tick streaming
+  # 2026-05-14: WebSocket plumbing fully wired -- ticks now drive
+  # `_check_position_exits` so SL/TP/peak-giveback fire on the broker's
+  # tick cadence (~500ms) instead of the 15s REST poll. Default still
+  # false until the cloud VM has demonstrated a stable WS session over
+  # at least one full trading day. To enable:
+  #   1. Confirm AngelOne credentials are funded (live mode only).
+  #   2. Set use_websocket: true.
+  #   3. (Recommended) keep ws_held_only: true so the agent only
+  #      subscribes to symbols it actually holds.
+  use_websocket: false
+  ws_held_only: true              # subscribe ONLY to currently-held symbols
   tick_intervals:
     - 1min
     - 5min
@@ -269,9 +279,25 @@ risk:
   # via signal-flip — a 74% giveback the price-trail never caught. With
   # these defaults the exit would have fired around 35% giveback,
   # locking in ~+Rs 180. Set peak_giveback_enabled: false to disable.
+  # 2026-05-14: lowered peak_giveback_arm_rr 1.5 -> 1.0. Was leaving a dead
+  # zone between 1.0R (trail activates) and 1.5R (peak-giveback armed) where
+  # a position drifting from +1.3R back to flat would only be caught by the
+  # 0.3% trail — too tight to survive a normal pullback. Now the giveback
+  # arms the moment trail activates so any 35% retracement from peak fires.
   peak_giveback_enabled: true
-  peak_giveback_arm_rr: 1.5      # only arm after position is up 1.5R
+  peak_giveback_arm_rr: 1.0      # arm at 1R (was 1.5; closes 1.0-1.5R dead zone)
   peak_giveback_pct: 35.0        # exit after 35% of peak R given back
+
+  # 2026-05-14 Breakeven-stop guard. Plugs the *other* MFE hole: a position
+  # that runs to +0.7R then reverses to a full -1R loss never hit the trail
+  # (which arms at +1R) so gave back 1.7R round-trip on what was briefly a
+  # winner. Once MFE >= breakeven_arm_rr, the SL is lifted to
+  # entry +/- breakeven_buffer_pct (covers ~6 bps round-trip charges + a
+  # slippage cushion). Worst case after half-R favorable becomes a scratch.
+  # Set breakeven_enabled: false to disable.
+  breakeven_enabled: true
+  breakeven_arm_rr: 0.5
+  breakeven_buffer_pct: 0.10     # 0.10% of entry covers MIS round-trip charges
 
   # Per-strategy circuit breaker — suspends ONE strategy for the day
   # after a bad run, while leaving the other strategies free to trade.
@@ -290,6 +316,32 @@ risk:
   # capacity for higher-conviction periods now that we can hold 12 concurrent.
   max_opens_per_window: 6
   opens_window_minutes: 5
+
+  # 2026-05-14 STRATEGY-CONCURRENCY CAP. Live evidence (this morning):
+  # 8 SHORT signals fired in 37 minutes, ALL `supertrend_follow`,
+  # ALL in `bear_high_vol` regime. 4 stopped out for -Rs 730 in 40 min.
+  # The per-strategy circuit-breaker only fires AFTER N losses -- but
+  # the entries had already happened, so the circuit didn't help.
+  # This cap blocks NEW entries once a single strategy already holds N
+  # concurrent positions. Recommendation: ~half of max_open_positions
+  # so we always carry meaningful diversification across strategies.
+  # 0 = disabled.
+  max_positions_per_strategy: 4
+
+  # 2026-05-14 SELF-SUFFICIENCY TRACKER. Account-owner stated goal:
+  # "passive income that covers running costs". Persists cumulative
+  # realised P&L since deployment to data/self_sufficiency.json
+  # (atomic write) and surfaces a GREEN/YELLOW/RED state on every
+  # audit checkpoint. Default cost stack is Angel One SmartAPI (FREE)
+  # + Cursor Pro + OCI free-tier + small power/internet allocation.
+  # If the operator does NOT pay Cursor out of trading P&L, drop the
+  # monthly figure to ~Rs 800.
+  self_sufficiency:
+    enabled: true
+    monthly_fixed_cost_inr: 2500   # Angel SmartAPI = Rs 0; Cursor + misc
+    trading_days_per_month: 20
+    ledger_path: "data/self_sufficiency.json"
+    red_floor_inr: 5000            # cumulative loss threshold for RED
 
   # Daily limits
   daily_loss_limit_pct: 3.0      # max 3% daily loss
@@ -429,6 +481,13 @@ risk:
   # Set to 0.0 to disable.
   min_holding_pnl_rs: 15.0
 
+  # 2026-05-14: scale the min_holding_pnl_rs floor by position notional. The
+  # absolute floor (Rs 15) is right-sized for the Rs 5k min_trade_notional but
+  # under-protects a Rs 30k position whose round-trip MIS charges are ~Rs 31.
+  # Runtime floor = max(min_holding_pnl_rs, charges_multiple * actual_round_trip).
+  # Set to 0 to revert to the flat absolute floor.
+  min_holding_charges_multiple: 1.5
+
   # Rejection cooldown (2026-05-04). Persistent gates (notional floor, safety
   # gate, sector concentration, ATR gate, etc.) almost always re-reject the
   # same (symbol, direction) every cycle until market conditions move enough
@@ -452,6 +511,31 @@ risk:
   # unrelated mid-caps (UNIONBANK, TTML, SUZLON etc.).
   unknown_sector_per_symbol: true
 
+  # 2026-05-14 Supersector roll-up. Collapse Banks + NBFC + Insurance + AMC
+  # + FinTech into a single "Financials" bucket so the 40% sector cap
+  # actually catches a multi-financial-ticker concentration. Live evidence:
+  # 2026-05-14 SHORT book held CENTRALBK + FEDERALBNK + TATACAP + CHOLAFIN
+  # = 4 of 6 positions in financials, slipping past the per-sector cap
+  # because each sub-bucket was independently below 40%. Set false to
+  # revert to the legacy fine-grained behaviour.
+  use_supersectors: true
+
+  # 2026-05-14 Event blackout calendar. Skip new entries on stocks within N
+  # trading days of a known catalyst -- earnings/dividend ex-date/AGM/board
+  # meeting/buyback. Empty file = no-op (permissive). Operator populates
+  # data/event_calendar.csv with rows like:
+  #   HDFCBANK,2026-05-15,results,Q4_FY26
+  # Common types: results | dividend | agm | board_meeting | buyback | stock_split
+  # Set enabled: false to bypass entirely.
+  event_blackout:
+    enabled: true
+    calendar_path: "data/event_calendar.csv"
+    days_before: 1                  # block entries the day before & day-of
+    days_after: 0                   # 0 = trade as normal post-event
+    # event_types: omit (None) = honour all types in the file. Set to a list
+    # like [results, buyback] to scope tighter (e.g. ignore minor dividends).
+    # event_types: [results, buyback]
+
   # Circuit-limit guard — reject entries into stocks already moved too far intraday.
   # NSE bands are typically 5/10/20%; near the band risk is asymmetric (freeze risk).
   circuit_proximity_pct: 8.0         # reject if day-move >= 8% vs previous close
@@ -462,6 +546,10 @@ robustness:
   max_losses_per_stock_per_day: 2  # blacklist a stock after 2 losses in a day
   late_entry_cutoff: "14:30"       # no new positions after 2:30 PM (need time for SL/TP to work)
   heartbeat_interval_cycles: 10    # log a health summary every 10 cycles
+  # 2026-05-14: cycle-count alone gave ~40-min cadence once a single cycle
+  # ballooned to 4 min (200-stock LTP scan), which made cloud liveness checks
+  # brittle. Wall-clock gate fires whichever comes first. 0 = disabled.
+  heartbeat_interval_seconds: 300
   eod_summary_time: "15:20"        # auto-send daily P&L report at this time
   max_cycle_errors: 5              # halt agent after 5 consecutive cycle errors
 
@@ -556,6 +644,15 @@ execution:
   long_entry_regimes:
     - bull_low_vol
     - bull_high_vol
+
+  # 2026-05-14 Intraday-regime overlay block. The daily long_entry_regimes
+  # gate above only sees the slow-moving regime (Nifty 200-EMA + VIX).
+  # When true (default), an intraday "risk_off" reading -- Nifty -0.5% in
+  # the last 60 min OR a VIX spike of +1.5 -- blocks new BUY entries even
+  # in a bullish daily regime. Catches flash-crash / mid-session reversal
+  # situations. Set false to disable the overlay's block (it remains
+  # logged regardless).
+  intraday_regime_block_longs: true
 
 # ── Operational controls (2026-05-06) ─────────────────────────────
 # These are meta-settings that govern how the agent behaves outside

@@ -415,6 +415,34 @@ def _section_risk_state(lines: List[str], since: datetime, until: datetime) -> D
     }
 
 
+def _section_self_sufficiency() -> Dict[str, Any]:
+    """2026-05-14: Surface the cumulative-realised vs running-cost ledger.
+
+    Reads the SAME ledger the trading agent writes to on every close, so
+    the audit response is exactly what the daemon currently believes.
+    Loads from the default config path; failures degrade silently.
+    """
+    try:
+        # Local import to avoid pulling the agent's heavy module graph
+        # into a tools-only run (pytest, manual smoke).
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "packages"))
+        from core.self_sufficiency import SelfSufficiencyTracker  # type: ignore
+        # Try to read the operator's config; fall back to defaults.
+        cfg: Dict[str, Any] = {}
+        try:
+            import yaml  # type: ignore
+            cfg_path = Path(__file__).resolve().parent.parent / "config.yaml"
+            if cfg_path.exists():
+                with cfg_path.open("r", encoding="utf-8") as f:
+                    cfg = yaml.safe_load(f) or {}
+        except Exception:
+            cfg = {}
+        tracker = SelfSufficiencyTracker.from_config(cfg)
+        return tracker.to_dict()
+    except Exception as e:
+        return {"enabled": False, "error": f"{type(e).__name__}: {e}"}
+
+
 # ── Markdown rendering ───────────────────────────────────────────────────
 
 def _render_markdown(now: datetime, data: Dict[str, Any], delta: Optional[Dict[str, Any]]) -> str:
@@ -589,6 +617,31 @@ def _render_markdown(now: datetime, data: Dict[str, Any], delta: Optional[Dict[s
             parts.append(f"- Blacklisted: {risk['blacklisted']}")
     parts.append("")
 
+    # 2026-05-14: Self-sufficiency status (cumulative realised vs running
+    # cost). Surfaces whether the agent has paid for itself yet.
+    ss = data.get("self_sufficiency", {})
+    if ss and ss.get("enabled") is True:
+        parts.append("## Self-sufficiency")
+        parts.append(
+            f"- State: **{ss.get('state', '?')}** · {ss.get('note', '')}"
+        )
+        parts.append(
+            f"- Cumulative realised since deployment "
+            f"(day {ss.get('days_since_deployment', 0)}): "
+            f"₹{ss.get('cumulative_realised_inr', 0):+.2f}"
+        )
+        parts.append(
+            f"- Cost burn-to-date: ₹{ss.get('cost_burned_to_date_inr', 0):.2f} "
+            f"(₹{ss.get('daily_breakeven_inr', 0):.2f}/trading-day, "
+            f"₹{ss.get('monthly_fixed_cost_inr', 0):.2f}/month)"
+        )
+        parts.append(f"- Coverage: {ss.get('coverage_pct', 0):.0f}%")
+        parts.append("")
+    elif ss and ss.get("error"):
+        parts.append("## Self-sufficiency")
+        parts.append(f"- (tracker error: {ss.get('error')})")
+        parts.append("")
+
     # Delta vs previous
     if delta:
         parts.append("## Delta vs previous checkpoint")
@@ -682,6 +735,7 @@ def run_and_save(
         ("signal_pipeline", lambda: _section_signal_pipeline(lines, since, now)),
         ("xgb", lambda: _section_xgb_firing(lines, since, now)),
         ("risk_state", lambda: _section_risk_state(lines, since, now)),
+        ("self_sufficiency", _section_self_sufficiency),
     )
     for key, fn in safe_calls:
         try:

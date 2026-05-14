@@ -273,6 +273,31 @@ class FeatureEngine:
         total_range = (high - low).replace(0, np.nan)
         df["body_pct"] = (close - opn).abs() / total_range
 
+        # 2026-05-14 ML uplift features ---------------------------------
+        # These are computed from columns the prior pipeline already
+        # populated (atr, supertrend, vwap, obv, rsi). Each is a thin
+        # transform that gives the XGBoost a *normalised* read on a
+        # signal whose raw value varies wildly by stock price level.
+        if "supertrend" in df.columns and "atr" in df.columns:
+            atr_safe = df["atr"].replace(0, np.nan)
+            df["dist_from_supertrend_atr"] = (close - df["supertrend"]) / atr_safe
+        if "vwap" in df.columns:
+            vwap_safe = df["vwap"].replace(0, np.nan)
+            df["vwap_dist_pct"] = (close - df["vwap"]) / vwap_safe * 100
+        if "atr" in df.columns:
+            tr = pd.concat([
+                high - low,
+                (high - close.shift()).abs(),
+                (low - close.shift()).abs(),
+            ], axis=1).max(axis=1)
+            avg_tr20 = tr.rolling(20).mean().replace(0, np.nan)
+            df["range_expansion"] = tr / avg_tr20
+        if "rsi" in df.columns:
+            df["rsi_delta_3"] = df["rsi"].diff(3)
+        if "obv" in df.columns:
+            obv_ma20 = df["obv"].rolling(20).mean().replace(0, np.nan)
+            df["obv_ratio"] = df["obv"] / obv_ma20
+
         # Time-of-day / day-of-week features (2026-05-06).
         # Markets behave differently at open (high vol/vol), midday (calm),
         # close (high vol/vol). Same with day-of-week (Mon/Fri patterns).
@@ -332,6 +357,11 @@ class FeatureEngine:
             "pivot", "support_1", "resistance_1",
             # Derived
             "dist_from_high_pct", "dist_from_low_pct", "gap_pct", "body_pct",
+            # 2026-05-14: new derived features for ML feature pack.
+            # Must stay registered here so get_ml_feature_columns()
+            # is a true subset of get_feature_columns().
+            "dist_from_supertrend_atr", "vwap_dist_pct",
+            "range_expansion", "rsi_delta_3", "obv_ratio",
             # Time-of-day cyclical encoding
             "tod_sin", "tod_cos", "dow_sin", "dow_cos",
             # Market context
@@ -339,16 +369,36 @@ class FeatureEngine:
         ]
 
     def get_ml_feature_columns(self) -> list[str]:
-        """Subset of features suitable for ML model input (all numeric, no NaN-heavy)."""
+        """Subset of features suitable for ML model input (all numeric, no NaN-heavy).
+
+        2026-05-14: expanded from 23 to 31 features to address the
+        "model is regime-blind" finding. New additions:
+          * ema_50 -- long-term trend context (was computed but unused)
+          * dist_from_supertrend_atr -- normalised distance from ST line
+          * vwap_dist_pct -- intraday institutional reference offset
+          * range_expansion -- bar TR vs 20-bar avg TR (vol regime)
+          * rsi_delta_3 -- 3-bar RSI velocity (momentum acceleration)
+          * obv_ratio -- accumulation vs 20-bar avg OBV (smart money)
+          * nifty_trend, india_vix -- daily market context (regime)
+        """
         return [
-            "ema_9", "ema_21", "macd", "macd_histogram", "adx",
+            # Trend
+            "ema_9", "ema_21", "ema_50", "macd", "macd_histogram", "adx",
+            # Momentum
             "rsi", "stoch_k", "williams_r", "roc",
+            "rsi_delta_3",
+            # Volatility / band position
             "atr", "bb_width", "bb_pct",
-            "vwap", "volume_ratio",
+            "range_expansion",
+            # Volume / accumulation
+            "vwap", "volume_ratio", "obv_ratio",
+            # Distance / position features
             "dist_from_high_pct", "dist_from_low_pct", "gap_pct", "body_pct",
+            "dist_from_supertrend_atr", "vwap_dist_pct",
+            # Trend regime (categorical -> int)
             "supertrend_direction",
-            # Time-of-day features added 2026-05-06 — markets behave very
-            # differently in open/midday/close windows and across weekdays.
-            # Cyclical sin/cos pairs avoid discontinuities at the boundary.
+            # Time-of-day cyclical pairs
             "tod_sin", "tod_cos", "dow_sin", "dow_cos",
+            # Market context (filled by training pipeline + live agent)
+            "nifty_trend", "india_vix",
         ]
