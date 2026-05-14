@@ -1,0 +1,71 @@
+# ----------------------------------------------------------------------
+# Stage 3 - controlled live basket (see docs/e2e_broker_test_plan.md)
+# ----------------------------------------------------------------------
+#
+# Applied to the base config via:
+#   python run_daemon.py --config config.yaml \
+#                        --config-overlay config_overlays/stage3.yaml \
+#                        --live --max-loss-rs 500 --single-shot
+#
+# Scope:
+#   - 5 large-cap, high-liquidity NSE symbols
+#   - Rs 5,000 total capital, Rs 1,000 per name
+#   - Single 3-hour session: 09:30 - 12:30 IST (set on the wrapper, NOT here)
+#   - Hard rupee floor: -Rs 500 realised (via --max-loss-rs)
+#   - One round-trip per symbol per day (via --single-shot)
+#
+# DO NOT add secrets or broker creds here -- the secrets module already
+# overlays env vars on top of this file.
+# ----------------------------------------------------------------------
+
+market:
+  # Force a 5-name basket. The scanner block below disables auto-discovery
+  # so this list is the universe.
+  instruments:
+    - RELIANCE
+    - HDFCBANK
+    - INFY
+    - TCS
+    - ICICIBANK
+  # Stage 3 hard session: 09:30 - 12:30 IST. Outside this window
+  # ``is_market_window()`` returns False and the wrapper goes to
+  # ``sleep_until_market``, so the daemon will not even attempt to
+  # place orders at 12:30:01. Acts as a wall-clock kill switch.
+  trading_hours:
+    start: "09:30"
+    end: "12:30"
+    pre_open: "09:15"
+
+scanner:
+  # Auto-scanner OFF for Stage 3 -- a controlled basket means a fixed
+  # universe. If this stays "true", the scanner will dilute capital across
+  # 200 random names and the rupee caps below become meaningless.
+  enabled: false
+  # Belt-and-suspenders: even if something flips ``enabled`` back to true,
+  # restrict the universe to the basket so a rogue scan can't add names.
+  universe:
+    - RELIANCE
+    - HDFCBANK
+    - INFY
+    - TCS
+    - ICICIBANK
+
+capital:
+  # Stage 3 cap. Note: real broker cash must be >= this. Pre-flight script
+  # asserts ``smart_api.rmsLimit().net >= initial_balance``.
+  initial_balance: 5000.0
+
+risk:
+  max_open_positions: 5            # one slot per basket name
+  max_trades_per_day: 5            # belt: blocks accidental flurries
+  # Stage 3 sees per-trade SL/TP from the strategy. The percentage
+  # daily-loss limit on Rs 5k is too lax (4% = Rs 200, but a single
+  # bad trade can do worse) -- ``--max-loss-rs 500`` is the operative
+  # floor. We still leave the pct gate in place as a soft backstop.
+  daily_loss_limit_pct: 10.0       # Rs 500 / Rs 5000 = 10%
+
+execution:
+  # Stage 3 places real orders. ``shadow_mode`` MUST be false; if you want
+  # a dry-run, drop ``--live`` from the CLI instead. Setting it explicitly
+  # so an accidental config edit doesn't leave us in shadow on go-live day.
+  shadow_mode: false

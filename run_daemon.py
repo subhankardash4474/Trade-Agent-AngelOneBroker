@@ -186,16 +186,65 @@ def sleep_until_market(config_path: str):
         _write_idle_heartbeat(config_path)
 
 
+def _deep_merge(base: dict, overlay: dict) -> dict:
+    """Recursively merge ``overlay`` into ``base``. Lists & scalars in
+    ``overlay`` replace whatever is in ``base`` (so ``market.instruments``
+    in an overlay file fully replaces, not concatenates). Dicts merge
+    key-by-key. Returns a *fully detached* result -- mutating the merged
+    dict (e.g. ``cfg["broker"]["mode"] = "live"`` downstream) does NOT
+    leak back into ``base`` or ``overlay``.
+    """
+    import copy
+    out = copy.deepcopy(base) if isinstance(base, dict) else {}
+    for k, v in (overlay or {}).items():
+        if isinstance(v, dict) and isinstance(out.get(k), dict):
+            out[k] = _deep_merge(out[k], v)
+        else:
+            out[k] = copy.deepcopy(v)
+    return out
+
+
 def run_once(config_path: str, paper: bool, interval: int, dashboard: bool,
              reset_balance: bool = False,
              max_loss_rs: float | None = None,
-             single_shot: bool = False):
-    """Single run of the trading agent. Returns when agent exits or crashes."""
+             single_shot: bool = False,
+             live: bool = False,
+             config_overlay: str | None = None):
+    """Single run of the trading agent. Returns when agent exits or crashes.
+
+    ``paper`` and ``live`` are mutually exclusive runtime overrides on top
+    of whatever ``broker.mode`` says in the YAML. Resolution order:
+      1. ``--paper`` -> force "paper" (even if config says live)
+      2. ``--live``  -> force "live"  (even if config says paper)
+      3. Neither    -> use the YAML value as-is
+
+    ``config_overlay`` is an optional second YAML file whose keys are
+    deep-merged over the base config. Used for Stage 3 / scenario
+    presets without forking ``config.yaml``.
+    """
     with open(config_path, "r") as f:
         config = yaml.safe_load(f)
 
+    if config_overlay:
+        with open(config_overlay, "r") as f:
+            overlay = yaml.safe_load(f) or {}
+        config = _deep_merge(config, overlay)
+        logger.warning(
+            f"[OVERLAY] applied {config_overlay} -- {len(overlay)} top-level "
+            f"section(s) merged"
+        )
+
     if paper:
         config["broker"]["mode"] = "paper"
+    elif live:
+        # Loud log line so a tail of the daemon stdout makes it obvious
+        # this run is touching real money. We do NOT short-circuit on a
+        # missing API key here -- ``connect_angelone`` will fail-fast
+        # with the actual reason. Better one error message than two.
+        logger.warning("=" * 60)
+        logger.warning("[E2E] --live: broker.mode -> 'live' (REAL MONEY)")
+        logger.warning("=" * 60)
+        config["broker"]["mode"] = "live"
 
     smart_api = None
     if config.get("broker", {}).get("mode") != "paper":
@@ -204,12 +253,18 @@ def run_once(config_path: str, paper: bool, interval: int, dashboard: bool,
 
     from trading_agent import TradingAgent
 
+    # When an overlay / mode-flag was applied, we pass the *merged* dict in
+    # via the new ``config`` kwarg so TradingAgent doesn't re-parse the raw
+    # YAML and silently drop our deltas. ``config_path`` is still passed so
+    # downstream code that wants the on-disk location (logs, post-mortem,
+    # etc.) keeps working.
     agent = TradingAgent(
         config_path=config_path,
         smart_api=smart_api,
         reset_balance=reset_balance,
         max_loss_rs=max_loss_rs,
         single_shot=single_shot,
+        config=config,
     )
 
     if dashboard:
@@ -255,7 +310,37 @@ def main():
              "at 2 (one entry, one exit). Existing position management is "
              "unaffected.",
     )
+    parser.add_argument(
+        "--config-overlay", default=None, metavar="PATH",
+        help="Optional second YAML file whose keys deep-merge over the "
+             "base ``--config``. Used for Stage 3 / scenario presets "
+             "(e.g. ``--config-overlay config_overlays/stage3.yaml``). "
+             "Lists & scalars in the overlay REPLACE whatever is in the "
+             "base; dicts merge key-by-key.",
+    )
+    parser.add_argument(
+        "--live", action="store_true",
+        help="Stage 3 cutover: force broker.mode = 'live' at runtime, "
+             "overriding whatever is in config.yaml. Required to place real "
+             "orders on AngelOne. Mutually exclusive with --paper -- if both "
+             "are set, --paper wins (defensive: a CLI typo should never "
+             "accidentally place real orders). This flag exists so the same "
+             "config file can be reused across paper / shadow / live runs "
+             "without git-flipping ``broker.mode`` in source control (which "
+             "is the kind of edit that gets forgotten on the way back to "
+             "paper).",
+    )
     args = parser.parse_args()
+
+    # Defensive: --paper always wins over --live. If someone types both
+    # on the CLI we treat it as paper. Better to lose a live session to a
+    # typo than to lose real money to one.
+    if args.paper and args.live:
+        logger.warning(
+            "Both --paper AND --live were passed. --paper wins (defensive). "
+            "If you intended live, remove --paper and rerun."
+        )
+        args.live = False
 
     signal.signal(signal.SIGINT, _signal_handler)
     signal.signal(signal.SIGTERM, _signal_handler)
@@ -270,16 +355,36 @@ def main():
     crash_count = 0
     backoff = 2
 
+    # Mode line resolution:
+    #   --paper          -> PAPER
+    #   --live           -> LIVE (real money)
+    #   neither          -> "config" (whatever the YAML says; logged
+    #                       explicitly so the operator never has to grep
+    #                       config.yaml to find out)
+    if args.paper:
+        mode_label = "PAPER (--paper)"
+    elif args.live:
+        mode_label = "LIVE (--live, REAL MONEY)"
+    else:
+        try:
+            with open(args.config, "r") as _f:
+                _cfg = yaml.safe_load(_f) or {}
+            mode_label = f"{(_cfg.get('broker') or {}).get('mode', 'unknown').upper()} (from config)"
+        except Exception:
+            mode_label = "unknown (config read failed)"
+
     logger.info("=" * 60)
     logger.info("TRADING AGENT DAEMON STARTED")
     logger.info(f"  Config: {args.config}")
-    logger.info(f"  Mode: {'PAPER' if args.paper else 'LIVE'}")
+    logger.info(f"  Mode: {mode_label}")
     logger.info(f"  Poll: {args.interval}s")
     logger.info(f"  Market hours only: {args.market_hours_only}")
     if args.max_loss_rs is not None:
         logger.warning(f"  [E2E] --max-loss-rs: Rs {args.max_loss_rs:,.2f} (hard rupee floor)")
     if args.single_shot:
         logger.warning("  [E2E] --single-shot: one round-trip per symbol per day")
+    if args.live:
+        logger.warning("  [E2E] --live: real-money orders -- pre-flight checks MUST be green")
     logger.info("=" * 60)
 
     while not _shutdown_requested:
@@ -299,7 +404,9 @@ def main():
             run_once(args.config, args.paper, args.interval, args.dashboard,
                      reset_balance=reset_flag,
                      max_loss_rs=args.max_loss_rs,
-                     single_shot=args.single_shot)
+                     single_shot=args.single_shot,
+                     live=args.live,
+                     config_overlay=args.config_overlay)
             logger.info("Agent exited cleanly")
             # 2026-05-13: do NOT just `break` here.
             #

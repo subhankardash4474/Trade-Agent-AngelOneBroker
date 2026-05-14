@@ -98,7 +98,8 @@ class TradingAgent:
     def __init__(self, config_path: str = "config.yaml", smart_api=None,
                  reset_balance: bool = False,
                  max_loss_rs: Optional[float] = None,
-                 single_shot: bool = False):
+                 single_shot: bool = False,
+                 config: Optional[dict] = None):
         """
         Optional kwargs (driven by run_daemon.py CLI flags):
             max_loss_rs: hard rupee floor on daily realised P&L (Stage 3 safety
@@ -109,8 +110,21 @@ class TradingAgent:
                 for Stage 3 live basket runs to bound the maximum number of
                 fills per symbol. Existing position management (SL/TP/trailing)
                 is unaffected.
+            config: pre-loaded config dict. When supplied (by ``run_daemon`` after
+                applying ``--config-overlay`` / ``--live`` overrides) we skip the
+                disk read so the deltas don't get silently dropped on re-parse.
+                The env-var overlay (``apply_env_to_config``) still runs so
+                credentials in ``.env`` continue to win over YAML placeholders.
+                If None, we fall back to the legacy path: load ``config_path``
+                from disk. Backwards-compatible.
         """
-        self.config = self._load_config(config_path)
+        if config is not None:
+            # Pre-loaded config (e.g. overlay-merged from run_daemon). Still
+            # apply env-var overrides so .env secrets continue to win.
+            load_dotenv()
+            self.config = apply_env_to_config(dict(config))
+        else:
+            self.config = self._load_config(config_path)
         self._setup_logging()
 
         # E2E / Stage 3 safety knobs. Stored before risk_manager build so

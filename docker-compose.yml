@@ -51,6 +51,11 @@ services:
       - ./models:/app/models:ro
       # Config is host-managed so edits don't require a rebuild
       - ./config.yaml:/app/config.yaml:ro
+      # Stage 3 / scenario overlays (small YAML files deep-merged on top of
+      # config.yaml via ``run_daemon.py --config-overlay``). Mounted in the
+      # base compose so the same image works for paper, shadow, and stage3
+      # runs without rebuilding.
+      - ./config_overlays:/app/config_overlays:ro
 
     healthcheck:
       test: ["CMD", "python", "/app/tools/health_check.py",

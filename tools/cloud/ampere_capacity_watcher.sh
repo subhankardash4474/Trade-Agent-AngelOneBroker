@@ -183,6 +183,19 @@ while [[ $(date +%s) -lt $deadline_ts ]]; do
         continue
     fi
 
+    # OCI sometimes returns HTTP 429 (TooManyRequests) when we've been
+    # polling too aggressively. This is TRANSIENT -- back off hard
+    # (30 min) and retry. Pre-2026-05-14 this was classified as a
+    # permanent config error and the watcher would bail; in practice
+    # that's what killed the first watcher run (35 attempts in 6.5h
+    # tripped the rate limiter at 14:42 UTC).
+    if echo "$launch_output" | grep -qiE "TooManyRequests|\"status\": *429|too many requests"; then
+        backoff_min=$((INTERVAL_MIN * 3))
+        log "rate-limited by OCI (429) -- backing off ${backoff_min}m"
+        sleep $((backoff_min * 60))
+        continue
+    fi
+
     log "ABORT: non-capacity error on attempt #${attempt}"
     log "--- launch_output ---"
     log "$launch_output"

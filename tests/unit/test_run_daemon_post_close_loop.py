@@ -57,6 +57,10 @@ class _FakeArgs:
         self.reset_balance = False
         self.max_loss_rs = None
         self.single_shot = False
+        # Added 2026-05-14 for Stage 3 prep -- run_daemon.main() now reads
+        # these fields. Default to paper-equivalent (no overlay, not live).
+        self.live = False
+        self.config_overlay = None
 
 
 def _run_main_one_pass(args, run_once_side_effect, is_market_window_seq,

@@ -1,0 +1,37 @@
+# =============================================================================
+# Stage 3 -- controlled 5-stock live basket (see docs/e2e_broker_test_plan.md)
+# =============================================================================
+# Override that swaps the daemon command for the Stage 3 launch flags. Run as:
+#
+#     docker compose -f docker-compose.yml -f docker-compose.stage3.yml \
+#                    up -d trader
+#
+# Notes:
+#   - This file ONLY contains the diff vs the base compose. Volumes, env_file,
+#     image, healthcheck, etc. all inherit from docker-compose.yml.
+#   - ``restart: "no"`` overrides the base ``unless-stopped``. Stage 3 is a
+#     deliberate, attended single-session run -- if it crashes we want to
+#     STOP and post-mortem, not silently restart.
+#   - ``--live`` flips broker.mode to "live". ``--config-overlay`` merges
+#     the Stage 3 deltas (5-name basket, Rs 5k cap, 09:30-12:30 window) over
+#     the base config. ``--max-loss-rs 500`` is the hard rupee floor.
+#     ``--single-shot`` caps fills at one round-trip per symbol per day.
+# =============================================================================
+
+services:
+  trader:
+    container_name: trader-stage3
+    restart: "no"
+    command:
+      - "python"
+      - "run_daemon.py"
+      - "--config"
+      - "config.yaml"
+      - "--config-overlay"
+      - "config_overlays/stage3.yaml"
+      - "--live"
+      - "--max-loss-rs"
+      - "500"
+      - "--single-shot"
+      - "--interval"
+      - "30"
