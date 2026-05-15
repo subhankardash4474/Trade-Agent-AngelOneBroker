@@ -70,7 +70,11 @@ param(
     [switch]$DryRun
 )
 
-$ErrorActionPreference = "Stop"
+# Note: deliberately NOT using ErrorActionPreference="Stop". PowerShell 5.1
+# treats native-command stderr (e.g. `git fetch`'s progress output) as
+# errors under Stop, which would abort the script on benign messages. We
+# check $LASTEXITCODE explicitly after each native command instead.
+$ErrorActionPreference = "Continue"
 
 function Write-Section {
     param([string]$Text)
@@ -102,17 +106,23 @@ if (-not (Test-Path -LiteralPath $SshKey)) {
 if (-not $SkipLocalChecks) {
     Write-Host ""
     Write-Host "[local] checking working tree..." -ForegroundColor Yellow
-    git diff-index --quiet HEAD --
+    & git diff-index --quiet HEAD --
     if ($LASTEXITCODE -ne 0) {
         Write-Host "[FAIL] local working tree is dirty -- commit or stash before deploying" -ForegroundColor Red
-        git status --short
+        & git status --short
         exit 2
     }
     Write-Host "[local] working tree is clean."
 
     Write-Host ""
     Write-Host "[local] fetching origin/$Branch ..." -ForegroundColor Yellow
-    & git fetch origin $Branch 2>&1 | ForEach-Object { "    $_" }
+    # git writes progress to stderr -- redirect to stdout via cmd.exe so
+    # PowerShell doesn't tag it as an error record.
+    & cmd.exe /c "git fetch origin $Branch 2>&1" | ForEach-Object { "    $_" }
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "[FAIL] git fetch failed (exit $LASTEXITCODE)" -ForegroundColor Red
+        exit 5
+    }
 
     $localHead = (& git rev-parse HEAD).Trim()
     $remoteHead = (& git rev-parse "origin/$Branch").Trim()
@@ -185,20 +195,50 @@ if ($DryRun) {
 # ──────────────────────────────────────────────────────────────────────
 # Execute the remote sequence
 # ──────────────────────────────────────────────────────────────────────
+# We CANNOT just pipe $remoteScript over SSH stdin -- PowerShell encodes
+# the pipe stream with CRLF line endings, which makes bash mangle every
+# line (e.g. `set -euo pipefail\r` -> "invalid option name pipefail").
+# Workaround: write the script to a local temp file with LF-only endings,
+# scp it to /tmp on the VM, then execute it via a single ssh call.
+# ──────────────────────────────────────────────────────────────────────
 Write-Section "Remote sequence"
+
+$localTemp = Join-Path $env:TEMP "trader_deploy_$([guid]::NewGuid().ToString('N').Substring(0,8)).sh"
+$remoteTemp = "/tmp/_trader_deploy_$([guid]::NewGuid().ToString('N').Substring(0,8)).sh"
+
+# Write LF-only.
+[IO.File]::WriteAllText($localTemp, ($remoteScript -replace "`r`n", "`n"), [Text.UTF8Encoding]::new($false))
+Write-Host "[local] wrote remote script to $localTemp ($(((Get-Item $localTemp).Length)) bytes, LF endings)"
+
+$scpArgs = @(
+    "-i", $SshKey,
+    "-o", "StrictHostKeyChecking=accept-new",
+    "-o", "ConnectTimeout=10",
+    "-q",
+    $localTemp,
+    "${SshUser}@${VmHost}:${remoteTemp}"
+)
+Write-Host "[local] uploading script -> ${SshUser}@${VmHost}:${remoteTemp} ..."
+& scp @scpArgs
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "[FAIL] scp failed (exit $LASTEXITCODE)" -ForegroundColor Red
+    Remove-Item $localTemp -ErrorAction SilentlyContinue
+    exit 6
+}
 
 $sshArgs = @(
     "-i", $SshKey,
     "-o", "StrictHostKeyChecking=accept-new",
     "-o", "ConnectTimeout=10",
-    "$SshUser@$VmHost",
-    "bash", "-s"
+    "${SshUser}@${VmHost}",
+    "bash $remoteTemp; _rc=`$?; rm -f $remoteTemp; exit `$_rc"
 )
-
-# Pipe the script over SSH stdin. This avoids escaping a giant one-liner
-# and works reliably with Windows OpenSSH client.
-$remoteScript | & ssh @sshArgs
+Write-Host "[local] executing remote script ..."
+Write-Host ""
+& ssh @sshArgs
 $exit = $LASTEXITCODE
+
+Remove-Item $localTemp -ErrorAction SilentlyContinue
 
 Write-Section "Deploy complete"
 Write-Host " Finished:  $(Get-Date -Format 'o')"
