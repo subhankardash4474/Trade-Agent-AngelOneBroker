@@ -16,6 +16,7 @@ import pytz
 import yaml
 from loguru import logger
 
+from core.cooldown_persistence import load_cooldown_state, save_cooldown_state
 from core.data_handler import DataHandler
 from core.database import Database
 from strategies.ensemble import EnsembleModel
@@ -521,6 +522,26 @@ class TradingAgent:
             "cooldown",  # exit cooldown is its own mechanism
             "shorts_disabled",  # config flag — only changes on config edit
         )
+
+        # 2026-05-15 Cooldown persistence. The three maps above live only in
+        # memory. A mid-session container restart wipes them -- live evidence
+        # at 14:46 IST today, where the 3 stop-out cooldowns vanished and
+        # only `late_entry_cutoff: 14:30` (already past) prevented a
+        # FEDERALBNK re-entry on a 2/2-confirmed SELL at 14:58.
+        # The persistence layer is fail-soft: load returns empty dicts on
+        # any error, save logs WARNING and swallows. Trading must never
+        # block on this. We load AFTER constructing the empty dicts so the
+        # in-memory state is the source of truth either way.
+        try:
+            restored_cd, restored_loss, restored_rej = load_cooldown_state(
+                reentry_cooldown=self._reentry_cooldown,
+                rejection_cooldown=timedelta(seconds=self._rejection_cooldown_seconds),
+            )
+            self._cooldown_map.update(restored_cd)
+            self._stock_loss_today.update(restored_loss)
+            self._rejection_cooldown_map.update(restored_rej)
+        except Exception as exc:  # noqa: BLE001 - persistence must not block startup
+            logger.warning(f"[COOLDOWN-PERSIST] load failed at init: {exc!r}")
 
         # Intraday strategy-contribution tally (reset at new-day boundary).
         # Used for EOD diversity monitor (Fix 6). Key = strategy name,
@@ -1144,6 +1165,21 @@ class TradingAgent:
 
     # ── Robustness Helpers ─────────────────────────────────────
 
+    def _persist_cooldown_state(self) -> None:
+        """Atomically snapshot the three cooldown maps to data/cooldowns.json.
+
+        Called from every mutation point (exit recording, blacklist bump,
+        rejection-cooldown seed, daily reset). Failure is logged WARNING
+        and swallowed -- a missed snapshot can never block trading."""
+        try:
+            save_cooldown_state(
+                self._cooldown_map,
+                self._stock_loss_today,
+                self._rejection_cooldown_map,
+            )
+        except Exception as exc:  # noqa: BLE001 - persistence must not block trading
+            logger.warning(f"[COOLDOWN-PERSIST] save failed: {exc!r}")
+
     def _reset_daily_trackers(self):
         """Reset per-day trackers at the start of each new trading day."""
         today = datetime.now(IST).date()
@@ -1157,6 +1193,10 @@ class TradingAgent:
             self._eod_summary_sent = False
             self._did_premarket_scan_today = False
             self._daily_tracker_date = today
+            # 2026-05-15: write the cleared snapshot so a same-day restart
+            # picks up the wipe (otherwise yesterday's stale snapshot would
+            # be loaded on next boot).
+            self._persist_cooldown_state()
             # GC the previous day's EOD flag so logs/ doesn't accumulate
             # one .flag file per calendar day forever. We deliberately
             # don't touch today's flag here (it would only exist if the
@@ -1523,14 +1563,23 @@ class TradingAgent:
         # TPs for cooldown purposes when comfortably positive (>= Rs 5).
         is_trailing_win = exit_reason == "trailing_stop" and pnl >= 5.0
 
+        mutated = False
         if is_loss or (not (is_take_profit or is_trailing_win) and pnl < 5.0):
             # Only cool down on losses or low-conviction breakeven exits.
             self._cooldown_map[symbol] = datetime.now(IST)
+            mutated = True
 
         if is_loss:
             self._stock_loss_today[symbol] = self._stock_loss_today.get(symbol, 0) + 1
+            mutated = True
             if self._stock_loss_today[symbol] >= self._max_losses_per_stock:
                 logger.warning(f"[BLACKLIST] {symbol} blacklisted for today ({self._stock_loss_today[symbol]} losses)")
+
+        # 2026-05-15 Persist cooldown / blacklist mutations so a container
+        # restart between 09:30 and 14:30 doesn't expose ex-stop-out stocks
+        # to re-entry. The save is fail-soft (logs WARNING, never raises).
+        if mutated:
+            self._persist_cooldown_state()
         else:
             # Track winning trail-runs: count consecutive TPs on the same stock today
             if is_take_profit:
@@ -2877,6 +2926,11 @@ class TradingAgent:
             cooldown_map = getattr(self, "_rejection_cooldown_map", None)
             if cooldown_map is not None:
                 cooldown_map[(signal.symbol, direction)] = datetime.now(IST)
+                # 2026-05-15 Persist on rejection-cooldown mutation. See
+                # _persist_cooldown_state docstring for rationale.
+                persist = getattr(self, "_persist_cooldown_state", None)
+                if callable(persist):
+                    persist()
 
     def _reason_skips_cooldown(self, reason: str) -> bool:
         """Whether this rejection reason should NOT seed the cooldown map.

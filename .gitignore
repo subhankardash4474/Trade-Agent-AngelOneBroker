@@ -81,6 +81,12 @@ data/self_sufficiency.json
 # write here can never be committed.
 data/prepare_dataset_*.log
 
+# 2026-05-15: cooldowns.json is per-deployment runtime state written by
+# core.cooldown_persistence after every stop-out / blacklist / rejection
+# update. Must not be committed -- snapshots are deployment-specific and
+# would defeat the daily-reset semantics if shared across hosts.
+data/cooldowns.json
+
 # ── Logs (all subdirs and roots) ────────────────────────────────
 logs/**/*.log
 logs/**/*.csv
