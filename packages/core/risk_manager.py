@@ -82,10 +82,15 @@ class TrailingStop:
         breakeven_arm_rr: float = 0.5,
         breakeven_buffer_pct: float = 0.10,
         breakeven_enabled: bool = True,
+        symbol: str = "",
     ):
         self.entry_price = entry_price
         self.current_sl = initial_sl
         self.side = side
+        # 2026-05-15 Symbol kept for observability logs on arm transitions.
+        # Default "" preserves the legacy API; RiskManager.create_trailing_stop
+        # plumbs the real symbol through.
+        self.symbol = symbol
         self.trail_activation_rr = trail_activation_rr
         self.trail_step_pct = trail_step_pct
         self.highest_since_entry = entry_price
@@ -132,8 +137,18 @@ class TrailingStop:
         unrealized_r = self._current_unrealized_r(current_price)
         self.last_unrealized_r = unrealized_r
         self.peak_unrealized_r = max(self.peak_unrealized_r, unrealized_r)
-        if self.peak_unrealized_r >= self.peak_arm_rr:
+        # 2026-05-15 Observability: log the FIRST time peak-giveback arms so
+        # operators can audit which positions ever reached +peak_arm_rr R.
+        # Without this, the only evidence of arming was an eventual exit
+        # tagged `peak_giveback` — silent if the position later closed via
+        # signal/trailing/SL/intraday-exit instead.
+        if not self.peak_giveback_armed and self.peak_unrealized_r >= self.peak_arm_rr:
             self.peak_giveback_armed = True
+            logger.info(
+                f"[PEAK-GIVEBACK-ARMED] {self.symbol or '?'} {self.side} "
+                f"peak_R={self.peak_unrealized_r:.2f} "
+                f"(arm_rr={self.peak_arm_rr:.2f}, giveback_pct={self.peak_giveback_pct:.0f}%)"
+            )
 
         # Breakeven arm (2026-05-14) -- monotonic, never disarms.
         if (
@@ -142,6 +157,18 @@ class TrailingStop:
             and self.peak_unrealized_r >= self.breakeven_arm_rr
         ):
             self.breakeven_armed = True
+            # 2026-05-15 Observability: log on the False->True transition so
+            # operators can audit which positions had the breakeven SL lift
+            # engaged. Yesterday's 5 stop-outs at -1.5% are a likely cohort
+            # this would have saved (or proven not to apply, if MFE never
+            # crossed 0.5R favorable).
+            be_sign = "+" if self.side == "BUY" else "-"
+            be_pct = self.breakeven_buffer_pct
+            logger.info(
+                f"[BREAKEVEN-ARMED] {self.symbol or '?'} {self.side} "
+                f"peak_R={self.peak_unrealized_r:.2f} entry={self.entry_price:.2f} "
+                f"(SL will lift to entry {be_sign}{be_pct:.2f}%)"
+            )
 
         if self.side == "BUY":
             self.highest_since_entry = max(self.highest_since_entry, current_price)
@@ -745,6 +772,9 @@ class RiskManager:
             peak_giveback_enabled=self.peak_giveback_enabled,
             trail_activation_rr=self.trailing_activation_rr,
             trail_step_pct=self.trailing_step_pct,
+            # 2026-05-15 Plumb symbol into TrailingStop so the new
+            # [BREAKEVEN-ARMED] / [PEAK-GIVEBACK-ARMED] logs are auditable.
+            symbol=symbol,
         )
         self._trailing_stops[symbol] = ts
         return ts

@@ -45,8 +45,16 @@ class FeatureEngine:
         df = self._add_price_action_features(df)
         df = self._add_derived_features(df)
 
-        if market_context:
-            df = self._add_market_context(df, market_context)
+        # 2026-05-14 BUGFIX: always emit market_context columns so the
+        # column contract of `get_ml_feature_columns()` is honoured.
+        # Previously this was gated on `if market_context:` which left
+        # nifty_trend/india_vix absent whenever the caller hadn't wired
+        # `set_market_context()` first — fine for trading_agent.py (which
+        # always sets it) but broken for the battery, ad-hoc scripts,
+        # and any test path. The defaults inside `_add_market_context`
+        # (nifty_trend=0 neutral, india_vix=15.0 mid-vol, sector=0.0)
+        # are safe stand-ins when no live context is available.
+        df = self._add_market_context(df, market_context or {})
 
         return df
 

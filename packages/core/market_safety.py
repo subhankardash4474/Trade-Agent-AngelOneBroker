@@ -314,6 +314,35 @@ NSE_SECTOR_MAP: Dict[str, str] = {
     # Diversified
     "ADANIENT": "Conglomerate", "TATAINVEST": "Conglomerate",
     "BAJAJHLDNG": "Conglomerate", "GODREJIND": "Conglomerate",
+    # ── 2026-05-15 expansion: symbols that traded unmapped on 2026-05-14 ──
+    # Live evidence (2026-05-14): TATACAP (NBFC) + 3 other financial shorts
+    # totalled 41.3% of equity but the supersector cap saw only 31.1% because
+    # TATACAP fell into UNKNOWN. Adding the gap-closers below; classifications
+    # reflect underlying business + how the 200-EMA / rate-cycle factor moves
+    # them, not necessarily NSE's industry tag.
+    "TATACAP": "NBFC",          # Tata Capital — diversified NBFC parent
+    "BSOFT": "IT",              # Birlasoft (current NSE symbol; legacy BIRLASOFT kept above)
+    "AEGISLOG": "Logistics",    # Aegis Logistics — oil & gas distribution
+    "KFINTECH": "FinTech",      # KFin Technologies — RTA / fund accounting
+    "PCBL": "Chemicals",        # Phillips Carbon Black
+    # Common financial-services scanner picks (proactive coverage)
+    "ABCAPITAL": "NBFC",        # Aditya Birla Capital — NBFC/insurance holdco
+    "M&MFIN": "NBFC", "POONAWALLA": "NBFC",
+    "IIFL": "NBFC", "MFSL": "NBFC", "SBICARD": "NBFC",
+    "360ONE": "NBFC", "EDELWEISS": "NBFC", "MANAPPURAM": "NBFC",
+    "PEL": "NBFC",              # Piramal Enterprises
+    # Capital markets / depository / brokers — FinTech bucket so they roll
+    # up to Financials via supersector (correlated to broader market vol)
+    "CDSL": "FinTech", "BSE": "FinTech", "MCX": "FinTech",
+    "ANGELONE": "FinTech", "CAMS": "FinTech", "IEXLTD": "FinTech",
+    # Shipping (its own concentration risk — global trade cycle)
+    "GESHIP": "Shipping", "SCI": "Shipping",
+    # Specialty chemicals / industrial intermediates scanner often picks
+    "CLEAN": "Chemicals", "FLUOROCHEM": "Chemicals", "NAVINFLUOR": "Chemicals",
+    "PIIND": "Chemicals", "ATUL": "Chemicals", "LINDEINDIA": "Chemicals",
+    # Industrial electrodes / graphite / refractories
+    "GRAPHITE": "Capital Goods", "HEG": "Capital Goods",
+    "CARBORUNIV": "Capital Goods",
 }
 
 
