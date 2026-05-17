@@ -367,18 +367,30 @@ class RiskManager:
         # halt threshold, the DB is almost certainly polluted (test runs, old
         # seed, manual reset). We clamp the peak to the current balance so the
         # circuit breaker doesn't trip on startup for spurious historical data.
+        # P2 logic-edges (2026-05-17): the OLD code silently CLAMPED the
+        # peak down to current balance when the implied drawdown exceeded
+        # the halt threshold ("treating as stale data"). That hid the
+        # very condition the halt was designed to enforce -- a real
+        # drawdown of 20%+ should HALT the agent, not be hand-waved away
+        # as stale state. New behavior: keep the real peak, emit a
+        # CRITICAL log, and let the halt fire on the very next can_trade
+        # check. The operator can explicitly recover via --reset-balance.
         effective_peak = max(initial_balance, peak_balance or 0.0)
         if peak_balance and peak_balance > initial_balance:
             implied_dd = (peak_balance - initial_balance) / peak_balance * 100
             if implied_dd >= self.drawdown_halt_pct:
-                logger.warning(
-                    f"DB historical peak Rs {peak_balance:,.2f} implies "
-                    f"{implied_dd:.1f}% drawdown vs current Rs {initial_balance:,.2f} "
-                    f"(halt threshold {self.drawdown_halt_pct}%). "
-                    f"Treating as stale data and resetting peak to current balance. "
-                    f"Use --reset-balance to formally reset."
+                logger.critical(
+                    f"[DRAWDOWN-HALT] DB historical peak Rs {peak_balance:,.2f} "
+                    f"implies {implied_dd:.1f}% drawdown vs current "
+                    f"Rs {initial_balance:,.2f} (halt threshold "
+                    f"{self.drawdown_halt_pct}%). RETAINING the real peak "
+                    f"so the halt fires on the next can_trade check. "
+                    f"If this is genuinely stale data (DB carry-over from "
+                    f"a different deployment), run with --reset-balance "
+                    f"to recover."
                 )
-                effective_peak = initial_balance
+                # Do NOT clamp: keep effective_peak = peak_balance so the
+                # drawdown gate trips.
             else:
                 logger.info(
                     f"Risk state seeded with historical peak Rs {peak_balance:,.2f} "

@@ -56,7 +56,13 @@ class ExecutionEngine:
         self.partial_fill_prob: float = exec_cfg.get("paper_partial_fill_prob", 0.0)
         self.partial_fill_min_ratio: float = exec_cfg.get("paper_partial_fill_min_ratio", 0.5)
 
-        self._order_log: list[dict] = []
+        # P3 polish (2026-05-17): bounded deque so a multi-month daemon
+        # doesn't slowly leak memory. The OLD ``list`` grew unbounded; on
+        # a heavy-trading day the order log alone could hit a few MB of
+        # dicts. 50,000 entries is plenty (covers ~5 years at the current
+        # rate) and lookup is O(n) anyway since we iterate.
+        from collections import deque as _deque
+        self._order_log: _deque = _deque(maxlen=50_000)
         self._pending_orders: dict[str, dict] = {}
         # 2026-05-14 LIVE-MODE SAFETY -----------------------------------
         # Track per-symbol broker-side SL-M order id + last trigger price.
@@ -794,6 +800,91 @@ class ExecutionEngine:
         except Exception as e:
             logger.error(f"Failed to fetch positions: {e}")
             return None
+
+    def reconcile_positions_with_broker(
+        self,
+        restored_positions: Dict[str, Dict],
+    ) -> Dict[str, Dict]:
+        """P2 restart-cluster (2026-05-17): close DB-side positions that
+        the broker has already flattened (RMS auto-flatten, manual close
+        by the operator, broker margin call). Returns a report keyed by
+        symbol with one of three statuses:
+
+          * ``ok``      DB and broker agree the position is open.
+          * ``orphan``  DB shows open, broker shows flat. Caller MUST
+                        close the DB-side position with reason
+                        ``broker_reconcile_at_boot``.
+          * ``skipped`` broker call failed or paper mode -- caller leaves
+                        the position as-is.
+
+        We do NOT touch the portfolio here; the caller (TradingAgent)
+        owns that. Keeps this concern at the daemon layer.
+        """
+        report: Dict[str, Dict] = {}
+        if not restored_positions:
+            return report
+        if self.mode == "paper":
+            for sym in restored_positions:
+                report[sym] = {"status": "skipped", "reason": "paper_mode"}
+            return report
+        try:
+            response = self.get_positions()
+        except Exception as exc:  # noqa: BLE001 - never block boot on this
+            logger.warning(
+                f"[POSITION-RECONCILE] broker positionBook fetch raised: "
+                f"{exc!r}. Skipping reconciliation -- positions left as DB."
+            )
+            for sym in restored_positions:
+                report[sym] = {"status": "skipped", "reason": "api_error"}
+            return report
+        if not response:
+            for sym in restored_positions:
+                report[sym] = {"status": "skipped", "reason": "empty_response"}
+            return report
+
+        rows = response.get("data") if isinstance(response, dict) else response
+        if not isinstance(rows, list):
+            for sym in restored_positions:
+                report[sym] = {"status": "skipped", "reason": "unexpected_shape"}
+            return report
+
+        broker_qty_by_symbol: Dict[str, int] = {}
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            sym = (row.get("tradingsymbol") or row.get("symbol") or "").strip()
+            if not sym:
+                continue
+            qty_raw = row.get("netqty") or row.get("net_quantity") or "0"
+            try:
+                broker_qty_by_symbol[sym] = int(float(qty_raw))
+            except (TypeError, ValueError):
+                broker_qty_by_symbol[sym] = 0
+
+        for sym, db_pos in restored_positions.items():
+            broker_qty = broker_qty_by_symbol.get(sym, 0)
+            if broker_qty == 0:
+                logger.critical(
+                    f"[POSITION-RECONCILE] {sym}: DB shows OPEN "
+                    f"({db_pos.get('side')} qty={db_pos.get('quantity')}) "
+                    f"but broker netqty=0. Likely RMS auto-flatten or "
+                    f"manual close. Marking ORPHAN; caller will close "
+                    f"the DB position with broker_reconcile_at_boot."
+                )
+                report[sym] = {
+                    "status": "orphan",
+                    "broker_netqty": broker_qty,
+                    "db_quantity": db_pos.get("quantity"),
+                }
+            else:
+                # Broker has a position too -- it's at least in the right
+                # direction if broker_qty has the same sign as DB's side.
+                report[sym] = {
+                    "status": "ok",
+                    "broker_netqty": broker_qty,
+                    "db_quantity": db_pos.get("quantity"),
+                }
+        return report
 
     @property
     def order_history(self) -> list[dict]:

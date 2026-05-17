@@ -147,31 +147,35 @@ class MeanReversion(BaseStrategy):
                 metadata={**metadata, "intent": "entry"},
             )
 
-        # EXIT: Z has reverted to within the exit band — thesis fulfilled.
-        # Emit a moderate-confidence SELL to let the ensemble close longs
-        # before price drifts to the other extreme (and BUY to close shorts).
-        # Requires the previous bar to have been outside the exit band, so we
-        # only signal on the transition (not continuously while inside).
+        # P2 logic-edges (2026-05-17): the OLD "EXIT" branch emitted a
+        # confidence=0.45 SELL/BUY signal whenever Z reverted into the
+        # exit band -- INCLUDING when there was no position to exit. The
+        # ensemble has no exit-only lane, so the entry path would happily
+        # short on the SELL signal (intent="mean_reversion_exit" was set
+        # in metadata but no consumer checked it). On a flat book, this
+        # turned the strategy into a stealth contrarian. We now emit HOLD
+        # with metadata so logging / analytics still see the transition
+        # but no trade fires. Position-management (trailing SL, peak-
+        # giveback, EOD square-off) is the single source of truth for
+        # exits.
         if (
             not pd.isna(z_prev)
             and abs(z) <= self.exit_z_score
             and abs(z_prev) > self.exit_z_score
         ):
-            # Direction-aware: if we came from the oversold side (z_prev < 0),
-            # price has risen back to mean → exit long via SELL signal.
-            # If we came from overbought (z_prev > 0), price has dropped back
-            # → exit short via BUY signal.
-            exit_side = Signal.SELL if z_prev < 0 else Signal.BUY
             logger.info(
-                f"[{self.name}] EXIT signal for {symbol} | Z={z:.2f} from Z_prev={z_prev:.2f} "
-                f"(thesis fulfilled, emitting {exit_side.name})"
+                f"[{self.name}] MEAN-REVERTED for {symbol} | Z={z:.2f} from "
+                f"Z_prev={z_prev:.2f} -- thesis fulfilled. Emitting HOLD "
+                f"(exit path is owned by position management, not the strategy)."
             )
             return self._make_signal(
-                exit_side, symbol, df,
-                confidence=0.45,  # moderate — only acts if ensemble agrees
-                stop_loss=None,
-                take_profit=None,
-                metadata={**metadata, "intent": "mean_reversion_exit"},
+                Signal.HOLD, symbol, df,
+                metadata={
+                    **metadata,
+                    "reason": "mean_reversion_complete",
+                    "z_prev": float(z_prev),
+                    "z_curr": float(z),
+                },
             )
 
         return self._make_signal(Signal.HOLD, symbol, df, metadata=metadata)

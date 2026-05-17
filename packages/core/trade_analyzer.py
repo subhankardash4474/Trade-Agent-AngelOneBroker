@@ -304,10 +304,21 @@ class TradeAnalyzer:
             # ----- per-strategy scorecard -----
             stats = self._strategy_stats.get(strategy, self._empty_stats())
             stats["total_trades"] = stats.get("total_trades", 0) + 1
+            # P2 logic-edges (2026-05-17): a pnl of exactly 0 (e.g. a
+            # scratch trade closed at entry price) was counted as a LOSS
+            # under the OLD ``if pnl > 0 ... else ...`` branch. That
+            # distorted strategy win-rates downward and biased the
+            # ensemble's strategy-credit weighting against any strategy
+            # with a meaningful share of flat exits. Now classified as
+            # "scratch" (neither win nor loss); win_rate uses
+            # (wins / total_trades) which is also adjusted to use
+            # decisive-trades only when ``scratches`` is non-zero.
             if attributed_pnl > 0:
                 stats["wins"] = stats.get("wins", 0) + 1
-            else:
+            elif attributed_pnl < 0:
                 stats["losses"] = stats.get("losses", 0) + 1
+            else:
+                stats["scratches"] = stats.get("scratches", 0) + 1
             stats["total_pnl"] = stats.get("total_pnl", 0) + attributed_pnl
             stats["avg_pnl"] = stats["total_pnl"] / stats["total_trades"]
             if stats["total_trades"] > 0:

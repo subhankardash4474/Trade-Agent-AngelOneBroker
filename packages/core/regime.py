@@ -240,11 +240,18 @@ def classify_intraday_regime(market_context: Optional[Dict]) -> str:
         return "unknown"
     nifty_intraday = market_context.get("nifty_intraday_pct")
     vix_delta = market_context.get("vix_intraday_delta")
-    if nifty_intraday is None and vix_delta is None:
+    # P2 logic-edges (2026-05-17): the OLD code imputed missing inputs to
+    # 0.0 (``float(x or 0.0)``), so a missing VIX delta combined with a
+    # +2% Nifty intraday would label the regime "risk_on" purely from the
+    # Nifty signal -- as if VIX were calm. That's exactly the regime we
+    # under-defended against during the 2026-05-08 spike. If EITHER
+    # input is missing, fall back to "unknown" so callers route to the
+    # permissive (no overlay) path instead of pretending a data gap is
+    # a calm reading.
+    if nifty_intraday is None or vix_delta is None:
         return "unknown"
-
-    nifty_intraday = float(nifty_intraday or 0.0)
-    vix_delta = float(vix_delta or 0.0)
+    nifty_intraday = float(nifty_intraday)
+    vix_delta = float(vix_delta)
 
     if nifty_intraday <= -0.5 or vix_delta >= 1.5:
         return "risk_off"

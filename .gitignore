@@ -91,6 +91,11 @@ data/cooldowns.json
 # TrailingStop state. Same per-host runtime contract as cooldowns.json.
 data/trailing_stops.json
 
+# 2026-05-17: runtime_state.json (P2 restart-cluster) -- per-deployment
+# intraday runtime state (per-strategy breaker, open-rate window, TP
+# streak). Same per-host runtime contract.
+data/runtime_state.json
+
 # ── Logs (all subdirs and roots) ────────────────────────────────
 logs/**/*.log
 logs/**/*.csv

@@ -155,8 +155,13 @@ class SelfSufficiencyTracker:
             return
         path = Path(self.ledger_path)
         if not path.exists():
+            # P2 logic-edges (2026-05-17): use IST date, not host date.
+            # The OLD code used ``date.today()`` which is host-local. A
+            # cloud VM in UTC would record ``deployed_on`` 5.5 hours
+            # earlier than the operator's actual IST trading day, which
+            # cascaded into off-by-one math on "days since deploy".
             self._ledger = {
-                "deployed_on": date.today().isoformat(),
+                "deployed_on": datetime.now(IST).date().isoformat(),
                 "cumulative_realised_inr": 0.0,
                 "last_update": datetime.now(IST).isoformat(),
             }

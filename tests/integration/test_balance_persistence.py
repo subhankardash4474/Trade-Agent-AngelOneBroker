@@ -106,14 +106,26 @@ class TestPeakBalancePersistence:
         assert rm.state.current_balance == 9_800.0
         assert rm.state.peak_balance == 10_500.0
 
-    def test_stale_peak_clamped_to_prevent_spurious_halt(self):
-        """If the DB peak would imply >30% drawdown already, treat as stale."""
+    def test_stale_peak_retained_so_real_drawdown_halts_p2_audit_fix(self):
+        """P2 logic-edges (2026-05-17): the OLD code silently clamped the
+        DB peak down to current balance whenever the implied drawdown
+        exceeded the halt threshold ("treating as stale"). That HID the
+        very condition the halt was designed to enforce -- a real 30%+
+        drawdown should HALT trading, not be hand-waved away.
+
+        New contract: the real peak is RETAINED. The circuit breaker
+        fires on the next can_trade check. Operator can explicitly
+        recover via --reset-balance if the DB really is stale.
+        """
         config = {"risk": {"drawdown_halt_pct": 30.0}}
-        # Peak 14_000 vs current 9_000 → 36% drawdown → over halt threshold
+        # Peak 14_000 vs current 9_000 -> ~36% drawdown -> over halt threshold
         rm = RiskManager(config, initial_balance=9_000.0, peak_balance=14_000.0)
-        # Peak should be clamped to current so the circuit breaker doesn't trip
-        assert rm.state.peak_balance == 9_000.0
+        # Peak is preserved (NOT clamped) so drawdown gate trips
+        assert rm.state.peak_balance == 14_000.0
         assert rm.state.current_balance == 9_000.0
+        # Compute current drawdown
+        dd = (rm.state.peak_balance - rm.state.current_balance) / rm.state.peak_balance * 100
+        assert dd >= 30.0  # confirms the halt threshold WILL trip on next check
 
     def test_risk_manager_falls_back_to_balance_if_no_peak(self, tmp_db_and_log):
         config = {"risk": {}}

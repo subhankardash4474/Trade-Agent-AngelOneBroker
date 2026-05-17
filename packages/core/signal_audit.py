@@ -101,8 +101,20 @@ class SignalAudit:
             with self._lock, open(path, "a", newline="", encoding="utf-8") as f:
                 w = csv.DictWriter(f, fieldnames=_COLUMNS)
                 w.writerow(row)
-        except Exception:
-            pass
+        except Exception as e:
+            # P2 logic-edges (2026-05-17): the OLD ``except: pass`` made
+            # disk-full / permission-denied invisible. The EOD diagnostics
+            # would silently report "0 signals today" instead of flagging
+            # the storage problem. Now we log WARNING so the operator
+            # sees the failure in the daemon log.
+            try:
+                from loguru import logger as _logger
+                _logger.warning(
+                    f"[SIGNAL-AUDIT] CSV write to {path} failed: {e!r}. "
+                    f"This row will be missing from EOD diagnostics."
+                )
+            except Exception:
+                pass
 
     def summarize_today(self) -> Dict[str, Any]:
         """Quick in-process summary for EOD diagnostics. Returns counts by

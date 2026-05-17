@@ -18,6 +18,7 @@ import yaml
 from loguru import logger
 
 from core.cooldown_persistence import load_cooldown_state, save_cooldown_state
+from core.runtime_state_persistence import load_runtime_state, save_runtime_state
 from core.trailing_stop_persistence import (
     load_trailing_states,
     restore_trailing_state,
@@ -205,6 +206,16 @@ class TradingAgent:
             logger.warning(f"Could not rehydrate daily risk state from DB: {e}")
 
         self.execution = ExecutionEngine(self.config, smart_api=smart_api, database=self.database)
+
+        # P2 restart-cluster (2026-05-17) -- LIVE-MODE SAFETY: track when the
+        # AngelOne JWT was minted so the main loop can refresh it before it
+        # expires. JWT lifetime is 8h; we attempt re-login at 7h. Skipped in
+        # paper mode (no smart_api).
+        self._broker_session_started_at: Optional[datetime] = (
+            datetime.now(IST) if smart_api is not None else None
+        )
+        self._smart_api = smart_api  # kept for re-login swap
+        self._jwt_refresh_attempted_at: Optional[datetime] = None
         self.portfolio = Portfolio(
             initial_balance=effective_balance,
             commission_pct=self.config.get("backtest", {}).get("commission_pct", 0.03),
@@ -244,6 +255,61 @@ class TradingAgent:
                 f"[SL-RECONCILE] reconciliation failed unexpectedly ({e}); "
                 f"restored positions remain unprotected in tracking. "
                 f"Continuing boot — manual SL audit recommended."
+            )
+
+        # P2 restart-cluster (2026-05-17) -- LIVE-MODE SAFETY: position
+        # reconciliation with the broker. If the broker auto-flattened a
+        # position out-of-band (RMS rule violation, margin call, manual
+        # operator close via the broker UI) while the daemon was down, the
+        # DB / portfolio still shows the trade as open. Trading on a ghost
+        # position is bad: we'd hold a phantom seat in the position-cap
+        # while having nothing to actually exit. P0 #4 closed the same hole
+        # for the SL-order side; this closes it for the underlying position.
+        try:
+            if self.portfolio.positions:
+                # Serialize positions for the reconcile call (just side and
+                # quantity needed for the comparison).
+                restored_for_reconcile = {
+                    sym: {"side": pos.side, "quantity": pos.quantity}
+                    for sym, pos in self.portfolio.positions.items()
+                }
+                report = self.execution.reconcile_positions_with_broker(
+                    restored_for_reconcile
+                )
+                for sym, entry in report.items():
+                    if entry.get("status") == "orphan":
+                        # Best-effort: close DB-side with a synthetic
+                        # zero-pnl entry-price exit so the strategy
+                        # attribution doesn't get a misleading P&L
+                        # (we don't know the broker's actual fill price).
+                        pos = self.portfolio.positions.get(sym)
+                        if not pos:
+                            continue
+                        try:
+                            self.portfolio.close_position(
+                                symbol=sym,
+                                exit_price=pos.entry_price,  # zero PnL
+                                exit_time=datetime.now(IST),
+                                exit_reason="broker_reconcile_at_boot",
+                            )
+                            logger.critical(
+                                f"[POSITION-RECONCILE] {sym} closed DB-side "
+                                f"with reason=broker_reconcile_at_boot. "
+                                f"P&L recorded as zero (true broker fill "
+                                f"price unknown). Operator action: review "
+                                f"broker statement for actual fill."
+                            )
+                        except Exception as e:
+                            logger.critical(
+                                f"[POSITION-RECONCILE] {sym} orphan-close "
+                                f"failed: {e!r}. Position remains in DB "
+                                f"-- manual cleanup required."
+                            )
+        except Exception as e:
+            logger.error(
+                f"[POSITION-RECONCILE] boot reconcile failed unexpectedly "
+                f"({e}); positions left as DB. Manual broker-vs-DB audit "
+                f"recommended before resuming trading."
             )
         self.alert_manager = AlertManager(self.config)
         self.feature_engine = FeatureEngine()
@@ -394,10 +460,26 @@ class TradingAgent:
         # MIS only — squared off at intraday_exit_time).
         exec_cfg = self.config.get("execution", {}) or {}
         self._enable_short_selling: bool = bool(exec_cfg.get("enable_short_selling", False))
-        self._short_selling_regimes: set = set(
-            exec_cfg.get("short_selling_regimes")
-            or ["bear_high_vol", "bear_low_vol", "sideways"]
-        )
+        # P2 logic-edges (2026-05-17): the OLD ``or [...]`` fallback masked
+        # an explicit empty-list config: ``short_selling_regimes: []`` in
+        # config.yaml meant "no short selling allowed" but the truthy
+        # short-circuit on empty-list turned it into the permissive
+        # default. ``is None`` is the correct guard for "key missing"
+        # vs "key set to empty".
+        _raw_regimes = exec_cfg.get("short_selling_regimes")
+        if _raw_regimes is None:
+            self._short_selling_regimes: set = {
+                "bear_high_vol", "bear_low_vol", "sideways",
+            }
+        else:
+            self._short_selling_regimes = set(_raw_regimes)
+            if not self._short_selling_regimes and self._enable_short_selling:
+                logger.warning(
+                    "[CONFIG] execution.short_selling_regimes is empty BUT "
+                    "execution.enable_short_selling=True. No regime will "
+                    "ever allow a short. If this was intentional, also set "
+                    "enable_short_selling=False to be explicit."
+                )
 
         # Long-entry regime guard (2026-05-05 backtest finding). Mirror of
         # the short-selling regime guard, but for BUY entries. Backtest
@@ -425,6 +507,13 @@ class TradingAgent:
         )
 
         self._cooldown_map: Dict[str, datetime] = {}      # symbol → last losing exit time
+        # P2 logic-edges (2026-05-17): parallel side tracker. Records the
+        # SIDE that experienced the cooldown-triggering exit so the
+        # opposite-side edge isn't blocked.  In-memory only (the disk
+        # snapshot keeps the legacy bare-symbol format; on restart the
+        # side info is lost and we conservatively fall back to bare-symbol
+        # blocking until the next exit refreshes the side).
+        self._cooldown_side_map: Dict[str, str] = {}
         self._stock_loss_today: Dict[str, int] = {}        # symbol → loss count today
         self._consec_tp_today: Dict[str, int] = {}         # symbol → consecutive TPs today (trend continuation)
 
@@ -585,6 +674,24 @@ class TradingAgent:
             self._rejection_cooldown_map.update(restored_rej)
         except Exception as exc:  # noqa: BLE001 - persistence must not block startup
             logger.warning(f"[COOLDOWN-PERSIST] load failed at init: {exc!r}")
+
+        # P2 restart-cluster (2026-05-17) -- LIVE-MODE SAFETY: rehydrate the
+        # three intraday runtime state buckets so a mid-day restart doesn't
+        # silently unsuspend a strategy that hit its circuit-breaker pre-
+        # restart, or forget the last N opens used by the global open-rate
+        # cap. See runtime_state_persistence.py for the full motivation.
+        try:
+            restored_strat, restored_opens, restored_tp = load_runtime_state(
+                open_rate_window=timedelta(minutes=self._opens_window_minutes),
+            )
+            for s, v in restored_strat.items():
+                self._strategy_state[s] = v
+            for ts, sym in restored_opens:
+                self._recent_opens.append((ts, sym))
+            for sym, c in restored_tp.items():
+                self._consec_tp_today[sym] = c
+        except Exception as exc:  # noqa: BLE001 - persistence must not block startup
+            logger.warning(f"[RUNTIME-PERSIST] load failed at init: {exc!r}")
 
         # P1 #15 (2026-05-17) -- LIVE-MODE SAFETY: rehydrate TrailingStop
         # state for every restored open position. Without this, a mid-session
@@ -960,6 +1067,11 @@ class TradingAgent:
                     if self._check_emergency_stop():
                         break
 
+                    # P2 restart-cluster (2026-05-17): refresh AngelOne JWT
+                    # before 8h expiry. Cheap (datetime compare) when not
+                    # due; full re-login when threshold crossed.
+                    self._maybe_refresh_broker_session()
+
                     # Reset daily trackers at the start of each new day
                     self._reset_daily_trackers()
 
@@ -1177,7 +1289,11 @@ class TradingAgent:
         except KeyError:
             return
 
-        self.tick_aggregator.process_tick(symbol, price, volume)
+        # P2 tick-path cluster (2026-05-17): pass exchange-side timestamp
+        # through (set by websocket_client from message.exchange_timestamp)
+        # so candle bucketing uses the real event time, not local wall-clock.
+        tick_ts = tick.get("timestamp")
+        self.tick_aggregator.process_tick(symbol, price, volume, timestamp=tick_ts)
         try:
             self.database.store_tick(symbol, price, volume,
                                      bid=tick.get("bid", 0), ask=tick.get("ask", 0))
@@ -1222,6 +1338,28 @@ class TradingAgent:
         prev = self._ws_subscribed_held_set()
         if held == prev:
             return
+        # P2 tick-path cluster (2026-05-17): the OLD filter silently dropped
+        # any held position whose token resolved to empty. The position then
+        # never got tick-driven exits and the operator had no signal. Now we
+        # surface those cases via a CRITICAL log + alert; the subscription
+        # itself still skips the empty-token entries (the broker rejects
+        # them anyway).
+        missing_token = sorted(s for s in held if not self._get_token(s))
+        if missing_token:
+            logger.critical(
+                f"[WS-HELD-RESUBSCRIBE] {missing_token}: no token resolved; "
+                f"these positions will receive NO WS ticks and rely on the "
+                f"15s polling loop for exits. Operator action: refresh the "
+                f"instruments universe."
+            )
+            try:
+                self.alert_manager.send_alert(
+                    "WS Resubscribe Missing Tokens",
+                    f"No WS subscription for held positions: {missing_token}",
+                    level="critical",
+                )
+            except Exception:
+                pass
         held_instruments = [
             {"symbol": s, "token": self._get_token(s)} for s in held if self._get_token(s)
         ]
@@ -1279,6 +1417,84 @@ class TradingAgent:
         except Exception as exc:  # noqa: BLE001 - persistence must not block trading
             logger.warning(f"[TRAIL-PERSIST] save failed: {exc!r}")
 
+    def _maybe_refresh_broker_session(self) -> None:
+        """P2 restart-cluster (2026-05-17): refresh the AngelOne JWT before
+        the 8h lifetime expires.
+
+        Cheap pre-check (datetime comparison) runs every cycle. The actual
+        re-login is gated to once-per-hour to avoid hammering AngelOne if
+        login keeps failing. Re-login swaps ``self.execution._api`` and
+        ``self.data_handler._api`` so the next API call uses the fresh JWT.
+
+        Skipped entirely in paper mode (``_smart_api`` is None)."""
+        if self._smart_api is None or self._broker_session_started_at is None:
+            return
+        age = datetime.now(IST) - self._broker_session_started_at
+        # Refresh threshold: 7h. JWT expires at 8h, so we have a 1h grace
+        # window in case the re-login itself takes a few attempts.
+        if age < timedelta(hours=7):
+            return
+        # Don't retry more than once an hour
+        if self._jwt_refresh_attempted_at is not None:
+            if (datetime.now(IST) - self._jwt_refresh_attempted_at) < timedelta(hours=1):
+                return
+        self._jwt_refresh_attempted_at = datetime.now(IST)
+
+        broker_cfg = self.config.get("broker", {})
+        if broker_cfg.get("mode") == "paper":
+            return
+        try:
+            from SmartApi import SmartConnect  # type: ignore
+            import pyotp  # type: ignore
+            api = SmartConnect(api_key=broker_cfg["api_key"])
+            totp = pyotp.TOTP(broker_cfg["totp_secret"]).now()
+            session = api.generateSession(
+                broker_cfg["client_id"], broker_cfg["password"], totp
+            )
+            if not session or not session.get("status"):
+                msg = (session or {}).get("message", "no message")
+                logger.critical(
+                    f"[JWT-REFRESH] re-login failed (age={age}): {msg}. "
+                    f"Trading will start failing once the old JWT expires. "
+                    f"Operator action: investigate immediately."
+                )
+                self.alert_manager.send_alert(
+                    "JWT Refresh Failed",
+                    f"AngelOne re-login at session age {age} failed: {msg}",
+                    level="critical",
+                )
+                return
+            # Swap the API objects everywhere the daemon holds a reference.
+            self._smart_api = api
+            self.execution._api = api
+            self.data_handler._api = api
+            self._broker_session_started_at = datetime.now(IST)
+            logger.warning(
+                f"[JWT-REFRESH] AngelOne session refreshed at "
+                f"{self._broker_session_started_at.isoformat()} "
+                f"(old session age was {age}). Trading continues."
+            )
+        except Exception as exc:  # noqa: BLE001 - must not crash trading
+            logger.critical(
+                f"[JWT-REFRESH] re-login raised {exc!r}. Next attempt in "
+                f"~1h. Old JWT will expire at "
+                f"{(self._broker_session_started_at + timedelta(hours=8)).isoformat()}."
+            )
+
+    def _persist_runtime_state(self) -> None:
+        """P2 restart-cluster (2026-05-17): atomically snapshot the three
+        intraday runtime maps to data/runtime_state.json. Called from every
+        mutation point (strategy outcome record, open-window append, TP
+        streak bump, daily reset). Failure is logged and swallowed."""
+        try:
+            save_runtime_state(
+                self._strategy_state,
+                self._recent_opens,
+                self._consec_tp_today,
+            )
+        except Exception as exc:  # noqa: BLE001 - persistence must not block trading
+            logger.warning(f"[RUNTIME-PERSIST] save failed: {exc!r}")
+
     def _reset_daily_trackers(self):
         """Reset per-day trackers at the start of each new trading day."""
         today = datetime.now(IST).date()
@@ -1288,6 +1504,7 @@ class TradingAgent:
             self._consec_tp_today.clear()
             self._strategy_contrib_today.clear()
             self._strategy_state.clear()
+            self._recent_opens.clear()
             self._rejection_cooldown_map.clear()
             self._eod_summary_sent = False
             self._did_premarket_scan_today = False
@@ -1296,6 +1513,9 @@ class TradingAgent:
             # picks up the wipe (otherwise yesterday's stale snapshot would
             # be loaded on next boot).
             self._persist_cooldown_state()
+            # P2 restart-cluster (2026-05-17): same rationale for the
+            # strategy_state / recent_opens / consec_tp_today snapshot.
+            self._persist_runtime_state()
             # GC the previous day's EOD flag so logs/ doesn't accumulate
             # one .flag file per calendar day forever. We deliberately
             # don't touch today's flag here (it would only exist if the
@@ -1604,11 +1824,26 @@ class TradingAgent:
             )
         return "\n".join(lines)
 
-    def _is_in_cooldown(self, symbol: str) -> bool:
-        """Check if a stock is in re-entry cooldown after a recent exit."""
+    def _is_in_cooldown(self, symbol: str, side: Optional[str] = None) -> bool:
+        """Check re-entry cooldown after a recent losing exit.
+
+        P2 logic-edges (2026-05-17): legacy behavior cooled down BOTH sides
+        of a symbol after a loss on either side. The audit pointed out that
+        long stop-outs and short edges are independent -- a HDFCBANK long
+        stop-out at 11:00 shouldn't block a HDFCBANK short signal that has
+        nothing to do with the previous trade's thesis. We now key the
+        cooldown by (symbol, side) when ``side`` is provided. When the
+        caller doesn't pass a side (legacy code paths), the strict
+        bare-symbol semantics are retained for back-compat.
+        """
         last_exit = self._cooldown_map.get(symbol)
         if last_exit is None:
             return False
+        # If a side is provided, only same-side stops should block re-entry.
+        if side is not None:
+            stored_side = self._cooldown_side_map.get(symbol)
+            if stored_side is not None and stored_side != side:
+                return False
         elapsed = datetime.now(IST) - last_exit
         return elapsed < self._reentry_cooldown
 
@@ -1645,7 +1880,8 @@ class TradingAgent:
         h, m = map(int, self._late_entry_cutoff.split(":"))
         return now.hour > h or (now.hour == h and now.minute >= m)
 
-    def _record_exit(self, symbol: str, pnl: float, exit_reason: str = ""):
+    def _record_exit(self, symbol: str, pnl: float, exit_reason: str = "",
+                     side: Optional[str] = None):
         """
         Record exit for cooldown and daily loss tracking.
 
@@ -1666,6 +1902,11 @@ class TradingAgent:
         if is_loss or (not (is_take_profit or is_trailing_win) and pnl < 5.0):
             # Only cool down on losses or low-conviction breakeven exits.
             self._cooldown_map[symbol] = datetime.now(IST)
+            # P2 logic-edges (2026-05-17): record the side too so the
+            # opposite-direction edge can still fire. ``side`` is the
+            # POSITION's entry side ("BUY" for longs, "SELL" for shorts).
+            if side:
+                self._cooldown_side_map[symbol] = side
             mutated = True
 
         if is_loss:
@@ -1687,6 +1928,10 @@ class TradingAgent:
                     f"[TP-STREAK] {symbol}: {self._consec_tp_today[symbol]} consecutive TPs today "
                     f"(no cooldown — letting trend continuation re-enter immediately)"
                 )
+                # P2 restart-cluster (2026-05-17): persist TP streak so a
+                # restart between an entry and the next trend-continuation
+                # entry doesn't forget that we've already won twice.
+                self._persist_runtime_state()
 
     def _effective_signal_exit_floor(self, position, current_price: float) -> float:
         """Notional-aware unrealized-PnL floor for the signal-exit fast-path.
@@ -2078,8 +2323,14 @@ class TradingAgent:
         now = datetime.now(IST)
         h, m = map(int, self._eod_summary_time.split(":"))
         if now.hour > h or (now.hour == h and now.minute >= m):
+            # P2 restart-cluster (2026-05-17): set the in-memory flag
+            # BEFORE building the report (cheap dedupe against the
+            # *same* in-process retry within the next minute) but DEFER
+            # the on-disk flag write until AFTER ``send_alert`` succeeds.
+            # The OLD code wrote the flag first, so any exception in
+            # build_diagnostics / send_alert left the flag on disk and
+            # the email never went out on restart. See [3] in the audit.
             self._eod_summary_sent = True
-            self._save_eod_sent_flag()
             summary = self.portfolio.get_summary()
             risk = self.risk_manager.get_risk_summary()
 
@@ -2114,7 +2365,14 @@ class TradingAgent:
                 f"Cash: Rs {summary['cash']:,.2f}\n"
                 f"Equity (mark-to-market): Rs {_equity_now:,.2f}"
                 + (f"  (peak Rs {_peak:,.2f})" if _peak else "") + "\n"
-                f"Drawdown: {risk['drawdown_pct']:.1f}%   [agent halts at 20%]"
+                # P3 polish (2026-05-17): the OLD "[agent halts at 20%]"
+                # was hardcoded; the actual halt threshold comes from
+                # config.risk.drawdown_halt_pct (which the operator might
+                # have raised/lowered). The hardcoded 20% was confusingly
+                # close to but NOT equal to the configured value during
+                # half the 2026 trading days. Render the configured value.
+                f"Drawdown: {risk['drawdown_pct']:.1f}%   "
+                f"[agent halts at {self.risk_manager.drawdown_halt_pct:.0f}%]"
                 f"{open_pos_block}"
                 f"{diag}"
                 f"{strategy_mix}"
@@ -2129,7 +2387,27 @@ class TradingAgent:
             # (it includes the same metrics plus daily diagnostics and
             # strategy-mix breakdown), so the Daily Report call is pure
             # duplicate noise. Removed.
-            self.alert_manager.send_alert("EOD Summary", report, level="info")
+            # P2 restart-cluster (2026-05-17): only persist the EOD flag
+            # AFTER send_alert returns without raising. If the SMTP call
+            # blows up (timeout, auth fail, transient DNS), we want the
+            # next restart to retry the email rather than silently
+            # eat it.
+            try:
+                self.alert_manager.send_alert("EOD Summary", report, level="info")
+                self._save_eod_sent_flag()
+            except Exception as exc:  # noqa: BLE001
+                # Reset in-memory flag so the next cycle in this same
+                # process retries. The on-disk flag was not written so
+                # a restart will also retry.
+                self._eod_summary_sent = False
+                logger.error(
+                    f"[EOD] send_alert failed: {exc!r}. Flag NOT persisted "
+                    f"to disk; next cycle will retry. (was: report-build "
+                    f"succeeded but email transport failed)"
+                )
+                # Skip the post-mortem / journal blocks below since the
+                # EOD email is what triggers them by convention.
+                return
 
             # Self-learning daily journal
             try:
@@ -2986,6 +3264,10 @@ class TradingAgent:
         right after a successful order placement."""
         if self._max_opens_per_window > 0:
             self._recent_opens.append((datetime.now(IST), symbol))
+            # P2 restart-cluster (2026-05-17): persist so a mid-window
+            # restart doesn't reset the open-rate counter and let us
+            # burst through the cap.
+            self._persist_runtime_state()
 
     def _audit_reject(
         self,
@@ -3291,7 +3573,12 @@ class TradingAgent:
         # P1 #15 (2026-05-17): persist after the removal so the next-boot
         # rehydrate doesn't try to restore state for a closed position.
         self._persist_trailing_states()
-        self._record_exit(symbol, record.pnl, exit_reason=exit_reason)
+        # P2 logic-edges (2026-05-17): plumb the side through so the
+        # cooldown can be keyed by (symbol, side).
+        self._record_exit(
+            symbol, record.pnl, exit_reason=exit_reason,
+            side=getattr(record, "side", None),
+        )
         self._on_trade_closed(record)
         return order, record
 
@@ -3386,11 +3673,17 @@ class TradingAgent:
             )
             return
 
-        # Robustness gates (cooldown, blacklist, late-day cutoff) — apply to
-        # both sides. A repeatedly-losing symbol is risky no matter the side.
-        if self._is_in_cooldown(symbol):
+        # P2 logic-edges (2026-05-17): cooldown now keyed by (symbol, side).
+        # A losing long stop-out at 11:00 still blocks new longs on the
+        # same name for ``reentry_cooldown_minutes``, but no longer blocks
+        # an independent short edge that came in later. See _is_in_cooldown
+        # docstring for the rationale.
+        if self._is_in_cooldown(symbol, side=direction_label):
             remaining = self._reentry_cooldown - (datetime.now(IST) - self._cooldown_map[symbol])
-            logger.info(f"[COOLDOWN] Skipping {symbol}: re-entry cooldown ({remaining.seconds // 60}m remaining)")
+            logger.info(
+                f"[COOLDOWN] Skipping {symbol} {direction_label}: re-entry "
+                f"cooldown ({remaining.seconds // 60}m remaining)"
+            )
             self._audit_reject(signal, current_price, f"cooldown:{remaining.seconds // 60}m")
             return
         if self._is_stock_blacklisted(symbol):
@@ -4193,6 +4486,11 @@ class TradingAgent:
         else:
             st["consec_losses"] = 0
 
+        # P2 restart-cluster (2026-05-17): persist BEFORE the suspended
+        # early-return so even a strategy that just hit its 3rd consec
+        # loss (about to suspend below) is captured on disk.
+        self._persist_runtime_state()
+
         if st["suspended"]:
             return  # already suspended for the day
 
@@ -4206,6 +4504,9 @@ class TradingAgent:
                 f"({st['consec_losses']} consecutive losses, "
                 f"day_pnl=Rs {st['daily_pnl']:+.2f})"
             )
+            # P2 restart-cluster: persist immediately after the suspended
+            # transition so a restart in the next minute can't unsuspend.
+            self._persist_runtime_state()
             return
 
         # Threshold 2: per-strategy daily PnL floor (% of initial capital)
@@ -4218,6 +4519,7 @@ class TradingAgent:
                     st["suspended_reason"] = (
                         f"daily_pnl=Rs {st['daily_pnl']:+.2f} <= floor Rs {floor:+.2f}"
                     )
+                    self._persist_runtime_state()
                     logger.warning(
                         f"[STRATEGY-BREAKER] {strat} suspended for the day "
                         f"({st['suspended_reason']})"

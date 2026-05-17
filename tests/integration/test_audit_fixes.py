@@ -229,14 +229,21 @@ class TestMeanReversionExit:
         return df
 
     def test_exit_signal_on_revert_from_oversold(self):
-        """Z transitions from deeply negative to near-zero → SELL to close longs."""
+        """Z transitions from deeply negative to near-zero.
+
+        P2 logic-edges (2026-05-17): the OLD strategy emitted a confidence
+        0.45 SELL signal here to "let the ensemble close longs". But with
+        no position open the ensemble would route that SELL into a SHORT
+        entry, turning the strategy into a stealth contrarian. New
+        behaviour: emit HOLD with metadata indicating the mean-revert was
+        detected. Exits are owned by position management (trailing SL,
+        peak-giveback, EOD square-off), not the strategy.
+        """
         from strategies.mean_reversion import MeanReversion
         from strategies.base_strategy import Signal
 
         mr = MeanReversion({"lookback_period": 10, "entry_z_score": 2.0, "exit_z_score": 0.5})
 
-        # Hand-craft a df with known z_scores at last 2 rows by controlling
-        # close values around mean. The strategy computes z internally.
         n = 15
         closes = list(np.full(n - 2, 100.0))  # flat 100
         closes += [90.0]     # z_prev very negative (oversold)
@@ -248,9 +255,11 @@ class TestMeanReversionExit:
         }, index=pd.date_range("2026-04-28 09:15", periods=n, freq="5min"))
 
         sig = mr.generate_signal(df, "TEST")
-        # Should emit SELL (exit long) with intent=mean_reversion_exit
-        assert sig.signal == Signal.SELL
-        assert sig.metadata.get("intent") == "mean_reversion_exit"
+        # Must NOT emit SELL/BUY -- new contract is HOLD with metadata.
+        assert sig.signal == Signal.HOLD
+        assert sig.metadata.get("reason") == "mean_reversion_complete"
+        assert sig.metadata.get("z_prev") is not None
+        assert sig.metadata.get("z_curr") is not None
 
 
 # ─────────────────────────────────────────────────────────────

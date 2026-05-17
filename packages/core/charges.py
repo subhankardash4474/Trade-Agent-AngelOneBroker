@@ -7,28 +7,60 @@ Computes realistic per-trade costs for:
                   + stamp duty + DP (CDSL) charges on SELL
 
 All values are fractions unless stated otherwise.
-Rates are as of 2026-04-28 (update here if broker/SEBI change).
+Rates are as of 2026-04-28.
+
+P3 polish (2026-05-17): rates can now be overridden at runtime via env vars
+without a rebuild. Useful when SEBI / the broker bumps a rate mid-deployment
+and we need a hot patch. Example:
+
+    export TRADING_CHARGES_STT_INTRADAY_SELL=0.0003   # SEBI raised STT
+    export TRADING_CHARGES_BROKERAGE_MAX=15.0          # broker promo
+
+Any rate not overridden uses the hardcoded default. The override applies
+at module-import time; callers do not need to be changed.
+
+UPDATE PROCEDURE when SEBI / broker change rates permanently:
+  1. Update the constant below.
+  2. Add a comment noting the effective date + the SEBI/broker circular.
+  3. Bump the model version if backtesting will be re-run with new costs.
+  4. Remove any matching env-var override on the OCI VM.
 """
 
+import os
 from dataclasses import dataclass
 from typing import Literal
 
+
+def _env_float(name: str, default: float) -> float:
+    """Read a TRADING_CHARGES_<NAME> env override, fall back to default.
+
+    Bad values (non-numeric) silently fall back; we never want a typo to
+    crash the daemon at import time."""
+    raw = os.environ.get(f"TRADING_CHARGES_{name}")
+    if raw is None:
+        return default
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return default
+
+
 # ---- Rate constants (NSE Equity) ----
-BROKERAGE_INTRADAY_PCT = 0.0003       # 0.03% per order (buy or sell)
-BROKERAGE_DELIVERY_PCT = 0.0           # Zerodha delivery = Rs 0
-BROKERAGE_MAX_PER_ORDER = 20.0         # Rs 20 cap per order
+BROKERAGE_INTRADAY_PCT = _env_float("BROKERAGE_INTRADAY_PCT", 0.0003)
+BROKERAGE_DELIVERY_PCT = _env_float("BROKERAGE_DELIVERY_PCT", 0.0)
+BROKERAGE_MAX_PER_ORDER = _env_float("BROKERAGE_MAX", 20.0)
 
-STT_INTRADAY_SELL = 0.00025            # 0.025% on sell side only (intraday)
-STT_DELIVERY = 0.001                   # 0.1% on both buy & sell (delivery)
+STT_INTRADAY_SELL = _env_float("STT_INTRADAY_SELL", 0.00025)
+STT_DELIVERY = _env_float("STT_DELIVERY", 0.001)
 
-NSE_TXN_CHARGE = 0.0000297             # 0.00297% both sides
-SEBI_CHARGE = 0.000001                 # Rs 10 per crore = 0.0001%
-STAMP_DUTY_BUY = 0.00003               # 0.003% on buy side only
-GST_RATE = 0.18                        # 18% on (brokerage + txn + SEBI)
+NSE_TXN_CHARGE = _env_float("NSE_TXN_CHARGE", 0.0000297)
+SEBI_CHARGE = _env_float("SEBI_CHARGE", 0.000001)
+STAMP_DUTY_BUY = _env_float("STAMP_DUTY_BUY", 0.00003)
+GST_RATE = _env_float("GST_RATE", 0.18)
 
 # Delivery only
-DP_CHARGE_CDSL = 13.5                  # per scrip per day on sell (delivery)
-DP_GST = 0.18
+DP_CHARGE_CDSL = _env_float("DP_CHARGE_CDSL", 13.5)
+DP_GST = _env_float("DP_GST", 0.18)
 
 
 @dataclass

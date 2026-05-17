@@ -80,6 +80,12 @@ class HistoricalCache:
     call sites.
     """
 
+    # P2 tick-path cluster (2026-05-17): how stale a cache file may be
+    # before we refetch when the request's end_date is recent. History
+    # doesn't change for end_dates older than yesterday, so we only
+    # apply the TTL when end_date is "today-ish".
+    _FRESH_TTL_SECONDS = 3600.0  # 1 hour
+
     def __init__(self, source: _DataSourceLike, cache_dir: str | Path):
         self._source = source
         self._cache_dir = Path(cache_dir)
@@ -98,24 +104,49 @@ class HistoricalCache:
         path = self._key_path(symbol, interval, start_date, end_date)
 
         if path.exists():
+            # P2 tick-path cluster (2026-05-17): freshness check. The OLD
+            # code treated the cache as immutable: if the file existed it
+            # was returned verbatim. That worked for historical end_dates
+            # (yesterday, last week, ...) but broke for end_date=today --
+            # the morning's bars were cached, the afternoon's bars were
+            # never refetched even after the partial-day parquet was
+            # superseded by the broker. Forces refetch when end_date is
+            # "today or after" AND the cache file is older than the TTL.
             try:
-                df = pd.read_parquet(path)
-                logger.debug(
-                    f"[HistoricalCache] HIT {symbol} {interval} "
+                today = datetime.now().date()
+                stale = (
+                    end_date.date() >= today
+                    and (datetime.now().timestamp() - path.stat().st_mtime)
+                        > self._FRESH_TTL_SECONDS
+                )
+            except OSError:
+                stale = False
+            if stale:
+                logger.info(
+                    f"[HistoricalCache] STALE {symbol} {interval} "
                     f"{start_date.date()}->{end_date.date()} "
-                    f"({len(df)} bars from {path.name})"
+                    f"(cache age > {self._FRESH_TTL_SECONDS:.0f}s and "
+                    f"end_date is today). Refetching."
                 )
-                return df
-            except Exception as e:
-                # Corrupt / partial parquet -- delete and refetch.
-                logger.warning(
-                    f"[HistoricalCache] cache file unreadable, refetching: "
-                    f"{path} ({e})"
-                )
+            else:
                 try:
-                    path.unlink()
-                except OSError:
-                    pass
+                    df = pd.read_parquet(path)
+                    logger.debug(
+                        f"[HistoricalCache] HIT {symbol} {interval} "
+                        f"{start_date.date()}->{end_date.date()} "
+                        f"({len(df)} bars from {path.name})"
+                    )
+                    return df
+                except Exception as e:
+                    # Corrupt / partial parquet -- delete and refetch.
+                    logger.warning(
+                        f"[HistoricalCache] cache file unreadable, refetching: "
+                        f"{path} ({e})"
+                    )
+                    try:
+                        path.unlink()
+                    except OSError:
+                        pass
 
         df = self._source.get_historical_data(
             symbol=symbol,

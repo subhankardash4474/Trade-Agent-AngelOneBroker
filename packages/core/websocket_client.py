@@ -7,6 +7,7 @@ tick data at ~500ms per instrument. Feeds ticks to the TickAggregator.
 import json
 import threading
 import time
+from datetime import datetime
 from typing import Callable, Dict, List, Optional
 
 import pytz
@@ -190,6 +191,20 @@ class WebSocketClient:
                 "high": float(message.get("high_price_day", 0)) / 100,
                 "low": float(message.get("low_price_day", 0)) / 100,
             }
+            # P2 tick-path cluster (2026-05-17): pass the exchange-side tick
+            # timestamp through so the aggregator can stamp candles with the
+            # event time instead of host wall-clock. Closes the gap where
+            # a slow consumer (laggy network, GC pause) would attribute
+            # ticks to the WRONG candle bucket. Field is `exchange_timestamp`
+            # in epoch millis on AngelOne; defensive: skip if absent.
+            exch_ts_ms = message.get("exchange_timestamp")
+            if exch_ts_ms:
+                try:
+                    tick["timestamp"] = datetime.fromtimestamp(
+                        float(exch_ts_ms) / 1000.0, tz=IST
+                    )
+                except (TypeError, ValueError, OSError):
+                    pass
 
             if self.on_tick:
                 self.on_tick(tick)

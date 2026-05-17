@@ -207,6 +207,13 @@ class Portfolio:
             min_cash = None
             latest_open_time: Optional[datetime] = None
             for row in saved:
+                # P2 restart-cluster (2026-05-17): plumb ``regime`` and
+                # ``contributing_strategies`` through the restore path. The
+                # OLD code dropped both fields, so a mid-session restart
+                # silently lost the strategy attribution that the learner
+                # uses to credit/debit per-strategy P&L on exit. The DB
+                # already persists them (see database.py:200-201, 433-462,
+                # 516-530) -- we just weren't using them.
                 pos = Position(
                     symbol=row["symbol"],
                     side=row["side"],
@@ -217,6 +224,8 @@ class Portfolio:
                     take_profit=row.get("take_profit"),
                     strategy=row.get("strategy", ""),
                     order_id=row.get("order_id", ""),
+                    regime=row.get("regime") or None,
+                    contributing_strategies=row.get("contributing_strategies") or None,
                 )
                 self.positions[row["symbol"]] = pos
                 ca = row.get("cash_after")

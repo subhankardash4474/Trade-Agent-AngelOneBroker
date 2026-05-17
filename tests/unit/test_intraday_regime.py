@@ -64,11 +64,14 @@ def test_risk_off_takes_precedence_over_risk_on():
     assert classify_intraday_regime(ctx) == "risk_off"
 
 
-def test_partial_signals_still_classify():
-    """If only one signal is populated, classify on what we have."""
-    # Just VIX spike, no nifty data
-    assert classify_intraday_regime({"vix_intraday_delta": 2.0}) == "risk_off"
-    # Just nifty rally, no vix data
-    ctx = {"nifty_intraday_pct": 0.7}
-    # vix_delta defaults to 0 -> rally + calm vix -> risk_on
-    assert classify_intraday_regime(ctx) == "risk_on"
+def test_partial_signals_return_unknown_p2_audit_fix():
+    """P2 logic-edges (2026-05-17): the OLD code imputed a missing input
+    to 0.0, so a +2% Nifty rally without VIX data would be labelled
+    risk_on as if VIX were calm. Now we require BOTH inputs; missing
+    either returns "unknown" so callers route to the permissive (no
+    overlay) path instead of pretending a data gap is a calm reading.
+    """
+    # VIX spike but no nifty data -> unknown (cannot confirm risk_off)
+    assert classify_intraday_regime({"vix_intraday_delta": 2.0}) == "unknown"
+    # Nifty rally but no vix data -> unknown (cannot confirm risk_on)
+    assert classify_intraday_regime({"nifty_intraday_pct": 0.7}) == "unknown"

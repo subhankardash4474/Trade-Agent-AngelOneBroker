@@ -141,8 +141,20 @@ class EventCalendar:
             )
             return count
         except Exception as e:
-            logger.error(f"[EVENT-CAL] Failed to load {self.path}: {e}")
-            self._events_by_symbol = {}
+            # P2 logic-edges (2026-05-17): the OLD path WIPED ``_events_by_symbol``
+            # on any parse error. A typo introduced into the CSV mid-day
+            # silently disabled ALL blackouts -- including the ones that had
+            # loaded successfully on the last good reload. New behavior:
+            # preserve the previously-loaded events. The operator gets a
+            # loud ERROR + alert and a stale-but-safe blackout map until
+            # the file is fixed. Setting `_loaded_once = True` is still
+            # done so we don't keep re-trying every cycle.
+            logger.error(
+                f"[EVENT-CAL] Failed to load {self.path}: {e}. PRESERVING "
+                f"the previously-loaded {sum(len(v) for v in self._events_by_symbol.values())} "
+                f"events from the last successful reload so blackouts stay "
+                f"active until the file is fixed."
+            )
             self._loaded_once = True
             return 0
 

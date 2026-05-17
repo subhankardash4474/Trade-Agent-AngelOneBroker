@@ -151,14 +151,29 @@ class FeatureEngine:
     def _add_momentum_features(df: pd.DataFrame) -> pd.DataFrame:
         close, high, low = df["close"], df["high"], df["low"]
 
-        # RSI
+        # RSI -- P2 logic-edges (2026-05-17): the OLD computation produced
+        # NaN whenever avg_loss was exactly 0 (flat window or strictly up-
+        # trending segment), which downstream often silently coerced to 0
+        # (RSI 0 = extreme oversold = strong DOWN bias = the exact OPPOSITE
+        # of reality). Fix by handling the degenerate ratios explicitly:
+        #   avg_loss == 0 AND avg_gain > 0  -> all-up window, RSI = 100
+        #   avg_gain == 0 AND avg_loss > 0  -> all-down window, RSI = 0
+        #   avg_gain == 0 AND avg_loss == 0 -> truly flat, RSI = 50 (neutral)
         delta = close.diff()
         gain = delta.where(delta > 0, 0.0)
         loss = -delta.where(delta < 0, 0.0)
         avg_gain = gain.ewm(com=13, min_periods=14).mean()
         avg_loss = loss.ewm(com=13, min_periods=14).mean()
         rs = avg_gain / avg_loss.replace(0, np.nan)
-        df["rsi"] = 100 - (100 / (1 + rs))
+        rsi = 100 - (100 / (1 + rs))
+        # Targeted overrides where rs was forced to NaN by avg_loss==0:
+        flat_up = (avg_loss == 0) & (avg_gain > 0)
+        flat_down = (avg_gain == 0) & (avg_loss > 0)
+        flat_flat = (avg_loss == 0) & (avg_gain == 0)
+        rsi = rsi.where(~flat_up, 100.0)
+        rsi = rsi.where(~flat_down, 0.0)
+        rsi = rsi.where(~flat_flat, 50.0)
+        df["rsi"] = rsi
 
         # Stochastic Oscillator (14, 3, 3)
         low14 = low.rolling(14).min()
