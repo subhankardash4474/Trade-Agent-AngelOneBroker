@@ -87,6 +87,10 @@ data/prepare_dataset_*.log
 # would defeat the daily-reset semantics if shared across hosts.
 data/cooldowns.json
 
+# 2026-05-17: trailing_stops.json (P1 #15) -- per-deployment in-flight
+# TrailingStop state. Same per-host runtime contract as cooldowns.json.
+data/trailing_stops.json
+
 # ── Logs (all subdirs and roots) ────────────────────────────────
 logs/**/*.log
 logs/**/*.csv

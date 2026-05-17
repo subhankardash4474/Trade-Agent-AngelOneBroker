@@ -156,14 +156,61 @@ class TestSectorExposure:
         )
         assert ok is True
 
-    def test_zero_equity_permissive(self):
-        ok, _ = check_sector_exposure(
+    # P1 #6 (2026-05-17): when equity <= 0 (MTM-distorted glitch, or transient
+    # negative right after a big loss), the OLD code returned True and bypassed
+    # the sector cap entirely \u2014 exactly when concentration matters most. New
+    # behaviour: use gross exposure as fallback denominator; only the truly
+    # degenerate (no positions, no proposed cost) case fails closed.
+
+    def test_zero_equity_with_no_positions_refuses_trade(self):
+        """Degenerate case: equity<=0 AND no existing positions AND zero cost
+        - we can't measure anything meaningful, so fail closed."""
+        ok, reason = check_sector_exposure(
             symbol="TCS",
             current_positions_by_symbol={},
-            additional_cost=1000.0,
+            additional_cost=0.0,
             total_equity=0.0,
         )
-        assert ok is True
+        assert ok is False
+        assert "equity<=0" in reason
+
+    def test_zero_equity_falls_back_to_gross_exposure_denominator(self):
+        """With existing positions or a proposed cost, the fallback denominator
+        is gross exposure. Within cap -> allow; over cap -> reject."""
+        ok, reason = check_sector_exposure(
+            symbol="TCS",            # IT bucket
+            current_positions_by_symbol={"INFY": 2000.0, "WIPRO": 2000.0},
+            additional_cost=1000.0,   # IT sector would now be 5000 / 5000 = 100%
+            total_equity=0.0,
+            max_sector_exposure_pct=40.0,
+        )
+        assert ok is False, reason
+        assert "fallback" in reason.lower()
+
+    def test_zero_equity_fallback_passes_when_under_cap(self):
+        """Within the cap on the gross-exposure denominator must still allow."""
+        ok, reason = check_sector_exposure(
+            symbol="TCS",
+            current_positions_by_symbol={"HDFCBANK": 5000.0, "SBIN": 3000.0},
+            additional_cost=1000.0,   # IT sector = 1000/9000 = ~11% < 40%
+            total_equity=0.0,
+            max_sector_exposure_pct=40.0,
+        )
+        assert ok is True, reason
+        assert "fallback" in reason.lower()
+
+    def test_negative_equity_uses_fallback_path(self):
+        """Negative equity (which can happen during an MTM glitch) must
+        not skip the cap. Same fallback as zero-equity."""
+        ok, reason = check_sector_exposure(
+            symbol="TCS",
+            current_positions_by_symbol={"INFY": 6000.0},
+            additional_cost=1000.0,   # IT = 7000/7000 = 100%
+            total_equity=-500.0,
+            max_sector_exposure_pct=40.0,
+        )
+        assert ok is False
+        assert "fallback" in reason.lower()
 
 
 class TestSectorMap:

@@ -41,10 +41,41 @@ class WebSocketClient:
         self._subscriptions: Dict[str, str] = {}
 
     def subscribe(self, instruments: List[dict]):
-        """Register instruments for tick subscription."""
+        """Register instruments for tick subscription (additive).
+
+        Upserts each symbol into the subscription dict. Existing entries
+        are NOT removed -- use ``set_subscriptions`` or ``unsubscribe``
+        for that. See P1 #14 for why surgical removal matters."""
         for inst in instruments:
-            self._subscriptions[inst["symbol"]] = inst.get("token", "")
+            self._subscriptions[inst["symbol"]] = str(inst.get("token", ""))
         logger.info(f"WebSocket subscriptions: {list(self._subscriptions.keys())}")
+
+    def set_subscriptions(self, instruments: List[dict]):
+        """P1 #14 (2026-05-17): replace the subscription set wholesale.
+
+        Use this for held-only mode (or any caller that needs the broker
+        to STOP receiving ticks for stale symbols on next reconnect). The
+        old ``subscribe`` is upsert-only, so a position close left its
+        symbol in ``_subscriptions`` forever -- the broker happily kept
+        sending ticks for closed names, wasting bandwidth and the agent's
+        WS-thread CPU."""
+        new_map: Dict[str, str] = {}
+        for inst in instruments:
+            new_map[inst["symbol"]] = str(inst.get("token", ""))
+        removed = sorted(set(self._subscriptions) - set(new_map))
+        added = sorted(set(new_map) - set(self._subscriptions))
+        self._subscriptions = new_map
+        if added or removed:
+            logger.info(
+                f"WebSocket subscriptions replaced: "
+                f"+{added} -{removed} (now {sorted(self._subscriptions)})"
+            )
+
+    def unsubscribe(self, symbol: str) -> bool:
+        """P1 #14 (2026-05-17): surgically drop a symbol from subscriptions.
+
+        Returns True if the symbol was present and removed."""
+        return self._subscriptions.pop(symbol, None) is not None
 
     def start(self):
         """Start the WebSocket connection in a background thread."""
@@ -106,7 +137,21 @@ class WebSocketClient:
                     self.on_error(error)
 
             def on_close(wsapp):
-                logger.info("AngelOne WebSocket closed")
+                # P1 #13 (2026-05-17) -- LIVE-MODE SAFETY: SmartWebSocketV2's
+                # ``connect()`` returns normally when the server closes the
+                # session (idle timeout, broker rollover, network drop). The
+                # OLD code just logged and let the background thread die
+                # while ``_running`` stayed True. Ticks then stopped silently
+                # for the rest of the day -- no exits fired, no alarm. We
+                # now kick the reconnect loop unless the daemon was asked
+                # to stop. Exponential backoff caps at 60s in _reconnect_loop.
+                logger.warning("AngelOne WebSocket closed")
+                if self._running:
+                    logger.warning(
+                        "AngelOne WebSocket closed while running -- "
+                        "scheduling reconnect."
+                    )
+                    self._reconnect_loop()
 
             sws.on_data = on_data
             sws.on_open = on_open
@@ -175,7 +220,10 @@ class WebSocketClient:
                     self.on_connect()
 
             def on_close(ws, code, reason):
-                logger.info(f"Kite WebSocket closed: {code} {reason}")
+                # P1 #13 (2026-05-17): mirror angelone -- reconnect if still running.
+                logger.warning(f"Kite WebSocket closed: {code} {reason}")
+                if self._running:
+                    self._reconnect_loop()
 
             def on_error(ws, code, reason):
                 logger.error(f"Kite WebSocket error: {code} {reason}")
@@ -254,24 +302,46 @@ class WebSocketClient:
 
     # ── Helpers ──────────────────────────────────────────────
 
-    def _token_to_symbol(self, token: str) -> Optional[str]:
+    def _token_to_symbol(self, token) -> Optional[str]:
+        """Map a broker tick token back to its tradingsymbol.
+
+        P2 fix (2026-05-17, audit "Live tick path cluster"): both arguments
+        must be string-compared. ``_subscriptions`` stores tokens as strings
+        (from instruments JSON) but AngelOne tick payloads sometimes deliver
+        them as ints. Cast both to str so a tick on token 11536 (int) still
+        matches the stored "11536" (str). Previously dropped ticks silently
+        ate the exit signal for the symbol."""
+        token_s = str(token).strip()
         for sym, tok in self._subscriptions.items():
-            if tok == token:
+            if str(tok).strip() == token_s:
                 return sym
         return None
 
     def _reconnect_loop(self):
-        """Auto-reconnect with exponential backoff."""
+        """Auto-reconnect with exponential backoff.
+
+        P1 #13 (2026-05-17): previously had ``break`` after the first
+        successful reconnect attempt -- so when the SECOND session also
+        ended (very common: broker rollover at midnight, 8h JWT, etc.),
+        the loop exited and the daemon was tickless again. Now we stay
+        in the reconnect loop until ``_running`` is False (stop()
+        called). The inner ``_run_angelone``/``_run_kite`` blocks until
+        the session ends; on return we back off and try again."""
         delay = 2
         while self._running:
             logger.info(f"Reconnecting WebSocket in {delay}s...")
             time.sleep(delay)
-            delay = min(delay * 2, 60)
             try:
                 if self._broker == "angelone":
                     self._run_angelone()
                 elif self._broker == "kite":
                     self._run_kite()
-                break
+                else:
+                    return  # simulation mode: no reconnect needed
+                # If the inner _run_* call returns without raising, the
+                # session ended cleanly. We've already logged "closed"
+                # in on_close. Reset the backoff and try again.
+                delay = 2
             except Exception as e:
                 logger.error(f"Reconnection failed: {e}")
+                delay = min(delay * 2, 60)

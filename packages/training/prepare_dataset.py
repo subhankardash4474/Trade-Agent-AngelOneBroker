@@ -98,11 +98,21 @@ def fetch_market_context(start: str, end: str, period: str | None = None) -> pd.
         vix_close.index = vix_close.index.tz_localize(None).normalize()
         ctx = ctx.reindex(ctx.index.union(vix_close.index))
         ctx["india_vix"] = vix_close
+    # P1 #8 (2026-05-17) -- train/serve consistency: live FeatureEngine fills
+    # missing nifty_trend with 0 (neutral / sideways). Training MUST use the
+    # same sentinel or the model learns a non-existent "bull" signal that the
+    # serve path never produces. Same rationale as P1 #11 in trading_agent:
+    # the bull sentinel silently licensed bear-regime trades.
+    #
+    # NOTE FOR PRODUCTION: models/xgboost_model.pkl trained 2026-05-14 used
+    # the OLD bull default. After this fix, retrain before the next live
+    # deploy to remove the residual train/serve skew. Until then the loaded
+    # model still has the old bias baked in.
     if "nifty_trend" not in ctx.columns:
-        ctx["nifty_trend"] = 1
+        ctx["nifty_trend"] = 0
     if "india_vix" not in ctx.columns:
         ctx["india_vix"] = 15.0
-    ctx["nifty_trend"] = ctx["nifty_trend"].ffill().fillna(1).astype(int)
+    ctx["nifty_trend"] = ctx["nifty_trend"].ffill().fillna(0).astype(int)
     ctx["india_vix"] = ctx["india_vix"].ffill().fillna(15.0).astype(float)
     logger.info(f"Market context covers {len(ctx)} trading days "
                 f"({ctx.index.min()} to {ctx.index.max()})")
@@ -170,14 +180,15 @@ def prepare_dataset(
             day_index = featured.index.tz_localize(None).normalize() if (
                 hasattr(featured.index, "tz_localize")
             ) else pd.DatetimeIndex(featured.index).normalize()
+            # P1 #8 (2026-05-17): align default with serve path (0 = neutral).
             featured["nifty_trend"] = market_ctx["nifty_trend"].reindex(
                 day_index, method="ffill"
-            ).fillna(1).astype(int).values
+            ).fillna(0).astype(int).values
             featured["india_vix"] = market_ctx["india_vix"].reindex(
                 day_index, method="ffill"
             ).fillna(15.0).astype(float).values
         else:
-            featured["nifty_trend"] = 1
+            featured["nifty_trend"] = 0
             featured["india_vix"] = 15.0
 
         labels = create_labels(featured, horizon=horizon, threshold_pct=label_threshold_pct)
@@ -209,10 +220,39 @@ def prepare_dataset(
     logger.info(f"  UP:   {sum(combined['label']==1)} ({sum(combined['label']==1)/len(combined)*100:.1f}%)")
     logger.info(f"  DOWN: {sum(combined['label']==0)} ({sum(combined['label']==0)/len(combined)*100:.1f}%)")
 
-    # Split: 80% train, 20% test (time-based, not random)
-    split_idx = int(len(combined) * 0.8)
-    train = combined.iloc[:split_idx]
-    test = combined.iloc[split_idx:]
+    # P1 #7 (2026-05-17) -- ML INTEGRITY: split by CALENDAR TIME, not by row
+    # index. The OLD code did ``combined.iloc[:0.8*N]`` after ``pd.concat``,
+    # which puts symbol1's last bars at row N1, symbol2's last bars at row
+    # N1+N2, etc. So a 2025-12-31 candle for SYMBOL_A could be in train while
+    # SYMBOL_B's 2025-12-31 candle ends up in test -- the model learns "what
+    # other symbols did on the same date" and the test-set ROC-AUC is
+    # inflated by cross-symbol leakage.
+    #
+    # Time-based split: sort by index (which is the bar timestamp for each
+    # row), take the 80th-percentile timestamp as the cutoff, train on
+    # rows strictly before, test on rows on/after. Guarantees no calendar
+    # overlap between the two splits.
+    if hasattr(combined.index, "tz_localize") and len(combined) > 1:
+        try:
+            sorted_idx = combined.sort_index()
+            timestamps = sorted_idx.index
+            # Use the 80th-percentile timestamp as cutoff.
+            cutoff_idx = int(len(timestamps) * 0.8)
+            cutoff = timestamps[cutoff_idx]
+            train = sorted_idx[sorted_idx.index < cutoff]
+            test = sorted_idx[sorted_idx.index >= cutoff]
+            logger.info(f"Time-based split cutoff: {cutoff} "
+                        f"(train={len(train)}, test={len(test)})")
+        except Exception as exc:  # noqa: BLE001 - fall back to row split if index unusable
+            logger.warning(f"Time-based split failed ({exc!r}); using row-index split.")
+            split_idx = int(len(combined) * 0.8)
+            train = combined.iloc[:split_idx]
+            test = combined.iloc[split_idx:]
+    else:
+        # Degenerate case (no timestamp index, or single row): row split.
+        split_idx = int(len(combined) * 0.8)
+        train = combined.iloc[:split_idx]
+        test = combined.iloc[split_idx:]
 
     train_path = os.path.join(output_dir, "train_dataset.csv")
     test_path = os.path.join(output_dir, "test_dataset.csv")
@@ -228,12 +268,24 @@ def main():
     parser.add_argument("--config", default="config.yaml")
     parser.add_argument("--start", default="2023-01-01")
     parser.add_argument("--end", default="2026-03-29")
-    parser.add_argument("--interval", default="1d")
+    # P1 #9 (2026-05-17) -- TRAIN/SERVE CONSISTENCY: live FeatureEngine
+    # computes ``tod_sin/cos`` and ``dow_sin/cos`` from 5-minute bars
+    # (tick_aggregator emits 1min/5min/15min). Training on 1d bars made
+    # those four features land in a totally different distribution
+    # (24 intraday slots vs 1 per day) -- the model was effectively
+    # ignoring them at serve time. Default is now 5m to match serve.
+    # ``--interval 1d`` is still allowed for long-horizon research, but
+    # we emit a WARNING below so the operator knows the model produced
+    # from this run will NOT match the live FeatureEngine.
+    parser.add_argument("--interval", default="5m")
     # `period` is the right way to fetch intraday data — yfinance silently
     # truncates to last 60 days when interval < 1d, regardless of start/end.
     parser.add_argument("--period", default=None,
                         help="Use yfinance period (e.g. '60d') instead of start/end. "
                              "Required for intraday intervals (5m, 15m, etc.)")
+    # P1 #9 -- canonical live-serve interval. Update this string if the
+    # tick_aggregator base candle ever changes (currently 5min in live).
+    SERVE_INTERVAL = "5m"
     parser.add_argument("--horizon", type=int, default=3,
                         help="Bars ahead to predict (3 bars = 15min on 5m candles)")
     parser.add_argument("--threshold-pct", type=float, default=0.3,
@@ -279,6 +331,21 @@ def main():
         symbols = symbols[: args.limit]
 
     logger.info(f"Resolved {len(symbols)} symbols: {symbols[:5]}{'...' if len(symbols) > 5 else ''}")
+
+    # P1 #9 (2026-05-17): emit a loud warning if the chosen interval does
+    # not match the canonical live-serve interval. Operators sometimes pick
+    # 1d for long-history experiments -- that's fine for research, but the
+    # resulting model must NOT be deployed because tod_sin/cos and dow_sin/cos
+    # will land in a totally different distribution at serve time.
+    if args.interval != SERVE_INTERVAL:
+        logger.warning(
+            f"[TRAIN/SERVE-SKEW] --interval={args.interval} does NOT match "
+            f"the live FeatureEngine interval ({SERVE_INTERVAL}). The "
+            f"tod_sin/cos and dow_sin/cos features will have a different "
+            f"distribution than what the daemon sees at serve time. Do NOT "
+            f"deploy this model to production -- it is for research only."
+        )
+
     prepare_dataset(
         symbols, args.start, args.end, args.interval, args.horizon, args.output,
         period=args.period, label_threshold_pct=args.threshold_pct,

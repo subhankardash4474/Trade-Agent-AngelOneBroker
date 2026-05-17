@@ -545,3 +545,69 @@ def test_reconcile_empty_positions_is_noop():
     report = eng.reconcile_sl_orders_from_broker({})
     assert report == {}
     api.orderBook.assert_not_called()
+
+
+# ── P1 #12 (2026-05-17) -- modify_stop_loss false-positive on status:false ──
+#
+# Angel SmartAPI returns HTTP 200 with `{"status": false, "message": "..."}`
+# on validation failures. The OLD code logged "SL modified" and returned True
+# whenever no exception was raised, even though the broker order was unchanged.
+# Trail SL only existed in RAM in that case.
+
+
+def test_modify_sl_returns_false_when_broker_status_is_false():
+    api = MagicMock()
+    api.modifyOrder.return_value = {
+        "status": False,
+        "message": "invalid trigger price (below LTP)",
+    }
+    eng = _live_engine_with_mock_api(api)
+    ok = eng.modify_stop_loss("SL-ORD-X", 1490.0)
+    assert ok is False, (
+        "P1 #12 regression: modify_stop_loss returned True on broker "
+        "status=false response. Trail SL only exists in RAM."
+    )
+
+
+def test_modify_sl_returns_true_on_legacy_string_response():
+    """Some SDK versions return the new order id as a bare string. That
+    should still be treated as success (back-compat)."""
+    api = MagicMock()
+    api.modifyOrder.return_value = "OK"
+    eng = _live_engine_with_mock_api(api)
+    assert eng.modify_stop_loss("SL-ORD-X", 1490.0) is True
+
+
+def test_modify_sl_returns_true_on_status_true_dict():
+    api = MagicMock()
+    api.modifyOrder.return_value = {"status": True, "data": {"orderid": "SL-ORD-X"}}
+    eng = _live_engine_with_mock_api(api)
+    assert eng.modify_stop_loss("SL-ORD-X", 1490.0) is True
+
+
+def test_modify_sl_returns_false_on_empty_response():
+    """Broker returned None / empty dict. Could mean throttle, partial
+    response. Treat as failure so the caller can retry / alert."""
+    api = MagicMock()
+    api.modifyOrder.return_value = None
+    eng = _live_engine_with_mock_api(api)
+    assert eng.modify_stop_loss("SL-ORD-X", 1490.0) is False
+
+
+def test_modify_sl_propagates_false_through_update_trigger():
+    """Integration: update_sl_trigger_for_symbol calls modify_stop_loss.
+    A status=false response must make update_sl_trigger return False so
+    the trail loop knows the propagation failed."""
+    api = MagicMock()
+    api.placeOrder.side_effect = ["ENTRY-1", "SL-1"]
+    api.modifyOrder.return_value = {"status": False, "message": "invalid"}
+    eng = _live_engine_with_mock_api(api)
+    eng.place_order(
+        symbol="HDFCBANK", token="123", transaction_type="BUY",
+        quantity=10, price=1500.0, stop_loss=1485.0,
+    )
+    # First trigger update would normally succeed; verify failure path
+    ok = eng.update_sl_trigger_for_symbol("HDFCBANK", 1490.0)
+    assert ok is False
+    # The cached trigger must NOT have been updated (still original 1485)
+    assert eng.get_sl_order_for_symbol("HDFCBANK")["trigger"] == pytest.approx(1485.0)

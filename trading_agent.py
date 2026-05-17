@@ -18,6 +18,11 @@ import yaml
 from loguru import logger
 
 from core.cooldown_persistence import load_cooldown_state, save_cooldown_state
+from core.trailing_stop_persistence import (
+    load_trailing_states,
+    restore_trailing_state,
+    save_trailing_states,
+)
 from core.data_handler import DataHandler
 from core.database import Database
 from strategies.ensemble import EnsembleModel
@@ -326,8 +331,13 @@ class TradingAgent:
             self.instruments: List[dict] = self.config.get("market", {}).get("instruments", [])
 
         # Market context (updated periodically via live data)
+        # P1 #11 (2026-05-17): nifty_trend default = 0 (neutral / unknown)
+        # rather than 1 (bull). If the very first market-context refresh
+        # fails or returns short history, the OLD default silently licensed
+        # bullish regime-sizing & short-selling gates. Neutral keeps gates
+        # cautious without halting trading.
         self._market_context: Dict = {
-            "india_vix": 15.0, "nifty_trend": 1, "sector_momentum": 0.0,
+            "india_vix": 15.0, "nifty_trend": 0, "sector_momentum": 0.0,
             # 2026-05-14 Intraday regime overlay -- updated each market-context
             # refresh. ``classify_intraday_regime`` reads these to detect
             # mid-session risk-on/risk-off shifts that the daily 200-EMA + VIX
@@ -575,6 +585,45 @@ class TradingAgent:
             self._rejection_cooldown_map.update(restored_rej)
         except Exception as exc:  # noqa: BLE001 - persistence must not block startup
             logger.warning(f"[COOLDOWN-PERSIST] load failed at init: {exc!r}")
+
+        # P1 #15 (2026-05-17) -- LIVE-MODE SAFETY: rehydrate TrailingStop
+        # state for every restored open position. Without this, a mid-session
+        # restart resets `highest_since_entry`, `breakeven_armed`,
+        # `peak_giveback_armed`, etc. to defaults -- the position is back at
+        # its initial-SL distance even if pre-restart the trail had locked
+        # in profit or breakeven had armed. The snapshot is stashed here
+        # and consumed by ``risk_manager.create_trailing_stop`` (which we
+        # monkey-wrap below) when each restored position is repopulated
+        # into the trailing-stop registry. We do NOT call create_trailing_stop
+        # from here -- the rest of the restart sequence (e.g. portfolio
+        # _restore_positions feeding into trading_agent's own rehydration)
+        # owns that. We just make the snapshot available for lookup.
+        try:
+            self._trailing_state_snapshots: Dict[str, dict] = load_trailing_states()
+        except Exception as exc:  # noqa: BLE001 - persistence must not block startup
+            logger.warning(f"[TRAIL-PERSIST] load failed at init: {exc!r}")
+            self._trailing_state_snapshots = {}
+
+        # Wrap risk_manager.create_trailing_stop so restored snapshots are
+        # automatically applied. This is done as a wrap (rather than
+        # editing risk_manager) so the persistence concern stays at the
+        # daemon layer; RiskManager keeps its narrow responsibility.
+        if self._trailing_state_snapshots:
+            original_create = self.risk_manager.create_trailing_stop
+
+            def _create_trailing_stop_with_restore(
+                symbol, entry_price, initial_sl, side="BUY",
+                *,
+                _orig=original_create,
+                _snaps=self._trailing_state_snapshots,
+            ):
+                ts = _orig(symbol, entry_price, initial_sl, side)
+                snap = _snaps.pop(symbol, None)
+                if snap is not None:
+                    restore_trailing_state(ts, snap)
+                return ts
+
+            self.risk_manager.create_trailing_stop = _create_trailing_stop_with_restore
 
         # Intraday strategy-contribution tally (reset at new-day boundary).
         # Used for EOD diversity monitor (Fix 6). Key = strategy name,
@@ -1177,7 +1226,13 @@ class TradingAgent:
             {"symbol": s, "token": self._get_token(s)} for s in held if self._get_token(s)
         ]
         try:
-            self.ws_client.subscribe(held_instruments)
+            # P1 #14 (2026-05-17): use set_subscriptions so closed-position
+            # symbols actually get dropped on next reconnect. The OLD
+            # subscribe() call was upsert-only, so a position that closed
+            # at 10:30 stayed in _subscriptions forever; on the next WS
+            # reconnect we'd re-subscribe the broker to the closed name's
+            # ticks and waste CPU parsing them.
+            self.ws_client.set_subscriptions(held_instruments)
             self._ws_subscribed_held = held
             logger.info(
                 f"[WS] held-only resubscribe: {sorted(held)} "
@@ -1212,6 +1267,17 @@ class TradingAgent:
             )
         except Exception as exc:  # noqa: BLE001 - persistence must not block trading
             logger.warning(f"[COOLDOWN-PERSIST] save failed: {exc!r}")
+
+    def _persist_trailing_states(self) -> None:
+        """P1 #15 (2026-05-17): atomically snapshot all live TrailingStops.
+
+        Called from the SL/TP/trailing/peak-giveback check path (every
+        cycle the trail mutates) and after creation/removal. Failure is
+        logged WARNING and swallowed."""
+        try:
+            save_trailing_states(self.risk_manager._trailing_stops)
+        except Exception as exc:  # noqa: BLE001 - persistence must not block trading
+            logger.warning(f"[TRAIL-PERSIST] save failed: {exc!r}")
 
     def _reset_daily_trackers(self):
         """Reset per-day trackers at the start of each new trading day."""
@@ -2271,7 +2337,20 @@ class TradingAgent:
                     f"200 EMA (Nifty={current_nifty:.0f}, EMA200={ema200:.0f})"
                 )
             elif nifty_closes:
-                self._market_context["nifty_trend"] = 1
+                # P1 #11 (2026-05-17) -- LIVE-MODE SAFETY: when Yahoo returns
+                # SOME Nifty data but fewer than 200 closes (transient API
+                # truncation / weekend gap on a fresh boot), the OLD code pinned
+                # nifty_trend = 1 (bull). That silently bypassed every bear-
+                # regime defense (regime-sizing, short-selling gate, can_trade
+                # 200-EMA filter). Bear-day false-positive cost is bigger than
+                # missing one cycle of trend signal, so default to 0 (neutral
+                # / unknown) which keeps the filters cautious without halting.
+                logger.warning(
+                    f"Nifty trend: insufficient history "
+                    f"({len(nifty_closes)} closes < 200); defaulting to 0 "
+                    f"(neutral). Regime-dependent gates will be cautious."
+                )
+                self._market_context["nifty_trend"] = 0
 
             # 2026-05-14 Intraday overlay -- pull a 1-min Nifty bar to compute
             # ~60-min momentum, and snapshot VIX vs morning open. Best-effort:
@@ -3209,6 +3288,9 @@ class TradingAgent:
 
         self.risk_manager.record_trade(record.pnl)
         self.risk_manager.remove_trailing_stop(symbol)
+        # P1 #15 (2026-05-17): persist after the removal so the next-boot
+        # rehydrate doesn't try to restore state for a closed position.
+        self._persist_trailing_states()
         self._record_exit(symbol, record.pnl, exit_reason=exit_reason)
         self._on_trade_closed(record)
         return order, record
@@ -3682,6 +3764,9 @@ class TradingAgent:
                 return
 
             ts = self.risk_manager.create_trailing_stop(symbol, filled_price, stop_loss, side)
+            # P1 #15 (2026-05-17): snapshot immediately so a crash before
+            # the first trail update still leaves the position recoverable.
+            self._persist_trailing_states()
             if trend_continuation:
                 ts.trail_activation_rr = 0.5
                 ts.trail_step_pct = 0.6
@@ -3880,6 +3965,7 @@ class TradingAgent:
         always enter through `_check_position_exits` so concurrent callers
         (WS thread + main loop) cannot race on the same symbol's exit."""
         to_close = []
+        any_trail_mutation = False
         for symbol, pos in self.portfolio.positions.items():
             price = current_prices.get(symbol)
             if price is None:
@@ -3887,6 +3973,8 @@ class TradingAgent:
 
             # Update trailing stop (also tracks peak-giveback state)
             trailing_sl = self.risk_manager.update_trailing_stop(symbol, price)
+            if trailing_sl is not None:
+                any_trail_mutation = True
             effective_sl = trailing_sl if trailing_sl else pos.stop_loss
 
             # 2026-05-14 LIVE-MODE SAFETY: propagate the trail SL to the
@@ -3959,6 +4047,13 @@ class TradingAgent:
                     f"PnL: \u20B9{record.pnl:+.2f}",
                     level=level,
                 )
+
+        # P1 #15 (2026-05-17): snapshot trailing-stop state if anything
+        # mutated this cycle. Cheap (a few-symbol JSON write); the next
+        # restart can rehydrate breakeven_armed / peak_giveback_armed /
+        # highest_since_entry etc. instead of starting from defaults.
+        if any_trail_mutation or to_close:
+            self._persist_trailing_states()
 
     def _square_off_all(self, reason: str = "eod_square_off"):
         logger.info(f"Squaring off all positions: {reason}")

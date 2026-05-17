@@ -63,6 +63,21 @@ class TestPositionSizing:
         reduced_qty = rm.calculate_position_size(price=100.0, stop_loss_price=98.5)
         assert reduced_qty <= normal_qty
 
+    # P1 #10 (2026-05-17): refuse when SL+ATR both missing. Previously
+    # silently returned max-cap shares (10-50x oversize on a buggy caller).
+    def test_no_sl_no_atr_refuses_trade(self, rm):
+        qty = rm.calculate_position_size(price=100.0)
+        assert qty == 0
+
+    def test_no_sl_zero_atr_refuses_trade(self, rm):
+        qty = rm.calculate_position_size(price=100.0, atr=0)
+        assert qty == 0
+
+    def test_no_sl_negative_atr_refuses_trade(self, rm):
+        # Should not happen in practice but defend against a malformed ATR.
+        qty = rm.calculate_position_size(price=100.0, atr=-1.0)
+        assert qty == 0
+
 
 class TestCanTrade:
     def test_initial_can_trade(self, rm):

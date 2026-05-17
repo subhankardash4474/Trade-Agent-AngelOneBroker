@@ -176,7 +176,15 @@ class ExecutionEngine:
         return None
 
     def modify_stop_loss(self, order_id: str, new_sl: float) -> bool:
-        """Update the stop-loss on a pending SL order (for trailing stops)."""
+        """Update the stop-loss on a pending SL order (for trailing stops).
+
+        P1 #12 (2026-05-17) -- LIVE-MODE SAFETY: Angel SmartAPI returns
+        HTTP 200 with ``{"status": false, "message": "..."}`` on most
+        validation failures (insufficient margin change, order in terminal
+        state, invalid trigger). The OLD code treated absence of an exception
+        as success and logged "SL modified" while the broker order was
+        unchanged. Trail SL only existed in RAM. Now we parse the response.
+        """
         if self.mode == "paper":
             if order_id in self._pending_orders:
                 self._pending_orders[order_id]["stop_loss_price"] = new_sl
@@ -188,12 +196,32 @@ class ExecutionEngine:
             return False
 
         try:
-            self._api.modifyOrder({
+            response = self._api.modifyOrder({
                 "variety": "NORMAL",
                 "orderid": order_id,
                 "triggerprice": str(new_sl),
             })
-            logger.info(f"SL modified: {order_id} → {new_sl:.2f}")
+            # Two shapes we accept as success:
+            #   1) Truthy non-dict (legacy SDK returns the new order id as a
+            #      bare string -- still success).
+            #   2) Dict with status truthy. Anything else (status=false,
+            #      empty dict, None) is treated as failure.
+            if isinstance(response, dict):
+                status_ok = bool(response.get("status"))
+                if not status_ok:
+                    logger.error(
+                        f"Failed to modify SL for {order_id}: broker rejected "
+                        f"with status=false (message={response.get('message')!r}). "
+                        f"Trail SL update did NOT propagate to broker."
+                    )
+                    return False
+            elif not response:
+                logger.error(
+                    f"Failed to modify SL for {order_id}: broker returned "
+                    f"empty/None response. Trail SL update did NOT propagate."
+                )
+                return False
+            logger.info(f"SL modified: {order_id} \u2192 {new_sl:.2f}")
             return True
         except Exception as e:
             logger.error(f"Failed to modify SL for {order_id}: {e}")

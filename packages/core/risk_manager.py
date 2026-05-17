@@ -608,7 +608,19 @@ class RiskManager:
             shares_by_risk = int(risk_amount / risk_per_share)
             return max(1, min(shares_by_risk, max_shares_by_value))
 
-        return max(1, max_shares_by_value)
+        # P1 #10 (2026-05-17) -- LIVE-MODE SAFETY: when BOTH stop_loss_price
+        # and atr are missing (or atr<=0), we have NO meaningful risk-per-share
+        # measure. The OLD code fell through to ``max_shares_by_value`` here,
+        # i.e. it silently sized the position to the max-position-value cap as
+        # if the trade had ZERO risk per share. In production trading_agent
+        # always passes both args, but any future call site that forgets one
+        # would request a 10-50x oversize. Refuse the trade explicitly.
+        logger.error(
+            f"[POSITION-SIZE] refusing trade: no stop_loss and no ATR provided. "
+            f"price={price}, side={side}, regime={regime}. Without a risk-per-share "
+            f"measure we cannot size safely. Returning 0 (skip)."
+        )
+        return 0
 
     # ── ATR-Based Stop-Loss ──────────────────────────────────
 

@@ -438,18 +438,48 @@ def check_sector_exposure(
             Financials cap. Default off for backward compatibility; the
             agent overlay flips it on at the config level.
     """
-    if total_equity <= 0:
-        return True, "no_equity_check"
-
+    # P1 #6 (2026-05-17) — LIVE-MODE SAFETY: fail-closed when equity is
+    # non-positive. The old code returned `(True, "no_equity_check")` here,
+    # i.e. the sector cap was BYPASSED precisely in the MTM-distorted regime
+    # where concentration matters most (e.g. a transient quote spike that
+    # makes unrealised P&L look like a wipe-out). Without this gate, a
+    # cascade of new entries can fire during the worst part of the day.
+    #
+    # Fallback denominator: gross notional of existing positions plus the
+    # additional cost. When that is also zero we have nothing meaningful to
+    # measure against — refuse the trade explicitly. This is much rarer in
+    # practice than the equity-glitch case so the strict failure mode is OK.
     bucket = _bucket_for(symbol, unknown_per_symbol, use_supersectors)
     existing_sector_value = sum(
         v for s, v in current_positions_by_symbol.items()
         if _bucket_for(s, unknown_per_symbol, use_supersectors) == bucket
     )
     new_sector_value = existing_sector_value + additional_cost
-    sector_pct = new_sector_value / total_equity * 100
-
     display_bucket = bucket.replace("UNKNOWN:", "UNKNOWN/")
+
+    if total_equity <= 0:
+        gross_exposure = (
+            sum(current_positions_by_symbol.values()) + additional_cost
+        )
+        if gross_exposure <= 0:
+            return False, (
+                "sector_concentration: equity<=0 and gross_exposure<=0; "
+                "refusing new entry until portfolio state is meaningful"
+            )
+        sector_pct_fallback = new_sector_value / gross_exposure * 100
+        if sector_pct_fallback > max_sector_exposure_pct:
+            return False, (
+                f"sector_concentration_fallback: {display_bucket} would be "
+                f"{sector_pct_fallback:.1f}% of GROSS (equity\u22640; "
+                f"cap {max_sector_exposure_pct}%, "
+                f"existing Rs {existing_sector_value:,.0f})"
+            )
+        return True, (
+            f"ok_fallback (sector {display_bucket} @ "
+            f"{sector_pct_fallback:.1f}% of gross; equity<=0)"
+        )
+
+    sector_pct = new_sector_value / total_equity * 100
 
     if sector_pct > max_sector_exposure_pct:
         return False, (

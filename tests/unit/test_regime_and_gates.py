@@ -38,6 +38,14 @@ class TestRegimeClassification:
         assert classify_regime({}) == "unknown"
         assert classify_regime({"nifty_trend": 1}) == "unknown"
 
+    # P1 #11 (2026-05-17): when Yahoo Nifty history is short (<200 closes)
+    # or absent, trading_agent now defaults nifty_trend to 0 (neutral) rather
+    # than 1 (bull). Verify classify_regime routes 0 to "sideways" so the
+    # sideways position-size multiplier applies \u2014 bear defenses retained.
+    def test_neutral_trend_routes_to_sideways(self):
+        assert classify_regime({"nifty_trend": 0, "india_vix": 14.0}) == "sideways"
+        assert classify_regime({"nifty_trend": 0, "india_vix": 22.0}) == "sideways"
+
     def test_mr_multiplier_favors_sideways(self):
         assert regime_multiplier("mean_reversion", "sideways") > 1.0
         assert regime_multiplier("mean_reversion", "bull_low_vol") < 1.0
