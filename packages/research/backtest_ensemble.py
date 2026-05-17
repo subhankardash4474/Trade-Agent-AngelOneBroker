@@ -25,13 +25,18 @@ import argparse
 import json
 import os
 import sys
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
 import pandas as pd
+import pytz
 import yaml
 from loguru import logger
+
+IST = pytz.timezone("Asia/Kolkata")
+PROGRESS_LOG_INTERVAL_EVENTS = 10_000
 
 try:
     sys.stdout.reconfigure(encoding="utf-8")
@@ -191,9 +196,39 @@ class EnsembleBacktester:
 
         # Build a unified, time-ordered event stream across symbols so
         # portfolio constraints (max positions, cash) are enforced chronologically.
+        # We compute total_events from market_data BEFORE consuming the
+        # generator so the progress meter has a denominator. This is the
+        # same sum _merge_bars iterates over, so it's exact, not an estimate.
+        total_events = sum(len(df) for df in market_data.values())
         events = self._merge_bars(market_data)
 
-        for ts, symbol, bar, df_slice in events:
+        run_t0 = time.time()
+        next_progress_at = PROGRESS_LOG_INTERVAL_EVENTS
+
+        for event_idx, (ts, symbol, bar, df_slice) in enumerate(events, start=1):
+            # Periodic progress log. Without this, the worker emits only
+            # strategy-signal lines and there is no way (short of reading
+            # source) to tell whether a multi-hour run is 10% or 90% done.
+            # See logs/backtests/smoke_2var_20260515_152858 — 45h with no
+            # progress signal, the symptom that surfaced this gap.
+            if event_idx >= next_progress_at or event_idx == total_events:
+                elapsed = max(time.time() - run_t0, 1e-6)
+                pct = event_idx / total_events * 100 if total_events else 0.0
+                rate = event_idx / elapsed
+                remaining = max(total_events - event_idx, 0)
+                eta_sec = remaining / rate if rate > 0 else 0.0
+                eta_str = self._format_duration(eta_sec)
+                # ts is the bar timestamp (tz-aware pandas Timestamp); just
+                # render it as ISO so the operator sees real market dates
+                # advancing.
+                sim_date = str(ts)[:10]
+                logger.info(
+                    f"[BATTERY-PROGRESS] {event_idx:,}/{total_events:,} "
+                    f"({pct:5.1f}%) | sim_date={sim_date} | rate={rate:,.0f} ev/s "
+                    f"| elapsed={self._format_duration(elapsed)} | ETA={eta_str}"
+                )
+                next_progress_at += PROGRESS_LOG_INTERVAL_EVENTS
+
             close = float(bar["close"])
 
             # Check SL/TP exits for any open position on this symbol
@@ -205,7 +240,14 @@ class EnsembleBacktester:
                 if trigger:
                     exit_price = self._apply_slippage(close, pos.side, exit=True)
                     record = portfolio.close_position(
-                        symbol, exit_price, exit_reason=trigger
+                        symbol,
+                        exit_price,
+                        exit_reason=trigger,
+                        # Use simulated bar timestamp, not wall-clock.
+                        # Without this, holding_minutes on TradeRecord and
+                        # any time-based exit rule end up measured in real
+                        # seconds elapsed while the backtest was running.
+                        exit_time=self._ts_to_datetime(ts),
                     )
                     if record:
                         rm.record_trade(record.pnl)
@@ -314,6 +356,9 @@ class EnsembleBacktester:
                 take_profit=tp,
                 regime=regime,
                 contributing_strategies=agg.contributing_strategies,
+                # Stamp entry with simulated bar timestamp so trade
+                # records and holding_minutes reflect market time.
+                entry_time=self._ts_to_datetime(ts),
             )
             gate_stats.executed += 1
             equity_curve.append(portfolio.get_total_value({symbol: close}))
@@ -322,10 +367,24 @@ class EnsembleBacktester:
         for symbol, df in market_data.items():
             if symbol in portfolio.positions and not df.empty:
                 last_close = float(df["close"].iloc[-1])
-                record = portfolio.close_position(symbol, last_close, exit_reason="backtest_end")
+                # Final-bar timestamp for each symbol — keeps holding_minutes
+                # internally consistent with the simulated session.
+                last_ts = df.index[-1]
+                record = portfolio.close_position(
+                    symbol,
+                    last_close,
+                    exit_reason="backtest_end",
+                    exit_time=self._ts_to_datetime(last_ts),
+                )
                 if record:
                     rm.record_trade(record.pnl)
                     trades.append(self._trade_to_dict(record, "backtest_end"))
+
+        total_elapsed = time.time() - run_t0
+        logger.info(
+            f"[BATTERY-PROGRESS] DONE in {self._format_duration(total_elapsed)} "
+            f"| {total_events:,} events | {total_events / max(total_elapsed, 1e-6):,.0f} ev/s"
+        )
 
         return self._build_result(trades, equity_curve, gate_stats)
 
@@ -344,6 +403,37 @@ class EnsembleBacktester:
                 continue
             built.append(cls(strat_cfg.get(n, {})))
         return built
+
+    @staticmethod
+    def _ts_to_datetime(ts) -> datetime:
+        """Convert a bar index (pandas Timestamp, numpy datetime64, or python
+        datetime) into a tz-aware Python datetime in IST.
+
+        Used so portfolio.open_position / close_position record the
+        SIMULATED bar timestamp, not wall-clock. yfinance 5-minute bars
+        already carry Asia/Kolkata tzinfo, but downstream code that
+        sometimes round-trips through naive timestamps can lose it; we
+        normalize both paths here.
+        """
+        if isinstance(ts, pd.Timestamp):
+            py_dt = ts.to_pydatetime()
+        elif isinstance(ts, datetime):
+            py_dt = ts
+        else:
+            # numpy datetime64 / int — best-effort coerce via pandas.
+            py_dt = pd.Timestamp(ts).to_pydatetime()
+        if py_dt.tzinfo is None:
+            return IST.localize(py_dt)
+        return py_dt.astimezone(IST)
+
+    @staticmethod
+    def _format_duration(seconds: float) -> str:
+        seconds = max(seconds, 0.0)
+        if seconds < 60:
+            return f"{seconds:4.1f}s"
+        if seconds < 3600:
+            return f"{seconds / 60:4.1f}m"
+        return f"{seconds / 3600:4.1f}h"
 
     def _merge_bars(self, market_data: Dict[str, pd.DataFrame]):
         """Yield (timestamp, symbol, bar_row, slice_up_to_and_including_bar) events

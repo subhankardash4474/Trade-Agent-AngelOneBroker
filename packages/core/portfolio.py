@@ -332,12 +332,24 @@ class Portfolio:
         market_trend: Optional[int] = None,
         regime: Optional[str] = None,
         contributing_strategies: Optional[Dict[str, float]] = None,
+        entry_time: Optional[datetime] = None,
     ) -> bool:
         """
         Open a new position. Thread-safe: serialized via `_pos_lock` so
         concurrent callers for the same symbol cannot both pass the
         duplicate-position check. The DB further enforces uniqueness via
         PRIMARY KEY on `open_positions.symbol`.
+
+        `entry_time` lets callers (specifically the backtester) stamp the
+        position with the simulated bar timestamp instead of wall-clock.
+        When None (the live path), it defaults to `datetime.now(IST)` so
+        existing call-sites are unchanged. Without this the backtester
+        recorded wall-clock entry times, so any time-based logic — most
+        notably `holding_minutes` on TradeRecord and any "max-holding"
+        risk gate — was measured in real seconds elapsed *while the
+        backtest was running*, not in simulated market time. Discovered
+        2026-05-17 while diagnosing why a 60-day smoke battery had been
+        churning for 45+ hours with no progress signal.
         """
         with self._pos_lock:
             # Defensive duplicate-position guard (in-memory + DB re-check).
@@ -381,7 +393,15 @@ class Portfolio:
             # Persist to DB FIRST (PRIMARY KEY enforces uniqueness). If this
             # fails due to a concurrent insert, abort before mutating
             # in-memory state.
-            entry_time = datetime.now(IST)
+            if entry_time is None:
+                entry_time = datetime.now(IST)
+            elif entry_time.tzinfo is None:
+                # Backtest-supplied bar timestamps from pandas are usually
+                # tz-aware (yfinance bars are IST), but defend against the
+                # naive case so we don't mix tz-aware and naive datetimes
+                # downstream (e.g. close_position's holding_minutes calc
+                # would raise TypeError on naive - aware subtraction).
+                entry_time = IST.localize(entry_time)
             entry_time_iso = entry_time.isoformat()
             if self._db is not None:
                 try:
@@ -444,7 +464,13 @@ class Portfolio:
         symbol: str,
         exit_price: float,
         exit_reason: str = "signal",
+        exit_time: Optional[datetime] = None,
     ) -> Optional[TradeRecord]:
+        """`exit_time` lets backtest callers stamp the simulated bar
+        timestamp; live callers leave it None (defaults to wall-clock).
+        See open_position docstring for the full backtest-correctness
+        rationale.
+        """
         with self._pos_lock:
             pos = self.positions.get(symbol)
             if pos is None:
@@ -495,7 +521,10 @@ class Portfolio:
             else:
                 self.cash += pos.entry_price * pos.quantity + gross_pnl - exit_commission
 
-            exit_time = datetime.now(IST)
+            if exit_time is None:
+                exit_time = datetime.now(IST)
+            elif exit_time.tzinfo is None:
+                exit_time = IST.localize(exit_time)
             holding_minutes = 0.0
             try:
                 entry_time = pos.entry_time

@@ -103,3 +103,79 @@ class TestSummary:
         assert "total_value" in summary
         assert "metrics" in summary
         assert "realized_pnl" in summary
+
+
+class TestSimulatedTimestamps:
+    """Regression tests for the 2026-05-17 backtest-correctness fix.
+
+    Before the fix, open_position/close_position unconditionally used
+    `datetime.now(IST)` for entry_time and exit_time. The backtester
+    therefore recorded wall-clock entry/exit times and computed
+    holding_minutes against real elapsed seconds — not against the
+    simulated bar timestamps it was iterating over. These tests pin the
+    contract: explicit `entry_time` / `exit_time` win over wall-clock,
+    naive datetimes get IST-localized, and the live path (no argument
+    passed) still falls back to wall-clock.
+    """
+
+    def test_explicit_entry_time_overrides_wallclock(self, portfolio):
+        import pytz
+        from datetime import datetime as dt
+
+        ist = pytz.timezone("Asia/Kolkata")
+        bar_ts = ist.localize(dt(2026, 3, 18, 10, 15))
+        portfolio.open_position(
+            "RELIANCE", "BUY", 2500.0, 1, entry_time=bar_ts,
+        )
+        # Position's entry_time must be the bar timestamp, not the
+        # current wall-clock value (the test obviously isn't running
+        # at March 18, 2026, 10:15 IST).
+        assert portfolio.positions["RELIANCE"].entry_time == bar_ts
+
+    def test_explicit_exit_time_produces_simulated_holding_minutes(self, portfolio):
+        import pytz
+        from datetime import datetime as dt
+
+        ist = pytz.timezone("Asia/Kolkata")
+        entry_ts = ist.localize(dt(2026, 3, 18, 10, 00))
+        exit_ts = ist.localize(dt(2026, 3, 18, 10, 45))  # +45 simulated minutes
+
+        portfolio.open_position(
+            "TCS", "BUY", 3500.0, 1, entry_time=entry_ts,
+        )
+        record = portfolio.close_position("TCS", 3520.0, exit_time=exit_ts)
+
+        assert record is not None
+        # 45 simulated minutes — NOT the real wall-clock fraction-of-a-second
+        # this test takes to run.
+        assert 44.5 <= record.holding_minutes <= 45.5
+
+    def test_naive_entry_time_is_ist_localized(self, portfolio):
+        from datetime import datetime as dt
+
+        naive_bar = dt(2026, 3, 18, 10, 15)  # no tzinfo
+        portfolio.open_position(
+            "INFY", "BUY", 1500.0, 1, entry_time=naive_bar,
+        )
+        et = portfolio.positions["INFY"].entry_time
+        # Without IST localization we'd see a naive datetime; assert tz-aware.
+        assert et.tzinfo is not None
+        # And same wall-time digits.
+        assert (et.year, et.month, et.day, et.hour, et.minute) == (
+            2026, 3, 18, 10, 15,
+        )
+
+    def test_no_entry_time_falls_back_to_wallclock(self, portfolio):
+        """Live path must remain unchanged: when callers don't pass
+        entry_time we still use datetime.now(IST).
+        """
+        from datetime import datetime as dt
+        import pytz
+
+        ist = pytz.timezone("Asia/Kolkata")
+        before = dt.now(ist)
+        portfolio.open_position("SBIN", "BUY", 600.0, 5)
+        after = dt.now(ist)
+
+        et = portfolio.positions["SBIN"].entry_time
+        assert before <= et <= after
