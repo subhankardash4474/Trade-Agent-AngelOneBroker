@@ -120,6 +120,10 @@ battery_*.log
 emergency_stop
 STOP
 
+# 2026-05-17: run_battery writes its current run_id here so a Ctrl-C
+# can be resumed; transient per-host marker, never source.
+.battery_run_id.txt
+
 # ── IDE & OS noise ──────────────────────────────────────────────
 .vscode/
 .idea/

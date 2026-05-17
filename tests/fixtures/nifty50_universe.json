@@ -1,0 +1,20 @@
+{
+  "_meta": {
+    "name": "NIFTY-50 (May 2026)",
+    "description": "Top 50 stocks by market cap (NIFTY-50 index composition). Used for fast pre-live battery validation: 50 stocks x 60 days runs in ~15-20 min on workers=2, whereas the full 232-stock v2 universe takes 12+ hours per variant.",
+    "frozen_at": "2026-05-14",
+    "note": "These are the first 50 symbols of tests/fixtures/battery_v2_universe.json by market-cap order. Refresh quarterly if NIFTY-50 composition changes."
+  },
+  "universe": [
+    "RELIANCE", "TCS", "HDFCBANK", "INFY", "ICICIBANK",
+    "HINDUNILVR", "SBIN", "BHARTIARTL", "KOTAKBANK", "ITC",
+    "LT", "AXISBANK", "BAJFINANCE", "ASIANPAINT", "MARUTI",
+    "HCLTECH", "SUNPHARMA", "TITAN", "ULTRACEMCO", "NTPC",
+    "WIPRO", "POWERGRID", "NESTLEIND", "TATAMOTORS", "M&M",
+    "JSWSTEEL", "ADANIENT", "ADANIPORTS", "ONGC", "COALINDIA",
+    "TATASTEEL", "BAJAJFINSV", "TECHM", "INDUSINDBK", "HINDALCO",
+    "BPCL", "GRASIM", "DRREDDY", "DIVISLAB", "CIPLA",
+    "EICHERMOT", "BRITANNIA", "APOLLOHOSP", "TATACONSUM", "HEROMOTOCO",
+    "SBILIFE", "BAJAJ-AUTO", "HDFCLIFE", "LTIM", "UPL"
+  ]
+}
