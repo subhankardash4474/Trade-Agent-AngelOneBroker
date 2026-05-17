@@ -7,9 +7,10 @@ into a continuous, production-grade trading loop.
 
 import os
 import sys
+import threading
 import time
 from datetime import datetime, time as dtime, timedelta, date
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
 import pytz
@@ -207,6 +208,38 @@ class TradingAgent:
             product_type=self.config.get("execution", {}).get("product_type", "INTRADAY"),
             reset_balance=reset_balance,
         )
+
+        # P0 #2 (2026-05-15) — LIVE-MODE SAFETY: serialize exit checks.
+        # `_check_position_exits` runs from BOTH the main scan loop (fast-
+        # exits poll every ~15s) AND the WebSocket background thread (every
+        # tick). Without this lock, the same symbol's SL/peak-giveback gate
+        # can be tripped concurrently by both paths; both submit flatten
+        # orders before either close_position clears the in-memory position.
+        # Result: doubled exit orders on a fast move — near-100% probability
+        # on the first WS-enabled day with any volatile tick.
+        self._exit_check_lock = threading.Lock()
+
+        # P0 #4 (2026-05-15) — LIVE-MODE SAFETY: restart SL reconciliation.
+        # If the daemon was restarted mid-session with open positions, the
+        # portfolio rehydrates from DB but the fresh ExecutionEngine has an
+        # empty `_sl_orders_by_symbol`. The broker still holds the original
+        # SL-M legs. Without this step, `update_sl_trigger_for_symbol`
+        # silently no-ops (trail SL never propagates after restart) and
+        # `cancel_sl_order_for_symbol` silently no-ops (next close leaves
+        # an orphaned SL behind that can fire as a reverse trade). Yesterday's
+        # SL-tracking PR exactly tried to close this hole — it stayed open
+        # for restart paths. Paper mode + empty-positions = no-op.
+        try:
+            if self.portfolio.positions:
+                self.execution.reconcile_sl_orders_from_broker(
+                    self.portfolio.positions
+                )
+        except Exception as e:
+            logger.error(
+                f"[SL-RECONCILE] reconciliation failed unexpectedly ({e}); "
+                f"restored positions remain unprotected in tracking. "
+                f"Continuing boot — manual SL audit recommended."
+            )
         self.alert_manager = AlertManager(self.config)
         self.feature_engine = FeatureEngine()
         self.ensemble = EnsembleModel(self.config)
@@ -3097,6 +3130,89 @@ class TradingAgent:
             # Duplicate short
             self._audit_reject(signal, current_price, "already_open:duplicate_short")
 
+    # P0 #1 (2026-05-15) — LIVE-MODE SAFETY: coordinated exit helper.
+    #
+    # Previous pattern on every close path was:
+    #   (a) place flatten order
+    #   (b) close portfolio in-memory
+    #   (c) cancel broker SL-M
+    # The window between (a) and (c) left BOTH orders live at the broker.
+    # An adverse tick could trigger the SL-M and the flatten in the same
+    # round-trip → accidentally short (or long) after we thought we'd
+    # flattened. The orphaned-SL hazard the SL registry was designed to
+    # prevent was effectively still present for the duration of every exit.
+    #
+    # New ordering:
+    #   1. Cancel broker SL-M.
+    #   2. Place flatten.
+    #   3. Update internal portfolio + risk state on flatten success.
+    #
+    # New edge cases the helper handles:
+    #   • Cancel fails but SL is tracked → log CRITICAL, still flatten (a
+    #     stuck broker SL is preferable to a stuck open position).
+    #   • Flatten fails AFTER a successful cancel → CRITICAL alert + return
+    #     None. Position is naked at broker until ops intervenes or P0 #4's
+    #     boot-time broker reconciliation re-arms it.
+    def _close_position_safely(
+        self,
+        symbol: str,
+        token: Optional[str],
+        exit_side: str,
+        quantity: int,
+        price: float,
+        tag: str,
+        exit_reason: str,
+    ) -> tuple[Optional[dict], Optional[Any]]:
+        """Cancel broker SL then place flatten. See class-level note above.
+
+        Returns (order_dict, trade_record). Either element may be None on
+        failure; callers should branch on order being None vs record being
+        None (e.g. portfolio.close_position returned no record).
+        """
+        sl_existed = self.execution.get_sl_order_for_symbol(symbol) is not None
+        cancel_ok = self.execution.cancel_sl_order_for_symbol(symbol)
+        if sl_existed and not cancel_ok:
+            logger.critical(
+                f"[SAFE-EXIT] {symbol}: broker SL cancel FAILED before flatten "
+                f"(tag={tag}, reason={exit_reason}). Double-fill possible; "
+                f"proceeding with flatten anyway (stuck SL is the lesser evil)."
+            )
+
+        order = self.execution.place_order(
+            symbol=symbol, token=token, transaction_type=exit_side,
+            quantity=quantity, price=price, tag=tag,
+        )
+        flatten_ok = bool(order and order.get("status") in ("FILLED", "PLACED"))
+        if not flatten_ok:
+            if cancel_ok and sl_existed:
+                logger.critical(
+                    f"[SAFE-EXIT] {symbol}: cancel OK but flatten FAILED. "
+                    f"POSITION IS NAKED AT BROKER (no SL, no exit). "
+                    f"Manual reconciliation required. tag={tag}."
+                )
+                try:
+                    self.alert_manager.send_alert(
+                        f"CRITICAL: Naked position {symbol}",
+                        f"{symbol}: broker SL cancelled but flatten order failed "
+                        f"(tag={tag}, reason={exit_reason}). Position is open "
+                        f"without protection. Square off manually NOW.",
+                        level="critical",
+                    )
+                except Exception:
+                    pass
+            return None, None
+
+        filled_price = order.get("filled_price") or price
+        record = self.portfolio.close_position(symbol, filled_price, exit_reason=exit_reason)
+        if record is None:
+            return order, None
+
+        self.risk_manager.record_trade(record.pnl)
+        self.risk_manager.remove_trailing_stop(symbol)
+        self._record_exit(symbol, record.pnl, exit_reason=exit_reason)
+        self._on_trade_closed(record)
+        return order, record
+
     def _exit_on_signal(
         self,
         signal: TradeSignal,
@@ -3131,27 +3247,19 @@ class TradingAgent:
             except Exception:
                 pass
 
-        # Exit side is the opposite of the position side.
+        # P0 #1 (2026-05-15): cancel broker SL BEFORE flatten via the safe helper.
         exit_tx = "SELL" if pos.side == "BUY" else "BUY"
-        order = self.execution.place_order(
-            symbol=symbol, token=token, transaction_type=exit_tx,
+        order, record = self._close_position_safely(
+            symbol=symbol, token=token, exit_side=exit_tx,
             quantity=pos.quantity, price=current_price,
-            tag=signal.strategy_name,
+            tag=signal.strategy_name, exit_reason="signal",
         )
-        if order and order.get("status") in ("FILLED", "PLACED"):
+        if order and record:
             filled_price = order.get("filled_price") or current_price
-            record = self.portfolio.close_position(symbol, filled_price, exit_reason="signal")
-            if record:
-                # 2026-05-14 LIVE-MODE SAFETY: cancel any orphaned broker SL.
-                self.execution.cancel_sl_order_for_symbol(symbol)
-                self.risk_manager.record_trade(record.pnl)
-                self.risk_manager.remove_trailing_stop(symbol)
-                self._record_exit(symbol, record.pnl, exit_reason="signal")
-                self._on_trade_closed(record)
-                self.alert_manager.send_trade_alert(
-                    exit_tx, symbol, pos.quantity, filled_price,
-                    signal.strategy_name, pnl=record.pnl,
-                )
+            self.alert_manager.send_trade_alert(
+                exit_tx, symbol, pos.quantity, filled_price,
+                signal.strategy_name, pnl=record.pnl,
+            )
 
     def _open_new_position(
         self,
@@ -3735,34 +3843,42 @@ class TradingAgent:
                 continue
             token = self._get_token(symbol)
             exit_side = "SELL" if pos.side == "BUY" else "BUY"
-            order = self.execution.place_order(
-                symbol=symbol, token=token, transaction_type=exit_side,
+            # P0 #1 (2026-05-15): cancel broker SL BEFORE flatten via the safe helper.
+            order, rec = self._close_position_safely(
+                symbol=symbol, token=token, exit_side=exit_side,
                 quantity=pos.quantity, price=price,
-                tag="carryover_profit_lock",
+                tag="carryover_profit_lock", exit_reason="carryover_profit_lock",
             )
-            if order and order.get("status") in ("FILLED", "PLACED"):
+            if order and rec:
                 filled = order.get("filled_price") or price
-                rec = self.portfolio.close_position(
-                    symbol, filled, exit_reason="carryover_profit_lock"
+                self.alert_manager.send_alert(
+                    "Exit: CARRYOVER_PROFIT_LOCK",
+                    f"{pos.side} {pos.quantity}x{symbol} @ \u20B9{filled:.2f} | "
+                    f"Locked PnL: \u20B9{rec.pnl:+.2f} (was carryover from "
+                    f"{pos.entry_time.date()})",
+                    level="info",
                 )
-                if rec:
-                    self.execution.cancel_sl_order_for_symbol(symbol)
-                    self.risk_manager.record_trade(rec.pnl)
-                    self.risk_manager.remove_trailing_stop(symbol)
-                    self._record_exit(symbol, rec.pnl,
-                                      exit_reason="carryover_profit_lock")
-                    self._on_trade_closed(rec)
-                    self.alert_manager.send_alert(
-                        "Exit: CARRYOVER_PROFIT_LOCK",
-                        f"{pos.side} {pos.quantity}x{symbol} @ \u20B9{filled:.2f} | "
-                        f"Locked PnL: \u20B9{rec.pnl:+.2f} (was carryover from "
-                        f"{pos.entry_time.date()})",
-                        level="info",
-                    )
         self._carryover_lock_done = True
 
     def _check_position_exits(self, current_prices: Dict[str, Optional[float]]):
-        """Check SL/TP/trailing for all open positions."""
+        """Check SL/TP/trailing for all open positions.
+
+        P0 #2 (2026-05-15) — LIVE-MODE SAFETY: this body is serialized
+        across the main scan loop and the WebSocket background thread by
+        `self._exit_check_lock`. A coarse single lock is fine for our
+        position-book size (≤10 positions); fine-grained per-symbol
+        locking would be overkill. The lock guards the *combined*
+        check + flatten transaction, not just the check — so the second
+        thread enters after the first has cleared `portfolio.positions`
+        and finds nothing to do.
+        """
+        with self._exit_check_lock:
+            self._check_position_exits_locked(current_prices)
+
+    def _check_position_exits_locked(self, current_prices: Dict[str, Optional[float]]):
+        """Locked body of `_check_position_exits`. Do not call directly —
+        always enter through `_check_position_exits` so concurrent callers
+        (WS thread + main loop) cannot race on the same symbol's exit."""
         to_close = []
         for symbol, pos in self.portfolio.positions.items():
             price = current_prices.get(symbol)
@@ -3825,30 +3941,24 @@ class TradingAgent:
                 if ts is not None and getattr(ts, "trailing_active", False):
                     actual_reason = "trailing_stop"
 
-            order = self.execution.place_order(
-                symbol=symbol, token=token, transaction_type=exit_side,
-                quantity=pos.quantity, price=price, tag=f"auto_{actual_reason}",
+            # P0 #1 (2026-05-15): cancel broker SL BEFORE flatten via the safe helper.
+            order, record = self._close_position_safely(
+                symbol=symbol, token=token, exit_side=exit_side,
+                quantity=pos.quantity, price=price,
+                tag=f"auto_{actual_reason}", exit_reason=actual_reason,
             )
-            if order and order.get("status") in ("FILLED", "PLACED"):
+            if order and record:
                 filled_price = order.get("filled_price") or price
-                record = self.portfolio.close_position(symbol, filled_price, exit_reason=actual_reason)
-                if record:
-                    # 2026-05-14 LIVE-MODE SAFETY: cancel orphaned broker SL.
-                    self.execution.cancel_sl_order_for_symbol(symbol)
-                    self.risk_manager.record_trade(record.pnl)
-                    self.risk_manager.remove_trailing_stop(symbol)
-                    self._record_exit(symbol, record.pnl, exit_reason=actual_reason)
-                    self._on_trade_closed(record)
-                    # Alert level driven by realised PnL, not the trigger
-                    # name — a trailing-stop locking in profit is GOOD news
-                    # and shouldn't be flagged as a warning.
-                    level = "warning" if record.pnl < 0 else "info"
-                    self.alert_manager.send_alert(
-                        f"Exit: {actual_reason.upper()}",
-                        f"{pos.side} {pos.quantity}x{symbol} @ \u20B9{filled_price:.2f} | "
-                        f"PnL: \u20B9{record.pnl:+.2f}",
-                        level=level,
-                    )
+                # Alert level driven by realised PnL, not the trigger
+                # name — a trailing-stop locking in profit is GOOD news
+                # and shouldn't be flagged as a warning.
+                level = "warning" if record.pnl < 0 else "info"
+                self.alert_manager.send_alert(
+                    f"Exit: {actual_reason.upper()}",
+                    f"{pos.side} {pos.quantity}x{symbol} @ \u20B9{filled_price:.2f} | "
+                    f"PnL: \u20B9{record.pnl:+.2f}",
+                    level=level,
+                )
 
     def _square_off_all(self, reason: str = "eod_square_off"):
         logger.info(f"Squaring off all positions: {reason}")
@@ -3856,22 +3966,15 @@ class TradingAgent:
             pos = self.portfolio.positions.get(symbol)
             if not pos:
                 continue
-            price = self.data_handler.get_ltp(symbol, self._get_token(symbol)) or pos.entry_price
+            token = self._get_token(symbol)
+            price = self.data_handler.get_ltp(symbol, token) or pos.entry_price
             exit_side = "SELL" if pos.side == "BUY" else "BUY"
-            order = self.execution.place_order(
-                symbol=symbol, token=self._get_token(symbol),
-                transaction_type=exit_side, quantity=pos.quantity,
-                price=price, tag=reason,
+            # P0 #1 (2026-05-15): cancel broker SL BEFORE flatten via the safe helper.
+            self._close_position_safely(
+                symbol=symbol, token=token, exit_side=exit_side,
+                quantity=pos.quantity, price=price,
+                tag=reason, exit_reason=reason,
             )
-            if order and order.get("status") in ("FILLED", "PLACED"):
-                filled = order.get("filled_price") or price
-                record = self.portfolio.close_position(symbol, filled, exit_reason=reason)
-                if record:
-                    self.execution.cancel_sl_order_for_symbol(symbol)
-                    self.risk_manager.record_trade(record.pnl)
-                    self.risk_manager.remove_trailing_stop(symbol)
-                    self._record_exit(symbol, record.pnl, exit_reason=reason)
-                    self._on_trade_closed(record)
 
         self.alert_manager.send_alert(
             "Square Off Complete",

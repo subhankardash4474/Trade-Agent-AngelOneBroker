@@ -107,6 +107,41 @@ class TestCanTrade:
         allowed, reason = rm.can_trade(market_context={"india_vix": 15.0, "nifty_trend": 1})
         assert allowed is True
 
+    # P0 #5 (2026-05-15): regression guards. A None / NaN / non-numeric value
+    # in market_context used to raise TypeError ("'>' not supported between
+    # instances of 'NoneType' and 'int'"), aborting the trading cycle. After
+    # 5 such failures the daemon halted. These verify the defensive coercion.
+    def test_can_trade_handles_none_vix(self, rm):
+        allowed, reason = rm.can_trade(market_context={"india_vix": None, "nifty_trend": 1})
+        assert allowed is True, reason
+
+    def test_can_trade_handles_string_vix(self, rm):
+        allowed, reason = rm.can_trade(market_context={"india_vix": "n/a", "nifty_trend": 1})
+        assert allowed is True, reason
+
+    def test_can_trade_handles_numeric_string_vix(self, rm):
+        # Some upstream caches return numbers as strings; we still want them parsed.
+        allowed, reason = rm.can_trade(market_context={"india_vix": "30.0", "nifty_trend": 1})
+        assert allowed is False
+        assert "VIX" in reason
+
+    def test_can_trade_handles_none_nifty_trend(self, rm):
+        # None nifty_trend must not raise. Default to neutral (=1, allows entry).
+        allowed, reason = rm.can_trade(
+            market_context={"india_vix": 15.0, "nifty_trend": None}
+        )
+        assert allowed is True, reason
+
+    def test_can_trade_handles_nan_vix(self, rm):
+        # NaN > x is always False in Python float semantics, so this would not
+        # have crashed historically, but the new path uses float() which
+        # propagates NaN. Verify we still allow trading (NaN compares False).
+        import math
+        allowed, reason = rm.can_trade(
+            market_context={"india_vix": math.nan, "nifty_trend": 1}
+        )
+        assert allowed is True, reason
+
 
 class TestDrawdownTiers:
     def test_normal_tier(self, rm):

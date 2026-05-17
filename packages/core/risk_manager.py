@@ -483,13 +483,35 @@ class RiskManager:
             return False, f"Past intraday exit time ({self.intraday_exit_time})"
 
         # Market regime filters
+        # 2026-05-15 LIVE-MODE SAFETY (P0 #5): defensively coerce values that
+        # arrive from external feeds. If the upstream context has the key with
+        # a None/NaN/string value, a raw comparison `None > self.max_vix`
+        # raises TypeError, the trading cycle aborts, and after 5 consecutive
+        # failures the daemon halts. Same pattern for nifty_trend (KeyError
+        # safety + non-int values from cached snapshots).
         if market_context:
-            vix = market_context.get("india_vix", 0)
+            vix_raw = market_context.get("india_vix", 0)
+            try:
+                vix = float(vix_raw) if vix_raw is not None else 0.0
+            except (TypeError, ValueError):
+                logger.warning(
+                    f"can_trade: india_vix has non-numeric value {vix_raw!r}; "
+                    "treating as 0 (regime filter bypass for this cycle)"
+                )
+                vix = 0.0
             if vix > self.max_vix:
                 return False, f"India VIX too high: {vix:.1f} (max: {self.max_vix})"
 
             if self.require_nifty_above_200ema:
-                nifty_trend = market_context.get("nifty_trend", 1)
+                trend_raw = market_context.get("nifty_trend", 1)
+                try:
+                    nifty_trend = int(trend_raw) if trend_raw is not None else 1
+                except (TypeError, ValueError):
+                    logger.warning(
+                        f"can_trade: nifty_trend has non-numeric value {trend_raw!r}; "
+                        "treating as 1 (neutral, allows entry)"
+                    )
+                    nifty_trend = 1
                 if nifty_trend == -1:
                     return False, "Nifty below 200-day EMA — bearish regime"
 

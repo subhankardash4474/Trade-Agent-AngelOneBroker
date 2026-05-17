@@ -384,6 +384,30 @@ class ExecutionEngine:
                                 "quantity": quantity,
                                 "token": token,
                             }
+                        else:
+                            # P0 #3 (2026-05-15) — LIVE-MODE SAFETY:
+                            # entry order succeeded but SL placement failed
+                            # (margin glitch, API throttle, rejection). Prior
+                            # code would return ``result`` and the caller
+                            # would record an "OK entry" in the portfolio
+                            # while broker reality is a NAKED position. Single
+                            # API hiccup = unhedged exposure with uncapped
+                            # downside until we (or RMS) notice.
+                            #
+                            # Rollback strategy: immediately place a counter
+                            # market order to flatten. Log CRITICAL so the
+                            # operator sees the rollback in the daemon log
+                            # even if the trading agent later reports the
+                            # entry as "failed". Counter-flatten over cancel
+                            # because the entry may already be filled and a
+                            # cancelOrder on a filled order is a no-op.
+                            self._entry_sl_rollback(
+                                symbol=symbol, token=token,
+                                entry_order_id=response,
+                                entry_tx=tx_type, quantity=quantity,
+                                requested_stop_loss=stop_loss,
+                            )
+                            return None
 
                     return result
 
@@ -395,6 +419,70 @@ class ExecutionEngine:
 
         logger.error(f"Order FAILED after {self.retry_attempts} attempts")
         return None
+
+    def _entry_sl_rollback(
+        self,
+        *,
+        symbol: str,
+        token: str,
+        entry_order_id: str,
+        entry_tx: str,
+        quantity: int,
+        requested_stop_loss: float,
+    ) -> None:
+        """P0 #3 (2026-05-15) — emergency rollback when entry placed but
+        the SL leg failed.
+
+        Counter-flatten with a market order on the OPPOSITE side. Cleans
+        the order-log tracking artifacts of the failed compound so the
+        caller treats the entry as if it never happened. The original
+        entry's DB ledger row is intentionally retained so the rollback
+        attempt is auditable post-mortem.
+        """
+        logger.critical(
+            f"[ENTRY-ROLLBACK] {symbol}: entry order {entry_order_id} placed "
+            f"but SL placement FAILED (requested trigger \u20B9{requested_stop_loss:.2f}). "
+            f"Initiating counter-flatten to avoid naked position."
+        )
+        counter_side = "SELL" if entry_tx == "BUY" else "BUY"
+        try:
+            flatten_params = {
+                "variety": "NORMAL",
+                "tradingsymbol": symbol,
+                "symboltoken": token,
+                "transactiontype": counter_side,
+                "exchange": self.exchange,
+                "ordertype": "MARKET",
+                "producttype": self.product_type,
+                "duration": "DAY",
+                "quantity": str(quantity),
+            }
+            counter_id = self._api.placeOrder(flatten_params)
+            if counter_id:
+                logger.critical(
+                    f"[ENTRY-ROLLBACK] {symbol}: counter-flatten {counter_side} "
+                    f"x{quantity} placed (order {counter_id}). Net broker exposure "
+                    f"should be zero. Manual reconciliation still recommended."
+                )
+            else:
+                logger.critical(
+                    f"[ENTRY-ROLLBACK] {symbol}: broker returned empty id for "
+                    f"counter-flatten. POSITION MAY BE NAKED. INTERVENE NOW."
+                )
+        except Exception as e:
+            logger.critical(
+                f"[ENTRY-ROLLBACK] {symbol}: counter-flatten FAILED ({e}). "
+                f"POSITION IS NAKED AT BROKER. IMMEDIATE INTERVENTION REQUIRED."
+            )
+
+        # Remove the failed compound's tracking artifacts so the caller's
+        # in-memory state matches "entry never succeeded" semantics.
+        try:
+            if self._order_log and self._order_log[-1].get("order_id") == entry_order_id:
+                self._order_log.pop()
+        except Exception:
+            pass
+        self._pending_orders.pop(entry_order_id, None)
 
     def _place_sl_order(self, symbol: str, token: str, quantity: int,
                         trigger_price: float, tx_type: str) -> Optional[str]:
@@ -500,6 +588,137 @@ class ExecutionEngine:
         """Defensive introspection. Used by the heartbeat / health check
         to flag any SL we believe is active on the broker."""
         return dict(self._sl_orders_by_symbol)
+
+    # P0 #4 (2026-05-15) — LIVE-MODE SAFETY: restart reconciliation.
+    #
+    # When the daemon restarts mid-session with open positions, the portfolio
+    # is rehydrated from the DB but `_sl_orders_by_symbol` is empty in this
+    # fresh ExecutionEngine instance. The broker, however, still has the
+    # original SL-M orders live (broker state outlasts our process). Without
+    # this reconciliation step:
+    #   • `update_sl_trigger_for_symbol` silently returns False — trail SL
+    #     never propagates to the broker again.
+    #   • `cancel_sl_order_for_symbol` silently returns True (treats the
+    #     missing entry as "nothing to cancel") — so on the next close we
+    #     leave an orphaned SL behind that can fire later as a reverse trade.
+    #
+    # This is the exact bug the SL-tracking PR was supposed to close,
+    # reintroduced by ignoring the restart path.
+
+    def reconcile_sl_orders_from_broker(
+        self, restored_positions: dict
+    ) -> dict:
+        """Rebuild ``_sl_orders_by_symbol`` from the broker's order book.
+
+        For each restored position, looks for a live SL-M order on the
+        same symbol whose ``transactiontype`` is opposite (i.e. the
+        protective leg) and registers it. Logs CRITICAL for any position
+        that has no matching broker SL — that position is unprotected
+        and ops must intervene.
+
+        Args:
+            restored_positions: {symbol: Position-like} as held by Portfolio.
+
+        Returns:
+            Dict {symbol: status} where status is one of
+              ``reconciled`` — broker SL found and registered;
+              ``unprotected`` — no SL-M found for this symbol;
+              ``skipped_paper`` — paper mode, no broker to query.
+        """
+        report: dict[str, str] = {}
+        if self.mode == "paper" or self._api is None:
+            for sym in restored_positions:
+                report[sym] = "skipped_paper"
+            return report
+        if not restored_positions:
+            return report
+        try:
+            order_book = self._api.orderBook()
+        except Exception as e:
+            logger.error(
+                f"[SL-RECONCILE] orderBook() call failed ({e}); all "
+                f"restored positions remain UNPROTECTED in tracking. "
+                f"Trail SL propagation will no-op until a restart with "
+                f"working broker connectivity."
+            )
+            for sym in restored_positions:
+                report[sym] = "unprotected"
+                logger.critical(
+                    f"[SL-RECONCILE] {sym}: unable to query broker, no SL "
+                    f"registered. Manual reconciliation needed."
+                )
+            return report
+
+        if not order_book or not order_book.get("status"):
+            logger.warning(
+                f"[SL-RECONCILE] orderBook() returned empty/false-status "
+                f"payload: {order_book!r}"
+            )
+            for sym in restored_positions:
+                report[sym] = "unprotected"
+            return report
+
+        # Build a symbol -> [orders] index restricted to live SL-M legs.
+        # Angel's order statuses: "trigger pending", "open", "open pending",
+        # "validation pending" — we accept anything that isn't a terminal
+        # state. The terminal states are "complete", "rejected", "cancelled".
+        TERMINAL = {"complete", "rejected", "cancelled"}
+        live_sl_orders: dict[str, list[dict]] = {}
+        for order in order_book.get("data", []) or []:
+            try:
+                if (order.get("ordertype") or "").upper() != "SL-M":
+                    continue
+                status = (order.get("status") or "").lower()
+                if status in TERMINAL:
+                    continue
+                sym = order.get("tradingsymbol")
+                if not sym:
+                    continue
+                live_sl_orders.setdefault(sym, []).append(order)
+            except Exception:
+                continue
+
+        for sym, pos in restored_positions.items():
+            candidates = live_sl_orders.get(sym, [])
+            expected_side = "SELL" if getattr(pos, "side", "BUY") == "BUY" else "BUY"
+            match = None
+            for cand in candidates:
+                if (cand.get("transactiontype") or "").upper() == expected_side:
+                    match = cand
+                    break
+            if match is None:
+                report[sym] = "unprotected"
+                logger.critical(
+                    f"[SL-RECONCILE] {sym}: position restored (side={pos.side}, "
+                    f"qty={pos.quantity}, entry={pos.entry_price}) but no "
+                    f"matching live SL-M order found on broker. POSITION IS "
+                    f"UNPROTECTED. Trail SL updates will silently no-op."
+                )
+                continue
+            try:
+                trigger = float(match.get("triggerprice") or 0.0)
+            except (TypeError, ValueError):
+                trigger = 0.0
+            self._sl_orders_by_symbol[sym] = {
+                "order_id": match.get("orderid"),
+                "trigger": trigger,
+                "side": expected_side,
+                "quantity": int(float(match.get("quantity") or pos.quantity)),
+                "token": match.get("symboltoken") or "",
+            }
+            report[sym] = "reconciled"
+            logger.info(
+                f"[SL-RECONCILE] {sym}: re-registered broker SL "
+                f"{match.get('orderid')} @ trigger \u20B9{trigger:.2f}"
+            )
+
+        n_recon = sum(1 for v in report.values() if v == "reconciled")
+        n_unprot = sum(1 for v in report.values() if v == "unprotected")
+        logger.info(
+            f"[SL-RECONCILE] complete: {n_recon} reconciled, "
+            f"{n_unprot} unprotected (out of {len(restored_positions)} restored)"
+        )
+        return report
 
     def get_order_status(self, order_id: str) -> Optional[dict]:
         if self.mode == "paper":
