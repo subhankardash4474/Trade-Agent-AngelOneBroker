@@ -17,9 +17,19 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 try:
     import streamlit as st
-except ImportError:
-    print("Streamlit not installed. Run: pip install streamlit")
-    sys.exit(1)
+except ImportError as _exc:
+    # Re-raise instead of sys.exit so test_module_imports can catch it
+    # via its OPTIONAL_IMPORT_ALLOWED tuple and skip cleanly. sys.exit
+    # propagates SystemExit which bypasses the skip path and shows up
+    # as a hard CI failure on minimal Python images that don't ship
+    # streamlit. The CLI entry-point (run via `streamlit run ...`)
+    # never hits this branch because streamlit imports itself before
+    # invoking us; this branch only fires under bare-python import.
+    print("Streamlit not installed. Run: pip install streamlit", file=sys.stderr)
+    raise ModuleNotFoundError(
+        "streamlit is an optional dashboard dependency; install with "
+        "`pip install streamlit` to use monitoring/streamlit_app.py"
+    ) from _exc
 
 import plotly.express as px
 import plotly.graph_objects as go

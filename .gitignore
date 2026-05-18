@@ -105,6 +105,7 @@ logs/**/*.txt
 logs/**/*.pkl
 logs/**/*.yaml
 logs/**/*.yml
+logs/**/*.html
 # Keep folder structure so first clone has the empty dirs
 !logs/**/.gitkeep
 

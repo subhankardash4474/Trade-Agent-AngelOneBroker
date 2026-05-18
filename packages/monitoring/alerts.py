@@ -12,6 +12,7 @@ Network resilience:
 """
 
 import hashlib
+import html as _html_lib
 import json
 import os
 import re
@@ -27,6 +28,16 @@ from typing import Optional
 import pytz
 import requests
 from loguru import logger
+
+# Optional: markdown renderer for HTML email bodies. Falls back to a
+# styled <pre> block if not installed -- existing behaviour, just less
+# pretty. Imported lazily here so a missing dep doesn't fail the
+# module import (e.g. on minimal CI images).
+try:
+    import markdown as _markdown
+    _MARKDOWN_AVAILABLE = True
+except ImportError:
+    _MARKDOWN_AVAILABLE = False
 
 IST = pytz.timezone("Asia/Kolkata")
 
@@ -59,6 +70,184 @@ _RETRYABLE_STATUS = {408, 425, 429, 500, 502, 503, 504}
 _BACKOFF_DELAYS = [0, 2, 8, 24]
 
 _FAILED_ALERTS_DIR = Path("logs") / "failed_alerts"
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# HTML email rendering
+# ─────────────────────────────────────────────────────────────────────────
+# Level → accent color for the left-bar / header strip / verdict pills.
+# Webmail clients (Gmail in particular) aggressively strip <style> blocks,
+# so all colors / spacing are inlined on the elements that need them.
+_LEVEL_COLORS = {
+    "info":     "#2196F3",   # blue
+    "warning":  "#FF9800",   # amber
+    "error":    "#F44336",   # red
+    "critical": "#B71C1C",   # deep red
+    "success":  "#4CAF50",   # green
+}
+
+# Base typography + light/dark friendly palette. Most readers run light
+# mode in Gmail/Outlook, but `prefers-color-scheme` does NOT apply
+# inside an email iframe; we just bias for light and accept that dark-
+# mode readers see the same bg-light shell (their client will overlay).
+_EMAIL_FONT_STACK = (
+    "-apple-system, BlinkMacSystemFont, 'Segoe UI', "
+    "Roboto, Helvetica, Arial, sans-serif"
+)
+_MONO_FONT_STACK = "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace"
+
+
+def _render_email_html(body: str, level: str, subject: str = "") -> str:
+    """Render a (markdown-ish) body into clean HTML for email clients.
+
+    Why this exists
+    ---------------
+    Until 2026-05-19 the SMTP and Resend paths both wrapped the raw
+    body in <pre>{body}</pre>, which preserved newlines but lost
+    every markdown convention (headings, tables, emphasis, code).
+    Profit-diagnostic and EOD-summary mails -- both authored in
+    markdown -- arrived as walls of pseudo-text. This helper turns
+    them into something an operator can actually scan from a phone.
+
+    Strategy
+    --------
+    * Prefer the `markdown` library with the `tables` and `fenced_code`
+      extensions (covers the formats our generators emit).
+    * Inline every style on the element that needs it -- Gmail's webmail
+      strips <style> blocks wholesale.
+    * Add a level-coloured left bar so the operator sees severity at a
+      glance, plus a small subject echo above the body for context
+      (the email client's own subject row is sometimes truncated).
+    * Fall back to a styled <pre> (existing behaviour) if `markdown`
+      isn't installed. The text/plain alternative goes out in the same
+      multipart so anyone whose client refuses HTML still gets the
+      raw markdown.
+    """
+    accent = _LEVEL_COLORS.get(level, "#333333")
+
+    if _MARKDOWN_AVAILABLE:
+        try:
+            body_html = _markdown.markdown(
+                body,
+                extensions=["tables", "fenced_code", "sane_lists", "nl2br"],
+                output_format="html5",
+            )
+            body_html = _scrub_unsafe_tags(body_html)
+        except Exception as exc:  # pragma: no cover - markdown lib edge case
+            logger.warning(
+                f"markdown render failed ({type(exc).__name__}); "
+                "falling back to <pre>."
+            )
+            body_html = f"<pre style='font-family:{_MONO_FONT_STACK};white-space:pre-wrap;'>{_html_lib.escape(body)}</pre>"
+    else:
+        body_html = (
+            f"<pre style='font-family:{_MONO_FONT_STACK};"
+            f"white-space:pre-wrap;'>{_html_lib.escape(body)}</pre>"
+        )
+
+    # Light per-element styling. Tables get borders + zebra-stripe via
+    # inline styles applied AFTER markdown renders (markdown's table
+    # extension doesn't add any styling of its own).
+    body_html = _add_table_styling(body_html)
+
+    subject_strip = ""
+    if subject:
+        subject_strip = (
+            f'<div style="font-size:13px;color:#666;margin-bottom:4px;'
+            f'font-family:{_EMAIL_FONT_STACK};">{_html_lib.escape(subject)}</div>'
+        )
+
+    return (
+        '<!DOCTYPE html>'
+        '<html>'
+        '<head><meta charset="utf-8"></head>'
+        f'<body style="margin:0;padding:18px;background:#f6f7f9;'
+        f'font-family:{_EMAIL_FONT_STACK};color:#222;">'
+        '<div style="max-width:760px;margin:0 auto;background:#fff;'
+        'border-radius:8px;overflow:hidden;'
+        'box-shadow:0 1px 3px rgba(0,0,0,.08);">'
+        f'<div style="height:6px;background:{accent};"></div>'
+        '<div style="padding:18px 22px;">'
+        f'{subject_strip}'
+        '<div style="font-size:14.5px;line-height:1.55;">'
+        f'{body_html}'
+        '</div>'
+        '</div>'
+        '<div style="padding:10px 22px;background:#fafafa;'
+        'border-top:1px solid #eee;font-size:11px;color:#999;">'
+        'Trading Agent · IST · '
+        f'{datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S")}'
+        '</div>'
+        '</div>'
+        '</body>'
+        '</html>'
+    )
+
+
+# Tag families that should NEVER appear in an alert email body, even
+# if they show up verbatim in an interpolated broker error message or
+# log scrape. Profit-diagnostic / EOD bodies stitch together strings
+# from many sources; markdown 3.x preserves raw inline HTML by default
+# (its old ``safe_mode`` was removed in 3.0), so we scrub here. This
+# is NOT a full sanitizer -- only the realistic vectors for "looks
+# wrong in the inbox" or "mail client warns about scripting".
+_UNSAFE_TAGS = ("script", "iframe", "object", "embed", "style")
+_UNSAFE_TAG_RE = re.compile(
+    r"<(/?)\s*(" + "|".join(_UNSAFE_TAGS) + r")\b([^>]*)>",
+    flags=re.IGNORECASE,
+)
+# Strip inline event handlers like onclick="..." onerror="..." that
+# could survive a tag rename. Belt and suspenders.
+_INLINE_EVENT_RE = re.compile(r"\son\w+\s*=\s*\"[^\"]*\"", flags=re.IGNORECASE)
+
+
+def _scrub_unsafe_tags(html: str) -> str:
+    """Escape raw <script>/<iframe>/<style>/event-handler attributes.
+
+    Operates on the markdown-rendered HTML, not on the body source --
+    legitimate uses of these strings (e.g. a log line mentioning the
+    word ``onerror``) inside fenced code blocks are preserved because
+    the markdown library has already escaped them to ``&lt;script&gt;``
+    inside ``<pre><code>``. Only RAW occurrences (inline HTML that
+    markdown let through unchanged) get neutralised.
+    """
+    def _escape(match: "re.Match[str]") -> str:
+        return _html_lib.escape(match.group(0))
+
+    html = _UNSAFE_TAG_RE.sub(_escape, html)
+    html = _INLINE_EVENT_RE.sub("", html)
+    return html
+
+
+def _add_table_styling(html: str) -> str:
+    """Apply inline styles to <table>/<th>/<td> tags so webmail clients
+    render them with visible borders and a subtle zebra stripe.
+
+    This is a string-pass post-processor because markdown's table
+    extension emits clean tags but no styling -- and rewriting the
+    extension is more invasive than a 4-line regex substitute.
+    """
+    if "<table>" not in html:
+        return html
+    html = html.replace(
+        "<table>",
+        '<table style="border-collapse:collapse;width:100%;'
+        'margin:10px 0;font-size:13px;">',
+    )
+    html = html.replace(
+        "<th>",
+        '<th style="border:1px solid #ddd;padding:6px 8px;'
+        'background:#f1f3f5;text-align:left;font-weight:600;">',
+    )
+    html = html.replace(
+        "<td>",
+        '<td style="border:1px solid #e5e7eb;padding:6px 8px;'
+        'font-family:' + _MONO_FONT_STACK + ';">',
+    )
+    return html
+
+
+# ─────────────────────────────────────────────────────────────────────────
 
 
 def _sanitize_filename(s: str) -> str:
@@ -271,7 +460,7 @@ class AlertManager:
         dated_subject = f"{today} | {subject}"
         provider = self._email_cfg.get("provider", "smtp").lower()
         if provider == "resend":
-            self._send_email_resend(dated_subject, body)
+            self._send_email_resend(dated_subject, body, level=level)
             return
         self._send_email_smtp(dated_subject, body, level)
 
@@ -288,20 +477,20 @@ class AlertManager:
             if delay:
                 time.sleep(delay)
             try:
-                msg = MIMEMultipart()
+                # Multipart/alternative: text/plain first, then text/html.
+                # RFC 2046 says clients should prefer the LAST acceptable
+                # part, which on every modern reader (Gmail, Outlook,
+                # Apple Mail, ProtonMail) means the HTML one. Operators
+                # piping the alert through grep / a CLI mail reader
+                # still get the markdown source untouched.
+                msg = MIMEMultipart("alternative")
                 msg["From"] = self._email_cfg["sender"]
                 msg["To"] = self._email_cfg["recipient"]
                 msg["Subject"] = f"[Trading Agent] {subject}"
 
-                color = {"info": "#2196F3", "warning": "#FF9800", "error": "#F44336"}.get(level, "#333")
-                html = f"""
-                <html><body>
-                <div style="border-left: 4px solid {color}; padding: 12px; font-family: monospace;">
-                <pre>{body}</pre>
-                </div>
-                </body></html>
-                """
-                msg.attach(MIMEText(html, "html"))
+                html = _render_email_html(body, level, subject=subject)
+                msg.attach(MIMEText(body, "plain", "utf-8"))
+                msg.attach(MIMEText(html, "html", "utf-8"))
 
                 with smtplib.SMTP(self._email_cfg["smtp_server"], self._email_cfg["smtp_port"], timeout=15) as server:
                     server.starttls()
@@ -354,7 +543,7 @@ class AlertManager:
             ok = False
             try:
                 if provider == "resend":
-                    ok = self._send_email_resend(subject, body, spool_on_fail=False)
+                    ok = self._send_email_resend(subject, body, spool_on_fail=False, level=level)
                 else:
                     ok = self._send_email_smtp(subject, body, level, spool_on_fail=False)
             except Exception as e:
@@ -376,7 +565,7 @@ class AlertManager:
             logger.info(f"[ALERT-SPOOL] drain summary: sent={sent} failed={failed} skipped={skipped}")
         return {"sent": sent, "failed": failed, "skipped": skipped}
 
-    def _send_email_resend(self, subject: str, body: str, *, spool_on_fail: bool = True) -> bool:
+    def _send_email_resend(self, subject: str, body: str, *, spool_on_fail: bool = True, level: str = "info") -> bool:
         """Send email through Resend API with retry-on-network-error and
         disk-spool fallback. Returns True on success, False on terminal
         failure (which also writes a JSON spool file under logs/failed_alerts/
@@ -390,16 +579,21 @@ class AlertManager:
             return False
 
         full_subject = f"[Trading Agent] {subject}"
+        html_body = _render_email_html(body, level, subject=subject)
+        # Resend accepts both `html` and `text` -- ship both so the
+        # plain-text fallback works for any client that strips HTML.
         payload = {
             "from": sender,
             "to": [recipient],
             "subject": full_subject,
-            "html": f"<pre>{body}</pre>",
+            "html": html_body,
+            "text": body,
         }
         spool_payload = {
             "provider": "resend",
             "subject": subject,
             "body": body,
+            "level": level,
         }
 
         last_reason = "unknown"

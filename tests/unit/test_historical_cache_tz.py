@@ -32,9 +32,32 @@ from pathlib import Path
 from unittest.mock import MagicMock
 
 import pandas as pd
+import pytest
 import pytz
 
-from core.historical_cache import HistoricalCache, IST
+# These tests round-trip OHLCV frames through parquet to exercise the
+# real on-disk freshness path of HistoricalCache. pandas delegates
+# parquet I/O to pyarrow / fastparquet; CI minimal images often skip
+# both. The historical_cache production code uses parquet directly,
+# so the tests can't pivot to pickle without papering over the actual
+# code path. Cleanest fix: skip the entire module if no parquet engine
+# is available -- the runtime container always ships pyarrow.
+_PARQUET_ENGINE_AVAILABLE = False
+for _engine in ("pyarrow", "fastparquet"):
+    try:
+        __import__(_engine)
+        _PARQUET_ENGINE_AVAILABLE = True
+        break
+    except ImportError:
+        continue
+if not _PARQUET_ENGINE_AVAILABLE:
+    pytest.skip(
+        "neither pyarrow nor fastparquet available; "
+        "historical_cache tests exercise the real parquet round-trip",
+        allow_module_level=True,
+    )
+
+from core.historical_cache import HistoricalCache, IST  # noqa: E402
 
 
 def _df_with_one_row() -> pd.DataFrame:

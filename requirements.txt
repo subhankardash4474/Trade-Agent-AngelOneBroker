@@ -38,6 +38,11 @@ pytest-cov>=4.1.0
 
 # Email alerts
 resend>=0.7.0
+# Markdown -> HTML for daily / EOD / profit-diagnostic emails so they
+# render with tables, headings, code blocks instead of a wall of
+# pre-formatted text. Pure-python; tiny dep. Falls back gracefully
+# in alerts.py if absent (e.g. minimal CI image without it).
+markdown>=3.5
 
 # ML / training
 xgboost>=2.0.0
