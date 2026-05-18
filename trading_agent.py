@@ -782,6 +782,22 @@ class TradingAgent:
         # silently unsuspend a strategy that hit its circuit-breaker pre-
         # restart, or forget the last N opens used by the global open-rate
         # cap. See runtime_state_persistence.py for the full motivation.
+        #
+        # 2026-05-18 audit fix: ``self._strategy_state`` USED to be
+        # initialised ~70 lines below in the per-strategy-circuit-breaker
+        # block, so on a restart where the snapshot was non-empty the
+        # loop ``self._strategy_state[s] = v`` raised AttributeError, the
+        # ``except`` swallowed it, and the runtime state was silently
+        # LOST (suspended strategies got re-armed, open-rate window
+        # zeroed, TP-streak counters reset). We now initialise the
+        # buckets immediately before the load call so a non-empty
+        # snapshot is honoured. The legacy assignment ~70 lines below
+        # has been removed (single source of truth). See the live agent
+        # log warning at 2026-05-18 15:30:57 for the bug fingerprint.
+        # state shape:
+        #   strategy_name -> {consec_losses, daily_pnl, suspended,
+        #                     suspended_reason, trades}
+        self._strategy_state: Dict[str, Dict] = {}
         try:
             restored_strat, restored_opens, restored_tp = load_runtime_state(
                 open_rate_window=timedelta(minutes=self._opens_window_minutes),
@@ -851,9 +867,11 @@ class TradingAgent:
         self._strategy_daily_loss_pct: float = float(
             risk_cfg_raw.get("strategy_daily_loss_pct", 1.0)
         )
-        # state shape:
-        #   strategy_name -> {consec_losses, daily_pnl, suspended, suspended_reason, trades}
-        self._strategy_state: Dict[str, Dict] = {}
+        # NB: ``self._strategy_state`` is initialised earlier (just before
+        # the ``load_runtime_state`` call) so a non-empty snapshot can be
+        # honoured at boot. See the 2026-05-18 audit fix comment there.
+        # State shape: strategy_name -> {consec_losses, daily_pnl,
+        #                                suspended, suspended_reason, trades}.
         self._daily_tracker_date: Optional[datetime] = None
         # 2026-05-13: persist this across daemon restarts via a flag file
         # under ``logs/.eod_sent_<YYYY-MM-DD>.flag``. In-memory only meant
