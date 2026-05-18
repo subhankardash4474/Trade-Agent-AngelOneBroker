@@ -247,6 +247,15 @@ class TradingAgent:
         # decided-to-close symbol — does NOT deadlock on re-entry.
         self._exit_check_lock = threading.RLock()
 
+        # 2026-05-18 (Audit Issue #2): boot-time reconcile fires CRITICAL
+        # findings (orphan SL cancel-fail, position MISMATCH) BEFORE
+        # ``self.alert_manager`` is constructed a hundred-odd lines below,
+        # so the inline ``send_alert`` calls used to raise AttributeError
+        # and get swallowed by a bare ``except``. We now buffer the alert
+        # payloads here and flush them right after AlertManager exists.
+        # List of dicts with keys: ``title``, ``message``, ``level``.
+        self._pending_boot_alerts: List[Dict[str, str]] = []
+
         # P0 #4 (2026-05-15) — LIVE-MODE SAFETY: restart SL reconciliation.
         # If the daemon was restarted mid-session with open positions, the
         # portfolio rehydrates from DB but the fresh ExecutionEngine has an
@@ -256,16 +265,27 @@ class TradingAgent:
         # `cancel_sl_order_for_symbol` silently no-ops (next close leaves
         # an orphaned SL behind that can fire as a reverse trade). Yesterday's
         # SL-tracking PR exactly tried to close this hole — it stayed open
-        # for restart paths. Paper mode + empty-positions = no-op.
+        # for restart paths.
+        #
+        # P0 #3 residual fix (2026-05-18, Audit Bug #1) — the boot-time call
+        # USED to be gated on ``if self.portfolio.positions:`` which defeated
+        # the orphan / duplicate SL sweep added on 2026-05-18: the exact
+        # crash mode the sweep was designed for is a daemon crash AFTER the
+        # entry order filled but BEFORE the DB write, so on restart
+        # ``self.portfolio.positions == {}`` while a live SL-M sits on the
+        # broker. Removing the caller-side gate is the contract change the
+        # new `reconcile_sl_orders_from_broker` requires (it is now
+        # contract-bound to sweep orphans even with an empty restored-positions
+        # dict; paper mode + paper-engine are still no-ops internally).
         try:
-            if self.portfolio.positions:
-                self.execution.reconcile_sl_orders_from_broker(
-                    self.portfolio.positions
-                )
+            self.execution.reconcile_sl_orders_from_broker(
+                self.portfolio.positions
+            )
         except Exception as e:
             logger.error(
                 f"[SL-RECONCILE] reconciliation failed unexpectedly ({e}); "
-                f"restored positions remain unprotected in tracking. "
+                f"restored positions remain unprotected in tracking and any "
+                f"orphan broker SL-M legs were NOT swept. "
                 f"Continuing boot — manual SL audit recommended."
             )
 
@@ -339,25 +359,31 @@ class TradingAgent:
                                 f"Reasons: {entry.get('reasons')}. "
                                 f"Manual broker-vs-DB audit required."
                             )
-                            try:
-                                self.alert_manager.send_alert(
-                                    title=f"[CRITICAL] {sym} broker/DB mismatch",
-                                    message=(
-                                        f"Reconciliation found "
-                                        f"db={entry.get('db_side')} "
-                                        f"qty={entry.get('db_quantity')} vs "
-                                        f"broker={entry.get('broker_side')} "
-                                        f"qty={entry.get('broker_quantity')}. "
-                                        f"Trading blocked on this symbol "
-                                        f"for the rest of the session."
-                                    ),
-                                )
-                            except Exception:
-                                # alert_manager not yet wired up at this
-                                # init phase (it's constructed a few lines
-                                # below). Silent OK -- the CRITICAL log is
-                                # the primary signal.
-                                pass
+                            # 2026-05-18 (Audit Issue #2): the alert call USED
+                            # to be inline here, but ``self.alert_manager`` is
+                            # constructed several lines below -- the call
+                            # always raised AttributeError and was silently
+                            # swallowed by the bare ``except Exception``. Plus
+                            # ``level=`` was missing so even after the alert
+                            # could land it would route through the default
+                            # ``info`` channel rather than the critical
+                            # channel an op would actually wake up for. Now
+                            # we buffer the alert payload and dispatch it
+                            # right after AlertManager is constructed (see
+                            # ``_dispatch_pending_boot_alerts`` below).
+                            self._pending_boot_alerts.append({
+                                "title": f"[CRITICAL] {sym} broker/DB mismatch",
+                                "message": (
+                                    f"Reconciliation found "
+                                    f"db={entry.get('db_side')} "
+                                    f"qty={entry.get('db_quantity')} vs "
+                                    f"broker={entry.get('broker_side')} "
+                                    f"qty={entry.get('broker_quantity')}. "
+                                    f"Trading blocked on this symbol "
+                                    f"for the rest of the session."
+                                ),
+                                "level": "critical",
+                            })
                         except Exception as e:
                             logger.critical(
                                 f"[POSITION-RECONCILE] {sym} mismatch-block "
@@ -370,6 +396,15 @@ class TradingAgent:
                 f"recommended before resuming trading."
             )
         self.alert_manager = AlertManager(self.config)
+
+        # 2026-05-18 (Audit Issue #2): flush any CRITICAL alerts that the
+        # boot-time reconcile blocks queued up before AlertManager existed.
+        # These are mostly position MISMATCH and orphan-SL cancel failures
+        # detected at startup. We deliberately flush AFTER AlertManager so
+        # the alerts land on the configured critical channel rather than
+        # being lost to a swallowed AttributeError.
+        self._flush_pending_boot_alerts()
+
         self.feature_engine = FeatureEngine()
         self.ensemble = EnsembleModel(self.config)
 
@@ -1470,6 +1505,45 @@ class TradingAgent:
         self.database.store_candles(symbol, interval, df[["open", "high", "low", "close", "volume"]])
 
     # ── Robustness Helpers ─────────────────────────────────────
+
+    def _flush_pending_boot_alerts(self) -> None:
+        """Drain ``self._pending_boot_alerts`` through ``self.alert_manager``.
+
+        2026-05-18 (Audit Issue #2): the boot-time reconcile blocks
+        (``reconcile_sl_orders_from_broker`` orphan-cancel failures and
+        ``reconcile_positions_with_broker`` mismatches) used to call
+        ``self.alert_manager.send_alert(...)`` inline. But those reconcile
+        blocks run BEFORE ``self.alert_manager`` is constructed in
+        ``__init__`` -- so every send_alert raised ``AttributeError`` and
+        was silently swallowed by a bare ``except``. Plus the call was
+        missing ``level=`` so even after the AttributeError was fixed the
+        message would route via the default INFO channel rather than the
+        critical channel an operator would actually be paged on.
+
+        New contract: reconcile blocks APPEND a dict
+        ``{"title": ..., "message": ..., "level": ...}`` to
+        ``self._pending_boot_alerts``; this method flushes them right
+        after ``AlertManager`` is constructed. Idempotent (clears the
+        buffer at the end so re-calling this method is a no-op). Tolerant
+        of a missing buffer (legacy path) and of individual send failures
+        (the CRITICAL log was already fired at queue time, so the
+        forensic trail is intact even if the alert dispatch fails)."""
+        pending = getattr(self, "_pending_boot_alerts", None)
+        if not pending:
+            return
+        for entry in pending:
+            try:
+                self.alert_manager.send_alert(
+                    title=entry.get("title", "[CRITICAL] boot reconcile"),
+                    message=entry.get("message", ""),
+                    level=entry.get("level", "critical"),
+                )
+            except Exception as exc:
+                logger.error(
+                    f"[BOOT-ALERT] dispatch failed for "
+                    f"{entry.get('title', '?')!r}: {exc!r}"
+                )
+        self._pending_boot_alerts = []
 
     def _persist_cooldown_state(self) -> None:
         """Atomically snapshot the three cooldown maps to data/cooldowns.json.

@@ -121,6 +121,11 @@ class TestStrategyScorecard:
         so pnl==0 in a given regime would be counted as a loss in the
         regime scorecard while not in the per-strategy scorecard. Reproduce
         the bug, then assert it's fixed.
+
+        2026-05-18 (Audit Issue #4) revision: the win_rate denominator was
+        also fixed in the same audit pass to use DECISIVE trades
+        (wins + losses), not total_trades. So 1 win + 1 scratch is now
+        a clean 100% win-rate on decisive trades, not 50% diluted.
         """
         rec_win = _make_trade_record("rsi_momentum", pnl=40.0)
         rec_win.regime = "bear_high_vol"
@@ -135,7 +140,9 @@ class TestStrategyScorecard:
         assert r_stats["wins"] == 1
         assert r_stats["losses"] == 0
         assert r_stats["scratches"] == 1
-        assert r_stats["win_rate"] == pytest.approx(0.5)
+        # Decisive-trade win_rate: 1 win / (1 win + 0 losses) = 1.0.
+        # Scratches do NOT dilute the WR seen by the regime weighter.
+        assert r_stats["win_rate"] == pytest.approx(1.0)
 
     def test_scratch_trade_per_regime_does_not_distort_loss_branch(self, analyzer):
         """Negative pnl must still be counted as a loss in the regime branch."""
@@ -152,6 +159,51 @@ class TestStrategyScorecard:
         assert r_stats["wins"] == 0
         assert r_stats["losses"] == 1
         assert r_stats["scratches"] == 1
+        # Decisive-trade win_rate: 0 wins / (0 wins + 1 loss) = 0.0.
+        # The scratch isn't in the denominator so the WR isn't artificially
+        # nudged toward 50/50 just because of a flat exit.
+        assert r_stats["win_rate"] == pytest.approx(0.0)
+
+    def test_win_rate_uses_decisive_denominator_per_strategy(self, analyzer):
+        """2026-05-18 (Audit Issue #4): the per-strategy win_rate must use
+        the DECISIVE-trade denominator (wins + losses), not total_trades.
+        Without this fix, a 50% true-edge strategy with a meaningful share
+        of flat exits showed a depressed WR to the ensemble weight tuner,
+        causing it to demote a strategy that was actually pulling its
+        weight."""
+        # Pattern: 5 wins, 3 losses, 4 scratches.
+        for pnl in [50.0, 60.0, 70.0, 40.0, 30.0]:
+            analyzer.record_trade(_make_trade_record("rsi_momentum", pnl=pnl))
+        for pnl in [-20.0, -15.0, -25.0]:
+            analyzer.record_trade(_make_trade_record("rsi_momentum", pnl=pnl))
+        for _ in range(4):
+            analyzer.record_trade(_make_trade_record("rsi_momentum", pnl=0.0))
+
+        stats = analyzer.get_scorecard()["rsi_momentum"]
+        assert stats["total_trades"] == 12
+        assert stats["wins"] == 5
+        assert stats["losses"] == 3
+        assert stats["scratches"] == 4
+        # OLD (broken) formula: 5/12 = 0.4167.
+        # NEW (fixed)  formula: 5/(5+3) = 0.625 -- the true decisive WR.
+        assert stats["win_rate"] == pytest.approx(0.625, abs=1e-6), (
+            "Audit Issue #4 regression: win_rate must use decisive denominator "
+            "(wins + losses); scratches must NOT dilute the WR seen by the "
+            "ensemble weight tuner."
+        )
+
+    def test_win_rate_decisive_denominator_handles_all_scratches(self, analyzer):
+        """If every trade is a scratch, the decisive denominator is 0 and the
+        formula must fall back to 0.0 (NOT divide by zero) -- the strategy
+        has produced no decisive evidence either way."""
+        for _ in range(3):
+            analyzer.record_trade(_make_trade_record("rsi_momentum", pnl=0.0))
+        stats = analyzer.get_scorecard()["rsi_momentum"]
+        assert stats["total_trades"] == 3
+        assert stats["wins"] == 0
+        assert stats["losses"] == 0
+        assert stats["scratches"] == 3
+        assert stats["win_rate"] == pytest.approx(0.0)
 
     def test_profit_factor(self, analyzer):
         for pnl in [100, -50, 80, -30]:

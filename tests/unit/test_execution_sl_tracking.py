@@ -554,6 +554,52 @@ def test_reconcile_empty_positions_still_sweeps_orphans():
     api.orderBook.assert_called_once()
 
 
+def test_boot_caller_does_not_gate_sl_reconcile_on_empty_positions():
+    """Audit Bug #1 (2026-05-18 follow-up): the function-side
+    ``reconcile_sl_orders_from_broker({})`` correctly handles an empty
+    restored-positions dict (sweeps orphans), but the CALLER in
+    ``TradingAgent.__init__`` USED to short-circuit with
+    ``if self.portfolio.positions:`` before calling -- which defeated
+    the whole orphan-sweep purpose (the exact crash mode the sweep is
+    designed for is: crash AFTER entry filled but BEFORE DB persisted,
+    leaving zero DB positions and a live SL-M at broker).
+
+    This is a structural regression guard: if the gate is ever
+    reintroduced, this test fails loudly. A behavioural test would
+    require booting a full TradingAgent in live mode against a mock
+    Angel client, which is heavier than this layer warrants.
+    """
+    import inspect
+    import re
+    from trading_agent import TradingAgent
+
+    src = inspect.getsource(TradingAgent.__init__)
+    # Find the call to reconcile_sl_orders_from_broker; require that no
+    # ``if self.portfolio.positions:`` (or moral equivalent) sits within
+    # ~10 lines before it. We tolerate the line itself appearing later
+    # in the file (e.g. for the OTHER reconcile -- positions, not SL).
+    sl_calls = list(re.finditer(
+        r"reconcile_sl_orders_from_broker\s*\(", src
+    ))
+    assert sl_calls, (
+        "Audit Bug #1 regression: reconcile_sl_orders_from_broker is no "
+        "longer called from TradingAgent.__init__ -- the orphan SL sweep "
+        "at boot has been removed entirely."
+    )
+    for m in sl_calls:
+        # Look at the 10 lines preceding the call site.
+        prefix = src[: m.start()].splitlines()[-10:]
+        window = "\n".join(prefix)
+        assert "self.portfolio.positions" not in window or "if " not in window, (
+            "Audit Bug #1 regression: a guard like "
+            "`if self.portfolio.positions:` has reappeared immediately "
+            "before reconcile_sl_orders_from_broker -- this defeats the "
+            "orphan / duplicate SL sweep that the function is now "
+            "contract-bound to perform on an empty dict. Drop the gate.\n"
+            f"Offending preceding window:\n{window}"
+        )
+
+
 # ── P0 #3 residual (2026-05-18): orphan + duplicate SL sweep ─────────────────
 #
 # The previous reconciliation only looked at restored positions. Any live

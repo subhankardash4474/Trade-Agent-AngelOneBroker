@@ -321,8 +321,19 @@ class TradeAnalyzer:
                 stats["scratches"] = stats.get("scratches", 0) + 1
             stats["total_pnl"] = stats.get("total_pnl", 0) + attributed_pnl
             stats["avg_pnl"] = stats["total_pnl"] / stats["total_trades"]
-            if stats["total_trades"] > 0:
-                stats["win_rate"] = stats["wins"] / stats["total_trades"]
+            # 2026-05-18 (Audit Issue #4): use the DECISIVE-trade denominator
+            # so the win_rate the ensemble/regime weighter consumes actually
+            # reflects the edge. The previous formula was
+            # ``wins / total_trades`` which dilutes by ``scratches``, leaving
+            # the WR number flat even after the P2 scratch classification.
+            # New formula: ``wins / (wins + losses)``; reduces to the old
+            # value when scratches==0 and never divides by zero because at
+            # least one of wins/losses is non-zero in the branch above.
+            decisive_strat = stats.get("wins", 0) + stats.get("losses", 0)
+            if decisive_strat > 0:
+                stats["win_rate"] = stats["wins"] / decisive_strat
+            else:
+                stats["win_rate"] = 0.0
             stats = self._update_profit_factor(stats, attributed_pnl)
             stats = self._update_sharpe(stats, attributed_pnl)
             self._strategy_stats[strategy] = stats
@@ -353,8 +364,16 @@ class TradeAnalyzer:
                 r_stats["scratches"] = r_stats.get("scratches", 0) + 1
             r_stats["total_pnl"] = r_stats.get("total_pnl", 0) + attributed_pnl
             r_stats["avg_pnl"] = r_stats["total_pnl"] / r_stats["total_trades"]
-            if r_stats["total_trades"] > 0:
-                r_stats["win_rate"] = r_stats["wins"] / r_stats["total_trades"]
+            # 2026-05-18 (Audit Issue #4): same decisive-trade denominator
+            # parity with the per-strategy block above. Without this the
+            # ``bear_high_vol`` slot for a mean-reversion strategy showed
+            # ``wins / (wins+losses+scratches)`` -- e.g. 38% WR on a 52%
+            # true edge -- and the per-regime weighter under-credited it.
+            decisive_regime = r_stats.get("wins", 0) + r_stats.get("losses", 0)
+            if decisive_regime > 0:
+                r_stats["win_rate"] = r_stats["wins"] / decisive_regime
+            else:
+                r_stats["win_rate"] = 0.0
             r_stats = self._update_profit_factor(r_stats, attributed_pnl)
             r_stats = self._update_sharpe(r_stats, attributed_pnl)
             self._regime_stats[(strategy, regime)] = r_stats

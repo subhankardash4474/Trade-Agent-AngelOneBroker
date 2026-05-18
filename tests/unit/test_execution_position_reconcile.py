@@ -166,3 +166,125 @@ def test_mismatch_logs_critical():
     combined = "".join(captured)
     assert "MISMATCH" in combined
     assert "TCS" in combined
+
+
+# ── Audit Issue #2 (2026-05-18): boot alerts must land at level=critical ─────
+#
+# Before this fix the inline ``send_alert`` calls in the boot reconcile blocks
+# raised AttributeError (alert_manager doesn't exist yet) and were silently
+# swallowed by a bare ``except``. Plus the call was missing ``level=`` so even
+# if the AttributeError were fixed the alert would route via the default INFO
+# channel instead of the critical channel an operator wakes up for. The new
+# contract is: reconcile blocks BUFFER alert dicts into
+# ``self._pending_boot_alerts``; ``_flush_pending_boot_alerts`` then drains
+# them through ``self.alert_manager`` right after AlertManager is constructed.
+
+
+def test_flush_pending_boot_alerts_routes_at_critical_level():
+    """Buffered alerts are dispatched with the level the queuer chose,
+    not the AlertManager default. A mismatch finding must surface as
+    ``critical`` even though the buffer dict is opaque to the dispatcher."""
+    from trading_agent import TradingAgent
+    from unittest.mock import MagicMock
+
+    agent = TradingAgent.__new__(TradingAgent)
+    agent.alert_manager = MagicMock()
+    agent._pending_boot_alerts = [
+        {
+            "title": "[CRITICAL] TCS broker/DB mismatch",
+            "message": "db=BUY qty=100 vs broker=SELL qty=100",
+            "level": "critical",
+        },
+    ]
+    agent._flush_pending_boot_alerts()
+    agent.alert_manager.send_alert.assert_called_once_with(
+        title="[CRITICAL] TCS broker/DB mismatch",
+        message="db=BUY qty=100 vs broker=SELL qty=100",
+        level="critical",
+    )
+    # The buffer is drained so a second flush is a no-op (idempotent).
+    assert agent._pending_boot_alerts == []
+    agent._flush_pending_boot_alerts()
+    assert agent.alert_manager.send_alert.call_count == 1
+
+
+def test_flush_pending_boot_alerts_tolerates_missing_buffer():
+    """If a code path constructs an agent without populating
+    ``_pending_boot_alerts`` (legacy stubs, test harnesses), the flush
+    must be a graceful no-op rather than raising AttributeError."""
+    from trading_agent import TradingAgent
+    from unittest.mock import MagicMock
+
+    agent = TradingAgent.__new__(TradingAgent)
+    agent.alert_manager = MagicMock()
+    agent._flush_pending_boot_alerts()
+    agent.alert_manager.send_alert.assert_not_called()
+
+
+def test_flush_pending_boot_alerts_continues_past_individual_failures():
+    """If one send_alert raises (e.g. transient SMTP outage), the next
+    alert in the buffer still gets attempted. The CRITICAL log fired at
+    queue time is the primary forensic signal so a dispatch failure
+    must not lose the rest of the buffer."""
+    from trading_agent import TradingAgent
+    from unittest.mock import MagicMock
+
+    agent = TradingAgent.__new__(TradingAgent)
+    agent.alert_manager = MagicMock()
+    agent.alert_manager.send_alert.side_effect = [
+        RuntimeError("SMTP timeout"),
+        None,
+    ]
+    agent._pending_boot_alerts = [
+        {"title": "A1", "message": "m1", "level": "critical"},
+        {"title": "A2", "message": "m2", "level": "critical"},
+    ]
+    agent._flush_pending_boot_alerts()
+    assert agent.alert_manager.send_alert.call_count == 2
+
+
+def test_init_buffers_alerts_before_alertmanager_is_constructed():
+    """Structural regression guard for Audit Issue #2: the boot reconcile
+    blocks in ``TradingAgent.__init__`` must NOT call
+    ``self.alert_manager.send_alert(...)`` directly -- AlertManager
+    doesn't exist yet at that point and the call would raise
+    AttributeError. They must append to ``self._pending_boot_alerts``
+    instead, and ``_flush_pending_boot_alerts`` must be invoked AFTER
+    AlertManager is constructed.
+
+    Re-introducing an inline send_alert in the reconcile block (the bug
+    we just fixed) would silently swallow the alert again. This guard
+    fails loudly if anyone does that."""
+    import inspect
+    import re
+    from trading_agent import TradingAgent
+
+    src = inspect.getsource(TradingAgent.__init__)
+    # Locate the AlertManager-construction line; everything before it
+    # is the "pre-AlertManager" zone where inline send_alert is unsafe.
+    am_match = re.search(r"self\.alert_manager\s*=\s*AlertManager\(", src)
+    assert am_match, (
+        "AlertManager construction line moved or was removed from "
+        "TradingAgent.__init__ -- the audit guard below can't locate "
+        "the boundary between pre- and post-AlertManager init phases. "
+        "Update the regex if the construction call was renamed."
+    )
+    pre_am_src = src[: am_match.start()]
+    assert "self.alert_manager.send_alert" not in pre_am_src, (
+        "Audit Issue #2 regression: TradingAgent.__init__ now contains "
+        "an inline ``self.alert_manager.send_alert(...)`` call BEFORE "
+        "``self.alert_manager = AlertManager(...)``. AlertManager doesn't "
+        "exist yet at that point -- the call would AttributeError and be "
+        "swallowed by the surrounding bare-except. Append to "
+        "``self._pending_boot_alerts`` instead and let "
+        "``_flush_pending_boot_alerts`` dispatch after AlertManager is "
+        "constructed."
+    )
+    # And the dispatcher must actually be invoked post-construction.
+    post_am_src = src[am_match.start():]
+    assert "_flush_pending_boot_alerts" in post_am_src, (
+        "Audit Issue #2 regression: ``_flush_pending_boot_alerts()`` is "
+        "no longer called from TradingAgent.__init__ AFTER AlertManager "
+        "is constructed. Any alerts queued during boot reconcile will "
+        "stay buffered and never reach the operator."
+    )

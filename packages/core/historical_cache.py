@@ -127,12 +127,24 @@ class HistoricalCache:
                 # mtime comparison stays in epoch seconds (host-clock,
                 # which is correct regardless of TZ), but the
                 # "is end_date today?" check needs IST-relative dates.
+                #
+                # 2026-05-18 (Audit Issue #3): localize the NAIVE branch
+                # too. The previous version used ``end_dt.date()`` for a
+                # naive ``end_date``, which silently picked up the host
+                # timezone -- on a UTC host an IST-intended end_date like
+                # ``2026-05-18 02:30`` (naive) would compare as
+                # ``2026-05-18`` while ``today`` was already ``2026-05-19``
+                # IST, flipping the freshness check the wrong way around.
+                # We assume naive datetimes from callers are IST-intended
+                # (matches the rest of the codebase's convention) and
+                # localize before extracting the date.
                 today = datetime.now(IST).date()
                 end_dt = end_date
-                end_today_or_later = (
-                    end_dt.astimezone(IST).date() if end_dt.tzinfo
-                    else end_dt.date()
-                ) >= today
+                if end_dt.tzinfo is not None:
+                    end_date_local = end_dt.astimezone(IST).date()
+                else:
+                    end_date_local = IST.localize(end_dt).date()
+                end_today_or_later = end_date_local >= today
                 stale = (
                     end_today_or_later
                     and (datetime.now().timestamp() - path.stat().st_mtime)
