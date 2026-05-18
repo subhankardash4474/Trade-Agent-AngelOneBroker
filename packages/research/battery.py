@@ -417,7 +417,48 @@ def _write_comparison(rows: list, out_path: Path, meta: dict,
     out_path.write_text("\n".join(lines), encoding="utf-8")
 
 
+_BROKER_CRED_ENV_PREFIXES = ("ANGELONE_", "SMARTAPI_", "BROKER_", "KITE_")
+
+
+def _assert_backtester_isolation() -> None:
+    """Refuse to start the battery on a backtester-role host if any broker
+    credentials are present in the environment.
+
+    Activated by setting `BACKTESTER_MODE=1` (typically wired by the
+    backtester VM's systemd unit or `launch_battery.sh`). On the live
+    trader VM this var is absent, so this is a no-op there.
+
+    Rationale: the backtester VM has no broker IP whitelist by design and
+    must never touch a live broker socket. If we accidentally rsync a
+    populated .env file (or a developer pastes one), we want a loud
+    crash *before* the harness opens any data sources, not a silent path
+    where the wrong creds reach the wrong host.
+    """
+    if os.environ.get("BACKTESTER_MODE", "").strip().lower() not in (
+        "1", "true", "yes", "on",
+    ):
+        return
+    leaked = [
+        k for k in os.environ
+        if any(k.startswith(p) for p in _BROKER_CRED_ENV_PREFIXES)
+    ]
+    if leaked:
+        # Print to stderr (and not a logger) so the message is visible even
+        # if logging hasn't been initialised yet.
+        print(
+            "[BATTERY][FATAL] BACKTESTER_MODE=1 but the following broker "
+            "credential env vars are present: "
+            + ", ".join(sorted(leaked))
+            + ". A backtester host MUST NOT carry broker creds (no IP "
+            "whitelist, no live order surface). Aborting before any data "
+            "source is opened.",
+            file=sys.stderr,
+        )
+        raise SystemExit(9)
+
+
 def main() -> int:
+    _assert_backtester_isolation()
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", default="config.yaml")
     ap.add_argument("--days", type=int, default=30)

@@ -303,13 +303,21 @@ class TestLongRegimeConfigContract:
         for r in cfg["execution"]["long_entry_regimes"]:
             assert r in valid, f"Unknown regime '{r}' in long_entry_regimes"
 
-    def test_long_entry_regimes_are_bullish_or_at_least_neutral(self, cfg):
-        # Until we have backtest-validated long-side edge in bear regimes,
-        # don't ship a config that allows BUYs in bear tapes by default.
+    def test_long_entry_regimes_never_allow_bear_high_vol(self, cfg):
+        # freeze-v2.1 (2026-05-18): widened the allow set to include
+        # `sideways` and `bear_low_vol` so longs get evidence during the
+        # Phase A paper window (the regime detector classified every day
+        # of the Phase A window as a bear regime, so the previous
+        # bull-only policy meant longs never fired AT ALL).
+        # The hard contract we still enforce: BUYs MUST NOT fire in
+        # `bear_high_vol` -- that's the regime where the bear trend is
+        # strong AND volatility is elevated, i.e. the textbook
+        # short-bias / long-trap tape (sharp counter-trend bounces).
         for r in cfg["execution"]["long_entry_regimes"]:
-            assert "bear" not in r, (
-                f"BUY entries enabled in bear regime '{r}' — backtest "
-                "shows no validated long-side edge in bear tapes."
+            assert r != "bear_high_vol", (
+                "BUY entries enabled in bear_high_vol — strong bear "
+                "trend + high vol = textbook long-trap regime. "
+                "Remove it from long_entry_regimes."
             )
 
 
@@ -406,19 +414,28 @@ class TestLongRegimeGuardSymmetry:
         assert short_reason.startswith("short_regime:")
         assert long_reason.startswith("long_regime:")
 
-    def test_disjoint_default_allow_sets(self, cfg):
-        # The two guards should never *both* allow the same regime (that
-        # would invite simultaneous long+short attempts on the same tape).
-        # The recommended pairing is:
-        #   shorts: bear/sideways
-        #   longs:  bull
+    def test_no_overlap_in_strongly_directional_regimes(self, cfg):
+        # freeze-v2.1 (2026-05-18): we explicitly allow overlap in
+        # *neutral* regimes (`sideways`, `bear_low_vol`) because in
+        # those regimes either direction CAN have an edge intra-day --
+        # the ensemble + per-regime learning weights pick the side, and
+        # the strategy-concurrency cap (max_positions_per_strategy)
+        # prevents pile-on on one direction.
+        #
+        # What we still forbid: overlap in the strongly directional
+        # regimes -- `bull_low_vol`, `bull_high_vol`, `bear_high_vol` --
+        # because in those tapes one side is clearly dominant and
+        # opening positions in the counter direction is a hedge-pretending-
+        # to-be-an-edge anti-pattern.
         shorts = set(cfg["execution"].get("short_selling_regimes") or [])
         longs = set(cfg["execution"].get("long_entry_regimes") or [])
+        STRONG_REGIMES = {"bull_low_vol", "bull_high_vol", "bear_high_vol"}
         if longs and shorts:
-            overlap = shorts & longs
-            assert not overlap, (
-                f"shorts and longs both allowed in regimes {overlap} — "
-                "one direction should be off in any given regime."
+            forbidden_overlap = shorts & longs & STRONG_REGIMES
+            assert not forbidden_overlap, (
+                f"shorts and longs both allowed in strongly directional "
+                f"regimes {forbidden_overlap} — one direction must be off "
+                "in any clearly trending tape."
             )
 
 

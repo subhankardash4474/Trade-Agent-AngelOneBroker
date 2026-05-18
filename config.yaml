@@ -35,7 +35,13 @@ capital:
 # Stock Scanner — automatically finds the best stocks to trade
 scanner:
   enabled: true                     # true = auto-pick stocks, false = use market.instruments
-  top_n: 200                         # how many stocks to watch (picks best 100 from 300+)
+  # ── freeze-v2.1 (2026-05-18) ────────────────────────────────────────
+  # Widened 200 -> 300 to give Phase A paper validation more breadth
+  # without over-stressing the trader VM (E2.1.Micro, 1 OCPU / 1 GB).
+  # 200 was producing ~6-8 fresh setups/day; 300 should yield 9-12.
+  # The full Nifty 500 sweep happens on the dedicated backtester VM,
+  # not on the live trader.
+  top_n: 300                         # how many stocks to watch (picks best 100 from 300+)
   # 2026-05-08: raised 2000 -> 5000 alongside Rs 100k paper capital. With 15%
   # max_position_size_pct, a Rs 5k stock × ~20 qty = Rs 100k * 15% = Rs 15k.
   # Unlocks RELIANCE / MARUTI / BAJAJ-AUTO etc. that were previously skipped.
@@ -206,7 +212,18 @@ ensemble:
     # untested model dominate ensemble decisions on day one.
     xgboost_classifier: 1.0
     lstm_price_model: 1.8
-    supertrend_follow: 1.5
+    # ── freeze-v2.1 (2026-05-18) ─────────────────────────────────────────────
+    # supertrend_follow demoted to 0.0 weight per the system's own KILL
+    # verdict in logs/diagnostics/eod_2026-05-18.md:
+    #   N=17 trades, WR 35.3%, PF 0.35, Kelly -0.642, PnL Rs -896
+    # This strategy is responsible for ~79% of the 7-day net loss (-Rs 896
+    # of -Rs 1,132). Live evidence on 2026-05-14 also showed it concentrated
+    # 8 SHORT pile-ons in 37 min in bear_high_vol that cost -Rs 730.
+    # We leave the strategy CODE active so its signals still appear in
+    # signal_audit for diagnostic continuity; weight=0 means they don't
+    # influence ensemble decisions. Re-enable only after Phase 1 battery
+    # shows PF lower-CI > 1.0 in some regime.
+    supertrend_follow: 0.0
     opening_range_breakout: 1.3
     vwap_bounce: 1.2
     moving_average_crossover: 1.0
@@ -641,9 +658,29 @@ execution:
   # Empty list (or omit the key entirely) = PERMISSIVE (legacy behaviour,
   # no regime restriction on longs). Explicit list = restrict to the
   # listed regimes.
+  #
+  # ── freeze-v2.1 (2026-05-18) ─────────────────────────────────────────
+  # Added `sideways` and `bear_low_vol` to the allow set. On-disk
+  # diagnostic (logs/signal_audit_2026-05-18.csv) showed 8,900 / 8,900
+  # BUY signals REJECTED on 2026-05-18 with reason long_regime:bear_high_vol
+  # -- the regime detector has classified every day from 2026-05-12
+  # onward as bear_high_vol, so longs never fired across the entire
+  # Phase A paper window. The system effectively became a short-only
+  # bear-regime specialist by accident.
+  #
+  # For Phase A validation we widen the allow set to include the two
+  # neutral regimes (sideways, bear_low_vol) so longs get a chance to
+  # accumulate evidence during the 100-trade paper run. We intentionally
+  # KEEP bear_high_vol on the deny list -- that's the regime where
+  # shorts have a documented edge and longs are most dangerous (sharp
+  # mean-reversion bounces against the prevailing trend). The intraday
+  # risk-off overlay (intraday_regime_block_longs, below) still applies
+  # on top of this.
   long_entry_regimes:
     - bull_low_vol
     - bull_high_vol
+    - sideways
+    - bear_low_vol
 
   # 2026-05-14 Intraday-regime overlay block. The daily long_entry_regimes
   # gate above only sees the slow-moving regime (Nifty 200-EMA + VIX).
