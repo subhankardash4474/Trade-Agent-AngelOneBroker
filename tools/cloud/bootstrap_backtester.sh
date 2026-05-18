@@ -148,8 +148,17 @@ remote "
         git -C ${TRADER_HOME} checkout ${GIT_BRANCH}
         git -C ${TRADER_HOME} reset --hard origin/${GIT_BRANCH} || git -C ${TRADER_HOME} reset --hard ${GIT_BRANCH}
     fi
-    mkdir -p ${TRADER_HOME}/logs/backtests ${TRADER_HOME}/data
-    ls -la ${TRADER_HOME} | head -6
+    mkdir -p ${TRADER_HOME}/logs/backtests ${TRADER_HOME}/data ${TRADER_HOME}/models
+
+    # CRITICAL: the trading-agent image runs as in-container UID 1001 (the
+    # 'trader' service user baked into the Dockerfile). The bind-mounted
+    # host directories must be writable by that UID, otherwise the battery
+    # crashes with PermissionError as soon as it tries to mkdir
+    # logs/backtests/<run_id>/. Discovered the hard way during the first
+    # backtester deploy on 2026-05-18.
+    sudo chown -R 1001:1001 ${TRADER_HOME}/logs ${TRADER_HOME}/data ${TRADER_HOME}/models
+    sudo chmod -R u+rwX,g+rwX ${TRADER_HOME}/logs ${TRADER_HOME}/data ${TRADER_HOME}/models
+    ls -ld ${TRADER_HOME}/logs ${TRADER_HOME}/data ${TRADER_HOME}/models
 "
 
 echo "[5/6] Build the trading-agent image (this is the long step)..."

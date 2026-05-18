@@ -89,11 +89,18 @@ ssh "${SSH_OPTS[@]}" "${SSH_USER}@${BACKTESTER_VM_HOST}" "bash -lc '
         exit 5
     fi
 
+    # NOTE: the Dockerfile copies packages/, tools/, and a handful of
+    # top-level .py files into the image, but NOT tests/. The default
+    # universe-file path (tests/fixtures/battery_v2_universe.json) lives
+    # under tests/, so we bind-mount tests/fixtures read-only from the
+    # host. Cheaper than rebaking the image, and the universe file
+    # changes more often than the image does anyway.
     sudo docker run -d --rm \
         --name ${RUN_ID} \
         -e BACKTESTER_MODE=1 \
         -v ${TRADER_HOME}/logs:/app/logs \
         -v ${TRADER_HOME}/data:/app/data \
+        -v ${TRADER_HOME}/tests/fixtures:/app/tests/fixtures:ro \
         trading-agent:latest \
         python tools/run_battery.py ${REMOTE_ARGS}
 
