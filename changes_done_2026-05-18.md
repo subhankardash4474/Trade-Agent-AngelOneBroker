@@ -205,3 +205,98 @@ commit message body.
    section.
 5. **Freeze lift:** when the four exit criteria in `FREEZE_v2.1.md`
    are met. Target date 2026-06-08; slipping is fine.
+
+---
+
+## Late-evening addendum (2026-05-18 ~ 00:00 IST 2026-05-19)
+
+Two pieces shipped after the initial freeze + first-battery deploy.
+Both are *observability* / *operational tooling* (NOT frozen files),
+so no `freeze-bypass:` required.
+
+### A. Battery queue scheduler (`tools/run_battery_queue.py`)
+
+The backtester VM is up. The trader VM is on `freeze-v2.1`. To get
+maximum signal during the 3-week freeze window, the backtester should
+not sit idle between manual battery launches -- it should chain
+sequentially through a queue.
+
+* `tools/run_battery_queue.py` -- Python orchestrator. Reads a YAML
+  queue, for each job spawns `docker run` for `tools/run_battery.py`,
+  waits for container exit, marks done in
+  `data/battery_queue_state.json`, moves to next. Survives a VM reboot
+  via systemd; resumes an in-flight job by reusing its `run_id`
+  (battery harness already supports per-folder resume); skips jobs
+  already marked completed.
+* `tests/fixtures/battery_queue_example.yaml` -- 5-job starter queue
+  exploring 4 dimensions of variation: universe (v2 vs nifty50),
+  window (60/90/120d), train-vs-holdout slice, and walk-forward split.
+  ~70-80 h of continuous compute. When exhausted, the scheduler exits
+  cleanly (`Restart=on-failure` only, so systemd doesn't busy-loop).
+* `tools/cloud/battery-scheduler.service` -- systemd unit. Runs as
+  `opc`, auto-starts on boot.
+* `tools/cloud/install_battery_scheduler.sh` -- one-shot installer
+  for the VM. Idempotent. Copies the example queue into place,
+  installs + enables the unit, runs a dry-run sanity check.
+* Defence-in-depth: scheduler itself refuses to start if any
+  `ANGELONE_/SMARTAPI_/BROKER_/KITE_*` env var is set (rc=9), even
+  though the in-battery `_assert_backtester_isolation()` would catch
+  it too.
+
+**On start-up the scheduler waits for any pre-existing `battery_*`
+container to finish before processing its queue** -- so installing it
+mid-deploy (while the first ad-hoc battery is still running) is
+safe.
+
+### B. Per-strategy verdict in audit checkpoint
+
+Exit criterion #4 in `docs/FREEZE_v2.1.md` was:
+
+> "audit_checkpoint.py and the EOD diagnostic produce strategy-level
+> reports without manual SQL."
+
+The EOD email side has been doing this for a while (via
+`packages/research/diagnostic.py`). The 5-min audit checkpoint did
+NOT, so mid-session "how is each strategy doing" required a manual
+trades.csv pivot.
+
+`tools/audit_checkpoint.py` now adds `_section_per_strategy()` that
+calls into the same `diagnostic` module and embeds a compact table
+in every checkpoint:
+
+| Strategy | N | WR% | PF | Kelly | Expectancy | Net PnL | Verdict |
+
+plus a portfolio summary line. Lookback is fixed at 7 days to match
+the EOD horizon. Degrades silently when the DB is empty / missing
+(returns `enabled=True, n_trades_total=0`); a defensive 0-byte check
+also dodges a pre-existing connection leak in `load_trades` that was
+keeping Windows tempfile handles open.
+
+### Test deltas
+
+```
+tests/unit/test_battery_queue_scheduler.py     (NEW, 25 tests)
+tests/unit/test_audit_per_strategy_section.py  (NEW,  7 tests)
+```
+
+`pytest tests/`: **1229 passed in 47 s** (+32 vs. previous count;
+0 lints; 0 regressions).
+
+### Operator playbook for the new pieces
+
+```bash
+# ON THE BACKTESTER VM (after `git pull origin main`):
+cd /opt/trading-agent
+sudo bash tools/cloud/install_battery_scheduler.sh
+
+# When you're ready to let the queue start (it'll wait for the
+# current ad-hoc battery to finish before processing):
+sudo systemctl start battery-scheduler
+
+# Watch what it's doing:
+sudo journalctl -u battery-scheduler -f
+
+# Edit the queue and re-load (no daemon restart needed):
+sudo nano /opt/trading-agent/data/battery_queue.yaml
+sudo systemctl restart battery-scheduler
+```

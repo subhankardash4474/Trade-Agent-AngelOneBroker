@@ -1,0 +1,66 @@
+# freeze-v2.1 battery queue — 5 starter jobs for the backtester VM.
+#
+# Edit and reload by restarting the systemd unit:
+#     sudo systemctl restart battery-scheduler
+# The scheduler reads this file fresh on every (re)start, so adding new
+# jobs is just "edit + restart".
+#
+# Each job:
+#   * MUST have a unique `name`. The run_id is derived as
+#     `battery_<name>_<utc_ts>` the first time we launch it.
+#   * Inherits the defaults baked into tools/run_battery.py (interval
+#     defaults to 5m, workers to 1) unless overridden here.
+#   * Survives a VM reboot: the scheduler resumes incomplete runs via
+#     the battery harness's own run_id-folder mechanism, and marks
+#     completed jobs in data/battery_queue_state.json so they aren't
+#     re-run.
+#
+# To force a job to re-run (e.g. after editing universe file), delete
+# its entry from data/battery_queue_state.json and restart the unit.
+
+schema_version: 1
+
+jobs:
+  # ── 1. Baseline (matches today's deploy) ─────────────────────────────
+  - name: v2_baseline_90d
+    days: 90
+    interval: 5m
+    workers: 2
+    universe-file: tests/fixtures/battery_v2_universe.json
+
+  # ── 2. Smaller universe, faster turnaround ──────────────────────────
+  # Nifty 50 in 60d ~= 1.5h on workers=2. Useful as a "sanity check"
+  # that variant ordering is stable across universe choice.
+  - name: nifty50_60d
+    days: 60
+    interval: 5m
+    workers: 2
+    universe-file: tests/fixtures/nifty50_universe.json
+
+  # ── 3. Walk-forward TRAIN slice ──────────────────────────────────────
+  # First 60 of 90 days. Use to pick the best variant.
+  - name: v2_train_60d
+    days: 90
+    interval: 5m
+    workers: 2
+    universe-file: tests/fixtures/battery_v2_universe.json
+    train-window-days: 60
+
+  # ── 4. Walk-forward HOLDOUT slice ────────────────────────────────────
+  # Last 30 of 90 days. Variants that win on TRAIN must survive HOLDOUT.
+  # If a variant crumbles here, the train win was p-hacked.
+  - name: v2_holdout_30d
+    days: 90
+    interval: 5m
+    workers: 2
+    universe-file: tests/fixtures/battery_v2_universe.json
+    holdout-window-days: 30
+
+  # ── 5. Longer history sanity ─────────────────────────────────────────
+  # 120d uses the same v2 universe but a longer lookback. Useful for
+  # catching regime-dependence of variant rankings.
+  - name: v2_baseline_120d
+    days: 120
+    interval: 5m
+    workers: 2
+    universe-file: tests/fixtures/battery_v2_universe.json

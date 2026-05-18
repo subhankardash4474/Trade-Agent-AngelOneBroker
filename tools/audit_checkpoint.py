@@ -415,6 +415,107 @@ def _section_risk_state(lines: List[str], since: datetime, until: datetime) -> D
     }
 
 
+def _section_per_strategy(
+    db_path: str, lookback_days: int = 7,
+) -> Dict[str, Any]:
+    """Per-strategy verdict block — same numbers the EOD email derives,
+    but available mid-day inside every audit checkpoint.
+
+    Why this exists
+    ---------------
+    Exit criterion #4 in docs/FREEZE_v2.1.md: "audit_checkpoint.py and
+    the EOD diagnostic produce strategy-level reports without manual
+    SQL." The EOD email already calls into packages/research/diagnostic,
+    but the per-5-min checkpoint did not -- so during the day the
+    operator had to read trades.csv and pivot in Excel to see how each
+    strategy was doing. Now the same verdict (WR / PF / Kelly /
+    expectancy / KILL/WATCH/SCALE/KEEP) is in every checkpoint.
+
+    Returns: {
+        "lookback_days": int,
+        "n_trades_total": int,
+        "strategies": [
+            {"strategy": ..., "n": ..., "wr_pct": ..., "pf": ...,
+             "kelly": ..., "expectancy": ..., "net_pnl": ...,
+             "verdict": "KILL"|"WATCH"|"KEEP"|"SCALE"|"INSUFFICIENT_DATA"},
+            ...
+        ],
+        "portfolio": {"kelly": ..., "pf": ..., "net_pnl": ..., ...},
+    }
+
+    Degrades silently: on import failure / no DB / no trades, returns
+    {"enabled": False, "reason": ...} -- the audit checkpoint never
+    crashes the daemon.
+    """
+    try:
+        # Defensive: an earlier section (_section_positions) auto-creates
+        # a 0-byte SQLite file via sqlite3.connect side-effect when the
+        # path doesn't exist. Calling load_trades on a 0-byte file
+        # triggers a connection leak inside diagnostic.load_trades when
+        # the SELECT fails on the missing 'trades' table -- which
+        # prevents Windows tempfile cleanup in tests and leaves a stray
+        # handle in prod. Short-circuit before the import.
+        db_p = Path(db_path)
+        if not db_p.exists() or db_p.stat().st_size == 0:
+            return {
+                "enabled": True,
+                "lookback_days": lookback_days,
+                "n_trades_total": 0,
+                "strategies": [],
+                "portfolio": {},
+                "note": "DB absent or empty (no trades to analyse)",
+            }
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "packages"))
+        from research.diagnostic import (  # type: ignore
+            load_trades, aggregate, portfolio_summary,
+        )
+        trades = load_trades(db_p, days=lookback_days)
+        if not trades:
+            return {
+                "enabled": True,
+                "lookback_days": lookback_days,
+                "n_trades_total": 0,
+                "strategies": [],
+                "portfolio": {},
+                "note": "no closed trades in window",
+            }
+        stats = aggregate(trades)
+        port = portfolio_summary(stats)
+        # Sort by total_pnl desc so the best/worst strategies stand out.
+        ordered = sorted(stats.values(), key=lambda s: s.total_pnl, reverse=True)
+        return {
+            "enabled": True,
+            "lookback_days": lookback_days,
+            "n_trades_total": len(trades),
+            "strategies": [
+                {
+                    "strategy": s.strategy,
+                    "n": s.trades,
+                    "wr_pct": round(s.win_rate * 100, 1),
+                    "pf": round(s.profit_factor, 2),
+                    "kelly": round(s.kelly_fraction, 3),
+                    "expectancy": round(s.expectancy, 2),
+                    "net_pnl": round(s.total_pnl, 2),
+                    "verdict": s.verdict,
+                }
+                for s in ordered
+            ],
+            "portfolio": {
+                "trades": port.get("trades"),
+                "wr_pct": round(port.get("win_rate", 0.0) * 100, 1),
+                "pf": round(port.get("profit_factor", 0.0), 2),
+                "kelly": round(port.get("kelly", 0.0), 3),
+                "net_pnl": round(port.get("total_pnl", 0.0), 2),
+            },
+        }
+    except Exception as e:
+        return {
+            "enabled": False,
+            "lookback_days": lookback_days,
+            "reason": f"{type(e).__name__}: {e}",
+        }
+
+
 def _section_self_sufficiency() -> Dict[str, Any]:
     """2026-05-14: Surface the cumulative-realised vs running-cost ledger.
 
@@ -617,6 +718,42 @@ def _render_markdown(now: datetime, data: Dict[str, Any], delta: Optional[Dict[s
             parts.append(f"- Blacklisted: {risk['blacklisted']}")
     parts.append("")
 
+    # 2026-05-18 (freeze-v2.1 exit criterion #4): per-strategy verdict
+    # block. Same shape the EOD email uses; lookback is fixed at 7d
+    # which matches the EOD horizon.
+    ps = data.get("per_strategy", {})
+    if ps and ps.get("enabled") is True:
+        parts.append("## Per-strategy (last 7d)")
+        if ps.get("n_trades_total", 0) == 0:
+            parts.append("- (no closed trades in the lookback window)")
+        else:
+            parts.append(
+                "| Strategy | N | WR% | PF | Kelly | Expectancy | Net PnL | Verdict |"
+            )
+            parts.append("|---|---:|---:|---:|---:|---:|---:|---|")
+            for s in ps.get("strategies", []):
+                parts.append(
+                    f"| {s['strategy']} | {s['n']} | {s['wr_pct']:.1f} | "
+                    f"{s['pf']:.2f} | {s['kelly']:+.3f} | "
+                    f"Rs {s['expectancy']:+.2f} | "
+                    f"Rs {s['net_pnl']:+.0f} | **{s['verdict']}** |"
+                )
+            port = ps.get("portfolio", {})
+            if port:
+                parts.append("")
+                parts.append(
+                    f"**Portfolio:** N={port.get('trades', 0)} · "
+                    f"WR={port.get('wr_pct', 0.0):.1f}% · "
+                    f"PF={port.get('pf', 0.0):.2f} · "
+                    f"Kelly={port.get('kelly', 0.0):+.3f} · "
+                    f"Net PnL=Rs {port.get('net_pnl', 0.0):+.0f}"
+                )
+        parts.append("")
+    elif ps and ps.get("enabled") is False:
+        parts.append("## Per-strategy (last 7d)")
+        parts.append(f"- (disabled: {ps.get('reason', '?')})")
+        parts.append("")
+
     # 2026-05-14: Self-sufficiency status (cumulative realised vs running
     # cost). Surfaces whether the agent has paid for itself yet.
     ss = data.get("self_sufficiency", {})
@@ -735,6 +872,7 @@ def run_and_save(
         ("signal_pipeline", lambda: _section_signal_pipeline(lines, since, now)),
         ("xgb", lambda: _section_xgb_firing(lines, since, now)),
         ("risk_state", lambda: _section_risk_state(lines, since, now)),
+        ("per_strategy", lambda: _section_per_strategy(db_path)),
         ("self_sufficiency", _section_self_sufficiency),
     )
     for key, fn in safe_calls:

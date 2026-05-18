@@ -1,0 +1,49 @@
+[Unit]
+Description=Trading Agent battery queue scheduler (freeze-v2.1)
+Documentation=file:/opt/trading-agent/docs/FREEZE_v2.1.md
+After=docker.service network-online.target
+Wants=docker.service network-online.target
+
+[Service]
+Type=simple
+User=opc
+Group=opc
+WorkingDirectory=/opt/trading-agent
+# Read queue from the canonical location. Operator edits this file and
+# `systemctl restart battery-scheduler` to pick up the new shape.
+Environment=BATTERY_QUEUE_FILE=/opt/trading-agent/data/battery_queue.yaml
+
+# Use python3 from the host (NOT inside docker -- the scheduler ORCHESTRATES
+# docker, it doesn't run inside one). The repo lives in /opt/trading-agent
+# courtesy of bootstrap_backtester.sh.
+ExecStart=/usr/bin/python3 /opt/trading-agent/tools/run_battery_queue.py \
+    --queue /opt/trading-agent/data/battery_queue.yaml \
+    --state /opt/trading-agent/data/battery_queue_state.json \
+    --log-dir /opt/trading-agent/logs/battery_scheduler
+
+# When the queue is exhausted the process exits cleanly (rc=0); we do
+# NOT want systemd to bounce it back -- that'd just re-process the same
+# (now all-completed) queue in a tight loop. Restart=on-failure means
+# we only restart if the scheduler itself crashed (e.g. transient docker
+# daemon outage).
+Restart=on-failure
+RestartSec=60s
+
+# Allow long uninterrupted runs (each battery is 30 min - 14 h).
+TimeoutStartSec=0
+TimeoutStopSec=120
+
+# On stop, SIGTERM the scheduler; it doesn't currently propagate to the
+# in-flight docker container (that's the harness's resume-job's job),
+# but it does cleanly exit between jobs.
+KillMode=mixed
+KillSignal=SIGTERM
+
+# Logging: stdout/stderr go to journald, also tee to our log dir for
+# easy `tail -f`.
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=battery-scheduler
+
+[Install]
+WantedBy=multi-user.target
