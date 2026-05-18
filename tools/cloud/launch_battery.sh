@@ -95,8 +95,14 @@ ssh "${SSH_OPTS[@]}" "${SSH_USER}@${BACKTESTER_VM_HOST}" "bash -lc '
     # under tests/, so we bind-mount tests/fixtures read-only from the
     # host. Cheaper than rebaking the image, and the universe file
     # changes more often than the image does anyway.
+    # --no-healthcheck: the Dockerfile bakes a HEALTHCHECK for the live
+    # daemon (probes the in-process supervisor); a batch process doesn't
+    # expose that, so the container would otherwise be flagged
+    # "(unhealthy)" in `docker ps` even though the battery is making
+    # progress -- noisy and misleading for the operator. Suppress.
     sudo docker run -d --rm \
         --name ${RUN_ID} \
+        --no-healthcheck \
         -e BACKTESTER_MODE=1 \
         -v ${TRADER_HOME}/logs:/app/logs \
         -v ${TRADER_HOME}/data:/app/data \
