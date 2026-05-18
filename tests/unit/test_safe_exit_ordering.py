@@ -22,6 +22,7 @@ These tests pin the call ordering so the bug cannot regress silently.
 from __future__ import annotations
 
 from typing import Any
+import threading
 from unittest import mock
 
 import pytest
@@ -31,10 +32,18 @@ def _mk_agent_for_safe_exit(*, sl_tracked: bool, cancel_ok: bool, flatten_ok: bo
     """Construct a stub `TradingAgent` exposing just the surface used by
     `_close_position_safely`. We use `__new__` to skip the real (heavy)
     constructor — full integration of the close paths is covered elsewhere.
+
+    P0 #2 residual (2026-05-18): `_close_position_safely` now wraps its
+    entire body in `self._exit_check_lock` (an RLock) and runs an
+    idempotency check on `self.portfolio.positions[symbol]` before
+    touching the broker. The stub MUST therefore initialise both, or
+    every test in this file fails with AttributeError / KeyError that
+    looks unrelated.
     """
     from trading_agent import TradingAgent
 
     agent = TradingAgent.__new__(TradingAgent)
+    agent._exit_check_lock = threading.RLock()
 
     # Order of calls is recorded on the parent mock so we can assert
     # cancel-then-place ordering even though they live on different attrs.
@@ -67,6 +76,12 @@ def _mk_agent_for_safe_exit(*, sl_tracked: bool, cancel_ok: bool, flatten_ok: bo
 
     agent.portfolio = mock.Mock()
     agent.portfolio.close_position.return_value = record
+    # P0 #2 residual (2026-05-18): _close_position_safely now does an
+    # idempotency re-check `if symbol not in self.portfolio.positions:
+    # bail`. Seed the positions dict so the stub symbol is "open" at the
+    # time of the call. Tests that want to assert the "already-closed"
+    # branch can override this.
+    agent.portfolio.positions = {"TESTSYM": mock.Mock(side="BUY", quantity=10)}
 
     agent.risk_manager = mock.Mock()
     agent.alert_manager = mock.Mock()
@@ -74,6 +89,7 @@ def _mk_agent_for_safe_exit(*, sl_tracked: bool, cancel_ok: bool, flatten_ok: bo
     # Bypass the real instance methods that fire downstream effects.
     agent._record_exit = mock.Mock()
     agent._on_trade_closed = mock.Mock()
+    agent._persist_trailing_states = mock.Mock()
 
     return agent, call_log, record
 

@@ -1,26 +1,36 @@
-"""P0 #2 (2026-05-15) — LIVE-MODE SAFETY: regression tests for the lock
-that serializes `_check_position_exits` across the WebSocket thread and
-the main scan loop.
+"""P0 #2 (2026-05-15) + P0 #2-residual (2026-05-18) — LIVE-MODE SAFETY:
+regression tests for the lock that serializes the exit pipeline across
+EVERY caller path, not just the `_check_position_exits` poll path.
 
 Background
 ----------
-The trading agent has two concurrent producers for the exit-check path:
+The trading agent has FOUR concurrent producers that can close the same
+position:
 
-  • Main loop: every ~15s (`_fast_exits_sleep` slicing the poll cycle),
-    plus the regular full-scan cadence, calls `_check_position_exits`
+  • Main loop fast-exits poll: every ~15s calls `_check_position_exits`
     with a multi-symbol price snapshot.
-  • WebSocket thread (`_on_tick`): on every tick for a held symbol, calls
-    `_check_position_exits({symbol: price})`.
+  • WebSocket tick path (`_on_tick`): per-tick `_check_position_exits`.
+  • Signal reversal path (`_exit_on_signal`): ensemble flips on a held
+    symbol → calls `_close_position_safely` directly.
+  • End-of-day square-off (`_square_off_all`) and carryover profit-lock
+    (`_lock_in_carryover_profits`): both call `_close_position_safely`.
 
-Without a lock, the SAME symbol can hit the SL/peak-giveback gate twice
-in the same race window — once from the main thread's fast-exits poll,
-once from the WS thread's tick callback. Both produce a "close this
-symbol" decision; both call `_close_position_safely` (with our P0 #1 fix
-this means both cancel the SL and both submit a flatten). The position is
-flattened twice, leaving us accidentally long/short.
+The original P0 #2 fix put the lock at `_check_position_exits`, which
+only covered the first two callers. The audit on 2026-05-18 caught the
+gap: an ensemble SELL on a symbol already approaching its SL can race
+against the WS tick exit, both end up calling `_close_position_safely`,
+and the broker sees TWO flatten orders for the same lot. The agent is
+now accidentally net-short on the rebound — the exact double-flatten
+window we set out to close.
 
-These tests pin the contract that `_exit_check_lock` serializes the
-combined check+flatten transaction.
+Residual fix moved the lock INSIDE `_close_position_safely` (the single
+chokepoint that submits flatten orders), upgraded it to RLock so the
+existing `_check_position_exits_locked` body can still re-enter it, and
+added an idempotency check at the top: if `portfolio.positions` no
+longer has the symbol, the second caller logs and bails without
+submitting a duplicate flatten.
+
+These tests pin both the lock and the idempotency contract.
 """
 from __future__ import annotations
 
@@ -34,11 +44,16 @@ import pytest
 def _mk_agent_for_thread_safety_test():
     """Build a stub TradingAgent exposing just the surface that the
     `_check_position_exits` lock guards. We use `__new__` to skip the
-    real constructor and inject the minimal attribute set."""
+    real constructor and inject the minimal attribute set.
+
+    The lock is RLock (P0 #2 residual fix, 2026-05-18) — required so
+    `_check_position_exits_locked` can call `_close_position_safely`
+    without deadlocking on the second acquire.
+    """
     from trading_agent import TradingAgent
 
     agent = TradingAgent.__new__(TradingAgent)
-    agent._exit_check_lock = threading.Lock()
+    agent._exit_check_lock = threading.RLock()
 
     # Track every call into the locked body and how long each held the
     # lock. The test then asserts that no two calls overlapped.
@@ -124,17 +139,30 @@ def test_exit_check_serializes_ws_thread_against_main_thread():
     )
 
 
-def test_lock_exists_as_threading_lock_on_init():
-    """Light structural check: any future refactor that drops the lock
-    will fail this test. The lock must be a `threading.Lock` instance."""
+def test_lock_exists_as_reentrant_lock_on_init():
+    """Light structural check: any future refactor that drops or downgrades
+    the lock will fail this test. P0 #2 residual (2026-05-18) requires the
+    lock to be RE-ENTRANT (RLock) because `_check_position_exits_locked`
+    holds it and then calls `_close_position_safely`, which itself
+    re-acquires the same lock. A plain `Lock` would deadlock here on the
+    very first WS-tick-driven SL exit.
+    """
     agent, _ = _mk_agent_for_thread_safety_test()
-    # threading.Lock returns an instance of `_thread.lock`/`_thread.LockType`
-    # depending on Python version. Duck-type with acquire/release instead.
     assert hasattr(agent._exit_check_lock, "acquire")
     assert hasattr(agent._exit_check_lock, "release")
-    # Verify the lock works (acquire-then-release).
-    acquired = agent._exit_check_lock.acquire(timeout=0.5)
-    assert acquired is True
+
+    # Reentrancy probe: a non-reentrant lock would block on the second
+    # acquire from the same thread; an RLock returns immediately.
+    first = agent._exit_check_lock.acquire(timeout=0.5)
+    assert first is True
+    second = agent._exit_check_lock.acquire(timeout=0.5)
+    assert second is True, (
+        "P0 #2 residual regression: _exit_check_lock is NOT re-entrant. "
+        "The locked exit-check body cannot call _close_position_safely "
+        "(which now also acquires this lock) without deadlocking. "
+        "Restore threading.RLock()."
+    )
+    agent._exit_check_lock.release()
     agent._exit_check_lock.release()
 
 
@@ -146,7 +174,7 @@ def test_exception_in_locked_body_releases_lock():
     from trading_agent import TradingAgent
 
     agent = TradingAgent.__new__(TradingAgent)
-    agent._exit_check_lock = threading.Lock()
+    agent._exit_check_lock = threading.RLock()
 
     def _raising_body(prices):
         raise RuntimeError("simulated failure in exit-check body")
@@ -163,3 +191,197 @@ def test_exception_in_locked_body_releases_lock():
         "held. Next exit-check call would deadlock."
     )
     agent._exit_check_lock.release()
+
+
+# ──────────────────────────────────────────────────────────────────────
+# P0 #2 RESIDUAL (2026-05-18) — lock at _close_position_safely callee
+# ──────────────────────────────────────────────────────────────────────
+
+
+def _mk_agent_with_close_helper():
+    """Build a stub TradingAgent wired up just enough to exercise
+    `_close_position_safely` under contention.
+
+    Mocks:
+      * `portfolio.positions`: a real dict so the idempotency re-check
+        sees the position vanish after the first thread closes it.
+      * `execution.{get_sl_order_for_symbol,cancel_sl_order_for_symbol,
+        place_order}`: counters so we can assert the second thread did
+        NOT submit a duplicate flatten.
+      * `portfolio.close_position`: pops the symbol from positions and
+        returns a fake TradeRecord-shaped object.
+      * `risk_manager`, `alert_manager`, `_persist_trailing_states`,
+        `_record_exit`, `_on_trade_closed`: no-op mocks.
+
+    The real `_close_position_safely` body runs unmodified.
+    """
+    from trading_agent import TradingAgent
+
+    agent = TradingAgent.__new__(TradingAgent)
+    agent._exit_check_lock = threading.RLock()
+
+    counters = {
+        "place_order_calls": 0,
+        "cancel_sl_calls": 0,
+        "close_position_calls": 0,
+    }
+
+    class _StubPortfolio:
+        def __init__(self):
+            # Single open position used by the contention test.
+            self.positions = {
+                "RELIANCE": mock.Mock(side="BUY", quantity=10, entry_price=2800.0)
+            }
+            self._lock = threading.Lock()
+
+        def close_position(self, symbol, price, exit_reason="signal"):
+            counters["close_position_calls"] += 1
+            with self._lock:
+                # Sleep INSIDE close_position so contender threads have
+                # time to queue on _exit_check_lock and trip the
+                # idempotency re-check.
+                time.sleep(0.05)
+                if symbol not in self.positions:
+                    return None
+                del self.positions[symbol]
+            return mock.Mock(pnl=12.34, side="BUY")
+
+    class _StubExecution:
+        def __init__(self):
+            self._sl_orders = {"RELIANCE": "SL-ID-1"}
+
+        def get_sl_order_for_symbol(self, symbol):
+            return self._sl_orders.get(symbol)
+
+        def cancel_sl_order_for_symbol(self, symbol):
+            counters["cancel_sl_calls"] += 1
+            self._sl_orders.pop(symbol, None)
+            return True
+
+        def place_order(self, **kw):
+            counters["place_order_calls"] += 1
+            return {"status": "FILLED", "filled_price": kw["price"]}
+
+    agent.portfolio = _StubPortfolio()
+    agent.execution = _StubExecution()
+    agent.risk_manager = mock.Mock()
+    agent.alert_manager = mock.Mock()
+    agent._persist_trailing_states = mock.Mock()
+    agent._record_exit = mock.Mock()
+    agent._on_trade_closed = mock.Mock()
+    return agent, counters
+
+
+def test_close_position_safely_serializes_concurrent_callers():
+    """Two threads call `_close_position_safely` for the same symbol at
+    the same moment (the exact ensemble-SELL-while-SL-pending race the
+    audit caught). The lock + idempotency re-check together must result
+    in EXACTLY ONE flatten order at the broker.
+    """
+    agent, counters = _mk_agent_with_close_helper()
+
+    def runner(tag):
+        agent._close_position_safely(
+            symbol="RELIANCE",
+            token="12345",
+            exit_side="SELL",
+            quantity=10,
+            price=2800.0,
+            tag=tag,
+            exit_reason=tag,
+        )
+
+    t1 = threading.Thread(target=runner, args=("ws_tick_sl",))
+    t2 = threading.Thread(target=runner, args=("signal_reverse",))
+    t1.start()
+    t2.start()
+    t1.join(timeout=5)
+    t2.join(timeout=5)
+
+    assert counters["place_order_calls"] == 1, (
+        f"P0 #2 residual regression: place_order called "
+        f"{counters['place_order_calls']} times. Two threads both "
+        f"submitted a flatten — the broker is now net-reverse on this "
+        f"symbol. The lock at _close_position_safely OR the idempotency "
+        f"re-check (or both) regressed."
+    )
+    assert counters["cancel_sl_calls"] == 1, (
+        f"cancel_sl_order_for_symbol called {counters['cancel_sl_calls']} "
+        f"times. Should be exactly once — the second caller must hit the "
+        f"idempotency re-check and bail BEFORE touching the SL."
+    )
+
+
+def test_close_position_safely_can_be_called_from_inside_locked_body():
+    """The realistic call-chain is:
+
+        WS-tick → _check_position_exits → (acquires lock)
+          → _check_position_exits_locked → _close_position_safely
+            → (re-acquires SAME lock via RLock)
+
+    A non-reentrant lock would deadlock the entire trader process here
+    on the first WS-tick-driven exit, which is a P0 LIVE-MODE blocker.
+    Force the re-entrant path explicitly.
+    """
+    agent, counters = _mk_agent_with_close_helper()
+
+    completed = threading.Event()
+
+    def simulate_outer_holder():
+        with agent._exit_check_lock:
+            # Inner call should NOT block on the lock we already hold.
+            agent._close_position_safely(
+                symbol="RELIANCE",
+                token="12345",
+                exit_side="SELL",
+                quantity=10,
+                price=2800.0,
+                tag="reentrant_check",
+                exit_reason="reentrant_check",
+            )
+            completed.set()
+
+    t = threading.Thread(target=simulate_outer_holder)
+    t.start()
+    finished = completed.wait(timeout=2.0)
+    t.join(timeout=2.0)
+
+    assert finished, (
+        "P0 #2 residual regression: _close_position_safely DEADLOCKED "
+        "when called from inside a thread that already holds "
+        "_exit_check_lock. The lock must be threading.RLock(); a plain "
+        "threading.Lock() will hang the daemon on every WS-driven exit."
+    )
+    assert counters["place_order_calls"] == 1
+
+
+def test_close_position_safely_skips_when_already_closed_by_peer():
+    """Manually close the position FIRST, then call
+    `_close_position_safely`. The idempotency re-check must catch the
+    missing symbol and skip without touching the broker.
+    """
+    agent, counters = _mk_agent_with_close_helper()
+
+    # Peer thread already closed it.
+    del agent.portfolio.positions["RELIANCE"]
+
+    order, record = agent._close_position_safely(
+        symbol="RELIANCE",
+        token="12345",
+        exit_side="SELL",
+        quantity=10,
+        price=2800.0,
+        tag="late_caller",
+        exit_reason="signal",
+    )
+
+    assert order is None
+    assert record is None
+    assert counters["place_order_calls"] == 0, (
+        "Idempotency check failed: place_order was called for an "
+        "already-closed position. This is the double-flatten window."
+    )
+    assert counters["cancel_sl_calls"] == 0, (
+        "Idempotency check failed: cancel_sl_order_for_symbol was called "
+        "for an already-closed position. The broker SL was already gone."
+    )

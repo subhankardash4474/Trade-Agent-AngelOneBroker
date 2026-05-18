@@ -644,11 +644,21 @@ class ExecutionEngine:
     ) -> dict:
         """Rebuild ``_sl_orders_by_symbol`` from the broker's order book.
 
-        For each restored position, looks for a live SL-M order on the
-        same symbol whose ``transactiontype`` is opposite (i.e. the
-        protective leg) and registers it. Logs CRITICAL for any position
-        that has no matching broker SL — that position is unprotected
-        and ops must intervene.
+        Two passes:
+
+        1. Match-and-register pass — for each restored position, look for a
+           live SL-M order on the same symbol whose ``transactiontype`` is
+           opposite (the protective leg) and register the FIRST match. Log
+           CRITICAL for any restored position with no matching broker SL.
+
+        2. (P0 #3 residual, 2026-05-18) Orphan / duplicate sweep — any live
+           SL-M on the broker that does NOT correspond to a restored
+           position (orphan) OR is a SECOND matching SL-M for the same
+           symbol (duplicate) is CANCELLED. Rationale: a stale SL-M can
+           fire later and silently open an unintended reverse position
+           against an empty book — the exact bug the registry was meant to
+           kill. The most common cause is a daemon crash AFTER the entry
+           order filled but BEFORE the DB persisted it.
 
         Args:
             restored_positions: {symbol: Position-like} as held by Portfolio.
@@ -657,14 +667,16 @@ class ExecutionEngine:
             Dict {symbol: status} where status is one of
               ``reconciled`` — broker SL found and registered;
               ``unprotected`` — no SL-M found for this symbol;
+              ``orphan_cancelled`` — SL-M on broker had no matching DB
+                                     position; cancel issued OK;
+              ``orphan_cancel_failed`` — orphan SL-M cancel rejected by
+                                         broker; manual intervention needed;
               ``skipped_paper`` — paper mode, no broker to query.
         """
         report: dict[str, str] = {}
         if self.mode == "paper" or self._api is None:
             for sym in restored_positions:
                 report[sym] = "skipped_paper"
-            return report
-        if not restored_positions:
             return report
         try:
             order_book = self._api.orderBook()
@@ -712,6 +724,11 @@ class ExecutionEngine:
             except Exception:
                 continue
 
+        # Pass 1: match a live SL-M against each restored position.
+        # Track which order_ids we "used" so the orphan sweep can later
+        # cancel everything left behind without re-cancelling our own
+        # matched leg.
+        used_order_ids: set = set()
         for sym, pos in restored_positions.items():
             candidates = live_sl_orders.get(sym, [])
             expected_side = "SELL" if getattr(pos, "side", "BUY") == "BUY" else "BUY"
@@ -733,24 +750,97 @@ class ExecutionEngine:
                 trigger = float(match.get("triggerprice") or 0.0)
             except (TypeError, ValueError):
                 trigger = 0.0
+            matched_oid = match.get("orderid")
             self._sl_orders_by_symbol[sym] = {
-                "order_id": match.get("orderid"),
+                "order_id": matched_oid,
                 "trigger": trigger,
                 "side": expected_side,
                 "quantity": int(float(match.get("quantity") or pos.quantity)),
                 "token": match.get("symboltoken") or "",
             }
+            used_order_ids.add(matched_oid)
             report[sym] = "reconciled"
             logger.info(
                 f"[SL-RECONCILE] {sym}: re-registered broker SL "
-                f"{match.get('orderid')} @ trigger \u20B9{trigger:.2f}"
+                f"{matched_oid} @ trigger \u20B9{trigger:.2f}"
             )
+
+        # Pass 2 (P0 #3 residual, 2026-05-18): sweep orphans + duplicates.
+        # Anything left in `live_sl_orders` that we didn't use is either:
+        #   • A duplicate SL-M for a symbol whose primary leg we matched
+        #     in pass 1 (e.g. a previous bug double-placed; or the same
+        #     symbol got two entries that both placed SL legs and only
+        #     one survived in our DB).
+        #   • An orphan SL-M for a symbol with no DB position at all
+        #     (e.g. crash AFTER entry order filled but BEFORE the open
+        #     was persisted; or the operator manually closed the
+        #     position but the SL leg was never reaped).
+        # Either way, leaving it standing means a stale SL-M can later
+        # fire on the broker and silently open an unintended REVERSE
+        # position against an empty book. Cancel both classes.
+        n_orphan_ok = 0
+        n_orphan_fail = 0
+        n_dup_ok = 0
+        n_dup_fail = 0
+        for sym, orders in live_sl_orders.items():
+            in_restored = sym in restored_positions
+            for cand in orders:
+                oid = cand.get("orderid")
+                if not oid or oid in used_order_ids:
+                    continue
+                kind = "duplicate" if in_restored else "orphan"
+                trigger = cand.get("triggerprice")
+                tx = (cand.get("transactiontype") or "").upper()
+                logger.critical(
+                    f"[SL-RECONCILE] {sym}: {kind} live SL-M detected — "
+                    f"order_id={oid} side={tx} trigger=\u20B9{trigger}. "
+                    f"This was NOT registered to any restored position; "
+                    f"if left standing it can fire later and open an "
+                    f"unintended reverse position. Cancelling."
+                )
+                ok = False
+                try:
+                    ok = self.cancel_order(oid, variety="NORMAL")
+                except Exception as e:
+                    logger.error(
+                        f"[SL-RECONCILE] {sym}: {kind} cancel raised {e!r}; "
+                        f"order_id={oid} remains live at broker."
+                    )
+                if ok:
+                    if kind == "orphan":
+                        n_orphan_ok += 1
+                        # Orphans aren't in restored_positions, so they
+                        # surface in the report under their own key.
+                        report[sym] = "orphan_cancelled"
+                    else:
+                        n_dup_ok += 1
+                        # Duplicates: keep the "reconciled" status from
+                        # pass 1 so callers still see the symbol as
+                        # protected. The cancelled extra is in the log.
+                else:
+                    if kind == "orphan":
+                        n_orphan_fail += 1
+                        report[sym] = "orphan_cancel_failed"
+                        logger.critical(
+                            f"[SL-RECONCILE] {sym}: orphan SL-M CANCEL FAILED "
+                            f"(order_id={oid}). MANUAL INTERVENTION REQUIRED — "
+                            f"this order can still fire as a reverse trade."
+                        )
+                    else:
+                        n_dup_fail += 1
+                        logger.critical(
+                            f"[SL-RECONCILE] {sym}: duplicate SL-M CANCEL FAILED "
+                            f"(order_id={oid}). The primary SL leg is registered "
+                            f"but the duplicate remains live."
+                        )
 
         n_recon = sum(1 for v in report.values() if v == "reconciled")
         n_unprot = sum(1 for v in report.values() if v == "unprotected")
         logger.info(
             f"[SL-RECONCILE] complete: {n_recon} reconciled, "
-            f"{n_unprot} unprotected (out of {len(restored_positions)} restored)"
+            f"{n_unprot} unprotected, {n_orphan_ok} orphans cancelled "
+            f"({n_orphan_fail} failed), {n_dup_ok} duplicates cancelled "
+            f"({n_dup_fail} failed) (out of {len(restored_positions)} restored)"
         )
         return report
 

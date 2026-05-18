@@ -233,7 +233,19 @@ class TradingAgent:
         # orders before either close_position clears the in-memory position.
         # Result: doubled exit orders on a fast move — near-100% probability
         # on the first WS-enabled day with any volatile tick.
-        self._exit_check_lock = threading.Lock()
+        #
+        # P0 #2 residual (2026-05-18) — the original Lock was only acquired
+        # in `_check_position_exits`, not in `_close_position_safely`. The
+        # signal-driven exit path (`_exit_on_signal`), the EOD square-off
+        # (`_square_off_all`), and the carryover profit-lock could all call
+        # `_close_position_safely` concurrently with the WS-tick exit path
+        # and re-open the same double-flatten window we set out to close.
+        # Fix: lock moved into `_close_position_safely` (the only place we
+        # actually submit a flatten order). Lock upgraded to RLock so the
+        # existing `_check_position_exits_locked` body — which already
+        # holds the lock and then calls `_close_position_safely` for each
+        # decided-to-close symbol — does NOT deadlock on re-entry.
+        self._exit_check_lock = threading.RLock()
 
         # P0 #4 (2026-05-15) — LIVE-MODE SAFETY: restart SL reconciliation.
         # If the daemon was restarted mid-session with open positions, the
@@ -3529,58 +3541,81 @@ class TradingAgent:
         Returns (order_dict, trade_record). Either element may be None on
         failure; callers should branch on order being None vs record being
         None (e.g. portfolio.close_position returned no record).
+
+        P0 #2 residual (2026-05-18) — LIVE-MODE SAFETY: the entire
+        cancel-SL → place-flatten → close-portfolio sequence MUST run
+        under `self._exit_check_lock` so the WS-tick exit path and the
+        signal / square-off / carryover-lock paths cannot both submit
+        flatten orders for the same symbol. The lock is an RLock so this
+        re-acquire is free when the caller is already inside
+        `_check_position_exits_locked`.
         """
-        sl_existed = self.execution.get_sl_order_for_symbol(symbol) is not None
-        cancel_ok = self.execution.cancel_sl_order_for_symbol(symbol)
-        if sl_existed and not cancel_ok:
-            logger.critical(
-                f"[SAFE-EXIT] {symbol}: broker SL cancel FAILED before flatten "
-                f"(tag={tag}, reason={exit_reason}). Double-fill possible; "
-                f"proceeding with flatten anyway (stuck SL is the lesser evil)."
-            )
-
-        order = self.execution.place_order(
-            symbol=symbol, token=token, transaction_type=exit_side,
-            quantity=quantity, price=price, tag=tag,
-        )
-        flatten_ok = bool(order and order.get("status") in ("FILLED", "PLACED"))
-        if not flatten_ok:
-            if cancel_ok and sl_existed:
-                logger.critical(
-                    f"[SAFE-EXIT] {symbol}: cancel OK but flatten FAILED. "
-                    f"POSITION IS NAKED AT BROKER (no SL, no exit). "
-                    f"Manual reconciliation required. tag={tag}."
+        with self._exit_check_lock:
+            # Idempotency: another thread may have already closed this
+            # position while we were queued behind the lock. Without this
+            # re-check the second caller would `cancel_sl_order_for_symbol`
+            # (no-op now), submit a second flatten order, and ride the
+            # accidental reverse position until the next safety gate
+            # caught it (potentially never, since `portfolio.positions`
+            # is now empty for that symbol).
+            if symbol not in self.portfolio.positions:
+                logger.info(
+                    f"[SAFE-EXIT] {symbol} already closed by another thread "
+                    f"(tag={tag}, reason={exit_reason}). Skipping double-flatten."
                 )
-                try:
-                    self.alert_manager.send_alert(
-                        f"CRITICAL: Naked position {symbol}",
-                        f"{symbol}: broker SL cancelled but flatten order failed "
-                        f"(tag={tag}, reason={exit_reason}). Position is open "
-                        f"without protection. Square off manually NOW.",
-                        level="critical",
+                return None, None
+
+            sl_existed = self.execution.get_sl_order_for_symbol(symbol) is not None
+            cancel_ok = self.execution.cancel_sl_order_for_symbol(symbol)
+            if sl_existed and not cancel_ok:
+                logger.critical(
+                    f"[SAFE-EXIT] {symbol}: broker SL cancel FAILED before flatten "
+                    f"(tag={tag}, reason={exit_reason}). Double-fill possible; "
+                    f"proceeding with flatten anyway (stuck SL is the lesser evil)."
+                )
+
+            order = self.execution.place_order(
+                symbol=symbol, token=token, transaction_type=exit_side,
+                quantity=quantity, price=price, tag=tag,
+            )
+            flatten_ok = bool(order and order.get("status") in ("FILLED", "PLACED"))
+            if not flatten_ok:
+                if cancel_ok and sl_existed:
+                    logger.critical(
+                        f"[SAFE-EXIT] {symbol}: cancel OK but flatten FAILED. "
+                        f"POSITION IS NAKED AT BROKER (no SL, no exit). "
+                        f"Manual reconciliation required. tag={tag}."
                     )
-                except Exception:
-                    pass
-            return None, None
+                    try:
+                        self.alert_manager.send_alert(
+                            f"CRITICAL: Naked position {symbol}",
+                            f"{symbol}: broker SL cancelled but flatten order failed "
+                            f"(tag={tag}, reason={exit_reason}). Position is open "
+                            f"without protection. Square off manually NOW.",
+                            level="critical",
+                        )
+                    except Exception:
+                        pass
+                return None, None
 
-        filled_price = order.get("filled_price") or price
-        record = self.portfolio.close_position(symbol, filled_price, exit_reason=exit_reason)
-        if record is None:
-            return order, None
+            filled_price = order.get("filled_price") or price
+            record = self.portfolio.close_position(symbol, filled_price, exit_reason=exit_reason)
+            if record is None:
+                return order, None
 
-        self.risk_manager.record_trade(record.pnl)
-        self.risk_manager.remove_trailing_stop(symbol)
-        # P1 #15 (2026-05-17): persist after the removal so the next-boot
-        # rehydrate doesn't try to restore state for a closed position.
-        self._persist_trailing_states()
-        # P2 logic-edges (2026-05-17): plumb the side through so the
-        # cooldown can be keyed by (symbol, side).
-        self._record_exit(
-            symbol, record.pnl, exit_reason=exit_reason,
-            side=getattr(record, "side", None),
-        )
-        self._on_trade_closed(record)
-        return order, record
+            self.risk_manager.record_trade(record.pnl)
+            self.risk_manager.remove_trailing_stop(symbol)
+            # P1 #15 (2026-05-17): persist after the removal so the next-boot
+            # rehydrate doesn't try to restore state for a closed position.
+            self._persist_trailing_states()
+            # P2 logic-edges (2026-05-17): plumb the side through so the
+            # cooldown can be keyed by (symbol, side).
+            self._record_exit(
+                symbol, record.pnl, exit_reason=exit_reason,
+                side=getattr(record, "side", None),
+            )
+            self._on_trade_closed(record)
+            return order, record
 
     def _exit_on_signal(
         self,

@@ -539,12 +539,211 @@ def test_reconcile_in_paper_mode_is_noop():
     assert eng.get_sl_order_for_symbol("HDFCBANK") is None
 
 
-def test_reconcile_empty_positions_is_noop():
+def test_reconcile_empty_positions_still_sweeps_orphans():
+    """P0 #3 residual (2026-05-18): even with NO restored positions, we MUST
+    query the broker order book to detect any live SL-M left behind (e.g.
+    a previous run crashed AFTER the SL placed but BEFORE the open was
+    persisted). The pre-residual contract returned early here, which left
+    every orphan SL-M live on the broker indefinitely.
+    """
     api = MagicMock()
+    api.orderBook.return_value = {"status": True, "data": []}
     eng = _live_engine_with_mock_api(api)
     report = eng.reconcile_sl_orders_from_broker({})
     assert report == {}
-    api.orderBook.assert_not_called()
+    api.orderBook.assert_called_once()
+
+
+# ── P0 #3 residual (2026-05-18): orphan + duplicate SL sweep ─────────────────
+#
+# The previous reconciliation only looked at restored positions. Any live
+# SL-M on the broker that did NOT correspond to a restored position was
+# silently ignored — it stayed live, ready to fire later and open an
+# unintended reverse trade against an empty book. Multiple SL-Ms for the
+# same symbol (duplicates from a previous bug, or two entries that both
+# placed SL legs) had the same problem: only the first was used, the rest
+# stayed live.
+#
+# These tests pin the new contract: orphans + duplicates get cancelled,
+# CRITICAL-logged, and surfaced in the report so ops can audit.
+
+
+def test_reconcile_cancels_orphan_sl_for_unknown_symbol():
+    """Broker has a live SL-M for RELIANCE but the agent's DB has NO
+    RELIANCE position. The orphan must be cancelled, not silently
+    ignored — otherwise the next price touch opens an unintended
+    reverse position."""
+    api = MagicMock()
+    api.orderBook.return_value = {
+        "status": True,
+        "data": [{
+            "orderid": "SL-ORPHAN-1",
+            "tradingsymbol": "RELIANCE",
+            "transactiontype": "SELL",
+            "ordertype": "SL-M",
+            "status": "trigger pending",
+            "triggerprice": "2800.0",
+            "quantity": "5",
+            "symboltoken": "2885",
+        }],
+    }
+    api.cancelOrder.return_value = "CXL-OK"
+    eng = _live_engine_with_mock_api(api)
+
+    report = eng.reconcile_sl_orders_from_broker(restored_positions={})
+
+    assert report.get("RELIANCE") == "orphan_cancelled", (
+        f"P0 #3 residual regression: orphan SL-M was not cancelled. "
+        f"Report={report}. cancel_order calls={api.cancelOrder.call_args_list}"
+    )
+    api.cancelOrder.assert_called_once_with("SL-ORPHAN-1", "NORMAL")
+    # And the orphan should NOT be registered as a tracked SL.
+    assert eng.get_sl_order_for_symbol("RELIANCE") is None
+
+
+def test_reconcile_cancels_duplicate_sl_keeps_primary():
+    """Broker shows TWO live SL-Ms for the same symbol — same side
+    (the protective side for a BUY position). The first is matched
+    and registered; the second is a duplicate and must be cancelled.
+    """
+    api = MagicMock()
+    api.orderBook.return_value = {
+        "status": True,
+        "data": [
+            {
+                "orderid": "SL-PRIMARY",
+                "tradingsymbol": "HDFCBANK",
+                "transactiontype": "SELL",
+                "ordertype": "SL-M",
+                "status": "trigger pending",
+                "triggerprice": "1485.0",
+                "quantity": "10",
+                "symboltoken": "123",
+            },
+            {
+                "orderid": "SL-DUPLICATE",
+                "tradingsymbol": "HDFCBANK",
+                "transactiontype": "SELL",
+                "ordertype": "SL-M",
+                "status": "trigger pending",
+                "triggerprice": "1480.0",
+                "quantity": "10",
+                "symboltoken": "123",
+            },
+        ],
+    }
+    api.cancelOrder.return_value = "CXL-OK"
+    eng = _live_engine_with_mock_api(api)
+
+    positions = {"HDFCBANK": _StubPos("HDFCBANK", "BUY", 10, 1500.0)}
+    report = eng.reconcile_sl_orders_from_broker(positions)
+
+    assert report.get("HDFCBANK") == "reconciled", (
+        f"Primary SL should still register. Report={report}"
+    )
+    tracked = eng.get_sl_order_for_symbol("HDFCBANK")
+    assert tracked is not None and tracked["order_id"] == "SL-PRIMARY", (
+        "First matching SL-M must remain the registered primary."
+    )
+    # Duplicate must be cancelled. Only ONE cancel call (the duplicate).
+    api.cancelOrder.assert_called_once_with("SL-DUPLICATE", "NORMAL")
+
+
+def test_reconcile_orphan_cancel_failure_is_flagged():
+    """Broker rejects the orphan cancel. Status must escalate to
+    ``orphan_cancel_failed`` so ops can intervene manually instead of
+    assuming we cleaned up."""
+    api = MagicMock()
+    api.orderBook.return_value = {
+        "status": True,
+        "data": [{
+            "orderid": "SL-ORPHAN-2",
+            "tradingsymbol": "ITC",
+            "transactiontype": "SELL",
+            "ordertype": "SL-M",
+            "status": "trigger pending",
+            "triggerprice": "400.0",
+            "quantity": "100",
+            "symboltoken": "5",
+        }],
+    }
+    # cancel_order returns False on broker rejection (e.g. throttled,
+    # already cancelled by ops, market-hours mismatch).
+    api.cancelOrder.return_value = None
+    eng = _live_engine_with_mock_api(api)
+
+    report = eng.reconcile_sl_orders_from_broker(restored_positions={})
+
+    assert report.get("ITC") == "orphan_cancel_failed", (
+        f"Cancel rejection must surface as orphan_cancel_failed, not "
+        f"orphan_cancelled. Report={report}"
+    )
+
+
+def test_reconcile_multiple_orphans_all_cancelled_independently():
+    """Two unrelated orphans on the broker. Both should get cancel calls."""
+    api = MagicMock()
+    api.orderBook.return_value = {
+        "status": True,
+        "data": [
+            {
+                "orderid": "SL-ORPH-A",
+                "tradingsymbol": "TCS",
+                "transactiontype": "SELL",
+                "ordertype": "SL-M",
+                "status": "trigger pending",
+                "triggerprice": "3700.0",
+                "quantity": "5",
+                "symboltoken": "11536",
+            },
+            {
+                "orderid": "SL-ORPH-B",
+                "tradingsymbol": "INFY",
+                "transactiontype": "BUY",   # was a SHORT
+                "ordertype": "SL-M",
+                "status": "trigger pending",
+                "triggerprice": "1620.0",
+                "quantity": "8",
+                "symboltoken": "1594",
+            },
+        ],
+    }
+    api.cancelOrder.return_value = "CXL-OK"
+    eng = _live_engine_with_mock_api(api)
+
+    report = eng.reconcile_sl_orders_from_broker(restored_positions={})
+
+    assert report.get("TCS") == "orphan_cancelled"
+    assert report.get("INFY") == "orphan_cancelled"
+    cancelled_ids = {call.args[0] for call in api.cancelOrder.call_args_list}
+    assert cancelled_ids == {"SL-ORPH-A", "SL-ORPH-B"}
+
+
+def test_reconcile_does_not_cancel_terminal_status_sl():
+    """A broker SL-M in a terminal state (complete/rejected/cancelled) is
+    NOT live, so it must NOT trigger an orphan cancel call. Idempotency
+    against re-running reconcile after a previous run already cancelled
+    the orphan."""
+    api = MagicMock()
+    api.orderBook.return_value = {
+        "status": True,
+        "data": [{
+            "orderid": "SL-OLD-CANCELLED",
+            "tradingsymbol": "WIPRO",
+            "transactiontype": "SELL",
+            "ordertype": "SL-M",
+            "status": "cancelled",
+            "triggerprice": "200.0",
+            "quantity": "10",
+            "symboltoken": "1",
+        }],
+    }
+    eng = _live_engine_with_mock_api(api)
+
+    report = eng.reconcile_sl_orders_from_broker(restored_positions={})
+
+    assert report == {}
+    api.cancelOrder.assert_not_called()
 
 
 # ── P1 #12 (2026-05-17) -- modify_stop_loss false-positive on status:false ──

@@ -5,6 +5,7 @@ VIX-based regime filtering, consecutive loss protection, drawdown tiers,
 weekly loss limits, and market regime awareness.
 """
 
+import math
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
@@ -16,6 +17,30 @@ from loguru import logger
 from core.charges import compute_round_trip
 
 IST = pytz.timezone("Asia/Kolkata")
+
+
+def _parse_finite_number(value) -> Tuple[float, bool]:
+    """Parse ``value`` to a finite ``float``.
+
+    Returns ``(parsed, ok)``. ``ok`` is ``False`` when the value is:
+      * ``None`` (missing key or upstream nulled it)
+      * a string that does not parse to a number (``"n/a"``, ``""``, ...)
+      * ``NaN`` or ``±inf`` (Python's ``float('nan') > x`` is False, so a raw
+        comparison would silently let the value through every threshold gate)
+
+    Used by the live-money safety gates in ``RiskManager.can_trade`` so that
+    a transiently bad feed value REFUSES the cycle rather than coercing to
+    a permissive default. See the P0 #2 / P0 #3 residual fix on 2026-05-18.
+    """
+    if value is None:
+        return 0.0, False
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return 0.0, False
+    if math.isnan(parsed) or math.isinf(parsed):
+        return 0.0, False
+    return parsed, True
 
 
 @dataclass
@@ -501,30 +526,53 @@ class RiskManager:
         # raises TypeError, the trading cycle aborts, and after 5 consecutive
         # failures the daemon halts. Same pattern for nifty_trend (KeyError
         # safety + non-int values from cached snapshots).
+        #
+        # 2026-05-18 LIVE-MODE SAFETY (P0 #2 / P0 #3 residual): the previous
+        # patch fixed the crash but coerced bad values to 0/1 (calm / bull),
+        # which is PERMISSIVE for a safety gate — exactly the wrong direction
+        # for live-money. NaN VIX also slipped through because
+        # ``float('nan') > 25`` is False. Now: any unparseable / missing /
+        # non-finite value is treated as UNKNOWN and the cycle REFUSES entry.
+        # The next ``_refresh_market_context`` (every 10m) will restore a
+        # valid value and we resume trading. Cost: at worst a 10-minute
+        # entry pause on a transient feed glitch; benefit: no entries fired
+        # against a regime we cannot classify.
         if market_context:
-            vix_raw = market_context.get("india_vix", 0)
-            try:
-                vix = float(vix_raw) if vix_raw is not None else 0.0
-            except (TypeError, ValueError):
+            vix_value, vix_ok = _parse_finite_number(market_context.get("india_vix"))
+            if not vix_ok:
                 logger.warning(
-                    f"can_trade: india_vix has non-numeric value {vix_raw!r}; "
-                    "treating as 0 (regime filter bypass for this cycle)"
+                    f"can_trade: india_vix is unknown / unparseable / non-finite "
+                    f"(raw={market_context.get('india_vix')!r}). REFUSING entry "
+                    f"this cycle; will retry after next market-context refresh."
                 )
-                vix = 0.0
-            if vix > self.max_vix:
-                return False, f"India VIX too high: {vix:.1f} (max: {self.max_vix})"
+                return False, "India VIX unknown (fail-closed; awaiting refresh)"
+            if vix_value < 0:
+                logger.warning(
+                    f"can_trade: india_vix is negative ({vix_value:.2f}) — "
+                    f"upstream feed corruption. REFUSING entry this cycle."
+                )
+                return False, "India VIX negative (fail-closed; awaiting refresh)"
+            if vix_value > self.max_vix:
+                return False, f"India VIX too high: {vix_value:.1f} (max: {self.max_vix})"
 
             if self.require_nifty_above_200ema:
-                trend_raw = market_context.get("nifty_trend", 1)
-                try:
-                    nifty_trend = int(trend_raw) if trend_raw is not None else 1
-                except (TypeError, ValueError):
+                trend_value, trend_ok = _parse_finite_number(
+                    market_context.get("nifty_trend")
+                )
+                if not trend_ok:
                     logger.warning(
-                        f"can_trade: nifty_trend has non-numeric value {trend_raw!r}; "
-                        "treating as 1 (neutral, allows entry)"
+                        f"can_trade: nifty_trend is unknown / unparseable / non-finite "
+                        f"(raw={market_context.get('nifty_trend')!r}). REFUSING entry "
+                        f"this cycle; will retry after next market-context refresh."
                     )
-                    nifty_trend = 1
-                if nifty_trend == -1:
+                    return False, "Nifty trend unknown (fail-closed; awaiting refresh)"
+                # nifty_trend ∈ {-1 (below), 0 (neutral, P1 #11 default on
+                # insufficient history), 1 (above)}. Only an explicit -1
+                # bearish reading blocks; 0 (neutral) is permissive because
+                # the 200-EMA filter is not strictly violated, and 1
+                # (bullish) is clearly permissive.
+                trend_int = int(trend_value)
+                if trend_int == -1:
                     return False, "Nifty below 200-day EMA — bearish regime"
 
         return True, "OK"

@@ -125,35 +125,117 @@ class TestCanTrade:
     # P0 #5 (2026-05-15): regression guards. A None / NaN / non-numeric value
     # in market_context used to raise TypeError ("'>' not supported between
     # instances of 'NoneType' and 'int'"), aborting the trading cycle. After
-    # 5 such failures the daemon halted. These verify the defensive coercion.
-    def test_can_trade_handles_none_vix(self, rm):
-        allowed, reason = rm.can_trade(market_context={"india_vix": None, "nifty_trend": 1})
-        assert allowed is True, reason
+    # 5 such failures the daemon halted. The 2026-05-15 patch coerced bad
+    # values to 0/1 (calm/bull) — fixed the crash but became PERMISSIVE
+    # for the safety gate.
+    #
+    # P0 #2 / P0 #3 residual (2026-05-18): an audit caught that NaN VIX,
+    # None VIX, None nifty_trend etc. were all silently allowing trades
+    # because the gate was coercing them to passing values. Live-money
+    # safety contract: any unparseable / missing / non-finite market-
+    # context value REFUSES the cycle and waits for the next refresh.
+    # These tests now pin that fail-closed contract.
 
-    def test_can_trade_handles_string_vix(self, rm):
-        allowed, reason = rm.can_trade(market_context={"india_vix": "n/a", "nifty_trend": 1})
-        assert allowed is True, reason
-
-    def test_can_trade_handles_numeric_string_vix(self, rm):
-        # Some upstream caches return numbers as strings; we still want them parsed.
-        allowed, reason = rm.can_trade(market_context={"india_vix": "30.0", "nifty_trend": 1})
-        assert allowed is False
-        assert "VIX" in reason
-
-    def test_can_trade_handles_none_nifty_trend(self, rm):
-        # None nifty_trend must not raise. Default to neutral (=1, allows entry).
+    def test_can_trade_refuses_when_vix_is_none(self, rm):
+        """P0 residual: None VIX must NOT be coerced to 0 (calm). Refuse and
+        wait for the next refresh (within 10 minutes)."""
         allowed, reason = rm.can_trade(
-            market_context={"india_vix": 15.0, "nifty_trend": None}
+            market_context={"india_vix": None, "nifty_trend": 1}
         )
-        assert allowed is True, reason
+        assert allowed is False
+        assert "VIX" in reason and "unknown" in reason.lower()
 
-    def test_can_trade_handles_nan_vix(self, rm):
-        # NaN > x is always False in Python float semantics, so this would not
-        # have crashed historically, but the new path uses float() which
-        # propagates NaN. Verify we still allow trading (NaN compares False).
+    def test_can_trade_refuses_when_vix_is_string(self, rm):
+        """P0 residual: unparseable VIX string ('n/a', '', 'NA', ...) refuses."""
+        allowed, reason = rm.can_trade(
+            market_context={"india_vix": "n/a", "nifty_trend": 1}
+        )
+        assert allowed is False
+        assert "VIX" in reason and "unknown" in reason.lower()
+
+    def test_can_trade_refuses_when_vix_is_nan(self, rm):
+        """P0 residual: NaN VIX must refuse. The original 2026-05-15 patch
+        used ``float()`` which lets NaN through; the threshold ``nan > 25``
+        is False so a NaN VIX silently passed every gate."""
         import math
         allowed, reason = rm.can_trade(
             market_context={"india_vix": math.nan, "nifty_trend": 1}
+        )
+        assert allowed is False
+        assert "VIX" in reason and "unknown" in reason.lower()
+
+    def test_can_trade_refuses_when_vix_is_inf(self, rm):
+        """P0 residual: +inf VIX is also degenerate-feed; refuse rather
+        than letting the threshold ``inf > 25`` true-out into a bear-VIX
+        block (wrong reason)."""
+        allowed, reason = rm.can_trade(
+            market_context={"india_vix": float("inf"), "nifty_trend": 1}
+        )
+        assert allowed is False
+        # Either "unknown" (current contract) or "too high" (if a future
+        # tightening decides inf should be treated as "extreme high VIX").
+        assert "VIX" in reason
+
+    def test_can_trade_refuses_when_vix_is_negative(self, rm):
+        """Sanity: negative VIX is a corrupt feed (VIX is a non-negative
+        index by definition). Refuse rather than allowing a -5 VIX to
+        pass the ``vix > max_vix`` check trivially."""
+        allowed, reason = rm.can_trade(
+            market_context={"india_vix": -5.0, "nifty_trend": 1}
+        )
+        assert allowed is False
+        assert "VIX" in reason
+
+    def test_can_trade_handles_numeric_string_vix(self, rm):
+        """Some upstream caches return numbers as strings; the parser MUST
+        still parse them. This is the one case where coercion is the
+        right call (the value IS a valid number, just typed as str)."""
+        allowed, reason = rm.can_trade(
+            market_context={"india_vix": "30.0", "nifty_trend": 1}
+        )
+        assert allowed is False
+        assert "VIX" in reason and "too high" in reason
+
+    def test_can_trade_refuses_when_nifty_trend_is_none(self, rm):
+        """P0 residual: None nifty_trend was defaulting to 1 (bull) —
+        silently bull-biased the agent during data gaps. Now refuses
+        when require_nifty_above_200ema=True."""
+        allowed, reason = rm.can_trade(
+            market_context={"india_vix": 15.0, "nifty_trend": None}
+        )
+        assert allowed is False
+        assert "Nifty" in reason and "unknown" in reason.lower()
+
+    def test_can_trade_refuses_when_nifty_trend_is_string(self, rm):
+        """Unparseable nifty_trend ('bull', 'down', '?', ...) refuses."""
+        allowed, reason = rm.can_trade(
+            market_context={"india_vix": 15.0, "nifty_trend": "up"}
+        )
+        assert allowed is False
+        assert "Nifty" in reason
+
+    def test_can_trade_refuses_when_nifty_trend_is_nan(self, rm):
+        """NaN nifty_trend refuses (same NaN-bypass issue as VIX)."""
+        import math
+        allowed, reason = rm.can_trade(
+            market_context={"india_vix": 15.0, "nifty_trend": math.nan}
+        )
+        assert allowed is False
+        assert "Nifty" in reason
+
+    def test_can_trade_allows_neutral_nifty_trend(self, rm):
+        """nifty_trend == 0 (P1 #11 default on insufficient history) is
+        the explicit 'neutral / at-EMA' marker, NOT the 'unknown' marker.
+        It should ALLOW trading — only -1 (below EMA) blocks."""
+        allowed, reason = rm.can_trade(
+            market_context={"india_vix": 15.0, "nifty_trend": 0}
+        )
+        assert allowed is True, reason
+
+    def test_can_trade_allows_bullish_nifty_trend(self, rm):
+        """nifty_trend == 1 (above 200 EMA) allows."""
+        allowed, reason = rm.can_trade(
+            market_context={"india_vix": 15.0, "nifty_trend": 1}
         )
         assert allowed is True, reason
 

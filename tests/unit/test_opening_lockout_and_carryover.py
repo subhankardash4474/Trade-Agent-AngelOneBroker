@@ -122,6 +122,8 @@ def _wire_agent_for_carryover(closes_collected: list,
                                positions: dict | None = None,
                                *, before_lock_time: bool = False,
                                carryover_done: bool = False):
+    import threading
+
     a = _make_minimal_agent()
     a._carryover_lock_done = carryover_done
     a.portfolio = _FakePortfolio(positions or {})
@@ -129,6 +131,12 @@ def _wire_agent_for_carryover(closes_collected: list,
     a.execution.place_order = MagicMock(
         return_value={"status": "FILLED", "filled_price": None}
     )
+    # P0 #2 residual (2026-05-18): _close_position_safely now wraps in
+    # self._exit_check_lock and re-checks portfolio.positions for
+    # idempotency. Initialise both so the carryover-lock path doesn't
+    # blow up with AttributeError before reaching the assertion.
+    a._exit_check_lock = threading.RLock()
+    a._persist_trailing_states = MagicMock()
     a.risk_manager = MagicMock()
     a.alert_manager = MagicMock()
     a._record_exit = MagicMock()
