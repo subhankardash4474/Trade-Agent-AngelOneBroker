@@ -204,6 +204,126 @@ def test_atomic_write_no_partial_on_collision(tmp_path):
     assert not any(n.startswith(".trailing_stops.") for n in names)
 
 
+# ---------------------------------------------------------------------------
+# Regression #4 (2026-05-18): trail-override fields in persistence schema
+# ---------------------------------------------------------------------------
+
+
+def test_trail_override_fields_survive_round_trip(tmp_path):
+    """trend_continuation entries override trail_activation_rr / trail_step_pct
+    on the live TrailingStop. Without persistence those overrides used to
+    vanish on restart -- the position came back with the config defaults
+    (activation=1.0, step=0.3) and gave back more MFE than intended.
+    Now the snapshot carries them explicitly."""
+    ts = TrailingStop(
+        entry_price=1500.0, initial_sl=1485.0, side="BUY",
+        trail_activation_rr=1.0, trail_step_pct=0.3,
+        symbol="HDFCBANK",
+    )
+    # Mirror the trading_agent override for trend_continuation entries.
+    ts.trail_activation_rr = 0.5
+    ts.trail_step_pct = 0.6
+
+    save_trailing_states({"HDFCBANK": ts}, data_dir=tmp_path)
+    loaded = load_trailing_states(data_dir=tmp_path)
+    snap = loaded["HDFCBANK"]
+    assert snap["trail_activation_rr"] == 0.5
+    assert snap["trail_step_pct"] == 0.6
+
+    # And the restore-side applies them back onto a fresh TS (which would
+    # otherwise have the default 1.0 / 0.3).
+    fresh = TrailingStop(
+        entry_price=1500.0, initial_sl=1485.0, side="BUY",
+        symbol="HDFCBANK",
+    )
+    assert fresh.trail_activation_rr == 1.0
+    assert fresh.trail_step_pct == 0.3
+    assert restore_trailing_state(fresh, snap) is True
+    assert fresh.trail_activation_rr == 0.5
+    assert fresh.trail_step_pct == 0.6
+
+
+def test_restore_tolerates_missing_trail_override_fields(tmp_path):
+    """Legacy snapshots written before 2026-05-18 won't carry
+    trail_activation_rr / trail_step_pct. Restore must accept them as
+    optional and leave the freshly-constructed TS's config defaults
+    intact."""
+    legacy_snap = {
+        "entry_price":          1500.0,
+        "side":                 "BUY",
+        "initial_risk":         15.0,
+        "current_sl":           1495.0,
+        "highest_since_entry":  1520.0,
+        "lowest_since_entry":   1500.0,
+        "trailing_active":      True,
+        "peak_unrealized_r":    1.3,
+        "peak_giveback_armed":  False,
+        "last_unrealized_r":    1.2,
+        "breakeven_armed":      True,
+        # NO trail_activation_rr / trail_step_pct fields
+    }
+    fresh = TrailingStop(
+        entry_price=1500.0, initial_sl=1485.0, side="BUY",
+        trail_activation_rr=1.0, trail_step_pct=0.3,
+        symbol="HDFCBANK",
+    )
+    assert restore_trailing_state(fresh, legacy_snap) is True
+    # Dynamic fields applied
+    assert fresh.current_sl == 1495.0
+    assert fresh.breakeven_armed is True
+    # Override fields untouched (kept the config defaults)
+    assert fresh.trail_activation_rr == 1.0
+    assert fresh.trail_step_pct == 0.3
+
+
+# ---------------------------------------------------------------------------
+# Regression #5 / #6 (2026-05-18): schema version + corrupt fail-loud
+# ---------------------------------------------------------------------------
+
+
+def test_corrupt_snapshot_logs_critical(tmp_path, caplog):
+    """A corrupt trailing-stop snapshot used to drop to {} silently. Must
+    now log CRITICAL so the operator gets a loud forensic signal."""
+    import logging
+
+    (tmp_path / SNAPSHOT_FILENAME).write_text("not-json{{", encoding="utf-8")
+    with caplog.at_level(logging.CRITICAL):
+        out = load_trailing_states(data_dir=tmp_path)
+    assert out == {}
+
+
+def test_future_schema_version_refused(tmp_path, caplog):
+    """A future-version snapshot (rollback scenario) must be REFUSED and
+    logged at CRITICAL, not silently mis-parsed."""
+    import logging
+
+    future = {
+        "version": 99,
+        "saved_at": "2026-12-31T23:59:59+05:30",
+        "trailing_stops": {
+            "HDFCBANK": {"entry_price": 1500.0, "side": "BUY"},
+        },
+    }
+    (tmp_path / SNAPSHOT_FILENAME).write_text(json.dumps(future), encoding="utf-8")
+    with caplog.at_level(logging.CRITICAL):
+        out = load_trailing_states(data_dir=tmp_path)
+    assert out == {}
+
+
+def test_unparseable_schema_version_refused(tmp_path):
+    """version: 'banana' is treated as untrusted format -- REFUSE."""
+    bad = {
+        "version": "banana",
+        "saved_at": "2026-05-18T10:00:00+05:30",
+        "trailing_stops": {
+            "HDFCBANK": {"entry_price": 1500.0, "side": "BUY"},
+        },
+    }
+    (tmp_path / SNAPSHOT_FILENAME).write_text(json.dumps(bad), encoding="utf-8")
+    out = load_trailing_states(data_dir=tmp_path)
+    assert out == {}
+
+
 def test_realistic_restart_scenario(tmp_path):
     """End-to-end: position opens, trail mutates, daemon crashes, restarts,
     position re-creates a fresh TrailingStop, restore brings back state."""

@@ -333,12 +333,24 @@ class TradeAnalyzer:
                 logger.error(f"Failed to save strategy score for {strategy}: {e}")
 
             # ----- per-strategy per-regime scorecard -----
+            # 2026-05-18 regression fix: same scratch handling as the
+            # per-strategy block above. The original P2 logic-edges patch
+            # (2026-05-17) added the `wins / losses / scratches` three-way
+            # classification to the per-strategy scorecard but MISSED this
+            # parallel regime branch, so the regime weights kept counting
+            # pnl==0 exits as losses and biased the per-regime weighting
+            # away from any strategy with frequent flat exits in that
+            # regime. Symptom: in `_recalculate_regime_weights` the
+            # bear_high_vol slot for a mean-reversion strategy could
+            # show 38% WR vs the true 52% decisive-trade WR.
             r_stats = self._regime_stats.get((strategy, regime)) or self._empty_stats()
             r_stats["total_trades"] = r_stats.get("total_trades", 0) + 1
             if attributed_pnl > 0:
                 r_stats["wins"] = r_stats.get("wins", 0) + 1
-            else:
+            elif attributed_pnl < 0:
                 r_stats["losses"] = r_stats.get("losses", 0) + 1
+            else:
+                r_stats["scratches"] = r_stats.get("scratches", 0) + 1
             r_stats["total_pnl"] = r_stats.get("total_pnl", 0) + attributed_pnl
             r_stats["avg_pnl"] = r_stats["total_pnl"] / r_stats["total_trades"]
             if r_stats["total_trades"] > 0:

@@ -214,3 +214,188 @@ def test_reconnect_loop_simulation_broker_returns_immediately():
     with mock.patch("core.websocket_client.time.sleep", lambda *_: None):
         c._reconnect_loop()
     # Did not crash; just returned.
+
+
+# ── Regression #7 (2026-05-18) -- Kite tick exchange_timestamp ────────────
+
+
+def _make_kite_client():
+    c = WebSocketClient(broker="kite", config={}, smart_api=None)
+    c.subscribe([{"symbol": "TCS", "token": "11536"}])
+    return c
+
+
+def test_kite_tick_carries_exchange_timestamp_when_datetime():
+    """KiteConnect hands exchange_timestamp as a datetime. The aggregator
+    must receive it so candle bucketing uses event time, not wall-clock.
+    Closes the same bucket-skew bug the Angel patch fixed."""
+    from datetime import datetime as _dt
+
+    import pytz as _pytz
+
+    received = []
+    c = _make_kite_client()
+    c.on_tick = lambda t: received.append(t)
+    ist = _pytz.timezone("Asia/Kolkata")
+    event_time = ist.localize(_dt(2026, 5, 18, 10, 30, 15))
+
+    c._handle_kite_tick({
+        "instrument_token": "11536",
+        "last_price": 3500.0,
+        "volume_traded": 1000,
+        "exchange_timestamp": event_time,
+    })
+    assert len(received) == 1
+    assert "timestamp" in received[0]
+    assert received[0]["timestamp"] == event_time
+
+
+def test_kite_tick_localizes_naive_datetime():
+    """A naive datetime from Kite must be treated as IST so downstream
+    comparisons don't mix naive and aware values."""
+    from datetime import datetime as _dt
+
+    received = []
+    c = _make_kite_client()
+    c.on_tick = lambda t: received.append(t)
+
+    naive = _dt(2026, 5, 18, 10, 30, 15)
+    c._handle_kite_tick({
+        "instrument_token": "11536",
+        "last_price": 3500.0,
+        "exchange_timestamp": naive,
+    })
+    ts = received[0]["timestamp"]
+    assert ts.tzinfo is not None
+    assert ts.hour == 10 and ts.minute == 30
+
+
+def test_kite_tick_falls_back_to_last_trade_time():
+    """If exchange_timestamp is absent but last_trade_time is present,
+    use that instead -- Kite's docs list both as a usable event time."""
+    from datetime import datetime as _dt
+
+    import pytz as _pytz
+
+    received = []
+    c = _make_kite_client()
+    c.on_tick = lambda t: received.append(t)
+    ist = _pytz.timezone("Asia/Kolkata")
+    event_time = ist.localize(_dt(2026, 5, 18, 11, 45, 0))
+
+    c._handle_kite_tick({
+        "instrument_token": "11536",
+        "last_price": 3500.0,
+        "last_trade_time": event_time,
+    })
+    assert received[0]["timestamp"] == event_time
+
+
+def test_kite_tick_missing_timestamp_does_not_break():
+    """Defensive: an old / sparse tick without any event-time field must
+    still propagate (the aggregator will fall back to wall-clock as
+    before, but the tick itself is not dropped)."""
+    received = []
+    c = _make_kite_client()
+    c.on_tick = lambda t: received.append(t)
+
+    c._handle_kite_tick({
+        "instrument_token": "11536",
+        "last_price": 3500.0,
+    })
+    assert len(received) == 1
+    assert "timestamp" not in received[0]
+
+
+# ── P1 (2026-05-18) -- threaded reconnect dispatch + on_error wiring ───
+
+
+def test_schedule_reconnect_spawns_a_thread_once():
+    """The first call spawns a daemon thread running _reconnect_loop;
+    subsequent calls while that thread is alive must be no-ops."""
+    c = _make_client()
+    c._running = True
+
+    # Replace _reconnect_loop with a slow-running stub so we can race
+    # multiple _schedule_reconnect calls against it.
+    started_count = {"n": 0}
+    release = mock.MagicMock()
+
+    def slow_loop():
+        started_count["n"] += 1
+        # Hold the thread alive for the duration of the test.
+        while c._running:
+            release()
+            import time as _t
+            _t.sleep(0.01)
+
+    c._reconnect_loop = slow_loop
+
+    c._schedule_reconnect()
+    c._schedule_reconnect()
+    c._schedule_reconnect()
+
+    # Give the worker a beat to actually start running.
+    import time as _t
+    for _ in range(50):
+        if started_count["n"] >= 1:
+            break
+        _t.sleep(0.01)
+
+    try:
+        assert started_count["n"] == 1, (
+            "P1 (2026-05-18) regression: _schedule_reconnect must be "
+            "idempotent while a reconnect thread is alive. Saw "
+            f"{started_count['n']} starts."
+        )
+    finally:
+        c._running = False
+        c._reconnect_thread.join(timeout=1.0)
+
+
+def test_schedule_reconnect_noops_when_not_running():
+    """stop() flips _running to False; subsequent schedule_reconnect calls
+    must be silent no-ops so we don't fight with shutdown."""
+    c = _make_client()
+    c._running = False
+
+    started = {"n": 0}
+    c._reconnect_loop = lambda: started.__setitem__("n", started["n"] + 1)
+    c._schedule_reconnect()
+
+    import time as _t
+    _t.sleep(0.05)
+    assert started["n"] == 0
+
+
+def test_schedule_reconnect_respawns_after_previous_thread_exits():
+    """After a previous reconnect-loop thread cleanly exits (e.g. the
+    daemon transitioned through a stop()/start() cycle), a fresh
+    _schedule_reconnect call must be able to spawn again."""
+    c = _make_client()
+    c._running = True
+
+    runs = []
+
+    def quick_loop():
+        runs.append(1)
+        return  # exits immediately
+
+    c._reconnect_loop = quick_loop
+    c._schedule_reconnect()
+    # Wait for first thread to finish.
+    if c._reconnect_thread is not None:
+        c._reconnect_thread.join(timeout=1.0)
+    c._schedule_reconnect()
+    if c._reconnect_thread is not None:
+        c._reconnect_thread.join(timeout=1.0)
+
+    assert len(runs) == 2
+
+
+# ── on_error wiring (per-broker handler is created inside _run_*; we
+#    can't easily intercept it without launching the broker SDK. Instead
+#    we test the public surface: _schedule_reconnect is the new single
+#    entry point. The hand-off from on_error is exercised in an
+#    integration-style test in tests/integration when the SDK is
+#    stubbable.) ────────────────────────────────────────────────────────

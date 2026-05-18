@@ -152,6 +152,69 @@ def test_suspended_strategy_survives_same_day_restart(tmp_path):
     assert s["supertrend_follow"]["consec_losses"] == 3
 
 
+# ---------------------------------------------------------------------------
+# Regression #5 / #6 (2026-05-18): schema version + corrupt fail-loud
+# ---------------------------------------------------------------------------
+
+
+def test_corrupt_snapshot_logs_critical(tmp_path, caplog):
+    """A corrupt runtime_state snapshot used to drop to ({},[],{}) without
+    a loud signal. The lost state is the suspended-strategy circuit
+    breaker -- losing it silently means a suspended strategy comes back
+    armed. Must log CRITICAL now."""
+    import logging
+
+    (tmp_path / SNAPSHOT_FILENAME).write_text("not-json", encoding="utf-8")
+    with caplog.at_level(logging.CRITICAL):
+        s, o, t = load_runtime_state(
+            open_rate_window=timedelta(minutes=5), data_dir=tmp_path,
+        )
+    assert s == {} and o == [] and t == {}
+
+
+def test_future_schema_version_refused(tmp_path, caplog):
+    """A snapshot version higher than the current build must be REFUSED,
+    not silently mis-parsed."""
+    import logging
+
+    payload = {
+        "version": 42,
+        "saved_at": datetime.now(IST).isoformat(),
+        "strategy_state": {
+            "mean_reversion": {
+                "consec_losses": 5, "daily_pnl": -200.0,
+                "suspended": True, "suspended_reason": "x", "trades": 5,
+            },
+        },
+        "recent_opens": [],
+        "consec_tp_today": {},
+    }
+    (tmp_path / SNAPSHOT_FILENAME).write_text(json.dumps(payload), encoding="utf-8")
+
+    with caplog.at_level(logging.CRITICAL):
+        s, o, t = load_runtime_state(
+            open_rate_window=timedelta(minutes=5), data_dir=tmp_path,
+        )
+    assert s == {} and o == [] and t == {}
+
+
+def test_unparseable_schema_version_refused(tmp_path):
+    """version: object literal -> treated as untrusted format."""
+    payload = {
+        "version": {"oops": "this is a dict"},
+        "saved_at": datetime.now(IST).isoformat(),
+        "strategy_state": {},
+        "recent_opens": [],
+        "consec_tp_today": {},
+    }
+    (tmp_path / SNAPSHOT_FILENAME).write_text(json.dumps(payload), encoding="utf-8")
+
+    s, o, t = load_runtime_state(
+        open_rate_window=timedelta(minutes=5), data_dir=tmp_path,
+    )
+    assert s == {} and o == [] and t == {}
+
+
 def test_malformed_strategy_entries_skipped(tmp_path):
     """A row that isn't a dict is silently dropped instead of crashing
     the rest of the load."""

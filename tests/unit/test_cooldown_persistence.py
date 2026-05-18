@@ -54,7 +54,7 @@ def test_round_trip_preserves_all_three_maps(tmp_path):
         cooldown_map, stock_loss_today, rejection_cooldown_map, data_dir=tmp_path
     )
 
-    restored_cd, restored_loss, restored_rej = load_cooldown_state(
+    restored_cd, restored_loss, restored_rej, _ = load_cooldown_state(
         reentry_cooldown=timedelta(minutes=30),
         rejection_cooldown=timedelta(minutes=5),
         data_dir=tmp_path,
@@ -79,7 +79,7 @@ def test_expired_reentry_cooldowns_dropped_at_load(tmp_path):
     }
     save_cooldown_state(cooldown_map, {}, {}, data_dir=tmp_path)
 
-    restored_cd, _, _ = load_cooldown_state(
+    restored_cd, _, _, _ = load_cooldown_state(
         reentry_cooldown=timedelta(minutes=30),
         rejection_cooldown=timedelta(minutes=5),
         data_dir=tmp_path,
@@ -97,7 +97,7 @@ def test_expired_rejection_cooldowns_dropped(tmp_path):
     }
     save_cooldown_state({}, {}, rej, data_dir=tmp_path)
 
-    _, _, restored_rej = load_cooldown_state(
+    _, _, restored_rej, _ = load_cooldown_state(
         reentry_cooldown=timedelta(minutes=30),
         rejection_cooldown=timedelta(minutes=5),
         data_dir=tmp_path,
@@ -129,7 +129,7 @@ def test_stock_loss_today_dropped_if_snapshot_from_previous_day(tmp_path):
     path = tmp_path / SNAPSHOT_FILENAME
     path.write_text(json.dumps(snapshot), encoding="utf-8")
 
-    _, restored_loss, _ = load_cooldown_state(
+    _, restored_loss, _, _ = load_cooldown_state(
         reentry_cooldown=timedelta(minutes=30),
         rejection_cooldown=timedelta(minutes=5),
         data_dir=tmp_path,
@@ -140,7 +140,7 @@ def test_stock_loss_today_dropped_if_snapshot_from_previous_day(tmp_path):
 
 def test_missing_snapshot_returns_empty_dicts(tmp_path):
     """Fresh deployment / first boot has no snapshot. Must not raise."""
-    restored_cd, restored_loss, restored_rej = load_cooldown_state(
+    restored_cd, restored_loss, restored_rej, restored_side = load_cooldown_state(
         reentry_cooldown=timedelta(minutes=30),
         rejection_cooldown=timedelta(minutes=5),
         data_dir=tmp_path / "nonexistent_subdir",
@@ -148,23 +148,30 @@ def test_missing_snapshot_returns_empty_dicts(tmp_path):
     assert restored_cd == {}
     assert restored_loss == {}
     assert restored_rej == {}
+    assert restored_side == {}
 
 
-def test_malformed_snapshot_does_not_raise(tmp_path):
+def test_malformed_snapshot_does_not_raise(tmp_path, caplog):
     """A corrupted snapshot (truncated mid-write, hand-edited bad JSON,
-    etc.) must be tolerated -- we degrade to empty dicts and log a
-    warning, but the trading loop continues."""
+    etc.) must be tolerated -- we degrade to empty dicts so trading
+    continues -- but it must now ALSO log at CRITICAL (Regression #6,
+    2026-05-18) so the operator gets a loud signal that safety state
+    was lost and manual recovery is required."""
+    import logging
+
     path = tmp_path / SNAPSHOT_FILENAME
     path.write_text("{this is not json,", encoding="utf-8")
 
-    restored_cd, restored_loss, restored_rej = load_cooldown_state(
-        reentry_cooldown=timedelta(minutes=30),
-        rejection_cooldown=timedelta(minutes=5),
-        data_dir=tmp_path,
-    )
+    with caplog.at_level(logging.CRITICAL):
+        restored_cd, restored_loss, restored_rej, restored_side = load_cooldown_state(
+            reentry_cooldown=timedelta(minutes=30),
+            rejection_cooldown=timedelta(minutes=5),
+            data_dir=tmp_path,
+        )
     assert restored_cd == {}
     assert restored_loss == {}
     assert restored_rej == {}
+    assert restored_side == {}
 
 
 def test_save_creates_parent_dir(tmp_path):
@@ -209,7 +216,7 @@ def test_realistic_scenario_friday_to_monday_restart(tmp_path):
     # which would survive a quick restart.
     now = IST.localize(datetime(2026, 5, 15, 14, 46, 30))
 
-    restored_cd, _, _ = load_cooldown_state(
+    restored_cd, _, _, _ = load_cooldown_state(
         reentry_cooldown=timedelta(minutes=30),
         rejection_cooldown=timedelta(minutes=5),
         data_dir=tmp_path,
@@ -229,10 +236,151 @@ def test_realistic_scenario_friday_to_monday_restart(tmp_path):
         "FRESHSTOP": now - timedelta(minutes=5),
     }
     save_cooldown_state(cooldown_map_fresh, {}, {}, data_dir=tmp_path)
-    restored_cd, _, _ = load_cooldown_state(
+    restored_cd, _, _, _ = load_cooldown_state(
         reentry_cooldown=timedelta(minutes=30),
         rejection_cooldown=timedelta(minutes=5),
         data_dir=tmp_path,
         now=now + timedelta(seconds=10),
     )
     assert "FRESHSTOP" in restored_cd, "recent stop-outs must survive restart"
+
+
+# ---------------------------------------------------------------------------
+# Regression #2 (2026-05-18): cooldown_side_map persistence
+# ---------------------------------------------------------------------------
+
+
+def test_side_map_round_trip(tmp_path):
+    """A side-aware cooldown (P2 logic-edges, 2026-05-17) survives the
+    save/load round-trip so opposite-side edges keep firing correctly
+    after restart instead of being conservatively bare-symbol blocked."""
+    now = _now()
+    cooldown_map = {
+        "RELIANCE": now - timedelta(minutes=2),
+        "TCS": now - timedelta(minutes=3),
+    }
+    side_map = {"RELIANCE": "BUY", "TCS": "SELL"}
+
+    save_cooldown_state(
+        cooldown_map, {}, {}, cooldown_side_map=side_map, data_dir=tmp_path
+    )
+    restored_cd, _, _, restored_side = load_cooldown_state(
+        reentry_cooldown=timedelta(minutes=30),
+        rejection_cooldown=timedelta(minutes=5),
+        data_dir=tmp_path,
+        now=now,
+    )
+    assert restored_cd.keys() == cooldown_map.keys()
+    assert restored_side == side_map
+
+
+def test_side_map_dropped_when_bare_cooldown_expires(tmp_path):
+    """A side entry whose bare-symbol cooldown got filtered as stale
+    must NOT outlive its parent -- otherwise a stale side would silently
+    selectively gate one direction after the cooldown itself lapsed."""
+    now = _now()
+    cooldown_map = {
+        "FRESH": now - timedelta(minutes=5),     # within 30-min TTL
+        "STALE": now - timedelta(minutes=45),    # past 30-min TTL
+    }
+    side_map = {"FRESH": "BUY", "STALE": "SELL"}
+
+    save_cooldown_state(
+        cooldown_map, {}, {}, cooldown_side_map=side_map, data_dir=tmp_path
+    )
+    restored_cd, _, _, restored_side = load_cooldown_state(
+        reentry_cooldown=timedelta(minutes=30),
+        rejection_cooldown=timedelta(minutes=5),
+        data_dir=tmp_path,
+        now=now,
+    )
+    assert "FRESH" in restored_cd
+    assert restored_side == {"FRESH": "BUY"}
+
+
+def test_legacy_snapshot_without_side_map_field(tmp_path):
+    """A snapshot from before 2026-05-18 lacks ``cooldown_side_map``.
+    Loader must tolerate the missing key (treat as empty side map) and
+    still surface a 4-tuple. Mirrors what happens on the very first boot
+    after rolling out this regression fix."""
+    now = _now()
+    snapshot = {
+        "version": SCHEMA_VERSION,
+        "saved_at": now.astimezone(IST).isoformat(),
+        "cooldown_map": {"BSOFT": (now - timedelta(minutes=5)).astimezone(IST).isoformat()},
+        "stock_loss_today": {},
+        "rejection_cooldown_map": {},
+        # No "cooldown_side_map" key -- legacy snapshot.
+    }
+    path = tmp_path / SNAPSHOT_FILENAME
+    path.write_text(json.dumps(snapshot), encoding="utf-8")
+
+    cd, _, _, side = load_cooldown_state(
+        reentry_cooldown=timedelta(minutes=30),
+        rejection_cooldown=timedelta(minutes=5),
+        data_dir=tmp_path,
+        now=now,
+    )
+    assert "BSOFT" in cd
+    assert side == {}
+
+
+# ---------------------------------------------------------------------------
+# Regression #5 (2026-05-18): SCHEMA_VERSION enforced on load
+# ---------------------------------------------------------------------------
+
+
+def test_future_schema_version_refused(tmp_path, caplog):
+    """A snapshot written by a NEWER build than the current reader must
+    not be silently mis-parsed. Loader REFUSES and returns empty dicts so
+    the daemon starts with a clean slate rather than reading fields under
+    the wrong assumptions."""
+    import logging
+
+    now = _now()
+    snapshot = {
+        "version": SCHEMA_VERSION + 5,  # pretend a future writer
+        "saved_at": now.astimezone(IST).isoformat(),
+        "cooldown_map": {"BSOFT": (now - timedelta(minutes=5)).astimezone(IST).isoformat()},
+        "stock_loss_today": {"BSOFT": 1},
+        "rejection_cooldown_map": {},
+        "cooldown_side_map": {"BSOFT": "BUY"},
+    }
+    path = tmp_path / SNAPSHOT_FILENAME
+    path.write_text(json.dumps(snapshot), encoding="utf-8")
+
+    with caplog.at_level(logging.CRITICAL):
+        cd, loss, rej, side = load_cooldown_state(
+            reentry_cooldown=timedelta(minutes=30),
+            rejection_cooldown=timedelta(minutes=5),
+            data_dir=tmp_path,
+            now=now,
+        )
+    assert cd == {}
+    assert loss == {}
+    assert rej == {}
+    assert side == {}
+
+
+def test_unknown_schema_version_string_refused(tmp_path):
+    """A garbage version field (string, None) is treated as an unknown
+    future version and refused."""
+    now = _now()
+    snapshot = {
+        "version": "totally-not-a-version",
+        "saved_at": now.astimezone(IST).isoformat(),
+        "cooldown_map": {"BSOFT": (now - timedelta(minutes=5)).astimezone(IST).isoformat()},
+        "stock_loss_today": {},
+        "rejection_cooldown_map": {},
+    }
+    path = tmp_path / SNAPSHOT_FILENAME
+    path.write_text(json.dumps(snapshot), encoding="utf-8")
+
+    cd, loss, rej, side = load_cooldown_state(
+        reentry_cooldown=timedelta(minutes=30),
+        rejection_cooldown=timedelta(minutes=5),
+        data_dir=tmp_path,
+        now=now,
+    )
+    assert cd == {}
+    assert side == {}

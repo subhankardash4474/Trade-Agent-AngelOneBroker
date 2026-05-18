@@ -146,9 +146,21 @@ def prepare_dataset(
     output_dir: str = "data",
     period: str | None = None,
     label_threshold_pct: float = 0.3,
+    drop_skew_features: bool = False,
 ):
     """
     Full pipeline: download → features → labels → save.
+
+    Parameters
+    ----------
+    drop_skew_features
+        2026-05-18 (P1): when an off-canonical interval (e.g. daily bars
+        for long-horizon research) is used together with
+        ``--allow-distribution-skew``, the operator has explicitly
+        acknowledged the train/serve mismatch. Drop the offending
+        ``tod_*`` / ``dow_*`` columns from the produced dataset BEFORE
+        writing so even a deployed-by-mistake model can't carry the
+        distribution skew through to serve time. Other features remain.
     """
     os.makedirs(output_dir, exist_ok=True)
     feature_engine = FeatureEngine()
@@ -219,6 +231,25 @@ def prepare_dataset(
     logger.info(f"\nTotal dataset: {len(combined)} samples")
     logger.info(f"  UP:   {sum(combined['label']==1)} ({sum(combined['label']==1)/len(combined)*100:.1f}%)")
     logger.info(f"  DOWN: {sum(combined['label']==0)} ({sum(combined['label']==0)/len(combined)*100:.1f}%)")
+
+    # 2026-05-18 (P1): if the caller has explicitly opted-in to a
+    # distribution-skewed interval, drop the four cyclic-time features so
+    # they can't carry the skew into a deployed model. We do this AFTER
+    # the row-level dropna so the row count doesn't shift; the columns
+    # are simply removed from the wide dataset.
+    if drop_skew_features:
+        skew_cols = [
+            c for c in combined.columns
+            if c.startswith("tod_") or c.startswith("dow_")
+        ]
+        if skew_cols:
+            combined = combined.drop(columns=skew_cols)
+            logger.critical(
+                f"[TRAIN/SERVE-SKEW] dropped {skew_cols} from dataset "
+                f"because --allow-distribution-skew was set. Models "
+                f"trained on this dataset cannot use these features, "
+                f"which neutralises the interval mismatch."
+            )
 
     # P1 #7 (2026-05-17) -- ML INTEGRITY: split by CALENDAR TIME, not by row
     # index. The OLD code did ``combined.iloc[:0.8*N]`` after ``pd.concat``,
@@ -305,6 +336,22 @@ def main():
                         help="Use core.stock_scanner.NSE_UNIVERSE")
     parser.add_argument("--limit", type=int, default=None,
                         help="Take first N symbols only (post-resolve)")
+    # 2026-05-18 (P1): hard-block off-canonical intervals unless the
+    # operator explicitly opts in. Without this flag, daily-bar runs used
+    # to produce a deployable artifact whose tod_/dow_ features had a
+    # train/serve distribution skew that silently degraded live edge --
+    # the WARNING below was not enforceable. With the flag, the same
+    # daily-bar run is allowed for research, but tod_/dow_ columns are
+    # dropped from the dataset so the model can't carry the skew.
+    parser.add_argument(
+        "--allow-distribution-skew",
+        action="store_true",
+        help=(
+            "Opt-in to a non-canonical --interval (e.g. 1d). Required to "
+            "produce a dataset when --interval != serve interval. Causes "
+            "tod_*/dow_* features to be dropped from the dataset."
+        ),
+    )
     args = parser.parse_args()
 
     symbols: list[str] = []
@@ -332,23 +379,37 @@ def main():
 
     logger.info(f"Resolved {len(symbols)} symbols: {symbols[:5]}{'...' if len(symbols) > 5 else ''}")
 
-    # P1 #9 (2026-05-17): emit a loud warning if the chosen interval does
-    # not match the canonical live-serve interval. Operators sometimes pick
-    # 1d for long-history experiments -- that's fine for research, but the
-    # resulting model must NOT be deployed because tod_sin/cos and dow_sin/cos
-    # will land in a totally different distribution at serve time.
+    # 2026-05-18 (P1): a non-canonical --interval is now a HARD BLOCK
+    # unless the operator passes --allow-distribution-skew. The OLD path
+    # emitted a WARNING and continued -- the resulting model was
+    # deployable, and operator memory being what it is, several were
+    # eventually deployed. The block forces an explicit acknowledgement.
+    # When the override is set, we also drop tod_*/dow_* from the dataset
+    # so the model cannot carry the skew through to serve time.
     if args.interval != SERVE_INTERVAL:
-        logger.warning(
+        if not args.allow_distribution_skew:
+            logger.critical(
+                f"[TRAIN/SERVE-SKEW] --interval={args.interval} does NOT match "
+                f"the live FeatureEngine interval ({SERVE_INTERVAL}). "
+                f"Refusing to produce a dataset that would silently skew "
+                f"tod_sin/cos and dow_sin/cos at serve time. Pass "
+                f"--allow-distribution-skew to acknowledge and proceed "
+                f"(the offending columns will be dropped from the output)."
+            )
+            sys.exit(2)
+        logger.critical(
             f"[TRAIN/SERVE-SKEW] --interval={args.interval} does NOT match "
             f"the live FeatureEngine interval ({SERVE_INTERVAL}). The "
-            f"tod_sin/cos and dow_sin/cos features will have a different "
-            f"distribution than what the daemon sees at serve time. Do NOT "
-            f"deploy this model to production -- it is for research only."
+            f"operator has acknowledged the skew via "
+            f"--allow-distribution-skew. tod_*/dow_* features will be "
+            f"DROPPED from the produced dataset."
         )
 
     prepare_dataset(
         symbols, args.start, args.end, args.interval, args.horizon, args.output,
         period=args.period, label_threshold_pct=args.threshold_pct,
+        drop_skew_features=(args.interval != SERVE_INTERVAL
+                            and args.allow_distribution_skew),
     )
 
 

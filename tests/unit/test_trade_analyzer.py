@@ -105,6 +105,54 @@ class TestStrategyScorecard:
         assert stats["total_pnl"] == 90.0
         assert stats["win_rate"] == pytest.approx(0.6, abs=0.01)
 
+    def test_scratch_trade_not_counted_as_loss_per_strategy(self, analyzer):
+        """A pnl==0 (flat) close must not inflate the loss count."""
+        rec = _make_trade_record("rsi_momentum", pnl=0.0)
+        stats = analyzer.record_trade(rec)
+        assert stats["total_trades"] == 1
+        assert stats["wins"] == 0
+        assert stats["losses"] == 0
+        assert stats["scratches"] == 1
+
+    def test_scratch_trade_not_counted_as_loss_per_regime(self, analyzer):
+        """
+        2026-05-18 regression guard: the P2 logic-edges patch added scratch
+        handling to the per-strategy block but MISSED the per-regime block,
+        so pnl==0 in a given regime would be counted as a loss in the
+        regime scorecard while not in the per-strategy scorecard. Reproduce
+        the bug, then assert it's fixed.
+        """
+        rec_win = _make_trade_record("rsi_momentum", pnl=40.0)
+        rec_win.regime = "bear_high_vol"
+        rec_flat = _make_trade_record("rsi_momentum", pnl=0.0)
+        rec_flat.regime = "bear_high_vol"
+
+        analyzer.record_trade(rec_win)
+        analyzer.record_trade(rec_flat)
+
+        r_stats = analyzer._regime_stats[("rsi_momentum", "bear_high_vol")]
+        assert r_stats["total_trades"] == 2
+        assert r_stats["wins"] == 1
+        assert r_stats["losses"] == 0
+        assert r_stats["scratches"] == 1
+        assert r_stats["win_rate"] == pytest.approx(0.5)
+
+    def test_scratch_trade_per_regime_does_not_distort_loss_branch(self, analyzer):
+        """Negative pnl must still be counted as a loss in the regime branch."""
+        rec_loss = _make_trade_record("rsi_momentum", pnl=-30.0)
+        rec_loss.regime = "bull_low_vol"
+        rec_flat = _make_trade_record("rsi_momentum", pnl=0.0)
+        rec_flat.regime = "bull_low_vol"
+
+        analyzer.record_trade(rec_loss)
+        analyzer.record_trade(rec_flat)
+
+        r_stats = analyzer._regime_stats[("rsi_momentum", "bull_low_vol")]
+        assert r_stats["total_trades"] == 2
+        assert r_stats["wins"] == 0
+        assert r_stats["losses"] == 1
+        assert r_stats["scratches"] == 1
+
     def test_profit_factor(self, analyzer):
         for pnl in [100, -50, 80, -30]:
             stats = analyzer.record_trade(_make_trade_record("supertrend_follow", pnl=pnl))

@@ -72,6 +72,15 @@ def _serialize_trailing_stop(ts: Any) -> dict:
     Static fields (the thresholds, ``entry_price``, ``side``,
     ``_initial_risk``) are also captured for validation on load -- we
     only restore state onto a TrailingStop whose static params still match.
+
+    2026-05-18 regression fix: also snapshot ``trail_activation_rr`` and
+    ``trail_step_pct``. These are normally constants set from config, but
+    trend-continuation entries override them post-init (see
+    ``trading_agent._execute_signal`` -- the override sets activation=0.5
+    and step=0.6 to ride a known winner harder). Without persisting the
+    override, a restart resurrected the TrailingStop with the default
+    activation=1.0 / step=0.3, silently un-tightening the trail and
+    giving back more MFE than the operator chose.
     """
     return {
         "entry_price":          float(ts.entry_price),
@@ -85,6 +94,8 @@ def _serialize_trailing_stop(ts: Any) -> dict:
         "peak_giveback_armed":  bool(ts.peak_giveback_armed),
         "last_unrealized_r":    float(ts.last_unrealized_r),
         "breakeven_armed":      bool(ts.breakeven_armed),
+        "trail_activation_rr":  float(ts.trail_activation_rr),
+        "trail_step_pct":       float(ts.trail_step_pct),
     }
 
 
@@ -129,8 +140,43 @@ def load_trailing_states(
         with path.open("r", encoding="utf-8") as f:
             payload = json.load(f)
     except (json.JSONDecodeError, OSError) as exc:
-        logger.warning(f"[TRAIL-PERSIST] unreadable snapshot at {path}: {exc!r}")
+        # Regression #6 (2026-05-18): a corrupt trailing-stop snapshot
+        # used to silently drop to empty; the next mutation then
+        # overwrote it with a fresh empty file. Net effect: positions
+        # restarted with default-distance SLs even when the trail had
+        # locked in significant gains pre-restart. Promote to CRITICAL.
+        # The daemon still continues (empty dict) so the position is at
+        # least protected by its initial SL on the broker side.
+        logger.critical(
+            f"[TRAIL-PERSIST] CORRUPT snapshot at {path}: {exc!r}. "
+            "Trailing-stop progression state has been LOST. "
+            "Open positions will fall back to their initial-SL distance."
+        )
         return {}
+
+    # Regression #5 (2026-05-18): enforce SCHEMA_VERSION on load.
+    snapshot_version_raw = payload.get("version", 1)
+    try:
+        snapshot_version_int = int(snapshot_version_raw)
+    except (TypeError, ValueError):
+        logger.critical(
+            f"[TRAIL-PERSIST] UNPARSEABLE schema version {snapshot_version_raw!r} "
+            f"at {path}. REFUSING to load."
+        )
+        return {}
+    if snapshot_version_int > SCHEMA_VERSION:
+        logger.critical(
+            f"[TRAIL-PERSIST] FUTURE schema v{snapshot_version_int} at {path} "
+            f"(this build expects v<={SCHEMA_VERSION}). REFUSING to load."
+        )
+        return {}
+    if snapshot_version_int < 1:
+        logger.critical(
+            f"[TRAIL-PERSIST] INVALID schema v{snapshot_version_int} at {path}. "
+            "REFUSING to load."
+        )
+        return {}
+
     out: Dict[str, dict] = {}
     for sym, snap in (payload.get("trailing_stops") or {}).items():
         if not isinstance(snap, dict):
@@ -201,6 +247,22 @@ def restore_trailing_state(
             f"({exc!r}); ignoring."
         )
         return False
+
+    # 2026-05-18 regression fix: restore the trend-continuation overrides
+    # if the snapshot carried them. Optional fields; default behavior is
+    # to keep whatever the freshly-constructed TrailingStop already has
+    # (the config defaults) so legacy snapshots from before this regression
+    # patch continue to work unchanged.
+    if "trail_activation_rr" in snapshot:
+        try:
+            ts.trail_activation_rr = float(snapshot["trail_activation_rr"])
+        except (TypeError, ValueError):
+            pass
+    if "trail_step_pct" in snapshot:
+        try:
+            ts.trail_step_pct = float(snapshot["trail_step_pct"])
+        except (TypeError, ValueError):
+            pass
 
     logger.info(
         f"[TRAIL-PERSIST] {ts.symbol or '?'}: restored state "

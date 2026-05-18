@@ -160,7 +160,46 @@ def load_runtime_state(
         with path.open("r", encoding="utf-8") as f:
             payload = json.load(f)
     except (json.JSONDecodeError, OSError) as exc:
-        logger.warning(f"[RUNTIME-PERSIST] unreadable snapshot at {path}: {exc!r}")
+        # Regression #6 (2026-05-18): suspended-strategy state is a
+        # SAFETY artefact. Silently dropping to empty meant a strategy
+        # that hit its circuit-breaker pre-restart could be re-engaged
+        # by the next mutation writing a fresh empty file. Promote to
+        # CRITICAL so the operator gets a loud signal that protective
+        # state was lost. Daemon still continues -- empty state is a
+        # safe (over-permissive) default for runtime state specifically,
+        # because the per-strategy breaker will re-arm on the next
+        # losing trade. The signal here matters for forensics.
+        logger.critical(
+            f"[RUNTIME-PERSIST] CORRUPT snapshot at {path}: {exc!r}. "
+            "Strategy-suspension / open-rate / TP-streak state has been LOST. "
+            "Manual recovery required -- see runbook."
+        )
+        return {}, [], {}
+
+    # Regression #5 (2026-05-18): enforce SCHEMA_VERSION on load.
+    # Same rationale as cooldown_persistence: a forward-version snapshot
+    # written by a newer build than the current reader must be REFUSED
+    # rather than silently mis-parsed under the old layout.
+    snapshot_version_raw = payload.get("version", 1)
+    try:
+        snapshot_version_int = int(snapshot_version_raw)
+    except (TypeError, ValueError):
+        logger.critical(
+            f"[RUNTIME-PERSIST] UNPARSEABLE schema version {snapshot_version_raw!r} "
+            f"at {path}. REFUSING to load."
+        )
+        return {}, [], {}
+    if snapshot_version_int > SCHEMA_VERSION:
+        logger.critical(
+            f"[RUNTIME-PERSIST] FUTURE schema v{snapshot_version_int} at {path} "
+            f"(this build expects v<={SCHEMA_VERSION}). REFUSING to load."
+        )
+        return {}, [], {}
+    if snapshot_version_int < 1:
+        logger.critical(
+            f"[RUNTIME-PERSIST] INVALID schema v{snapshot_version_int} at {path}. "
+            "REFUSING to load."
+        )
         return {}, [], {}
 
     if now is None:

@@ -104,6 +104,49 @@ class WebSocketClient:
                 pass
         logger.info("WebSocket client stopped")
 
+    # ── 2026-05-18 (P1) -- reconnect dispatcher ──────────────────────────
+    #
+    # Why this exists. The old code called ``self._reconnect_loop()``
+    # SYNCHRONOUSLY from inside ``on_close`` and from ``_run_*``'s
+    # exception handler. ``_reconnect_loop`` then called ``_run_*`` again,
+    # whose ``on_close`` would (on the next disconnect) call
+    # ``_reconnect_loop`` again -- the call stack grew by one ``_run_*``
+    # frame on every reconnect. On a flaky network during a long session
+    # the stack eventually overflowed and the WS thread died.
+    #
+    # Plus a second hole: ``on_error`` only logged. A transport-level
+    # error that didn't cleanly trigger ``on_close`` (TCP half-open,
+    # KiteConnect's known "error without close" race) left the feed dead
+    # with no recovery. The audit (2026-05-18) called this out as P1.
+    #
+    # Fix: spawn ``_reconnect_loop`` on a fresh daemon thread, idempotent
+    # (no-op if one is already alive). ``on_close``, ``on_error``, and
+    # the ``_run_*`` exception handlers all funnel through this single
+    # entry point. The original WS thread returns cleanly so the call
+    # stack does not grow.
+
+    def _schedule_reconnect(self) -> None:
+        """Spawn (or no-op) a daemon thread that drives ``_reconnect_loop``.
+
+        Idempotency rules:
+          * If ``_running`` is False (stop() was called), no-op -- the
+            daemon is shutting down.
+          * If a reconnect thread is already alive, no-op -- one
+            reconnect cycle at a time.
+        """
+        if not self._running:
+            return
+        existing = getattr(self, "_reconnect_thread", None)
+        if existing is not None and existing.is_alive():
+            return
+        t = threading.Thread(
+            target=self._reconnect_loop,
+            daemon=True,
+            name=f"ws-reconnect-{self._broker}",
+        )
+        self._reconnect_thread = t
+        t.start()
+
     # ── AngelOne WebSocket ───────────────────────────────────
 
     def _run_angelone(self):
@@ -133,9 +176,25 @@ class WebSocketClient:
                     self.on_connect()
 
             def on_error(wsapp, error):
+                # 2026-05-18 (P1): an error often DOES NOT trigger an
+                # on_close (TCP half-open, transient broker bug, JWT
+                # rotation mid-frame). The OLD code just logged and let
+                # the feed silently die. Now we best-effort close the
+                # underlying socket (which usually drives on_close → the
+                # reconnect path) AND schedule a reconnect ourselves as a
+                # belt-and-suspenders fallback.
                 logger.error(f"AngelOne WebSocket error: {error}")
                 if self.on_error:
-                    self.on_error(error)
+                    try:
+                        self.on_error(error)
+                    except Exception:
+                        pass
+                if self._running:
+                    try:
+                        wsapp.close()
+                    except Exception:
+                        pass
+                    self._schedule_reconnect()
 
             def on_close(wsapp):
                 # P1 #13 (2026-05-17) -- LIVE-MODE SAFETY: SmartWebSocketV2's
@@ -146,13 +205,18 @@ class WebSocketClient:
                 # for the rest of the day -- no exits fired, no alarm. We
                 # now kick the reconnect loop unless the daemon was asked
                 # to stop. Exponential backoff caps at 60s in _reconnect_loop.
+                #
+                # 2026-05-18 (P1): switched from synchronous
+                # ``self._reconnect_loop()`` to the threaded
+                # ``_schedule_reconnect`` to stop the call stack from
+                # growing one ``_run_*`` frame per reconnect.
                 logger.warning("AngelOne WebSocket closed")
                 if self._running:
                     logger.warning(
                         "AngelOne WebSocket closed while running -- "
                         "scheduling reconnect."
                     )
-                    self._reconnect_loop()
+                    self._schedule_reconnect()
 
             sws.on_data = on_data
             sws.on_open = on_open
@@ -166,8 +230,11 @@ class WebSocketClient:
             logger.error("SmartApi not installed, falling back to simulation mode")
             self._run_simulation()
         except Exception as e:
+            # 2026-05-18 (P1): threaded reconnect dispatch (see
+            # _schedule_reconnect docstring) so this frame can unwind
+            # instead of recursing into another _run_angelone.
             logger.error(f"AngelOne WebSocket error: {e}")
-            self._reconnect_loop()
+            self._schedule_reconnect()
 
     def _handle_angelone_tick(self, message):
         """Parse AngelOne tick data and fire callback."""
@@ -236,14 +303,31 @@ class WebSocketClient:
 
             def on_close(ws, code, reason):
                 # P1 #13 (2026-05-17): mirror angelone -- reconnect if still running.
+                # 2026-05-18 (P1): threaded dispatch -- see Angel path.
                 logger.warning(f"Kite WebSocket closed: {code} {reason}")
                 if self._running:
-                    self._reconnect_loop()
+                    self._schedule_reconnect()
 
             def on_error(ws, code, reason):
+                # 2026-05-18 (P1): same fix as Angel -- on_error must
+                # drive reconnect, not just log. Kite's documented
+                # behaviour is that on_error fires for transport errors
+                # that may or may not also produce an on_close; we make
+                # the recovery deterministic by scheduling reconnect on
+                # every error and best-effort closing the underlying
+                # socket so a clean on_close also fires.
                 logger.error(f"Kite WebSocket error: {code} {reason}")
                 if self.on_error:
-                    self.on_error(reason)
+                    try:
+                        self.on_error(reason)
+                    except Exception:
+                        pass
+                if self._running:
+                    try:
+                        ws.close()
+                    except Exception:
+                        pass
+                    self._schedule_reconnect()
 
             kws.on_ticks = on_ticks
             kws.on_connect = on_connect
@@ -257,8 +341,9 @@ class WebSocketClient:
             logger.error("kiteconnect not installed, falling back to simulation")
             self._run_simulation()
         except Exception as e:
+            # 2026-05-18 (P1): threaded reconnect dispatch.
             logger.error(f"Kite WebSocket error: {e}")
-            self._reconnect_loop()
+            self._schedule_reconnect()
 
     def _handle_kite_tick(self, tick_data: dict):
         """Parse Kite tick and fire callback."""
@@ -278,6 +363,37 @@ class WebSocketClient:
                 "high": float(tick_data.get("ohlc", {}).get("high", 0)),
                 "low": float(tick_data.get("ohlc", {}).get("low", 0)),
             }
+
+            # 2026-05-18 (Regression #7): mirror the Angel exchange_timestamp
+            # path. KiteConnect exposes the exchange-side trade time as a
+            # ``datetime`` (or absent) on each tick. Without this, a laggy
+            # consumer attributes Kite ticks to whichever wall-clock candle
+            # the bar-aggregator happens to be in at process time -- the
+            # exact bucket-skew bug the Angel patch closed. Defensive: skip
+            # if the field is absent or not a usable timestamp.
+            exch_ts = tick_data.get("exchange_timestamp") or tick_data.get("last_trade_time")
+            if exch_ts is not None:
+                try:
+                    if isinstance(exch_ts, datetime):
+                        # Kite sometimes hands back naive datetimes -- treat
+                        # them as IST so downstream comparisons don't mix
+                        # naive and aware values.
+                        tick["timestamp"] = (
+                            exch_ts if exch_ts.tzinfo is not None
+                            else IST.localize(exch_ts)
+                        )
+                    elif isinstance(exch_ts, (int, float)):
+                        tick["timestamp"] = datetime.fromtimestamp(
+                            float(exch_ts), tz=IST
+                        )
+                    elif isinstance(exch_ts, str):
+                        parsed = datetime.fromisoformat(exch_ts)
+                        tick["timestamp"] = (
+                            parsed if parsed.tzinfo is not None
+                            else IST.localize(parsed)
+                        )
+                except (TypeError, ValueError, OSError):
+                    pass
 
             if self.on_tick:
                 self.on_tick(tick)

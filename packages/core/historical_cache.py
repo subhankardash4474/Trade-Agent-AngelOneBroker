@@ -52,7 +52,16 @@ from pathlib import Path
 from typing import Optional, Protocol
 
 import pandas as pd
+import pytz
 from loguru import logger
+
+# Regression #8 (2026-05-18): TZ-discipline parity with the rest of the
+# codebase. Every other "is this today?" check uses IST; the freshness
+# guard below used a naive datetime.now() which would silently shift the
+# day boundary if the daemon ever ran on a non-IST host (e.g. a CI box
+# in UTC, the new OCI VM region default before TZ is set, or a developer
+# laptop in another timezone). Standardise on IST here too.
+IST = pytz.timezone("Asia/Kolkata")
 
 
 class _DataSourceLike(Protocol):
@@ -113,9 +122,19 @@ class HistoricalCache:
             # superseded by the broker. Forces refetch when end_date is
             # "today or after" AND the cache file is older than the TTL.
             try:
-                today = datetime.now().date()
+                # 2026-05-18 (Regression #8): use IST-aware now() so the
+                # day boundary matches the rest of the codebase. The
+                # mtime comparison stays in epoch seconds (host-clock,
+                # which is correct regardless of TZ), but the
+                # "is end_date today?" check needs IST-relative dates.
+                today = datetime.now(IST).date()
+                end_dt = end_date
+                end_today_or_later = (
+                    end_dt.astimezone(IST).date() if end_dt.tzinfo
+                    else end_dt.date()
+                ) >= today
                 stale = (
-                    end_date.date() >= today
+                    end_today_or_later
                     and (datetime.now().timestamp() - path.stat().st_mtime)
                         > self._FRESH_TTL_SECONDS
                 )

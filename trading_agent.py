@@ -289,7 +289,8 @@ class TradingAgent:
                     restored_for_reconcile
                 )
                 for sym, entry in report.items():
-                    if entry.get("status") == "orphan":
+                    status = entry.get("status")
+                    if status == "orphan":
                         # Best-effort: close DB-side with a synthetic
                         # zero-pnl entry-price exit so the strategy
                         # attribution doesn't get a misleading P&L
@@ -316,6 +317,51 @@ class TradingAgent:
                                 f"[POSITION-RECONCILE] {sym} orphan-close "
                                 f"failed: {e!r}. Position remains in DB "
                                 f"-- manual cleanup required."
+                            )
+                    elif status == "mismatch":
+                        # 2026-05-18 (Regression #3): broker has a position
+                        # for this symbol but on the wrong side or wrong
+                        # qty (half-fill / flipped side). Don't touch the
+                        # DB position (we don't know which side is correct
+                        # without operator review), but block new entries
+                        # on this symbol for the day by leveraging the
+                        # existing per-stock-loss blacklist. Caller of
+                        # ``_is_stock_blacklisted`` already gates entries.
+                        try:
+                            blacklist_threshold = max(
+                                self._max_losses_per_stock, 1
+                            )
+                            self._stock_loss_today[sym] = blacklist_threshold
+                            logger.critical(
+                                f"[POSITION-RECONCILE] {sym} flagged MISMATCH "
+                                f"-- new entries blocked via "
+                                f"stock_loss_today={blacklist_threshold}. "
+                                f"Reasons: {entry.get('reasons')}. "
+                                f"Manual broker-vs-DB audit required."
+                            )
+                            try:
+                                self.alert_manager.send_alert(
+                                    title=f"[CRITICAL] {sym} broker/DB mismatch",
+                                    message=(
+                                        f"Reconciliation found "
+                                        f"db={entry.get('db_side')} "
+                                        f"qty={entry.get('db_quantity')} vs "
+                                        f"broker={entry.get('broker_side')} "
+                                        f"qty={entry.get('broker_quantity')}. "
+                                        f"Trading blocked on this symbol "
+                                        f"for the rest of the session."
+                                    ),
+                                )
+                            except Exception:
+                                # alert_manager not yet wired up at this
+                                # init phase (it's constructed a few lines
+                                # below). Silent OK -- the CRITICAL log is
+                                # the primary signal.
+                                pass
+                        except Exception as e:
+                            logger.critical(
+                                f"[POSITION-RECONCILE] {sym} mismatch-block "
+                                f"failed: {e!r}. Manual intervention required."
                             )
         except Exception as e:
             logger.error(
@@ -677,13 +723,22 @@ class TradingAgent:
         # block on this. We load AFTER constructing the empty dicts so the
         # in-memory state is the source of truth either way.
         try:
-            restored_cd, restored_loss, restored_rej = load_cooldown_state(
+            (
+                restored_cd,
+                restored_loss,
+                restored_rej,
+                restored_side,
+            ) = load_cooldown_state(
                 reentry_cooldown=self._reentry_cooldown,
                 rejection_cooldown=timedelta(seconds=self._rejection_cooldown_seconds),
             )
             self._cooldown_map.update(restored_cd)
             self._stock_loss_today.update(restored_loss)
             self._rejection_cooldown_map.update(restored_rej)
+            # 2026-05-18 regression fix: restore the side tracker too.
+            # See cooldown_persistence.save_cooldown_state for the
+            # full motivation.
+            self._cooldown_side_map.update(restored_side)
         except Exception as exc:  # noqa: BLE001 - persistence must not block startup
             logger.warning(f"[COOLDOWN-PERSIST] load failed at init: {exc!r}")
 
@@ -1267,9 +1322,16 @@ class TradingAgent:
                     level="info",
                 )
 
-                # Resubscribe WebSocket if active
+                # Resubscribe WebSocket if active.
+                # 2026-05-18 (P1): use set_subscriptions (wholesale
+                # replace) instead of the upsert-only subscribe(). The
+                # OLD path left stocks that fell off the scanner result
+                # subscribed forever -- the broker kept sending ticks
+                # for them, wasting bandwidth and the WS thread's CPU.
+                # The held-only path at line ~1440 already uses the
+                # right call; this scanner-refresh path was the leak.
                 if self._use_websocket:
-                    self.ws_client.subscribe(self.instruments)
+                    self.ws_client.set_subscriptions(self.instruments)
             else:
                 logger.warning("Scanner returned no results, keeping current instruments")
         except Exception as e:
@@ -1277,8 +1339,14 @@ class TradingAgent:
 
     def _start_websocket(self):
         """Initialize WebSocket feed for real-time ticks."""
+        # 2026-05-18 (P1): set_subscriptions(...) on initial wire-up so a
+        # restart (where ``self.instruments`` is the freshly-scanned set)
+        # establishes a clean subscription state and doesn't inherit any
+        # leftover entries from a stale in-memory state (shouldn't happen
+        # at fresh start, but defensive in case the agent is restarted
+        # within the same Python process e.g. via test harness).
         self.ws_client.on_tick = self._on_tick
-        self.ws_client.subscribe(self.instruments)
+        self.ws_client.set_subscriptions(self.instruments)
         self.ws_client.start()
 
     def _on_tick(self, tick: dict):
@@ -1414,6 +1482,7 @@ class TradingAgent:
                 self._cooldown_map,
                 self._stock_loss_today,
                 self._rejection_cooldown_map,
+                cooldown_side_map=self._cooldown_side_map,
             )
         except Exception as exc:  # noqa: BLE001 - persistence must not block trading
             logger.warning(f"[COOLDOWN-PERSIST] save failed: {exc!r}")
@@ -1513,6 +1582,11 @@ class TradingAgent:
         if self._daily_tracker_date != today:
             self._stock_loss_today.clear()
             self._cooldown_map.clear()
+            # 2026-05-18 regression fix: parallel side tracker must reset
+            # alongside the bare-symbol cooldown_map. Without this, a
+            # stale side leaked across days and selectively blocked one
+            # side of the symbol for the entire next session.
+            self._cooldown_side_map.clear()
             self._consec_tp_today.clear()
             self._strategy_contrib_today.clear()
             self._strategy_state.clear()
@@ -4098,6 +4172,13 @@ class TradingAgent:
             if trend_continuation:
                 ts.trail_activation_rr = 0.5
                 ts.trail_step_pct = 0.6
+                # 2026-05-18 regression fix: re-snapshot AFTER the override
+                # so the tighter activation/step survives a restart. The
+                # schema now carries these fields explicitly; without the
+                # second write the on-disk snapshot kept the default
+                # activation=1.0 / step=0.3 values for the lifetime of the
+                # position.
+                self._persist_trailing_states()
             # 2026-05-14: keep WS subscription tight to held symbols.
             self._resubscribe_ws_to_held()
 

@@ -15,6 +15,58 @@ from loguru import logger
 IST = pytz.timezone("Asia/Kolkata")
 
 
+# Strings that AngelOne / Kite are known (or likely) to emit as a stringy
+# version of a boolean status field. Maintained at module scope so the
+# table is auditable. Lower-cased for the comparison.
+_BROKER_FALSE_STRINGS = frozenset({
+    "false", "0", "no", "fail", "failed", "rejected", "error",
+})
+_BROKER_TRUE_STRINGS = frozenset({
+    "true", "1", "yes", "ok", "okay", "success", "successful",
+})
+
+
+def _interpret_broker_status(value: object) -> bool:
+    """Interpret a broker response's ``status`` field as a strict boolean.
+
+    Why this exists: AngelOne historically sends ``status`` as a Python
+    bool, but production traces have shown it occasionally returns the
+    STRING ``"false"`` (e.g. on Modify rejections that the broker chose
+    to wrap rather than raise). The naive ``bool(value)`` check passes
+    ``"false"`` as truthy because every non-empty string is truthy in
+    Python -- which means the agent celebrated a "SL modified" the
+    broker had just rejected.
+
+    Contract:
+      * ``True`` / ``"true"`` / ``"ok"`` / ``"success"`` / ``"1"`` / etc.
+        -> True (success).
+      * ``False`` / ``"false"`` / ``"0"`` / ``"no"`` / ``"fail"`` / etc.
+        -> False (failure).
+      * ``None`` / empty string -> False (defensive).
+      * Numeric: non-zero -> True, zero -> False (mirrors stdlib bool).
+      * Any other type: ``bool(value)`` as a last-resort fallback.
+    """
+    if value is None:
+        return False
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        s = value.strip().lower()
+        if not s:
+            return False
+        if s in _BROKER_FALSE_STRINGS:
+            return False
+        if s in _BROKER_TRUE_STRINGS:
+            return True
+        # Unknown string -- be conservative and treat as failure so a
+        # silent broker contract change surfaces as a no-op rather than
+        # a false success. Logging is the caller's responsibility.
+        return False
+    if isinstance(value, (int, float)):
+        return value != 0
+    return bool(value)
+
+
 class ExecutionEngine:
     """
     Order execution layer supporting paper and live trading.
@@ -212,12 +264,22 @@ class ExecutionEngine:
             #      bare string -- still success).
             #   2) Dict with status truthy. Anything else (status=false,
             #      empty dict, None) is treated as failure.
+            #
+            # 2026-05-18 (P1 bool-trap): the old check was
+            # ``bool(response.get("status"))`` which had a silent bug --
+            # ``bool("false") == True`` in Python because any non-empty
+            # string is truthy. So when AngelOne returned ``{"status":
+            # "false", "message": "Modify rejected"}`` we mis-read it as
+            # success, logged "SL modified" and never re-tried. Now an
+            # explicit case-insensitive string check rejects "false",
+            # "0", "no", "fail", and "failed" while still accepting True,
+            # "true", "ok", "success".
             if isinstance(response, dict):
-                status_ok = bool(response.get("status"))
-                if not status_ok:
+                if not _interpret_broker_status(response.get("status")):
                     logger.error(
                         f"Failed to modify SL for {order_id}: broker rejected "
-                        f"with status=false (message={response.get('message')!r}). "
+                        f"with status={response.get('status')!r} "
+                        f"(message={response.get('message')!r}). "
                         f"Trail SL update did NOT propagate to broker."
                     )
                     return False
@@ -228,10 +290,64 @@ class ExecutionEngine:
                 )
                 return False
             logger.info(f"SL modified: {order_id} \u2192 {new_sl:.2f}")
+
+            # 2026-05-18 (P1 orderBook confirm): fetch the order book and
+            # verify the trigger price actually got updated to new_sl.
+            # AngelOne has been observed to return success but silently
+            # ignore the modify (RMS soft-reject, throttling). A mismatch
+            # surfaces as a WARNING (we still return True because the
+            # modify-response said ok and the trail might just be ahead of
+            # the orderBook snapshot), but the warning gives operator
+            # visibility into a sustained propagation gap.
+            try:
+                self._verify_sl_modify_propagated(order_id, new_sl)
+            except Exception as verify_exc:  # noqa: BLE001 - best effort
+                logger.debug(
+                    f"[SL-MODIFY-VERIFY] {order_id}: post-modify orderBook "
+                    f"check raised {verify_exc!r}; trusting modify response."
+                )
             return True
         except Exception as e:
             logger.error(f"Failed to modify SL for {order_id}: {e}")
             return False
+
+    def _verify_sl_modify_propagated(
+        self, order_id: str, expected_trigger: float
+    ) -> None:
+        """Sanity-check that a successful modify actually changed the trigger.
+
+        Logs WARNING on mismatch; never raises and never blocks the
+        caller's success path. The modify-response is still the source
+        of truth -- this is purely a forensic / monitoring signal."""
+        if self._api is None:
+            return
+        try:
+            order_book = self._api.orderBook()
+        except Exception:
+            return
+        if not isinstance(order_book, dict):
+            return
+        for order in order_book.get("data", []) or []:
+            if not isinstance(order, dict):
+                continue
+            if order.get("orderid") != order_id:
+                continue
+            try:
+                live_trigger = float(order.get("triggerprice") or 0)
+            except (TypeError, ValueError):
+                return
+            if live_trigger <= 0:
+                return
+            # Compare to within 1 paisa to tolerate float jitter.
+            if abs(live_trigger - expected_trigger) > 0.01:
+                logger.warning(
+                    f"[SL-MODIFY-VERIFY] {order_id}: broker accepted "
+                    f"modify but orderBook trigger is {live_trigger:.2f}, "
+                    f"expected {expected_trigger:.2f}. Possible RMS "
+                    f"soft-reject or stale snapshot; will reconcile on "
+                    f"next mutation."
+                )
+            return
 
     def _paper_order(
         self, symbol: str, token: str, tx_type: str,
@@ -898,14 +1014,22 @@ class ExecutionEngine:
         """P2 restart-cluster (2026-05-17): close DB-side positions that
         the broker has already flattened (RMS auto-flatten, manual close
         by the operator, broker margin call). Returns a report keyed by
-        symbol with one of three statuses:
+        symbol with one of four statuses:
 
-          * ``ok``      DB and broker agree the position is open.
-          * ``orphan``  DB shows open, broker shows flat. Caller MUST
-                        close the DB-side position with reason
-                        ``broker_reconcile_at_boot``.
-          * ``skipped`` broker call failed or paper mode -- caller leaves
-                        the position as-is.
+          * ``ok``       DB and broker agree on side AND quantity.
+          * ``orphan``   DB shows open, broker shows flat. Caller MUST
+                         close the DB-side position with reason
+                         ``broker_reconcile_at_boot``.
+          * ``mismatch`` DB and broker disagree on side or quantity (e.g.
+                         DB long-100 vs broker short-100, or DB 100 vs
+                         broker 50 from a half-fill that DB missed).
+                         Caller should alert and freeze new entries on
+                         this symbol until manual reconciliation.
+                         Added 2026-05-18 (Regression #3) -- previously
+                         any non-zero broker netqty was rubber-stamped
+                         ``ok`` without validating side/qty agreement.
+          * ``skipped``  broker call failed or paper mode -- caller leaves
+                         the position as-is.
 
         We do NOT touch the portfolio here; the caller (TradingAgent)
         owns that. Keeps this concern at the daemon layer.
@@ -953,10 +1077,16 @@ class ExecutionEngine:
 
         for sym, db_pos in restored_positions.items():
             broker_qty = broker_qty_by_symbol.get(sym, 0)
+            db_side = (db_pos.get("side") or "").upper()
+            try:
+                db_qty = abs(int(db_pos.get("quantity") or 0))
+            except (TypeError, ValueError):
+                db_qty = 0
+
             if broker_qty == 0:
                 logger.critical(
                     f"[POSITION-RECONCILE] {sym}: DB shows OPEN "
-                    f"({db_pos.get('side')} qty={db_pos.get('quantity')}) "
+                    f"({db_side} qty={db_qty}) "
                     f"but broker netqty=0. Likely RMS auto-flatten or "
                     f"manual close. Marking ORPHAN; caller will close "
                     f"the DB position with broker_reconcile_at_boot."
@@ -966,14 +1096,55 @@ class ExecutionEngine:
                     "broker_netqty": broker_qty,
                     "db_quantity": db_pos.get("quantity"),
                 }
-            else:
-                # Broker has a position too -- it's at least in the right
-                # direction if broker_qty has the same sign as DB's side.
+                continue
+
+            # 2026-05-18 (Regression #3): validate side + qty match.
+            # Previously: any non-zero broker_qty -> "ok". That hid a real
+            # bug class -- a half-filled entry (broker netqty=50, DB
+            # quantity=100) was silently rubber-stamped, and so was a
+            # flipped-side position (DB long-100, broker short-100 because
+            # an exit fill was misread as a fresh entry).
+            broker_side = "BUY" if broker_qty > 0 else "SELL"
+            broker_abs_qty = abs(broker_qty)
+
+            side_ok = db_side == broker_side
+            qty_ok = db_qty == broker_abs_qty
+
+            if side_ok and qty_ok:
                 report[sym] = {
                     "status": "ok",
                     "broker_netqty": broker_qty,
                     "db_quantity": db_pos.get("quantity"),
                 }
+                continue
+
+            # Mismatch: surface loudly so the operator can investigate
+            # before the next entry tries to add to the wrong side.
+            mismatch_reasons = []
+            if not side_ok:
+                mismatch_reasons.append(
+                    f"side(db={db_side}, broker={broker_side})"
+                )
+            if not qty_ok:
+                mismatch_reasons.append(
+                    f"qty(db={db_qty}, broker={broker_abs_qty})"
+                )
+            reason_str = " ".join(mismatch_reasons)
+            logger.critical(
+                f"[POSITION-RECONCILE] {sym}: DB / broker MISMATCH -- "
+                f"{reason_str}. DB position kept as-is; "
+                f"new entries on this symbol must be blocked until "
+                f"manual reconciliation."
+            )
+            report[sym] = {
+                "status": "mismatch",
+                "broker_netqty": broker_qty,
+                "broker_side": broker_side,
+                "broker_quantity": broker_abs_qty,
+                "db_side": db_side,
+                "db_quantity": db_qty,
+                "reasons": mismatch_reasons,
+            }
         return report
 
     @property

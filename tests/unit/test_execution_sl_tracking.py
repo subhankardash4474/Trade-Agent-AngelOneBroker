@@ -810,3 +810,113 @@ def test_modify_sl_propagates_false_through_update_trigger():
     assert ok is False
     # The cached trigger must NOT have been updated (still original 1485)
     assert eng.get_sl_order_for_symbol("HDFCBANK")["trigger"] == pytest.approx(1485.0)
+
+
+# ---------------------------------------------------------------------------
+# P1 (2026-05-18): bool('false') trap + orderBook propagation confirm
+# ---------------------------------------------------------------------------
+
+
+def test_modify_sl_rejects_string_false_status():
+    """The pre-fix bool() check celebrated ``status: "false"`` as success
+    because ``bool("false") == True`` in Python. Pin the fix."""
+    api = MagicMock()
+    api.modifyOrder.return_value = {"status": "false", "message": "RMS reject"}
+    eng = _live_engine_with_mock_api(api)
+    assert eng.modify_stop_loss("SL-ORD-X", 1490.0) is False
+
+
+@pytest.mark.parametrize("status_value", [
+    "FALSE", "False", "0", "no", "fail", "failed", "rejected", "error",
+    "  false  ",  # whitespace
+])
+def test_modify_sl_rejects_known_stringy_false_values(status_value):
+    """All known false-y string aliases the broker might emit are rejected."""
+    api = MagicMock()
+    api.modifyOrder.return_value = {"status": status_value, "message": "x"}
+    eng = _live_engine_with_mock_api(api)
+    assert eng.modify_stop_loss("SL-ORD-X", 1490.0) is False
+
+
+@pytest.mark.parametrize("status_value", [
+    True, "true", "True", "TRUE", "1", "ok", "OK", "yes", "success",
+])
+def test_modify_sl_accepts_known_truthy_status_values(status_value):
+    api = MagicMock()
+    api.modifyOrder.return_value = {"status": status_value, "data": {"orderid": "x"}}
+    api.orderBook.return_value = {
+        "data": [{"orderid": "SL-ORD-X", "triggerprice": "1490.00"}],
+    }
+    eng = _live_engine_with_mock_api(api)
+    assert eng.modify_stop_loss("SL-ORD-X", 1490.0) is True
+
+
+def test_modify_sl_rejects_unknown_stringy_status():
+    """Conservative default: a status string we don't recognise (broker
+    contract change, garbage) is treated as failure so it surfaces as a
+    no-op rather than a silent success."""
+    api = MagicMock()
+    api.modifyOrder.return_value = {"status": "maybe", "message": "?"}
+    eng = _live_engine_with_mock_api(api)
+    assert eng.modify_stop_loss("SL-ORD-X", 1490.0) is False
+
+
+def test_modify_sl_invokes_orderbook_verify_on_success():
+    """After a status=true modify, the engine must fetch orderBook to
+    verify the new trigger actually propagated."""
+    api = MagicMock()
+    api.modifyOrder.return_value = {"status": True}
+    api.orderBook.return_value = {
+        "data": [{"orderid": "SL-ORD-X", "triggerprice": "1490.00"}],
+    }
+    eng = _live_engine_with_mock_api(api)
+    assert eng.modify_stop_loss("SL-ORD-X", 1490.0) is True
+    api.orderBook.assert_called_once()
+
+
+def test_modify_sl_verify_warns_on_trigger_mismatch():
+    """If orderBook reports a different trigger than the one we just
+    modified to, log a WARNING (RMS soft-reject signal). The modify
+    response is still treated as success."""
+    api = MagicMock()
+    api.modifyOrder.return_value = {"status": True}
+    # Broker accepted the modify but kept the OLD trigger value -- RMS
+    # silent reject pattern observed in production.
+    api.orderBook.return_value = {
+        "data": [{"orderid": "SL-ORD-X", "triggerprice": "1485.00"}],
+    }
+    eng = _live_engine_with_mock_api(api)
+
+    from loguru import logger as loguru_logger
+
+    captured = []
+    handler_id = loguru_logger.add(
+        lambda msg: captured.append(str(msg)), level="WARNING",
+    )
+    try:
+        ok = eng.modify_stop_loss("SL-ORD-X", 1490.0)
+    finally:
+        loguru_logger.remove(handler_id)
+    assert ok is True  # response said success
+    assert any("SL-MODIFY-VERIFY" in m for m in captured)
+
+
+def test_modify_sl_verify_tolerates_orderbook_failure():
+    """A throwing orderBook call after a successful modify must not
+    flip the modify result to False -- it's a best-effort forensic check."""
+    api = MagicMock()
+    api.modifyOrder.return_value = {"status": True}
+    api.orderBook.side_effect = RuntimeError("API outage")
+    eng = _live_engine_with_mock_api(api)
+    assert eng.modify_stop_loss("SL-ORD-X", 1490.0) is True
+
+
+def test_modify_sl_verify_tolerates_missing_order_in_book():
+    """If the orderBook doesn't list our order_id (stale snapshot, page
+    cutoff), don't warn -- just no-op. Pinning this so we don't accidentally
+    fire spurious WARNINGs that desensitise the operator."""
+    api = MagicMock()
+    api.modifyOrder.return_value = {"status": True}
+    api.orderBook.return_value = {"data": [{"orderid": "OTHER-ORD"}]}
+    eng = _live_engine_with_mock_api(api)
+    assert eng.modify_stop_loss("SL-ORD-X", 1490.0) is True
