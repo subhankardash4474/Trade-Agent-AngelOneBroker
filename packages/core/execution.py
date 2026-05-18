@@ -7,7 +7,7 @@ trailing stop-loss updates, partial fill handling, and retry logic.
 import time
 import uuid
 from datetime import datetime
-from typing import Optional
+from typing import Dict, Optional
 
 import pytz
 from loguru import logger
