@@ -12,6 +12,12 @@ WorkingDirectory=/opt/trading-agent
 # Read queue from the canonical location. Operator edits this file and
 # `systemctl restart battery-scheduler` to pick up the new shape.
 Environment=BATTERY_QUEUE_FILE=/opt/trading-agent/data/battery_queue.yaml
+# CRITICAL: under systemd Python's stdout/stderr is block-buffered when
+# not attached to a TTY, so `[scheduler] ...` prints appear in journald
+# only when the buffer flushes -- which for a long-poll loop can mean
+# never. Set PYTHONUNBUFFERED=1 so journalctl -u battery-scheduler -f
+# is actually informative.
+Environment=PYTHONUNBUFFERED=1
 
 # Use python3 from the host (NOT inside docker -- the scheduler ORCHESTRATES
 # docker, it doesn't run inside one). The repo lives in /opt/trading-agent
