@@ -1,215 +1,219 @@
 # Backtester VM Runbook
 
-**Purpose**: stand up a dedicated OCI free-tier VM to run multi-day backtests
-(battery-v2: 200 stocks x 90 days x 18 variants, estimated 8-35 h depending
-on shape) without disturbing the live trader pod on
-`80.225.251.79`.
+> **Audience:** the operator (you) at the moment something goes wrong on
+> the backtester VM, when it's the worst time to be inventing a response.
+>
+> **Promise:** every section below pre-decides the response so you don't
+> improvise. Each scenario lists the trigger, the wrong move, and the
+> right sequence.
 
-**Status**: plan only. Bootstrap scripts and result-pull helpers will be
-shipped in the session immediately after the Ampere VM provisions. This
-document is the snapshot of architectural decisions so the next session
-has zero reconstruction cost.
+VM identity (as of 2026-05-19):
 
----
-
-## Decision matrix
-
-| Concern | Same-VM swap (rejected) | Dedicated backtester VM (chosen) |
-|---|---|---|
-| Trader during a 30 h batch | OFF | **Stays up** -- no missed market days |
-| Failure isolation | Backtester OOM could kill trader | **Separate failure domains** |
-| Mode-switch complexity | Lock file + market-hours guard + swap | **None** -- just SSH the other host |
-| AngelOne IP whitelist | Both modes share one IP | Only trader IP whitelisted; backtester has no broker creds |
-| Resource ceiling | 1 GB RAM, 1/8 OCPU | Up to 24 GB RAM, 4 OCPU (Ampere quota) |
-| Marginal cost | $0 | **$0** (within Always-Free) |
-
-The dedicated-VM path is strictly simpler than the same-VM swap was going
-to be. We are NOT building the compose `batch` profile, switch script,
-lock file, or 2 GB swapfile machinery on the trader VM.
+| Field | Value |
+|---|---|
+| Public IPv4 | `80.225.197.125` (OCI) |
+| SSH user | `opc` |
+| Trader home | `/home/opc/trading-agent` |
+| Git ref pinned at bootstrap | `freeze-v2.1` |
+| Battery scheduler unit | `battery-scheduler.service` |
+| Queue file | `data/battery_queue.yaml` |
+| State file | `data/battery_queue_state.json` |
+| Results | `logs/battery/<run_id>/` |
 
 ---
 
-## Target shape: Ampere A1 Flex, 2 OCPU + 12 GB RAM
+## 1. Backtester isolation guard fires (`SystemExit(9)`)
 
-OCI Always-Free includes **4 OCPU and 24 GB RAM** of Ampere A1 to be
-split across 1-4 instances. The backtester carves out half:
+**Trigger:** `tools/run_battery_queue.py` or a manual `run_battery`
+invocation aborts with `SystemExit(9)` and the message:
+`refusing to run battery — broker creds detected with BACKTESTER_MODE=1`.
 
-| Spec | Value | Why |
-|---|---|---|
-| Shape | `VM.Standard.A1.Flex` | Ampere ARM64, free tier |
-| OCPU | 2 | Lets `tools/run_battery.py --workers 2` (or 4 with hyperthreading) |
-| RAM  | 12 GB | Battery `market_data.pkl` ~340 MB raw -> ~1 GB in pandas; xgboost + features push to 3-4 GB; comfortable headroom |
-| OS   | Oracle Linux 9 ARM64 | Same as trader, same `oci_bootstrap.sh` flow |
-| Region | `ap-mumbai-1` | Match trader VM; capacity comes and goes here -- Hyderabad is fallback |
-| Storage | 50 GB boot | Default; result tarballs are small (<1 GB per battery run) |
-| Public IP | Reserved free IP | For SSH from laptop |
-| SSH key | `oci_trader_key.pub` (reused) | Same key as trader -- no new key management |
+**Wrong move:** `unset ANGELONE_API_KEY && retry`. Sometimes correct,
+sometimes not. The right question is "**how did the credential get
+there?**", not "**how do I get past the guard?**"
 
-**Capacity blocker**: at the time of writing the user has hit "Out of host
-capacity" on Ampere repeatedly. The community workaround is a polling
-script that retries `oci compute instance launch` every 5-10 minutes
-until OCI yields a slot. To be added as `tools/cloud/ampere_capacity_watcher.sh`
-in the next session if the user wants it (currently they will retry
-manually from the OCI console).
+**Right sequence:**
 
-**Fallback shape if Ampere stays unavailable**: 2nd `VM.Standard.E2.1.Micro`
-(AMD, 1 OCPU, 1 GB RAM). Has been a working environment for the trader, but
-for battery-v2 it would need:
-- 2 GB swapfile to cover RAM overruns during the data-cache load.
-- Sub-batching the 200-stock universe into 4 x 50-stock runs.
-- `--workers 1` (no parallelism).
-- Wall time roughly **35-45 hours per full battery run** vs ~8-12 h on
-  the Ampere 2-OCPU shape.
+1. **Do not retry.** The guard is the cheap part of the response.
+2. **Find the credential** that triggered the abort:
+   ```bash
+   ssh opc@80.225.197.125 \
+     "env | grep -iE 'angelone|smartapi|broker|kite' || cat /etc/systemd/system/battery-scheduler.service.d/*.env 2>/dev/null || true"
+   ```
+3. **Locate its source** — usually one of:
+   - `~/.env` or `~/trading-agent/.env` (leaked deploy)
+   - A systemd drop-in override
+   - An exported env var in `~/.bashrc` / `~/.profile`
+   - A docker-compose `.env` file mounted into the scheduler container
+4. **Remove the credential** from the source.
+5. **Rotate the credential at the broker.** It is now potentially
+   leaked — `printenv` output, shell history, `cat` to a file — and
+   the leak vector is what we just fixed. Issue a new key at Angel One,
+   update the live trader's `.env`, restart the live trader, *then*
+   come back to the backtester.
+6. **Verify the guard passes:**
+   ```bash
+   ssh opc@80.225.197.125 \
+     "cd ~/trading-agent && BACKTESTER_MODE=1 docker compose run --rm backtester python tools/run_battery_queue.py --dry-run"
+   ```
+7. **Re-enable the scheduler:** `sudo systemctl restart battery-scheduler`.
+8. **Document.** Add a one-line `freeze-bypass:` entry to the bypass
+   ledger in `docs/FREEZE_v2.1.md` only if the fix touched a frozen
+   file (almost certainly it didn't — the fix is operational).
+
+The guard exists precisely so this can't go wrong silently. When it
+fires, treat it as a useful event, not a friction point.
 
 ---
 
-## Architecture (post-Ampere-provision)
+## 2. Battery scheduler stopped
 
+**Trigger:** no new run for > 2 hours when the queue says one should
+have started. `systemctl status battery-scheduler` shows `inactive` or
+`failed`.
+
+**Right sequence:**
+
+1. **Capture the failure** before restarting:
+   ```bash
+   ssh opc@80.225.197.125 "sudo journalctl -u battery-scheduler --since '2 hours ago' --no-pager" > scheduler_failure_$(date +%Y%m%d_%H%M%S).log
+   ```
+2. **Check the state file** — `data/battery_queue_state.json` should
+   tell you which job was last completed. The next job should resume
+   on restart (`run_battery_queue.py` has resume semantics built in).
+3. **Restart:**
+   ```bash
+   ssh opc@80.225.197.125 "sudo systemctl restart battery-scheduler"
+   ```
+4. **Verify it started cleanly:**
+   ```bash
+   ssh opc@80.225.197.125 "sudo journalctl -u battery-scheduler --since '5 minutes ago' --no-pager"
+   ```
+   Expected: `loaded N jobs from queue`, then either `picking up where
+   we left off` or `waiting for in-flight container`.
+5. **If it crashes within 60 s of restart:** read the captured log
+   carefully — most failures are queue-file parse errors after an
+   edit. Validate the YAML with:
+   ```bash
+   ssh opc@80.225.197.125 "cd ~/trading-agent && python -c 'import yaml; print(yaml.safe_load(open(\"data/battery_queue.yaml\")))'"
+   ```
+
+Do NOT manually run individual batteries while the scheduler is also
+running. The scheduler's wait-loop will detect a pre-existing container
+and back off, but two concurrent batteries can race on the results
+directory.
+
+---
+
+## 3. Backtester VM reclaimed by OCI
+
+**Trigger:** SSH to `80.225.197.125` returns connection refused or
+"host unreachable" for > 15 minutes. The OCI console shows the
+instance as terminated or in a non-RUNNING state. Free-tier A1.Flex
+shapes are sometimes reclaimed under capacity pressure.
+
+**Right sequence:**
+
+1. **Confirm it's the VM, not the network.** Try pinging a known-up
+   host first.
+2. **Provision a replacement** through the OCI console (Always-Free
+   tier still works for new VMs after a reclaim).
+3. **Run the bootstrap script:**
+   ```powershell
+   tools/cloud/bootstrap_backtester.sh <new_ip>
+   ```
+   Bootstrap is idempotent and clones at `freeze-v2.1` automatically.
+4. **Restore the queue state if you snapshot it.** If the previous
+   VM's `data/battery_queue_state.json` was snapshotted (see §5), copy
+   it to the new VM. Otherwise the new scheduler will start the queue
+   from job 1 — which is acceptable; nothing is lost beyond compute
+   time.
+5. **Install the scheduler:**
+   ```bash
+   ssh opc@<new_ip> "cd ~/trading-agent && bash tools/cloud/install_battery_scheduler.sh"
+   ```
+6. **Document** the reclaim event in the next `changes_done_*.md`
+   with the new IP. Update §VM identity at the top of THIS file.
+
+The trader VM is unaffected by this scenario.
+
+---
+
+## 4. Battery run produces zero trades
+
+**Trigger:** `pull_battery_results.ps1 -RunId <id>` shows 0 closed
+trades across all symbols, or only a few trivial trades.
+
+**Likely cause** (in descending order of probability):
+
+1. The universe file is empty or malformed — the Docker container
+   resolved a 0-line `tests/fixtures/<universe>.json`.
+2. The window is on a non-trading-day range (e.g. a misconfigured
+   `--start-date` lands on a weekend cluster).
+3. The data source upstream of the historical cache failed and the
+   battery silently fell back to empty bars.
+4. A code path that the live trader doesn't exercise was broken by an
+   observability-only edit.
+
+**Right sequence:**
+
+1. **Read `logs/battery/<run_id>/battery.log`** — the first line
+   typically tells you the universe size and date range. If
+   `universe size: 0` is present, the file is wrong.
+2. **Verify the universe file** locally:
+   ```powershell
+   Get-Content tests/fixtures/<universe>.json | ConvertFrom-Json | Measure-Object
+   ```
+3. **Verify the date range** matches a real trading window. Days like
+   2026-04-14 (BR Ambedkar Jayanti) or 2026-05-01 (Maharashtra Day)
+   are non-trading and skew automated date math.
+4. **If both look right**, the bug is in code. Re-run with a single
+   symbol and verbose logging to narrow:
+   ```bash
+   ssh opc@80.225.197.125 \
+     "cd ~/trading-agent && docker compose run --rm backtester \
+        python -m packages.research.battery \
+        --universe INFY --days 7 --workers 1 --verbose 2>&1 | tee debug.log"
+   ```
+5. **Triage** based on the verbose output. Treat any fix to backtester
+   code as observability — does NOT touch a frozen file — so does not
+   count against the bypass cap.
+
+---
+
+## 5. Snapshot routine (preventive)
+
+To survive §3 (VM reclaim) gracefully, snapshot the backtester state
+periodically. Suggested daily cadence, before the queue starts the
+next overnight job:
+
+```bash
+ssh opc@80.225.197.125 \
+  "cd ~/trading-agent && tar czf /tmp/bt_snapshot_$(date +%Y%m%d).tgz \
+     data/battery_queue.yaml data/battery_queue_state.json \
+     logs/battery/ models/"
+scp opc@80.225.197.125:/tmp/bt_snapshot_*.tgz ./snapshots/
 ```
-  +--------------------+      no network coupling      +-----------------------+
-  | trader VM           |                              | backtester VM         |
-  | 80.225.251.79       |                              | <to be provisioned>   |
-  | E2.1.Micro (AMD)    |                              | A1.Flex 2/12 (Ampere) |
-  |                     |                              |                       |
-  | docker compose      |                              | docker run --rm       |
-  |   trader (live)     |                              |   battery_<runid>     |
-  |   running 24/7      |                              |   one-shot batch      |
-  |                     |                              |                       |
-  | logs/* (live)       |                              | logs/backtests/* (run results) |
-  | data/trading_agent.db (live)                       | no broker DB           |
-  +--------------------+                              +-----------------------+
-            \                                                   /
-             \--- laptop pulls from both via SSH+SCP/rclone ---/
-                  (pull_logs.ps1 already covers trader; new
-                   pull_battery_results.ps1 to be added)
-```
 
-Both VMs run the **same** `trading-agent:latest` image, built from the
-same `Dockerfile`. The only difference at runtime is the CMD:
-- trader: `python run_daemon.py --paper --interval 60`
-- backtester: `python tools/run_battery.py --days 90 --workers 2 --run-id <id>`
-
-This means a future code change auto-applies to both pods when each one
-rebuilds; no schema drift possible.
+Snapshots live outside both VMs so they survive a double-failure
+(trader + backtester) scenario.
 
 ---
 
-## Step-by-step: when Ampere capacity lands
+## 6. What this runbook does NOT cover
 
-**Stage 0 -- provision the VM (manual, OCI console or oci-cli)**
+- **Live trader incidents** — those are in `docs/healthcheck_runbook.md`
+  (if it exists) and the daemon's own alerting.
+- **Strategy edits** — frozen. See `FREEZE_v2.1.md`.
+- **Model retraining** — frozen for the duration of freeze-v2.1.
+- **Anything that requires touching `config.yaml` strategy/risk
+  blocks** — that's a freeze decision, not a runbook step.
 
-1. OCI Console > Compute > Instances > Create Instance.
-2. Image: Oracle Linux 9 (ARM).
-3. Shape: VM.Standard.A1.Flex; 2 OCPU; 12 GB memory.
-4. Networking: existing VCN; assign public IPv4.
-5. SSH key: paste `oci_trader_key.pub` contents (same key as trader).
-6. Boot volume: 50 GB.
-7. Click Create. Note the public IP -- this becomes `BACKTESTER_IP`.
-
-**Stage 1 -- bootstrap (script to be written, ~30 min in next session)**
-
-`tools/cloud/bootstrap_backtester.sh` will, from the user's laptop:
-1. `ssh ubuntu@$BACKTESTER_IP` via `oci_trader_key`.
-2. Install Docker + docker-compose plugin (same as `oci_bootstrap.sh`).
-3. Create the `trader` host user (UID 998 if free, else auto-allocate
-   and write into `.env` via the `TRADER_UID` machinery that already
-   lives in `Dockerfile` and `_deploy_inline.sh`).
-4. Allocate a 2 GB swapfile (`/swapfile`, 0644, fstab entry) -- harmless
-   on Ampere with 12 GB RAM, essential if the fallback Micro path is
-   used later.
-5. `git clone` the repo into `/opt/trading-agent`.
-6. `docker compose build trader` (this becomes the cached `trading-agent:latest`
-   image used for batteries too).
-7. Smoke-test: `docker run --rm trading-agent:latest python tools/run_battery.py --help`.
-
-**Stage 2 -- launch a battery (script to be written)**
-
-`tools/cloud/launch_battery.sh <args>` will:
-1. SSH to backtester VM.
-2. `docker run -d --rm --name battery_<timestamp> \
-     -v /opt/trading-agent/logs:/app/logs \
-     -v /opt/trading-agent/data:/app/data \
-     trading-agent:latest \
-     python tools/run_battery.py <args>`
-3. Print container ID + tail-log command.
-
-Typical invocation for battery-v2:
-```
-tools/cloud/launch_battery.sh \
-   --days 90 \
-   --workers 2 \
-   --symbols-file tests/fixtures/battery_v2_universe.json \
-   --run-id battery_v2_$(date +%Y%m%dT%H%M%S)
-```
-
-**Stage 3 -- monitor (no script, just SSH)**
-
-`ssh ubuntu@$BACKTESTER_IP docker logs -f battery_<id>` from laptop. The
-harness already writes mid-run `comparison.md` after every successful
-variant; tail that for human-readable progress.
-
-**Stage 4 -- pull results (script to be written)**
-
-`tools/cloud/pull_battery_results.ps1 <run_id>` will SCP
-`logs/backtests/<run_id>/` from backtester VM to laptop. Same
-SSH-key + same Windows pattern as `pull_logs.ps1`.
+If the situation isn't covered here, the right move is: **stop, write
+the new scenario into this file, decide the response, then act.**
+Improvising at 02:00 IST is the failure mode.
 
 ---
 
-## Resume semantics (free safety net)
-
-The battery harness (`packages/research/battery.py`) already supports
-`--resume <run_id>` and `--resume auto`. This means:
-
-* Killing the container mid-run (`docker stop battery_<id>` or kernel OOM)
-  is **safe** -- per-variant JSON files persist and the cached
-  `market_data.pkl` survives.
-* Restarting with `--resume` skips completed variants and reuses the
-  cached market data -- no expensive yfinance refetch.
-* If a Micro VM is provisioned first and Ampere lands mid-run, the
-  resume mechanism makes mid-batch migration trivial:
-  ```
-  # On Micro:
-  docker stop battery_<id>
-  rclone copy /opt/trading-agent/logs/backtests/<id>/ \
-      backtester:/opt/trading-agent/logs/backtests/<id>/
-
-  # On Ampere:
-  tools/cloud/launch_battery.sh --resume <id> --workers 2
-  ```
-
----
-
-## Risks / open questions
-
-1. **Ampere capacity**: blocker right now. Two mitigations: (a) manual
-   retry via console, (b) optional `ampere_capacity_watcher.sh` to be
-   added in next session if user wants automation.
-2. **xgboost ARM64 wheel availability**: confirmed. xgboost ships
-   `manylinux_2_28_aarch64` wheels for the version pinned in
-   `requirements.txt`. No source-build needed.
-3. **Historical data source**: battery harness fetches via yfinance.
-   Confirm fetch limits aren't hit on first run (the cache means
-   subsequent variants reuse data; only the cold start matters).
-4. **No broker credentials on backtester**: explicitly intentional.
-   The harness must NEVER load `.env` with `BROKER_*` keys. Need to
-   add a startup assertion to that effect when we wire the launcher --
-   tracked as a follow-up in the next session.
-
----
-
-## Deferred from this session
-
-Code artefacts -- to be written when an Ampere VM provisions:
-- `tools/cloud/bootstrap_backtester.sh`
-- `tools/cloud/launch_battery.sh`
-- `tools/cloud/pull_battery_results.ps1`
-- `tools/cloud/ampere_capacity_watcher.sh` (optional, offered separately)
-- Startup assertion that backtester image cannot load broker creds
-
-Research artefacts -- separate session, not deploy-related:
-- battery-v2 variant slate definition (currently `battery.py` has the
-  2026-05-08 V1..V15 slate; battery-v2 wants 18 variants tuned to the
-  open-questions from the 2026-05-13 morning audit)
-- Universe freeze: run `tools/_freeze_battery_v2_universe.py` and commit
-  `tests/fixtures/battery_v2_universe.json`
+*Author: Trading Agent dev (Subhanda) + Claude.*
+*Drafted: 2026-05-19, post-freeze-v2.1 deployment.*

@@ -161,6 +161,203 @@ class StratStats:
 
 
 # ─────────────────────────────────────────────────────────────────────
+# Statistical-significance helpers (2026-05-19, freeze-v2.1 observability)
+# ─────────────────────────────────────────────────────────────────────
+# These are observability additions in service of the
+# `freeze_contingencies.md` §C2 "statistical artefacts that look like
+# signal" failure mode. None of them change trade selection or behaviour
+# -- they only add columns / sections to the diagnostic report so the
+# operator can spot the distortion patterns the external verdict flagged:
+# one-lucky-trade PF, sector concentration, time-of-day clustering,
+# and small-sample noise dressed up as edge.
+
+import random as _random
+
+
+def bootstrap_pf_ci(
+    pnls: list[float],
+    n_resamples: int = 1000,
+    seed: int = 20260519,
+    ci_percent: float = 95.0,
+) -> tuple[float, float]:
+    """Bootstrap 95 % CI for profit factor from a per-trade PnL list.
+
+    Method: resample-with-replacement ``n_resamples`` times, compute PF
+    on each resample, return the (lower, upper) percentile band.
+
+    Why this matters
+    ----------------
+    A point-estimate PF on N=20 trades is statistically useless. A
+    bootstrap CI tells you what you actually know: if the lower CI is
+    above 1.0, the strategy is profitable with the stated confidence,
+    *given the trade distribution we've observed so far*. If the lower
+    CI is below 1.0, you cannot claim edge from this sample regardless
+    of where the point estimate landed.
+
+    The freeze exit-criteria (`FREEZE_v2.1_revision.md`) gate the edge
+    claim on lower-CI > 1.0, not on point PF.
+
+    Returns ``(lower, upper)``. Special cases:
+      * 0 trades  -> (0.0, 0.0)
+      * < 5 trades -> (0.0, inf) -- CI is uninformative, caller treats as INSUFFICIENT
+      * gross losses == 0 across all resamples -> (inf, inf) -- caller renders as ">inf"
+    """
+    if not pnls:
+        return (0.0, 0.0)
+    n = len(pnls)
+    if n < 5:
+        # Bootstrapping on < 5 trades is not statistically meaningful;
+        # explicitly signal that the CI is uninformative. Callers can
+        # treat any lower_ci == 0.0 + upper_ci == inf as INSUFFICIENT.
+        return (0.0, float("inf"))
+
+    rng = _random.Random(seed)
+    pfs: list[float] = []
+    for _ in range(n_resamples):
+        sample = [pnls[rng.randint(0, n - 1)] for _ in range(n)]
+        gw = sum(p for p in sample if p > 0)
+        gl = -sum(p for p in sample if p < 0)
+        if gl > 0:
+            pfs.append(gw / gl)
+        elif gw > 0:
+            pfs.append(float("inf"))
+        else:
+            pfs.append(0.0)
+
+    finite_pfs = [p for p in pfs if p != float("inf")]
+    if not finite_pfs:
+        return (float("inf"), float("inf"))
+
+    finite_pfs.sort()
+    alpha = (100.0 - ci_percent) / 2.0 / 100.0
+    lower_idx = max(0, int(len(finite_pfs) * alpha) - 1)
+    upper_idx = min(len(finite_pfs) - 1, int(len(finite_pfs) * (1 - alpha)))
+
+    # If a meaningful fraction of resamples had zero losses (PF=inf),
+    # the upper CI is genuinely unbounded -- report inf rather than the
+    # finite tail.
+    inf_share = (len(pfs) - len(finite_pfs)) / len(pfs)
+    upper = float("inf") if inf_share >= alpha else finite_pfs[upper_idx]
+    return (finite_pfs[lower_idx], upper)
+
+
+def pf_excluding_max_trade(pnls: list[float]) -> tuple[float, float]:
+    """Profit factor with the single largest-PnL trade removed.
+
+    Returns ``(pf_full, pf_excl_max)``. The delta between the two
+    answers the question "is this strategy's edge one lucky trade?"
+
+    Decision rule (`freeze_contingencies.md` §C2):
+      PF > 1.0 AND PF-excl-max < 0.8  -->  verdict downgraded to INSUFFICIENT.
+    """
+    if not pnls:
+        return (0.0, 0.0)
+    gw_full = sum(p for p in pnls if p > 0)
+    gl_full = -sum(p for p in pnls if p < 0)
+    pf_full = (gw_full / gl_full) if gl_full > 0 else (float("inf") if gw_full > 0 else 0.0)
+
+    if len(pnls) < 2:
+        return (pf_full, pf_full)
+
+    max_pnl = max(pnls)
+    # Only meaningful to "exclude max" if max was actually a win
+    if max_pnl <= 0:
+        return (pf_full, pf_full)
+
+    pnls_excl = list(pnls)
+    pnls_excl.remove(max_pnl)
+    gw = sum(p for p in pnls_excl if p > 0)
+    gl = -sum(p for p in pnls_excl if p < 0)
+    pf_excl = (gw / gl) if gl > 0 else (float("inf") if gw > 0 else 0.0)
+    return (pf_full, pf_excl)
+
+
+# Hour-of-day bucket boundaries for the entry-time histogram. These match
+# the IST market segments most strategies treat as meaningfully different:
+# opening burst (09:15-10:00), early morning (10-11), mid morning (11-12),
+# midday (12-13), early afternoon (13-14), pre-close (14-15:30).
+ENTRY_TIME_BUCKETS: list[tuple[str, int, int]] = [
+    ("09:15-10:00",  9, 10),
+    ("10:00-11:00", 10, 11),
+    ("11:00-12:00", 11, 12),
+    ("12:00-13:00", 12, 13),
+    ("13:00-14:00", 13, 14),
+    ("14:00-15:30", 14, 16),
+]
+
+
+def entry_time_histogram(stats_by_hour: dict) -> dict[str, dict]:
+    """Bucket a strategy's ``by_hour`` map into the 6 IST market segments.
+
+    Input is the existing ``StratStats.by_hour`` dict (hour-int -> {n, pnl}).
+    Output is bucket-name -> {n, pnl}, suitable for table rendering.
+    """
+    out: dict[str, dict] = {label: {"n": 0, "pnl": 0.0} for label, _, _ in ENTRY_TIME_BUCKETS}
+    for hr, b in stats_by_hour.items():
+        try:
+            hr_int = int(hr)
+        except (TypeError, ValueError):
+            continue
+        for label, lo, hi in ENTRY_TIME_BUCKETS:
+            if lo <= hr_int < hi:
+                out[label]["n"] += int(b.get("n", 0))
+                out[label]["pnl"] += float(b.get("pnl", 0.0))
+                break
+    return out
+
+
+def load_contaminated_days(project_root: Path | None = None) -> set[str]:
+    """Read ``logs/contaminated_days.csv`` and return the set of ISO dates.
+
+    File format (CSV, header required):
+      ``date,vix,nifty_pct,reason``
+    The ``date`` column must be ``YYYY-MM-DD``. Any row whose ``date``
+    parses is included; ``vix``/``nifty_pct``/``reason`` are informational
+    (operator-set; the existence of the row is what excludes the day).
+
+    Defined in `freeze_contingencies.md` §C8: any day with India VIX > 25
+    OR |NIFTY %| > 2.5 is marked CONTAMINATED. Phase A edge decision uses
+    the *exclusive* (contaminated-removed) PF.
+
+    Returns an empty set if the file is missing or unreadable -- the
+    diagnostic must keep working on a fresh checkout that has never
+    declared a contaminated day.
+    """
+    root = project_root or PROJECT_ROOT
+    path = root / "logs" / "contaminated_days.csv"
+    if not path.exists():
+        return set()
+    out: set[str] = set()
+    try:
+        import csv as _csv
+        with path.open(newline="", encoding="utf-8") as f:
+            reader = _csv.DictReader(f)
+            for row in reader:
+                d = (row.get("date") or "").strip()
+                if len(d) >= 10 and d[4] == "-" and d[7] == "-":
+                    out.add(d[:10])
+    except Exception as e:
+        print(f"[WARN] contaminated_days.csv unreadable: {e}", file=sys.stderr)
+    return out
+
+
+def filter_trades_excluding_contaminated(
+    trades: list[dict], contaminated: set[str]
+) -> list[dict]:
+    """Return only trades whose exit_time date is NOT in the contaminated set."""
+    if not contaminated:
+        return list(trades)
+    out: list[dict] = []
+    for t in trades:
+        ts = t.get("exit_time") or t.get("entry_time") or ""
+        d = str(ts)[:10] if ts else ""
+        if d and d in contaminated:
+            continue
+        out.append(t)
+    return out
+
+
+# ─────────────────────────────────────────────────────────────────────
 # Loaders
 # ─────────────────────────────────────────────────────────────────────
 def load_trades(db_path: Path, days: int | None = None,
@@ -316,6 +513,165 @@ def fmt_exit_reason_breakdown(stats: dict[str, StratStats]) -> str:
         for reason, b in sorted(s.by_exit_reason.items(), key=lambda kv: kv[1]["pnl"], reverse=True):
             rows.append(f"| {s.strategy} | {reason} | {b['n']} | Rs {b['pnl']:+.0f} | "
                         f"Rs {b['pnl']/max(b['n'],1):+.2f} |")
+    return "\n".join(rows)
+
+
+def aggregate_by_supersector(trades: list[dict]) -> dict[str, dict]:
+    """Group trades by supersector and compute PF/PnL per group.
+
+    Detects the §C2 sector-concentration artefact -- the verdict's
+    warning that "all winners in financials, all losers in IT" looks
+    like edge but is a regime rotation.
+
+    Returns supersector_name -> {n, wins, losses, gross_win, gross_loss,
+    pnl, pf}. Trades without a resolvable supersector go into the
+    "UNKNOWN" bucket so they're not silently lost.
+    """
+    try:
+        from core.market_safety import get_supersector
+    except Exception:
+        # If the symbol-mapping module isn't importable from this
+        # context (e.g. running diagnostic.py as a bare script outside
+        # the agent root), degrade gracefully -- emit an UNKNOWN-only
+        # bucket so the rest of the report still renders.
+        def get_supersector(symbol: str) -> str:  # type: ignore[unused-ignore]
+            return "UNKNOWN"
+
+    buckets: dict[str, dict] = defaultdict(lambda: {
+        "n": 0, "wins": 0, "losses": 0,
+        "gross_win": 0.0, "gross_loss": 0.0, "pnl": 0.0,
+    })
+    for t in trades:
+        sym = (t.get("symbol") or "").upper().strip()
+        if not sym:
+            ss = "UNKNOWN"
+        else:
+            try:
+                ss = get_supersector(sym) or "UNKNOWN"
+            except Exception:
+                ss = "UNKNOWN"
+        pnl = float(t.get("pnl") or 0.0)
+        b = buckets[ss]
+        b["n"] += 1
+        b["pnl"] += pnl
+        if pnl > 0.01:
+            b["wins"] += 1
+            b["gross_win"] += pnl
+        elif pnl < -0.01:
+            b["losses"] += 1
+            b["gross_loss"] += abs(pnl)
+
+    for b in buckets.values():
+        gw, gl = b["gross_win"], b["gross_loss"]
+        b["pf"] = (gw / gl) if gl > 0 else (float("inf") if gw > 0 else 0.0)
+    return dict(buckets)
+
+
+def fmt_per_supersector(buckets: dict[str, dict]) -> str:
+    """Render the per-supersector PF table."""
+    if not buckets:
+        return "_(no supersector data)_"
+    rows = [
+        "| Supersector | N | Wins | Losses | PF | PnL |",
+        "|---|---:|---:|---:|---:|---:|",
+    ]
+    for ss in sorted(buckets.keys(), key=lambda k: -buckets[k]["pnl"]):
+        b = buckets[ss]
+        pf_disp = f"{b['pf']:.2f}" if b["pf"] != float("inf") else "INF"
+        rows.append(
+            f"| {ss} | {b['n']} | {b['wins']} | {b['losses']} | "
+            f"{pf_disp} | Rs {b['pnl']:+,.0f} |"
+        )
+    return "\n".join(rows)
+
+
+def fmt_pf_excl_max(stats: dict[str, StratStats]) -> str:
+    """Render the PF / PF-excl-max-trade comparison table.
+
+    Detects the §C2 "one lucky trade" pattern. A strategy with PF > 1.0
+    but PF-excl-max < 0.8 is a single-trade illusion.
+    """
+    if not stats:
+        return "_(no trades)_"
+    rows = [
+        "| Strategy | N | PF | PF-excl-max | Δ | One-lucky-trade? |",
+        "|---|---:|---:|---:|---:|---|",
+    ]
+    for s in sorted(stats.values(), key=lambda x: -x.total_pnl):
+        if s.trades < 2:
+            continue
+        pf_full, pf_excl = pf_excluding_max_trade(s.pnl_series)
+        delta = pf_full - pf_excl if (pf_full != float("inf") and pf_excl != float("inf")) else None
+        is_lucky = pf_full > 1.0 and pf_excl < 0.8
+        pf_full_d = f"{pf_full:.2f}" if pf_full != float("inf") else "INF"
+        pf_excl_d = f"{pf_excl:.2f}" if pf_excl != float("inf") else "INF"
+        delta_d = f"{delta:+.2f}" if delta is not None else "n/a"
+        flag = "**YES**" if is_lucky else "no"
+        rows.append(
+            f"| {s.strategy} | {s.trades} | {pf_full_d} | {pf_excl_d} | "
+            f"{delta_d} | {flag} |"
+        )
+    return "\n".join(rows)
+
+
+def fmt_pf_ci(stats: dict[str, StratStats]) -> str:
+    """Render the bootstrap PF lower-95-CI table.
+
+    The freeze-revision exit criteria gate on lower-CI > 1.0, not on
+    point PF. This is the small-sample-trap guardrail the May-12 PF=1.20
+    reading would have failed.
+    """
+    if not stats:
+        return "_(no trades)_"
+    rows = [
+        "| Strategy | N | PF (point) | PF lower-95-CI | PF upper-95-CI | Verdict |",
+        "|---|---:|---:|---:|---:|---|",
+    ]
+    for s in sorted(stats.values(), key=lambda x: -x.total_pnl):
+        lo, hi = bootstrap_pf_ci(s.pnl_series)
+        pf_point = s.profit_factor
+        pf_point_d = f"{pf_point:.2f}" if pf_point != float("inf") else "INF"
+        lo_d = f"{lo:.2f}" if lo not in (float("inf"), float("-inf")) else "INF"
+        hi_d = f"{hi:.2f}" if hi != float("inf") else "INF"
+        if s.trades < 5:
+            ci_verdict = "INSUFFICIENT (N<5)"
+        elif lo > 1.0:
+            ci_verdict = "**EDGE confirmed** (lower-CI > 1.0)"
+        elif hi < 1.0:
+            ci_verdict = "**no edge** (upper-CI < 1.0)"
+        else:
+            ci_verdict = "inconclusive (CI straddles 1.0)"
+        rows.append(
+            f"| {s.strategy} | {s.trades} | {pf_point_d} | {lo_d} | {hi_d} | {ci_verdict} |"
+        )
+    return "\n".join(rows)
+
+
+def fmt_entry_time_histogram(stats: dict[str, StratStats]) -> str:
+    """Render the per-strategy entry-time histogram across 6 IST buckets.
+
+    Detects the §C2 time-of-day clustering artefact. If > 70 % of a
+    strategy's winning trades fire in a single 90-minute window, the
+    "edge" is time-dependent.
+    """
+    if not stats:
+        return "_(no trades)_"
+    bucket_labels = [lbl for lbl, _, _ in ENTRY_TIME_BUCKETS]
+    header = "| Strategy | " + " | ".join(bucket_labels) + " | Concentration |"
+    align = "|---|" + "|".join(["---:"] * len(bucket_labels)) + "|---|"
+    rows = [header, align]
+    for s in sorted(stats.values(), key=lambda x: -x.total_pnl):
+        hist = entry_time_histogram(s.by_hour)
+        cells = [f"{hist[lbl]['n']}" for lbl in bucket_labels]
+        # Concentration = share of trades in the most-populated bucket
+        total = sum(hist[lbl]["n"] for lbl in bucket_labels)
+        if total >= 5:
+            max_share = max(hist[lbl]["n"] for lbl in bucket_labels) / total
+            flag = (f"**{max_share*100:.0f}% in one bucket**"
+                    if max_share >= 0.70 else f"{max_share*100:.0f}%")
+        else:
+            flag = "n/a (<5 trades)"
+        rows.append(f"| {s.strategy} | " + " | ".join(cells) + f" | {flag} |")
     return "\n".join(rows)
 
 
@@ -516,6 +872,19 @@ def build_report(trades: list[dict], stats: dict[str, StratStats],
                  port: dict, args: argparse.Namespace) -> str:
     when = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     period = f"last {args.days}d" if args.days else "all-time"
+
+    # Contaminated-days inclusive/exclusive PF (freeze-v2.1 §C8).
+    # We compute both numbers up-front so the report can lead with the
+    # comparison rather than scattering it through later sections.
+    contaminated = load_contaminated_days()
+    clean_trades = filter_trades_excluding_contaminated(trades, contaminated)
+    excluded_n = len(trades) - len(clean_trades)
+    clean_stats = aggregate(clean_trades) if excluded_n else stats
+    clean_port = portfolio_summary(clean_stats) if excluded_n else port
+
+    # Per-supersector aggregation (freeze-v2.1 §C2).
+    supersector_buckets = aggregate_by_supersector(trades)
+
     lines = [
         f"# Profit Diagnostic — {period}",
         f"_Generated {when}_  |  DB: `{DB_PATH.name}`  |  Trades analyzed: **{len(trades)}**",
@@ -532,6 +901,23 @@ def build_report(trades: list[dict], stats: dict[str, StratStats],
         f"- **Commission paid:** Rs {port['total_commission']:.0f}  "
         f"(= {port['commission_drag_pct_pnl']:.0f}% of |PnL|)",
         "",
+        # Contaminated-days inclusive/exclusive comparison (§C8). Only
+        # rendered when at least one day has been declared contaminated;
+        # otherwise the line would be noise. The edge-claim should use
+        # the EXCLUSIVE PF per the freeze contract.
+        *(
+            [
+                f"### Contaminated-days adjustment ({excluded_n} trade(s) on {len(contaminated)} day(s) excluded)",
+                "",
+                "| Window | Trades | PnL | PF | WR % | Kelly |",
+                "|---|---:|---:|---:|---:|---:|",
+                f"| Inclusive (all days)   | {port['trades']}       | Rs {port['total_pnl']:+,.0f}       | {port['profit_factor']:.2f}       | {port['win_rate']*100:.1f}       | {port['kelly']:+.3f}       |",
+                f"| Exclusive (clean days) | {clean_port['trades']} | Rs {clean_port['total_pnl']:+,.0f} | {clean_port['profit_factor']:.2f} | {clean_port['win_rate']*100:.1f} | {clean_port['kelly']:+.3f} |",
+                "",
+                "_Edge claim uses **Exclusive**; risk-tolerance check uses Inclusive. Contamination is pre-defined as VIX > 25 OR |NIFTY %| > 2.5 (see `docs/freeze_contingencies.md` §C8 / `logs/contaminated_days.csv`)._",
+                "",
+            ] if excluded_n > 0 else []
+        ),
         # Phase-A rolling tracker -- only meaningful if the caller asked for
         # a recent window (otherwise it duplicates the TL;DR). Always emit
         # for short-window reports (days <= 30) so the daily EOD email leads
@@ -552,6 +938,30 @@ def build_report(trades: list[dict], stats: dict[str, StratStats],
         "- `WATCH` -- marginal, keep monitoring",
         "- `KILL` -- bleeding, disable in config",
         "- `INSUFFICIENT_DATA` -- need >=10 trades to decide",
+        "",
+        "## Statistical-significance check (freeze-v2.1 §C2)",
+        "",
+        "_The point-PF is uninformative on N<30. The bootstrap lower-CI is what gates an honest verdict. The freeze-v2.1 revision exit-criteria require **lower-CI > 1.0** to claim edge, not just point-PF > 1.0._",
+        "",
+        fmt_pf_ci(stats),
+        "",
+        "### PF excluding maximum-PnL trade",
+        "",
+        "_Detects \"edge is one lucky trade\" pattern. If PF > 1.0 AND PF-excl-max < 0.8, the verdict should be downgraded to INSUFFICIENT regardless of point PF._",
+        "",
+        fmt_pf_excl_max(stats),
+        "",
+        "### Entry-time histogram (IST buckets)",
+        "",
+        "_Detects time-of-day clustering. If > 70 % of a strategy's trades fire in one 90-minute window, the apparent edge is time-dependent._",
+        "",
+        fmt_entry_time_histogram(stats),
+        "",
+        "## Per-supersector PF",
+        "",
+        "_Detects sector-concentration artefacts. If PF varies by > 50 % across supersectors with N >= 5 each, the edge is sector-dependent (not generalisable)._",
+        "",
+        fmt_per_supersector(supersector_buckets),
         "",
         "## Long vs Short asymmetry",
         "",
