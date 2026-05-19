@@ -69,6 +69,51 @@ DEFAULT_SYMBOLS = [
 ]
 
 
+# ── Battery worker log filter (perf knob) ──────────────────────────────
+# The strategy and ensemble modules emit one INFO line per generated
+# signal (e.g. "[vwap_bounce] SELL RELIANCE @ 2842.50"). On a
+# 220-symbol × 90-day × 5-min battery that's millions of bars per
+# variant — the per-worker log file balloons to 6+ MB / variant and
+# the disk I/O measurably starves the cores on a 2-vCPU VM.
+#
+# This filter drops INFO from those modules but keeps:
+#   * harness messages (loguru name='__main__' / 'research.battery')
+#   * WARNING+ from anything (rejection cascades, exceptions)
+#   * the per-variant audit CSV (written outside loguru, unaffected)
+#
+# Set BATTERY_VERBOSE=1 to disable the filter (useful when debugging
+# a single variant locally and you want to see every signal).
+_BATTERY_QUIET_PREFIXES: tuple[str, ...] = (
+    "strategies.",      # strategies.vwap_bounce, .rsi_momentum, .supertrend_follow,
+                        # .ensemble, .opening_range_breakout, .mean_reversion,
+                        # .xgboost_classifier — all the per-bar signal emitters.
+    "core.portfolio",   # close_position / open_position spam (one INFO per fill).
+)
+
+
+def _battery_verbose_enabled() -> bool:
+    """True when BATTERY_VERBOSE=1 / true / yes (any case)."""
+    return os.environ.get("BATTERY_VERBOSE", "0").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+
+
+def _battery_log_filter(record) -> bool:
+    """Loguru filter: keep WARNING+ always, drop INFO from per-bar emitters.
+
+    Returns True (= keep) when the record should be written to the sink,
+    False (= drop) otherwise. Pure function over the record dict — safe
+    to call from worker subprocesses.
+    """
+    if _battery_verbose_enabled():
+        return True
+    name = record.get("name") or ""
+    if not any(name.startswith(p) for p in _BATTERY_QUIET_PREFIXES):
+        return True  # not a noisy module — keep at all levels
+    # Noisy module: only keep WARNING+ (loguru WARNING.no == 30).
+    return record["level"].no >= 30
+
+
 def _deep_set(cfg: dict, dotted: str, value):
     """Set nested key by dotted path: 'strategies.mean_reversion.tp_reversion_pct'."""
     parts = dotted.split(".")
@@ -290,6 +335,10 @@ def _run_variant_in_subprocess(
         str(worker_log),
         level="INFO",
         enqueue=True,
+        # Drop per-bar signal chatter so the worker log stays scannable
+        # AND I/O doesn't bottleneck the 2-vCPU backtester VM. See the
+        # _battery_log_filter docstring for what's kept vs dropped.
+        filter=_battery_log_filter,
         format="{time:YYYY-MM-DD HH:mm:ss} | {level:7} | {name}:{function}:{line} - {message}",
     )
     logger.info(f"[WORKER] starting variant {name}")
@@ -582,8 +631,9 @@ def main() -> int:
             print(f"[ERROR] failed to load --universe-file {uf_path}: {e}")
             return 3
 
-    # Mirror loguru into a per-run log file (append on resume)
-    logger.add(out_root / "log.txt", level="INFO")
+    # Mirror loguru into a per-run log file (append on resume).
+    # Same noise filter as the worker logs — keeps log.txt scannable.
+    logger.add(out_root / "log.txt", level="INFO", filter=_battery_log_filter)
 
     base_cfg = _load_base_config(ROOT / args.config)
     if args.capital is not None:

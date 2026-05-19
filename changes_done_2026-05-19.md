@@ -1,10 +1,13 @@
 # Trading Agent — Changes Done · 2026-05-19 (observability / CI / freeze pre-commitments)
 
-**Scope:** Three groups of changes shipped tonight in response to:
-(a) the GitHub Actions CI failure for the 2026-05-18 commit, (b) the
-operator's request for HTML-formatted alert emails, and (c) the
+**Scope:** Four groups of changes shipped over 2026-05-19 in response
+to: (a) the GitHub Actions CI failure for the 2026-05-18 commit, (b)
+the operator's request for HTML-formatted alert emails, (c) the
 external verdict pasted at 00:46 IST recommending pre-written
-contingencies for the freeze period.
+contingencies for the freeze period, and (d) the 09:39 IST live audit
+which found the backtester VM had been chewing for 10 h with 0 of 15
+variants completed — speed patches + a cloud-aware battery progress
+tool.
 
 **All changes fall under categories the `freeze-v2.1` contract
 (`docs/FREEZE_v2.1.md`) explicitly leaves unfrozen** — observability
@@ -320,7 +323,7 @@ verdict warns about.
 - `requirements.txt` (+ markdown>=3.5)
 - `.gitignore` (+ logs/**/*.html)
 
-### Batch 2 (this session)
+### Batch 2 (freeze pre-commitments)
 
 - `docs/FREEZE_v2.1.md` (+ 5 sections, no frozen content edited)
 - `docs/FREEZE_v2.1_revision.md` (new)
@@ -334,6 +337,161 @@ verdict warns about.
 - `tests/unit/test_diagnostic_freeze_extensions.py` (new, 22 tests)
 - `tests/unit/test_send_heartbeat.py` (new, 18 tests)
 - `changes_done_2026-05-19.md` (this file)
+
+### Batch 3 (this session) — battery throughput + cloud progress visibility
+
+Why this batch: the trader-VM audit at 09:39 IST showed a clean live
+deploy on `868d5ad`, but the backtester VM had been chewing on
+`battery_freeze_v21_20260518T181337` for 10+ hours with **0 of 15
+variants completed**. Per-worker logs were 6 MB+ each (signal-line
+chatter at INFO from `strategies.*` and `core.portfolio`), and the
+disk I/O was measurably starving the 2-vCPU VM. At the observed pace
+the FULL queue (5 jobs after this run) would have taken **2-3 weeks**
+of wall-time — longer than the freeze window. Plus there was no
+cloud-aware "is the battery making progress?" tool; `tools/battery_status.ps1`
+was laptop-only and reads local paths that don't exist on the VM
+workflow.
+
+The fix is pure observability + scheduling — no strategy, risk, or
+config touched, so it sits cleanly under the freeze-v2.1 "behaviour-
+preserving freeze-bypass" rule.
+
+**Speed patch 1 — quiet-logger filter for battery workers**
+
+`packages/research/battery.py`:
+
+- New `_BATTERY_QUIET_PREFIXES = ("strategies.", "core.portfolio")`
+  table identifying every per-bar emitter that contributed to the
+  log volume.
+- New `_battery_log_filter(record)` — pure function, called by loguru
+  for each record before it hits a sink. Drops INFO/DEBUG from the
+  noisy modules; keeps WARNING+ unconditionally so rejection
+  cascades and exceptions stay visible. Records from harness modules
+  (`__main__`, `research.battery`, `core.data_handler`, …) pass
+  through at all levels.
+- New `_battery_verbose_enabled()` checks `BATTERY_VERBOSE` env var
+  (truthy aliases: `1`, `true`, `yes`, `on`, case-insensitive). When
+  set, the filter is bypassed — useful when debugging a single
+  variant locally and you want to see every signal.
+- Wired into both `logger.add(...)` callsites:
+  the per-variant `workers/<name>.log` sink and the parent
+  `log.txt` sink. Both now apply `filter=_battery_log_filter`.
+
+Expected impact: per-worker log volume drops from ~6 MB / 10 h to
+under 100 KB / 10 h. The disk I/O headroom that opens up on the
+2-vCPU VM is the actual perf gain — fewer page faults,
+fewer fsync calls, more CPU cycles for the strategy code itself.
+Conservative throughput estimate: **2-4× faster per variant**, which
+brings the 5-job queue from ~14-22 days down to ~5-8 days at current
+universe sizing.
+
+The audit CSV (written by the harness outside loguru) is unaffected
+— full per-signal record retention for offline analysis.
+
+**Speed patch 2 — queue reorder for fast first-evidence**
+
+`tests/fixtures/battery_queue_example.yaml`:
+
+- Moved `nifty50_60d` (50 symbols × 60 days, the smallest job) to
+  slot #1, so the scheduler produces its first variant rankings in
+  ~12-18 h on `workers=2` instead of waiting 3-5 days for the
+  220-symbol `v2_baseline_90d` to finish first.
+- All five jobs preserved with identical parameters; only the
+  ordering changed. `v2_baseline_90d` now runs second.
+
+The on-VM copy at `/opt/trading-agent/data/battery_queue.yaml` will
+be updated to match this template via `scp` in the deploy step
+(after the current ad-hoc battery finishes — restarting the
+scheduler unit while a battery container is running would be
+disruptive).
+
+**Speed patch 3 was dropped — VM has only 2 vCPUs**
+
+`workers=2` was already maxing the box (observed 198 % CPU). Bumping
+to `workers=4` would just oversubscribe and add context-switch
+overhead. Recorded as cancelled in the change-log so a future
+operator doesn't repeat the analysis.
+
+**Battery progress feature — cloud-aware status script**
+
+`tools/battery_status_remote.ps1` (new, ~330 lines):
+
+Operator-facing equivalent of `tools/battery_status.ps1` but for the
+backtester VM. SSHes in once, runs a single bundled bash script
+(base64-encoded to sidestep PowerShell ⇄ bash ⇄ ssh quoting quirks
+including a CRLF gotcha that breaks `set +e` on Oracle Linux 8),
+parses the section-tagged output client-side, and renders:
+
+- Scheduler unit state (`active`/`inactive`, since-when, last 3
+  journal lines).
+- Active battery container — name, status (with `(unhealthy)`
+  highlighted yellow as a known cosmetic flag rather than red),
+  uptime, image, CPU %, memory.
+- Latest run — run_id, started at, comparison.md last-modified,
+  variants done count, **plus a best-effort ETA**:
+    - If 0 variants done after Xh: "per-variant lower bound ≥ Xh".
+    - If N done in Xh: "per-variant avg = X/Nh, ETA ≈ Y h
+      remaining (× workers=2)".
+- Active workers — last 1 line of each worker log + log size +
+  last-write-age (colour-coded: green < 5 min, yellow < 30 min,
+  red older).
+- Queue order with a ✓ marker against jobs already completed
+  (parsed from `data/battery_queue_state.json`).
+- comparison.md tail (configurable via `-MaxComparisonLines`,
+  default 30).
+- Host disk + `nproc` so capacity surprises are visible.
+
+Read-only by design — does not modify any file on the VM, does not
+restart any service, does not pull artefacts back. Operators who
+need the full run dir still use `pull_battery_results.ps1`. Mirrors
+the auth and path conventions of `pull_battery_results.ps1` so the
+laptop only has to learn one SSH-key / host pattern.
+
+**Tests added**
+
+- `tests/unit/test_battery_quiet_logger.py` — 44 tests across three
+  classes:
+    - `TestDefaultMode` (24): noisy-module INFO/DEBUG dropped at
+      every prefix; noisy-module WARNING+ kept; non-noisy modules
+      kept at every level; filter is a pure function (idempotent,
+      no record mutation).
+    - `TestVerboseMode` (16): `BATTERY_VERBOSE=1`/`true`/`yes`/`on`
+      (and case variants) bypass the filter; falsy or empty values
+      do not bypass; unset env var does not bypass.
+    - `TestStructuralGuards` (4): pin the `_BATTERY_QUIET_PREFIXES`
+      tuple so a future refactor can't silently shrink the
+      quiet-list and bring the log spam back; verify the filter
+      conforms to loguru's `callable(record) -> bool` contract.
+- Smoke-tested `tools/battery_status_remote.ps1` end-to-end against
+  the live backtester VM (80.225.197.125): full bundle returned in
+  2.4 s, all sections parsed cleanly, ETA estimate present, no
+  quoting / CRLF / bash error.
+
+**44 new tests, all green. Full battery-suite (94 tests): green. Lints clean.**
+
+### Batch 3 files
+
+- `packages/research/battery.py` (new filter + filter wired into
+  both `logger.add` calls)
+- `tests/fixtures/battery_queue_example.yaml` (queue reorder)
+- `tools/battery_status_remote.ps1` (new)
+- `tests/unit/test_battery_quiet_logger.py` (new, 44 tests)
+
+### Batch 3 deploy steps
+
+- `git pull` on backtester VM (already at `868d5ad`; this commit
+  carries the quiet-logger and the new template).
+- `scp` the reordered `tests/fixtures/battery_queue_example.yaml`
+  to `/opt/trading-agent/data/battery_queue.yaml`.
+- **Do not** restart `battery-scheduler.service` while the current
+  ad-hoc `battery_freeze_v21_*` container is still running. The
+  scheduler will read the new YAML on its next restart, which
+  happens naturally when the operator restarts the unit AFTER the
+  current battery finishes (or on next VM reboot).
+- The new logger filter only takes effect for variants spawned by a
+  rebuilt `trading-agent:latest` image; the existing 10 h-old
+  containers continue with the old code (acceptable — the existing
+  workers are nearly half-done with V1/V2 by I/O volume estimates).
 
 ## What did NOT change
 
