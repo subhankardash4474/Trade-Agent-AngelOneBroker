@@ -36,7 +36,16 @@ import yaml
 from loguru import logger
 
 IST = pytz.timezone("Asia/Kolkata")
+# Battery progress emission cadence. Whichever fires first wins:
+#   * every PROGRESS_LOG_INTERVAL_EVENTS events  -- bounds work-per-update on
+#     fast runs (full-CPU laptops do ~5,000 ev/s, so 10k ≈ 2s).
+#   * every PROGRESS_LOG_INTERVAL_SECONDS seconds -- bounds wall-time-per-update
+#     on slow runs (the 2-vCPU backtester VM does ~5 ev/s; 10k events alone
+#     would mean 33 min between updates, which is unusable for live monitoring
+#     and made the watchdog/operator think workers were hung).
+# The time floor is what makes battery_status_remote.ps1 actually useful.
 PROGRESS_LOG_INTERVAL_EVENTS = 10_000
+PROGRESS_LOG_INTERVAL_SECONDS = 60.0
 
 try:
     sys.stdout.reconfigure(encoding="utf-8")
@@ -204,6 +213,7 @@ class EnsembleBacktester:
 
         run_t0 = time.time()
         next_progress_at = PROGRESS_LOG_INTERVAL_EVENTS
+        last_progress_wall_t = run_t0
 
         for event_idx, (ts, symbol, bar, df_slice) in enumerate(events, start=1):
             # Periodic progress log. Without this, the worker emits only
@@ -211,8 +221,17 @@ class EnsembleBacktester:
             # source) to tell whether a multi-hour run is 10% or 90% done.
             # See logs/backtests/smoke_2var_20260515_152858 — 45h with no
             # progress signal, the symptom that surfaced this gap.
-            if event_idx >= next_progress_at or event_idx == total_events:
-                elapsed = max(time.time() - run_t0, 1e-6)
+            #
+            # Dual trigger: emit on event-count OR wall-clock, whichever
+            # fires first. On a 5 ev/s VM the event trigger alone fires
+            # every 33min — too sparse for live monitoring; the time
+            # trigger keeps updates flowing every PROGRESS_LOG_INTERVAL_SECONDS.
+            now_wall = time.time()
+            time_due = (now_wall - last_progress_wall_t) >= PROGRESS_LOG_INTERVAL_SECONDS
+            if (event_idx >= next_progress_at
+                    or time_due
+                    or event_idx == total_events):
+                elapsed = max(now_wall - run_t0, 1e-6)
                 pct = event_idx / total_events * 100 if total_events else 0.0
                 rate = event_idx / elapsed
                 remaining = max(total_events - event_idx, 0)
@@ -227,7 +246,12 @@ class EnsembleBacktester:
                     f"({pct:5.1f}%) | sim_date={sim_date} | rate={rate:,.0f} ev/s "
                     f"| elapsed={self._format_duration(elapsed)} | ETA={eta_str}"
                 )
-                next_progress_at += PROGRESS_LOG_INTERVAL_EVENTS
+                # Advance the event watermark to the next 10k boundary
+                # AT OR ABOVE current event_idx (handles the time-trigger
+                # case where event_idx hasn't reached next_progress_at yet).
+                while next_progress_at <= event_idx:
+                    next_progress_at += PROGRESS_LOG_INTERVAL_EVENTS
+                last_progress_wall_t = now_wall
 
             close = float(bar["close"])
 

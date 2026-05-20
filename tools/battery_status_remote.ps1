@@ -149,7 +149,14 @@ if [ -n "`$LATEST" ]; then
             sz=`$(sudo stat -c '%s' "`$RDIR/workers/`$f" 2>/dev/null)
             mt=`$(sudo stat -c '%Y' "`$RDIR/workers/`$f" 2>/dev/null)
             last=`$(sudo tail -1 "`$RDIR/workers/`$f" 2>/dev/null | cut -c1-220)
+            # Most-recent BATTERY-PROGRESS marker -- gives true %, sim_date,
+            # rate, ETA. Falls back gracefully (empty) when the worker hasn't
+            # emitted one yet (first ~10k bars or freshly-started worker).
+            prog=`$(sudo grep '\[BATTERY-PROGRESS\]' "`$RDIR/workers/`$f" 2>/dev/null | tail -1 | cut -c1-280)
             echo "WORKER|`$f|`$sz|`$mt|`$last"
+            if [ -n "`$prog" ]; then
+                echo "PROG|`$f|`$prog"
+            fi
         done
     fi
 fi
@@ -343,6 +350,17 @@ if (-not $runMap.run_id) {
 Write-Host ""
 Write-Host "== ACTIVE WORKERS ================================" -ForegroundColor Cyan
 $wRows = $work | Where-Object { $_ -match '^WORKER\|' }
+$pRows = $work | Where-Object { $_ -match '^PROG\|' }
+# Index PROG lines by worker filename for O(1) lookup.
+$progIdx = @{}
+foreach ($pr in $pRows) {
+    $pp = $pr -split '\|', 3   # 0=PROG 1=fname 2=raw progress line
+    if ($pp.Count -ge 3) { $progIdx[$pp[1]] = $pp[2] }
+}
+# Regex matches the format emitted by research.backtest_ensemble.run().
+# Kept lenient on whitespace because shells / ssh can re-collapse runs.
+$progressRe = '\[BATTERY-PROGRESS\]\s+([\d,]+)\s*/\s*([\d,]+)\s*\(\s*([\d.]+)%\s*\)\s*\|\s*sim_date=(\S+)\s*\|\s*rate=([\d,]+)\s*ev/s\s*\|\s*elapsed=(\S+)\s*\|\s*ETA=(\S+)'
+
 if (-not $wRows) {
     Write-Host "  [NO WORKER LOGS]" -ForegroundColor Yellow
 } else {
@@ -361,7 +379,28 @@ if (-not $wRows) {
         $last = if ($p.Count -ge 5) { $p[4] } else { '' }
         $color = if ($age.TotalMinutes -lt 5) { 'Green' } elseif ($age.TotalMinutes -lt 30) { 'Yellow' } else { 'Red' }
         Write-Host ("  [{0}]  {1,7} KB  last write: {2}" -f $name, $sizeKB, $ageStr) -ForegroundColor $color
-        if ($last) { Write-Host "    last: $last" -ForegroundColor Gray }
+
+        # If we have a parsed [BATTERY-PROGRESS] line for this worker,
+        # render the structured fields. Falls back to the raw last log
+        # line otherwise (covers brand-new workers that haven't emitted
+        # their first progress marker yet, or ones running with the
+        # old image pre-tightened cadence).
+        $progRaw = $progIdx[$name]
+        if ($progRaw -and ($progRaw -match $progressRe)) {
+            $done    = $Matches[1]
+            $total   = $Matches[2]
+            $pct     = $Matches[3]
+            $simDate = $Matches[4]
+            $rate    = $Matches[5]
+            $elapsed = $Matches[6]
+            $eta     = $Matches[7]
+            $pctNum = [double]$pct
+            $pctColor = if ($pctNum -ge 80) { 'Green' } elseif ($pctNum -ge 25) { 'Cyan' } else { 'Yellow' }
+            Write-Host ("    progress: {0,5}% [{1}/{2}]  sim_date={3}  rate={4} ev/s  elapsed={5}  ETA={6}" `
+                -f $pct, $done, $total, $simDate, $rate, $elapsed, $eta) -ForegroundColor $pctColor
+        } elseif ($last) {
+            Write-Host "    last: $last" -ForegroundColor Gray
+        }
     }
 }
 

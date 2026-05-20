@@ -174,8 +174,86 @@ def load_queue(queue_path: Path) -> list[dict]:
         if name in seen_names:
             raise SystemExit(f"[FATAL] duplicate job name '{name}' in queue.")
         seen_names.add(name)
+        validate_job_args(job, queue_path)
 
     return jobs
+
+
+# ──────────────── pre-flight validation ────────────────
+# Recognised intervals match the BacktestConfig._INTERVAL_ALIASES set on
+# the engine side. Keeping this as an explicit allow-list keeps a typo
+# ('5min ' with trailing space, '5M', 'hourly') from making it past the
+# scheduler and only surfacing inside the docker container 60s later.
+_VALID_INTERVALS = {"1m", "5m", "15m", "30m", "1h", "1d",
+                    "1min", "5min", "15min", "30min"}
+
+
+def validate_job_args(job: dict, queue_path: Path) -> None:
+    """Reject obvious mistakes before we burn a docker run on them.
+
+    Each check is a high-signal failure mode we've actually hit:
+      * unresolvable universe-file -> battery exits with code 3 inside
+        the container; the scheduler then marks the job 'failed' and
+        moves on, having wasted ~30s of docker-startup. Rejecting here
+        saves the round-trip and gives the operator a clear pointer.
+      * non-positive `days` -> the harness would download zero bars and
+        the EnsembleBacktester would emit `[BATTERY-PROGRESS] 0/0` then
+        write an empty result. Equally invisible to the operator.
+      * non-integer / negative `workers` -> docker run argv would carry
+        --workers -1 which battery.py refuses; clearer to fail here.
+      * unknown interval -> passed straight through to yfinance, which
+        accepts then silently returns nothing for some strings.
+    """
+    name = job["name"]
+
+    # universe-file: relative to queue file's project root. We resolve
+    # the same way run_battery.py will (PROJECT_ROOT-relative).
+    uf = job.get("universe-file")
+    if uf is not None:
+        uf_path = Path(uf)
+        if not uf_path.is_absolute():
+            uf_path = PROJECT_ROOT / uf_path
+        if not uf_path.exists():
+            raise SystemExit(
+                f"[FATAL] queue job '{name}': universe-file '{uf}' does not "
+                f"exist (resolved: {uf_path}). Fix the path in {queue_path} "
+                f"or remove the key to use the default symbols list."
+            )
+
+    # days: expect a positive int. Floats / strings get rejected.
+    days = job.get("days")
+    if days is not None:
+        if not isinstance(days, int) or isinstance(days, bool) or days <= 0:
+            raise SystemExit(
+                f"[FATAL] queue job '{name}': `days` must be a positive "
+                f"integer, got {days!r}."
+            )
+
+    # workers: 'auto' is permitted (the harness resolves it) or any
+    # positive int.
+    workers = job.get("workers")
+    if workers is not None:
+        if isinstance(workers, str):
+            if workers.strip().lower() != "auto":
+                raise SystemExit(
+                    f"[FATAL] queue job '{name}': `workers` string must be "
+                    f"'auto', got {workers!r}."
+                )
+        elif isinstance(workers, bool) or not isinstance(workers, int) or workers < 1:
+            raise SystemExit(
+                f"[FATAL] queue job '{name}': `workers` must be a positive "
+                f"integer or 'auto', got {workers!r}."
+            )
+
+    # interval: not a hard requirement, but if specified it must be a
+    # known shape so the engine doesn't silently fall back.
+    interval = job.get("interval")
+    if interval is not None:
+        if not isinstance(interval, str) or interval not in _VALID_INTERVALS:
+            raise SystemExit(
+                f"[FATAL] queue job '{name}': `interval` must be one of "
+                f"{sorted(_VALID_INTERVALS)}, got {interval!r}."
+            )
 
 
 # ───────────────────────── docker glue ─────────────────────────

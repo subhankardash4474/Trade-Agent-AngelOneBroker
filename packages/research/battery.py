@@ -36,7 +36,9 @@ import copy
 import json
 import os
 import pickle
+import re
 import sys
+import threading
 import time
 import traceback
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -98,6 +100,28 @@ def _battery_verbose_enabled() -> bool:
     )
 
 
+def _resolve_workers(raw_workers, cpu_count: int) -> tuple[int, str | None]:
+    """Resolve the --workers CLI value to a concrete integer.
+
+    Returns (resolved_int, info_message). info_message is non-None when
+    the caller should surface what just happened (e.g. "auto resolved to 7").
+    Raises ValueError on bogus input -- caller decides how to surface the
+    error (the CLI prints to stderr and returns exit code 8).
+    """
+    raw_str = str(raw_workers).strip().lower()
+    if raw_str == "auto":
+        resolved = max(1, cpu_count - 1)
+        msg = (f"[BATTERY] --workers=auto resolved to {resolved} "
+               f"(cpu_count={cpu_count})")
+        return resolved, msg
+    try:
+        return int(raw_str), None
+    except ValueError as exc:
+        raise ValueError(
+            f"--workers must be 'auto' or an integer; got {raw_workers!r}."
+        ) from exc
+
+
 def _battery_log_filter(record) -> bool:
     """Loguru filter: keep WARNING+ always, drop INFO from per-bar emitters.
 
@@ -112,6 +136,164 @@ def _battery_log_filter(record) -> bool:
         return True  # not a noisy module — keep at all levels
     # Noisy module: only keep WARNING+ (loguru WARNING.no == 30).
     return record["level"].no >= 30
+
+
+# ── Worker watchdog (deadlock detector) ────────────────────────────────
+# Defends against the case where a worker subprocess goes silent — GIL
+# deadlock, OOM thrashing, third-party library blocking on a kernel
+# resource — while the parent's ProcessPoolExecutor sees it as "still
+# running" and waits indefinitely. A 33h queue-blocking worker (real
+# incident: battery_freeze_v21_20260518T181337) is exactly the failure
+# mode this guards.
+#
+# The watchdog reads the worker's own log file's mtime: with the
+# tightened progress emission (every PROGRESS_LOG_INTERVAL_SECONDS),
+# mtime advances at least every ~60s during a healthy run. If mtime
+# stalls beyond max_silence_sec, the worker is presumed hung and
+# self-terminates with os._exit(124) so the parent sees a clean
+# CalledProcessError-equivalent and the queue moves on.
+#
+# Configurable via BATTERY_WATCHDOG_SILENCE_MIN (default 30). Setting
+# to 0 disables the watchdog entirely (useful for debugging).
+_WATCHDOG_DEFAULT_SILENCE_MIN = 30
+_WATCHDOG_POLL_SEC = 60
+
+
+def _watchdog_silence_sec() -> int:
+    """Resolve the configured silence threshold in seconds (0 = disabled)."""
+    raw = os.environ.get("BATTERY_WATCHDOG_SILENCE_MIN", "").strip()
+    if not raw:
+        return _WATCHDOG_DEFAULT_SILENCE_MIN * 60
+    try:
+        minutes = int(raw)
+    except ValueError:
+        return _WATCHDOG_DEFAULT_SILENCE_MIN * 60
+    return max(minutes, 0) * 60
+
+
+def _spawn_progress_watchdog(
+    worker_log: Path,
+    variant_name: str,
+    max_silence_sec: int,
+) -> threading.Thread | None:
+    """Start a daemon thread that suicides this worker if its log goes silent.
+
+    Returns the thread (so callers can join in tests) or None when the
+    watchdog is disabled (max_silence_sec <= 0). The thread is daemonic
+    so it never prevents normal worker exit.
+    """
+    if max_silence_sec <= 0:
+        return None
+
+    def _watch() -> None:
+        # Keep importing inside the thread so test patches of os._exit etc.
+        # take effect even when this module is imported once at startup.
+        import os as _os
+        import sys as _sys
+        import time as _time
+
+        # Allow a generous startup grace: market_data unpickle (300 MB) +
+        # FeatureEngine warmup can take 60-120s on the 2-vCPU VM before
+        # the first progress line emits. Without this, the watchdog can
+        # fire during legitimate startup.
+        startup_grace = max(max_silence_sec // 2, 120)
+        _time.sleep(min(startup_grace, max_silence_sec))
+
+        while True:
+            _time.sleep(_WATCHDOG_POLL_SEC)
+            try:
+                mtime = worker_log.stat().st_mtime
+            except (FileNotFoundError, OSError):
+                # Log not created yet, or filesystem hiccup — try again.
+                continue
+            age = _time.time() - mtime
+            if age > max_silence_sec:
+                msg = (
+                    f"[WATCHDOG] {variant_name}: no log activity for "
+                    f"{age:.0f}s (limit {max_silence_sec}s). Worker presumed "
+                    f"hung; suiciding with exit 124 so the queue can advance."
+                )
+                # Write to stderr (not loguru) — if loguru is the thing
+                # that's deadlocked, we'd never get the message out
+                # through the same sinks.
+                try:
+                    _sys.stderr.write(msg + "\n")
+                    _sys.stderr.flush()
+                except Exception:
+                    pass
+                _os._exit(124)
+
+    t = threading.Thread(
+        target=_watch,
+        name=f"battery-watchdog-{variant_name}",
+        daemon=True,
+    )
+    t.start()
+    return t
+
+
+# Compiled regex used by the parent's live-status reader to find the
+# most recent progress marker in a worker log file. Matches the line
+# format emitted by research.backtest_ensemble.run().
+_PROGRESS_LINE_RE = re.compile(
+    r"\[BATTERY-PROGRESS\]\s+"
+    r"(?P<done>[\d,]+)\s*/\s*(?P<total>[\d,]+)\s+"
+    r"\(\s*(?P<pct>[\d.]+)%\s*\)\s*\|\s*"
+    r"sim_date=(?P<sim_date>\S+)\s*\|\s*"
+    r"rate=(?P<rate>[\d,]+)\s*ev/s\s*\|\s*"
+    r"elapsed=(?P<elapsed>\S+)\s*\|\s*"
+    r"ETA=(?P<eta>\S+)"
+)
+
+
+def _parse_last_progress(log_path: Path) -> dict | None:
+    """Return the most recent [BATTERY-PROGRESS] payload or None.
+
+    Uses a tail-friendly read (last 32KB) so this stays cheap even on
+    multi-MB worker logs. The progress line format is fixed-width-ish
+    (~150 chars), so 32KB easily covers the last ~200 emissions and
+    guarantees we'll find one if any were emitted in the last
+    PROGRESS_LOG_INTERVAL_SECONDS window.
+    """
+    if not log_path.exists():
+        return None
+    try:
+        with log_path.open("rb") as f:
+            try:
+                f.seek(0, os.SEEK_END)
+                size = f.tell()
+                read_from = max(0, size - 32 * 1024)
+                f.seek(read_from)
+                tail = f.read().decode("utf-8", errors="replace")
+            except OSError:
+                # Tiny file — just read it whole.
+                f.seek(0)
+                tail = f.read().decode("utf-8", errors="replace")
+    except (FileNotFoundError, PermissionError):
+        return None
+
+    last_match = None
+    for m in _PROGRESS_LINE_RE.finditer(tail):
+        last_match = m
+    if last_match is None:
+        return None
+    g = last_match.groupdict()
+    try:
+        done = int(g["done"].replace(",", ""))
+        total = int(g["total"].replace(",", ""))
+        pct = float(g["pct"])
+        rate = int(g["rate"].replace(",", ""))
+    except ValueError:
+        return None
+    return {
+        "done": done,
+        "total": total,
+        "pct": pct,
+        "sim_date": g["sim_date"],
+        "rate_ev_s": rate,
+        "elapsed": g["elapsed"],
+        "eta": g["eta"],
+    }
 
 
 def _deep_set(cfg: dict, dotted: str, value):
@@ -340,8 +522,24 @@ def _run_variant_in_subprocess(
         # _battery_log_filter docstring for what's kept vs dropped.
         filter=_battery_log_filter,
         format="{time:YYYY-MM-DD HH:mm:ss} | {level:7} | {name}:{function}:{line} - {message}",
+        # Defence in depth: even with the quiet filter, a runaway
+        # WARNING storm could fill the disk on a multi-day battery.
+        # 50 MB rotation + 3-file retention bounds worst-case worker
+        # log usage to 200 MB regardless of run length.
+        rotation="50 MB",
+        retention=3,
     )
     logger.info(f"[WORKER] starting variant {name}")
+
+    # Watchdog must be installed AFTER the log sink (it reads the log's
+    # mtime as the heartbeat) and BEFORE the heavy work (so it covers
+    # market_data unpickle, feature load, model load, and the bt.run
+    # loop). Disabled when BATTERY_WATCHDOG_SILENCE_MIN=0.
+    _spawn_progress_watchdog(
+        worker_log=worker_log,
+        variant_name=name,
+        max_silence_sec=_watchdog_silence_sec(),
+    )
 
     market_data = _load_market_data_cache(out_root)
     if market_data is None:
@@ -422,14 +620,23 @@ def _completed_variant_names(out_root: Path) -> set[str]:
 
 
 def _write_comparison(rows: list, out_path: Path, meta: dict,
-                      *, complete: bool = False, failed: list | None = None):
+                      *, complete: bool = False, failed: list | None = None,
+                      active_workers: list | None = None):
     """Write/overwrite comparison.md.
 
     Called after every variant (rows grows incrementally), so the file is
     safe to read mid-run. The 'complete' flag adds a marker the resume
     detector keys off of.
+
+    `active_workers` (when provided) is a list of dicts with keys
+    {variant, pct, sim_date, rate_ev_s, elapsed, eta, log_age_sec}. The
+    live-update thread populates this so the operator can see ongoing
+    variants without SSHing in. The block is suppressed when `complete`
+    so the final comparison.md doesn't carry a stale "currently running"
+    section.
     """
     failed = failed or []
+    active_workers = active_workers or []
     status = "[COMPLETE]" if complete else "[IN-PROGRESS]"
     lines = []
     lines.append(f"# Overnight Backtest Battery -- Comparison {status}\n")
@@ -441,6 +648,22 @@ def _write_comparison(rows: list, out_path: Path, meta: dict,
     lines.append(f"- Initial capital: Rs {meta['capital']:,.0f}")
     lines.append(f"- Variants done: {len(rows)} / {meta.get('total_variants', '?')}"
                  f"   |  failed: {len(failed)}\n")
+
+    # Currently-running block (live updates from the live-md thread). Only
+    # included when there's actual progress to show AND the run isn't done.
+    if active_workers and not complete:
+        lines.append("## Currently running\n")
+        lines.append("| Variant | %    | sim_date   | rate (ev/s) | elapsed | ETA  | last log |")
+        lines.append("|---|---:|---|---:|---|---|---:|")
+        for w in active_workers:
+            age = int(w.get("log_age_sec", 0))
+            age_str = f"{age}s" if age < 120 else f"{age // 60}m"
+            lines.append(
+                "| {variant} | {pct:5.1f} | {sim_date} | {rate_ev_s:,} | "
+                "{elapsed} | {eta} | {age_str} |".format(age_str=age_str, **w)
+            )
+        lines.append("")
+
     lines.append("## Results\n")
     headers = ["Variant", "Trades", "WR%", "PnL", "PF", "R:R", "Exp", "Sharpe", "MaxDD%", "Ret%"]
     lines.append("| " + " | ".join(headers) + " |")
@@ -464,6 +687,84 @@ def _write_comparison(rows: list, out_path: Path, meta: dict,
             f"    `python tools/overnight_backtest_battery.py --resume {meta['run_id']}`"
         )
     out_path.write_text("\n".join(lines), encoding="utf-8")
+
+
+def _read_active_workers(workers_dir: Path, completed_names: set,
+                         max_age_sec: int = 300) -> list[dict]:
+    """Scan workers/*.log for variants currently in progress.
+
+    A worker is "active" iff:
+      * its log file exists in workers/ (created by _run_variant_in_subprocess)
+      * the variant doesn't already have a results JSON (not completed)
+      * the log file's mtime is within max_age_sec (default 5 min) -- this
+        filters out logs from finished/crashed prior workers whose logs are
+        still on disk but no longer being written to.
+      * the log contains at least one [BATTERY-PROGRESS] line.
+
+    Returned dicts carry the parsed progress payload plus the variant name
+    and log_age_sec so the renderer can flag stale workers.
+    """
+    if not workers_dir.exists():
+        return []
+    now = time.time()
+    active: list[dict] = []
+    for log_path in workers_dir.glob("*.log"):
+        variant = log_path.stem
+        if variant in completed_names:
+            continue
+        try:
+            mtime = log_path.stat().st_mtime
+        except OSError:
+            continue
+        log_age = now - mtime
+        if log_age > max_age_sec:
+            continue
+        progress = _parse_last_progress(log_path)
+        if progress is None:
+            continue
+        progress["variant"] = variant
+        progress["log_age_sec"] = int(log_age)
+        active.append(progress)
+    # Most-progressed-first reads naturally for the operator.
+    active.sort(key=lambda w: w["pct"], reverse=True)
+    return active
+
+
+def _live_md_loop(
+    out_root: Path,
+    state_provider,
+    stop_event: threading.Event,
+    *,
+    interval_sec: float = 60.0,
+) -> None:
+    """Background thread body: rewrite comparison.md every interval_sec.
+
+    `state_provider` is a thread-safe callable returning the tuple
+    (rows, failed, completed_names, meta) so the live thread sees a
+    consistent snapshot even while the main thread mutates rows on
+    each future completion.
+
+    Stops promptly when stop_event is set (single ~interval_sec lag).
+    """
+    workers_dir = out_root / "workers"
+    comp_path = out_root / "comparison.md"
+    while not stop_event.wait(interval_sec):
+        try:
+            rows, failed, completed_names, meta = state_provider()
+            active = _read_active_workers(workers_dir, completed_names)
+            _write_comparison(
+                sorted(rows, key=lambda r: r["variant"]),
+                comp_path,
+                meta,
+                complete=False,
+                failed=failed,
+                active_workers=active,
+            )
+        except Exception as exc:  # pragma: no cover -- defensive
+            # Live updates are best-effort; a transient FS error shouldn't
+            # take the parent down. Log at WARNING so it surfaces but
+            # the run continues.
+            logger.warning(f"[BATTERY] live-md update failed: {exc!r}")
 
 
 _BROKER_CRED_ENV_PREFIXES = ("ANGELONE_", "SMARTAPI_", "BROKER_", "KITE_")
@@ -549,21 +850,35 @@ def main() -> int:
                          "slice AND survives the holdout slice, it has real "
                          "edge; if it crumbles on holdout, the train win was "
                          "p-hacked.")
-    ap.add_argument("--workers", type=int, default=1,
+    ap.add_argument("--workers", default="1",
                     help="Number of parallel worker processes for variant "
-                         "execution (default: 1 = serial, preserves legacy "
-                         "behavior for CI/tests/debugging). Variants are "
-                         "embarrassingly parallel; battery-v2 (18 variants) "
-                         "wall-time at --workers 4 is ~3x faster than serial. "
-                         "Cap to (cpu_count - 1) and budget ~1.5 GB RAM/worker "
-                         "for a 200-stock universe.")
+                         "execution. Default: 1 (serial; preserves legacy "
+                         "behavior for CI/tests/debugging). Pass an integer "
+                         "or 'auto' to resolve to max(1, cpu_count - 1). "
+                         "Variants are embarrassingly parallel; battery-v2 "
+                         "(18 variants) wall-time at --workers 4 is ~3x "
+                         "faster than serial. Budget ~1.5 GB RAM/worker for "
+                         "a 200-stock universe; oversubscription beyond "
+                         "cpu_count rarely helps.")
     args = ap.parse_args()
+
+    # Resolve --workers (supports 'auto' + plain integer). 'auto' picks
+    # cpu_count - 1 so the OS / docker scheduler / live-md thread always
+    # have one core to work on without contention. We surface the resolved
+    # value in a log line so the operator can confirm intent in log.txt.
+    cpu = os.cpu_count() or 1
+    try:
+        args.workers, resolution_msg = _resolve_workers(args.workers, cpu)
+    except ValueError as exc:
+        print(f"[ERROR] {exc}", file=sys.stderr)
+        return 8
+    if resolution_msg:
+        print(resolution_msg)
 
     # Sanity-clamp workers: 0 or negative is nonsense; >cpu_count just wastes
     # memory on context-switching. Still allow oversubscription if the user
     # explicitly requests it (some I/O wait can hide behind extra processes),
     # but warn so the caller knows it's intentional.
-    cpu = os.cpu_count() or 1
     if args.workers < 1:
         args.workers = 1
     elif args.workers > cpu:
@@ -633,7 +948,15 @@ def main() -> int:
 
     # Mirror loguru into a per-run log file (append on resume).
     # Same noise filter as the worker logs — keeps log.txt scannable.
-    logger.add(out_root / "log.txt", level="INFO", filter=_battery_log_filter)
+    # Rotation/retention matches the worker sinks: a multi-day queue can
+    # otherwise produce a single multi-GB log.txt.
+    logger.add(
+        out_root / "log.txt",
+        level="INFO",
+        filter=_battery_log_filter,
+        rotation="50 MB",
+        retention=3,
+    )
 
     base_cfg = _load_base_config(ROOT / args.config)
     if args.capital is not None:
@@ -843,6 +1166,49 @@ def main() -> int:
                          "older run, re-run without --resume to regenerate the cache.)")
             return 4
 
+        # Coordination primitives for the live-md updater thread:
+        #   * comp_lock serialises writes to comparison.md so the main
+        #     thread (per-future-completion writes) and the live thread
+        #     (every-60s writes) can't interleave a half-rendered file.
+        #   * stop_event signals the live thread to exit cleanly when
+        #     the with-block finishes.
+        comp_lock = threading.Lock()
+        stop_event = threading.Event()
+
+        def _state_snapshot():
+            # Take a defensive copy of the mutable state the main thread
+            # owns so the live thread can iterate without seeing a
+            # mid-update race.
+            with comp_lock:
+                return (
+                    list(rows),
+                    list(failed),
+                    {r["variant"] for r in rows},
+                    _meta(datetime.now().isoformat(timespec="seconds")),
+                )
+
+        def _locked_write(rows_arg, failed_arg, *, active_workers=None,
+                          complete=False):
+            with comp_lock:
+                _write_comparison(
+                    sorted(rows_arg, key=lambda r: r["variant"]),
+                    out_root / "comparison.md",
+                    _meta(datetime.now().isoformat(timespec="seconds")),
+                    complete=complete, failed=failed_arg,
+                    active_workers=active_workers,
+                )
+
+        live_thread = threading.Thread(
+            target=_live_md_loop,
+            args=(out_root, _state_snapshot, stop_event),
+            kwargs={"interval_sec": 60.0},
+            name="battery-live-md",
+            daemon=True,
+        )
+        live_thread.start()
+        logger.info("[BATTERY] live comparison.md updater started "
+                    "(refresh every 60s while variants run)")
+
         try:
             with ProcessPoolExecutor(max_workers=args.workers) as pool:
                 futures = {
@@ -861,7 +1227,8 @@ def main() -> int:
                     try:
                         _, payload = fut.result()
                         summary = payload["summary"]
-                        rows.append(summary)
+                        with comp_lock:
+                            rows.append(summary)
                         logger.info(
                             f"[BATTERY] {name} done in {payload['elapsed_sec']}s | "
                             f"trades={summary['trades']}  pnl=Rs {summary['pnl']:+.2f}  "
@@ -876,27 +1243,29 @@ def main() -> int:
                         (out_root / "results" / f"{name}.failure.txt").write_text(
                             f"{datetime.now().isoformat()}\n{e}\n\n{tb}", encoding="utf-8"
                         )
-                        failed.append((name, str(e).splitlines()[0] if str(e) else type(e).__name__))
+                        with comp_lock:
+                            failed.append(
+                                (name, str(e).splitlines()[0] if str(e) else type(e).__name__)
+                            )
 
-                    # Single-writer comparison.md update from the parent.
-                    # Workers never touch this file, so no lock needed.
-                    _write_comparison(
-                        sorted(rows, key=lambda r: r["variant"]),
-                        out_root / "comparison.md",
-                        _meta(datetime.now().isoformat(timespec="seconds")),
-                        complete=False, failed=failed,
-                    )
+                    # Per-completion comparison.md write — same lock as
+                    # the live thread so we never tear a render.
+                    _locked_write(rows, failed)
         except KeyboardInterrupt:
             # Shutdown cleanly: with-block will cancel pending futures.
             logger.warning(f"[BATTERY] interrupted — partial results saved. "
                            f"Resume with: --resume {run_id}")
-            _write_comparison(
-                sorted(rows, key=lambda r: r["variant"]),
-                out_root / "comparison.md",
-                _meta(datetime.now().isoformat(timespec="seconds")),
-                complete=False, failed=failed,
-            )
+            stop_event.set()
+            live_thread.join(timeout=5)
+            _locked_write(rows, failed)
             return 130
+        finally:
+            # Whatever exit path we take (normal completion, exception,
+            # KeyboardInterrupt-already-handled), tear down the live
+            # thread before the parent main() returns. join with a timeout
+            # so a stuck thread can't hang the process.
+            stop_event.set()
+            live_thread.join(timeout=5)
 
     # ── Step 3: final comparison report ──
     finished = datetime.now().isoformat(timespec="seconds")

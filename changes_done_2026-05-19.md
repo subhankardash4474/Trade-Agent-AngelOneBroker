@@ -493,6 +493,163 @@ laptop only has to learn one SSH-key / host pattern.
   containers continue with the old code (acceptable — the existing
   workers are nearly half-done with V1/V2 by I/O volume estimates).
 
+## Batch 4 — Battery infrastructure hardening (2026-05-20, freeze-bypass)
+
+### Why this batch exists
+
+09:51 IST audit (2026-05-20) showed the `battery_freeze_v21_20260518T181337`
+container was 34h+ in with 0/15 variants completed. Closer reading of
+the worker logs revealed:
+
+  - V1 (baseline_current_shipped) was actually **62.5% done with 20h ETA**
+  - V2 (all_filters_off) was **63.6% done with 19.6h ETA**
+
+The progress emitter (`[BATTERY-PROGRESS]`) was already present in
+`research.backtest_ensemble` but only fired every 10,000 events, which
+at the VM's 5 ev/s rate meant **~33 minutes between progress lines**.
+The cloud status tool (`battery_status_remote.ps1`) read only the very
+last log line (typically a strategy chatter line), so it reported
+"no completions yet after 34h" — alarming and wrong. That mismatch
+between actual progress and operator-visible progress led to the
+near-decision to kill the container, which would have cost 33h of
+already-paid-for compute.
+
+The user's directive was explicit: **"fix all the issues in battery
+irrespective of freeze. i think we should do this both performance
+wise and functionality wise"** — authorising freeze-bypass for the
+backtester infrastructure (not the trading code). All changes here
+fall under research/observability tooling; trading behaviour is
+untouched.
+
+### What changed
+
+**Performance / functionality (both `packages/research/`)**:
+
+1. **Tightened progress emission cadence** (`backtest_ensemble.py`):
+   added `PROGRESS_LOG_INTERVAL_SECONDS = 60.0` alongside the existing
+   event threshold. Progress now emits whichever fires first — every
+   10k events OR every 60 seconds. On the 5 ev/s VM that turns the
+   30-min visibility gap into a 60-s heartbeat.
+
+2. **Worker watchdog** (`battery.py`): a daemon thread launched per
+   worker subprocess that watches `worker.log` mtime. If no log
+   activity for `BATTERY_WATCHDOG_SILENCE_MIN` minutes (default 30,
+   set to 0 to disable), the watchdog calls `os._exit(124)` — the
+   parent's `ProcessPoolExecutor` then sees the worker as failed and
+   the queue advances. Defends against deadlocked / GIL-stuck workers
+   blocking the queue indefinitely. Has a 2-minute startup grace
+   period so market_data unpickle (300 MB) can complete without
+   tripping the watchdog.
+
+3. **Live `comparison.md` updates** (`battery.py`): the parallel path
+   now spawns a `battery-live-md` thread that, every 60 seconds:
+     - scans `workers/*.log` for variants currently progressing
+       (mtime within 5 min, has a `[BATTERY-PROGRESS]` line, not in
+       the completed-variants set);
+     - parses the latest progress payload from each (using a
+       last-32KB tail-read so the parse stays cheap on multi-MB logs);
+     - re-renders `comparison.md` with a new "## Currently running"
+       block showing pct / sim_date / rate / elapsed / ETA.
+   A `threading.Lock` serialises writes between the live thread and
+   the per-future-completion writes the main thread does.
+
+4. **Pre-flight queue validation** (`tools/run_battery_queue.py`):
+   `validate_job_args()` now rejects bad jobs at scheduler load time
+   (universe-file not found, non-positive days, non-int / negative
+   workers, unknown interval). Saves the ~30s docker-run round-trip
+   each invalid job would otherwise burn before failing inside the
+   container.
+
+5. **`--workers auto`** (`battery.py`): new `_resolve_workers()`
+   helper accepts `'auto'` (case-insensitive), resolving to
+   `max(1, cpu_count - 1)`. Also accepts the existing integer values.
+   The queue validator was extended to accept `workers: auto` in the
+   YAML.
+
+6. **Worker log rotation** (`battery.py`): both the per-worker sink
+   and the run-level `log.txt` sink now carry `rotation="50 MB"` and
+   `retention=3`. Worst-case worker log usage on a multi-day run is
+   bounded to 200 MB (4 files × 50 MB) regardless of WARNING-storm
+   patterns.
+
+**Operator-facing observability** (`tools/battery_status_remote.ps1`):
+
+7. **Real per-worker progress in the status report**: the bash bundle
+   now extracts the most-recent `[BATTERY-PROGRESS]` line per worker
+   (via `grep '\[BATTERY-PROGRESS\]' | tail -1`), and the PowerShell
+   renderer parses it with a structured regex to surface
+   `progress: 62.5% [610,000/975,292]  sim_date=2026-04-15  rate=5 ev/s
+   elapsed=33.4h  ETA=20.0h`. Falls back gracefully to the previous
+   "last log line" view when the marker is absent (covers brand-new
+   workers and old-image runs).
+
+### Files touched (Batch 4)
+
+- `packages/research/backtest_ensemble.py` (time-based progress
+  trigger; +1 constant, +5 lines in the run loop)
+- `packages/research/battery.py` (watchdog, live-md thread,
+  comparison-md rendering, workers-auto helper, log rotation;
+  +250 lines net)
+- `tools/run_battery_queue.py` (`validate_job_args()`; +75 lines)
+- `tools/battery_status_remote.ps1` (PROG line + PS parser; +35 lines)
+- `tests/unit/test_battery_progress_and_live_md.py` (40 tests, new)
+- `tests/unit/test_battery_queue_preflight.py` (16 tests, new)
+
+### Why we did NOT kill the running container
+
+The 34h-old `battery_freeze_v21_20260518T181337` container is V1+V2
+at 62.5% and 63.6% respectively, with ~20h ETA each. V1 is the
+freeze baseline anchor — losing it would mean no comparison reference
+for the Friday review. The math was:
+
+- **Kill + redeploy**: 0% → 100% on new code (3-5x faster from
+  quiet-logger). 15 variants × ~5h each / 2 workers ≈ 37h.
+- **Let finish + redeploy**: V1+V2 finish in ~20h on old code.
+  Then 13 variants on new code at 5h each / 2 workers ≈ 33h.
+  **Total: ~53h, but preserves the freeze baseline.**
+
+The let-finish path adds ~16h of total wall-time but keeps the
+critical V1 anchor intact, so the deploy plan is:
+
+1. Ship Batch 4 to git (this commit).
+2. `git pull` on the backtester VM (no service restart yet).
+3. When V1+V2 finish (~tomorrow morning), rebuild the docker image
+   and restart `battery-scheduler.service`. The reordered queue
+   already puts `nifty50_60d` first, which combined with the new
+   throughput improvements should produce the first new-code variant
+   evidence within ~5h.
+
+### Tests added (Batch 4)
+
+- `test_battery_progress_and_live_md.py`: 40 tests covering
+  `_parse_last_progress` (5 cases), `_read_active_workers` (5),
+  `_write_comparison` active block (3), `_live_md_loop` (1),
+  watchdog config + spawn (6), progress emission constants (2),
+  `_resolve_workers` (8 — auto, case, single-core, integer
+  pass-through, error path).
+- `test_battery_queue_preflight.py`: 16 tests covering the four
+  validation axes (universe-file existence, days range, workers
+  shape, interval allow-list) plus error-message contracts.
+
+### Freeze-v2.1 ledger update
+
+This is the second freeze bypass since the contract was sealed
+(2026-05-18 commit `506cfe6`):
+
+  - **Bypass 1** (2026-05-19, Batches 1-3): HTML emails, CI green-up,
+    contingency docs, observability extensions, battery quiet-logger,
+    battery_status_remote tool. All operator-routine / observability
+    work, all freeze-safe by construction.
+  - **Bypass 2** (this commit, Batch 4): battery infrastructure
+    hardening. Trader-side code (`config.yaml`, `trading_agent.py`,
+    `strategies/*`, `risk_manager.py`, model artefact) byte-identical
+    to commit `506cfe6`.
+
+The `freeze-v2.1` contract authorises bypass slots for "research /
+backtester / observability tooling". This commit consumes one of
+those slots. **2/3 bypass slots used**; remaining slot reserved for
+critical operational fixes during the freeze period.
+
 ## What did NOT change
 
 - `config.yaml` — untouched.
