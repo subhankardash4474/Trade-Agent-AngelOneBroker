@@ -633,22 +633,64 @@ critical V1 anchor intact, so the deploy plan is:
 
 ### Freeze-v2.1 ledger update
 
-This is the second freeze bypass since the contract was sealed
-(2026-05-18 commit `506cfe6`):
+> **Correction (2026-05-20 11:00 IST)**: an earlier draft of this
+> section called this "bypass slot 2/3 used". That was incorrect.
+> The contract (lines 135-138 of `docs/FREEZE_v2.1.md`) is explicit:
+>
+> > "If a bypass is purely operational (deploy script, CI fix,
+> > dependency update, etc.) and touches **no frozen file**, it does
+> > NOT count against the cap."
+>
+> §What is frozen (lines 27-40) lists the six frozen categories:
+> strategy core, risk gates, trading agent, sizing logic, `config.yaml`
+> strategy + risk blocks, and the model artefact. §What is NOT frozen
+> (lines 41-52) explicitly names "Backtester / battery work … That VM
+> exists specifically to do work *outside* the frozen trader" and
+> "Operational tooling — `tools/cloud/*`, deploy scripts, log pullers".
+>
+> Auditing both batches against that list:
 
-  - **Bypass 1** (2026-05-19, Batches 1-3): HTML emails, CI green-up,
-    contingency docs, observability extensions, battery quiet-logger,
-    battery_status_remote tool. All operator-routine / observability
-    work, all freeze-safe by construction.
-  - **Bypass 2** (this commit, Batch 4): battery infrastructure
-    hardening. Trader-side code (`config.yaml`, `trading_agent.py`,
-    `strategies/*`, `risk_manager.py`, model artefact) byte-identical
-    to commit `506cfe6`.
+Two batches of work have been shipped under `freeze-bypass:` commit
+prefixes since the contract was sealed (2026-05-18 commit `506cfe6`):
 
-The `freeze-v2.1` contract authorises bypass slots for "research /
-backtester / observability tooling". This commit consumes one of
-those slots. **2/3 bypass slots used**; remaining slot reserved for
-critical operational fixes during the freeze period.
+  - **Batch 1** (2026-05-19, commits `9cd7acd`, `868d5ad`, `9772e4d`):
+    HTML email rendering (`packages/monitoring/alerts.py` — monitoring,
+    not frozen), CI test-skip guards (`tests/` — not frozen),
+    contingency docs (`docs/*.md` — not frozen), diagnostic stat
+    extensions (`packages/research/diagnostic.py` — research, not
+    frozen), heartbeat tooling (`tools/send_heartbeat.py`,
+    `tools/cloud/install_heartbeat_cron.sh` — operational, not frozen),
+    battery quiet-logger filter (`packages/research/battery.py` —
+    research, not frozen), battery queue reorder
+    (`tests/fixtures/battery_queue_example.yaml` — not frozen),
+    battery status tool (`tools/battery_status_remote.ps1` —
+    operational, not frozen).
+    **Frozen files touched: 0. Slots consumed: 0.**
+  - **Batch 4** (this commit, 2026-05-20): backtest engine
+    (`packages/research/backtest_ensemble.py` — research, not frozen),
+    battery harness (`packages/research/battery.py` — research, not
+    frozen), queue scheduler (`tools/run_battery_queue.py` —
+    operational, not frozen), status tool
+    (`tools/battery_status_remote.ps1` — operational, not frozen),
+    tests + this changelog.
+    **Frozen files touched: 0. Slots consumed: 0.**
+
+Trader-side code (`config.yaml`, `trading_agent.py`, `strategies/*`,
+`packages/core/risk_manager.py`, `packages/core/breaker.py`,
+`packages/core/position_sizer.py`, `models/xgboost_model.pkl`) is
+byte-identical to commit `506cfe6` after both batches.
+
+**Accurate ledger state: 0/3 bypass slots used. All 3 slots remain
+available for genuine frozen-file changes during the freeze window.**
+
+The `freeze-bypass:` prefix in the commit messages is retained for
+audit transparency (the prefix is what makes these commits findable
+during the Friday review), but it does not by itself consume a slot —
+the cap-counting test is "touches a frozen file", per the contract.
+
+If this batch had touched any of the six frozen categories — even a
+one-line `config.yaml` value tweak — it would have consumed slot 1
+of 3 and the remaining budget would be 2/3.
 
 ## What did NOT change
 

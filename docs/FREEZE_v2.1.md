@@ -236,12 +236,60 @@ In addition to the §Operator commitments above:
 Format: `YYYY-MM-DD | commit-sha | one-line justification`.
 Three slots max — adding a 4th means an explicit unfreeze decision.
 
+The cap-counting test is **"touches a frozen file"**, per the
+"Bypass discipline" rule above. Commits that carry the
+`freeze-bypass:` prefix for audit transparency but touch no frozen
+file are recorded in §Audit-only entries (below) and do NOT consume
+a slot.
+
+### Slot consumption (cap = 3)
+
 ```
-(empty as of 2026-05-19; first bypass appends here)
+(empty as of 2026-05-20; no frozen file has been touched since freeze-v2.1)
 ```
+
+**Slots used: 0 / 3.**
+**Slots remaining: 3.**
+
+### Audit-only entries (touched no frozen file; do not consume a slot)
+
+These rows exist so the Friday review can find every commit tagged
+`freeze-bypass:` in one place, even when the cap was not engaged.
+
+```
+2026-05-19 | 9cd7acd | observability: HTML email rendering + CI green-up
+2026-05-19 | 868d5ad | observability: freeze-v2.1 pre-commitments + diagnostic stat extensions
+2026-05-19 | 9772e4d | freeze-bypass: battery throughput + cloud-aware progress visibility
+2026-05-20 | 5934960 | freeze-bypass: battery infrastructure hardening (perf + functionality)
+```
+
+Audit-only entries cover: `packages/monitoring/alerts.py`, `tests/`,
+`docs/`, `packages/research/diagnostic.py`,
+`packages/research/battery.py`, `packages/research/backtest_ensemble.py`,
+`tools/send_heartbeat.py`, `tools/cloud/*`,
+`tools/run_battery_queue.py`, `tools/battery_status_remote.ps1`,
+`tests/fixtures/battery_queue_example.yaml`,
+`changes_done_*.md`. None of these are listed under
+§What is frozen.
+
+### What WOULD consume a slot
+
+A bypass commit is "slot-consuming" iff it modifies any file in:
+
+- `packages/strategies/` (strategy core)
+- `packages/core/risk_manager.py`, `packages/core/breaker.py`
+- `packages/core/position_sizer.py`
+- `trading_agent.py` (and `_pre_trade_safety_checks` in particular)
+- `config.yaml` strategy or risk blocks (per §Frozen settings)
+- `models/xgboost_model.pkl`
+
+A worked example: a one-line tweak to
+`risk.max_positions_per_strategy` in `config.yaml` IS frozen —
+that's slot 1. A one-line tweak to `tools/run_battery_queue.py` is
+NOT frozen — that's an audit-only entry.
 
 ---
 
 *Authors: Trading Agent dev (Subhanda) + Claude.*
 *Freeze starts: 2026-05-18, evening session. Tag: `freeze-v2.1`.*
-*Last revised: 2026-05-19 (post-verdict additions; no frozen behaviour touched).*
+*Last revised: 2026-05-20 (ledger reconciled; 0/3 slots used).*
