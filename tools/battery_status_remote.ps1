@@ -358,8 +358,12 @@ foreach ($pr in $pRows) {
     if ($pp.Count -ge 3) { $progIdx[$pp[1]] = $pp[2] }
 }
 # Regex matches the format emitted by research.backtest_ensemble.run().
-# Kept lenient on whitespace because shells / ssh can re-collapse runs.
-$progressRe = '\[BATTERY-PROGRESS\]\s+([\d,]+)\s*/\s*([\d,]+)\s*\(\s*([\d.]+)%\s*\)\s*\|\s*sim_date=(\S+)\s*\|\s*rate=([\d,]+)\s*ev/s\s*\|\s*elapsed=(\S+)\s*\|\s*ETA=(\S+)'
+# Kept lenient on whitespace because (a) shells / ssh can re-collapse
+# runs, and (b) backtest_ensemble pads `elapsed=` and `ETA=` to a
+# fixed width with printf, so once those drop into single-digit hours
+# the value gets a leading space (e.g. `ETA= 9.9h`). Allow `\s*` after
+# every `=` so single-digit padding doesn't break the match.
+$progressRe = '\[BATTERY-PROGRESS\]\s+([\d,]+)\s*/\s*([\d,]+)\s*\(\s*([\d.]+)%\s*\)\s*\|\s*sim_date=\s*(\S+)\s*\|\s*rate=\s*([\d,]+)\s*ev/s\s*\|\s*elapsed=\s*(\S+)\s*\|\s*ETA=\s*(\S+)'
 
 if (-not $wRows) {
     Write-Host "  [NO WORKER LOGS]" -ForegroundColor Yellow
