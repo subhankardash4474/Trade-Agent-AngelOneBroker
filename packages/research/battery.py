@@ -389,6 +389,37 @@ VARIANTS = [
     ("V15_mr_xgb_only", [
         ("strategies.active", ["mean_reversion", "xgboost_classifier"]),
     ]),
+
+    # ── Tier 6: completely-naked diagnostic (2026-05-21) ──
+    # What does the backtester look like when EVERY gate the harness models
+    # is turned off? V2 only neutralises the per-strategy trend filter; V16
+    # additionally drops every numerical floor to zero, lifts the
+    # concurrent-position cap, lets a stock keep firing after losses, and
+    # disables the dead-hour + expected-profit gates entirely. Diagnostic
+    # value: upper-bound on opportunity that all our safety nets are
+    # gating away.
+    #   * V16 PnL >> V1  -> gates are over-aggressive, loosen them
+    #   * V16 blows up   -> gates are doing real protective work
+    #   * V16 ~= V2      -> dead_hour + profit_gate aren't load-bearing;
+    #                       trend filter was the only meaningful gate
+    #   * V16 ~= V1      -> all 9 modelled gates combined do little;
+    #                       signal quality is the real bottleneck
+    #
+    # IMPORTANT: the backtest harness only models 9 of the live agent's
+    # ~40 gates (no cooldowns, opening lockout, concurrency caps, drawdown
+    # halt, event blackout, etc.). V16 disables the modelled subset, not
+    # the live agent's full safety perimeter.
+    ("V16_completely_naked", [
+        *_trend_all(None),                                          # per-strategy trend filter off
+        ("ensemble.confidence_threshold", 0.0),                     # accept any vote
+        ("robustness.min_entry_atr_pct", 0.0),                      # no vol floor
+        ("risk.min_profit_to_charges_ratio", 0.0),                  # no RR/charges gate
+        ("risk.min_absolute_reward_rs", 0.0),                       # no absolute-reward floor
+        ("risk.max_positions", 99),                                 # no concurrent cap
+        ("robustness.max_losses_per_stock_per_day", 99),            # no per-stock blacklist
+        ("backtest_gates.apply_dead_hour", False),                  # no dead-hour block
+        ("backtest_gates.apply_expected_profit_gate", False),       # no profit-gate logic
+    ]),
 ]
 
 
@@ -404,6 +435,11 @@ def _build_variant_config(base: dict, overrides: list) -> dict:
 
 
 def _bt_config(cfg: dict) -> BacktestConfig:
+    # 2026-05-21: also propagate the two boolean toggles -- apply_dead_hour
+    # and apply_expected_profit_gate -- from a dedicated `backtest_gates`
+    # config section so variants can disable them. Defaults preserve
+    # existing behaviour (both ON) for every variant that doesn't opt in.
+    bt_gates = cfg.get("backtest_gates", {}) or {}
     return BacktestConfig(
         initial_capital=cfg.get("backtest", {}).get("initial_capital", 25000.0),
         commission_pct=cfg.get("backtest", {}).get("commission_pct", 0.03),
@@ -414,6 +450,8 @@ def _bt_config(cfg: dict) -> BacktestConfig:
         min_absolute_reward_rs=cfg.get("risk", {}).get("min_absolute_reward_rs", 20.0),
         max_positions=cfg.get("risk", {}).get("max_positions", 3),
         max_losses_per_stock=cfg.get("robustness", {}).get("max_losses_per_stock_per_day", 2),
+        apply_dead_hour=bool(bt_gates.get("apply_dead_hour", True)),
+        apply_expected_profit_gate=bool(bt_gates.get("apply_expected_profit_gate", True)),
         product_type=cfg.get("execution", {}).get("product_type", "INTRADAY"),
     )
 
