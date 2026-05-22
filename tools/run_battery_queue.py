@@ -307,6 +307,7 @@ def build_docker_run_argv(job: dict, run_id: str, image: str) -> list[str]:
     """
     cmd: list[str] = [
         "sudo", "docker", "run",
+        "-d",                       # detached -- docker daemon owns the process
         "--name", run_id,
         "--no-healthcheck",
         "-e", "BACKTESTER_MODE=1",
@@ -434,10 +435,13 @@ def process_queue(
         save_state(state, state_path)
 
         # Spawn docker run (detached -- the docker daemon manages the
-        # process, we just wait for it).
+        # process, we just wait for it). The -d flag is already in argv
+        # (placed by build_docker_run_argv right after `docker run`); do
+        # NOT append it here -- python argparse on the inner script
+        # would reject an unrecognized -d at the tail.
         try:
             subprocess.run(
-                argv + ["-d"],   # detach; we'll inspect for status
+                argv,
                 check=True, capture_output=True, text=True, timeout=60,
             )
         except subprocess.CalledProcessError as exc:

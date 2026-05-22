@@ -164,6 +164,29 @@ class TestDockerArgvComposition:
         idx = argv.index("-e")
         assert argv[idx + 1] == "BACKTESTER_MODE=1"
 
+    def test_detached_flag_is_docker_arg_not_python_tail(self):
+        # 2026-05-22 regression: -d was being appended to the *end* of
+        # argv (i.e. as a python arg to run_battery.py), causing
+        # argparse to reject 'unrecognized arguments: -d' and every
+        # job to fail-fast at launch. -d MUST sit inside the docker
+        # arg block (before the image name), never inside the
+        # `python tools/run_battery.py ...` tail.
+        argv = q.build_docker_run_argv(self._job(), "rid", "trading-agent:latest")
+        # The image name marks the boundary between docker args and
+        # the inner python invocation. -d must come BEFORE it.
+        image_idx = argv.index("trading-agent:latest")
+        py_idx = argv.index("python")
+        assert "-d" in argv, "scheduler must launch detached"
+        d_idx = argv.index("-d")
+        assert d_idx < image_idx, (
+            f"-d at index {d_idx} must precede image at {image_idx}"
+        )
+        # And it must not be in the python tail (which starts at py_idx).
+        post_python = argv[py_idx:]
+        assert "-d" not in post_python, (
+            "stray -d in python invocation tail will trip argparse"
+        )
+
     def test_args_forwarded_as_long_flags(self):
         job = self._job()
         argv = q.build_docker_run_argv(job, "rid", "img")
