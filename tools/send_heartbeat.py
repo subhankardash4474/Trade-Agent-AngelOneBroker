@@ -310,12 +310,34 @@ def compose_body(now_ist: datetime,
 # Send path -- via the existing AlertManager
 # ─────────────────────────────────────────────────────────────────────
 def _load_config() -> dict:
-    """Load config.yaml from the project root."""
+    """Load config.yaml from the project root.
+
+    CRITICAL: apply the same env-var overlay that ``trading_agent.py``
+    applies on startup. Without this overlay, secrets like
+    ``RESEND_API_KEY`` stay as the literal placeholder
+    ``YOUR_RESEND_API_KEY`` in ``config.yaml`` and Resend rightly
+    rejects them with 401.
+
+    This was the root cause of the 2026-05-23 06:33 IST 401 incident:
+    the new key was correctly populated in ``.env`` and the container's
+    runtime env, but the standalone heartbeat script was reading
+    ``config.yaml`` raw and passing the placeholder to AlertManager.
+    """
     import yaml as _yaml
     cfg_path = PROJECT_ROOT / "config.yaml"
     if not cfg_path.exists():
         return {}
-    return _yaml.safe_load(cfg_path.read_text(encoding="utf-8")) or {}
+    cfg = _yaml.safe_load(cfg_path.read_text(encoding="utf-8")) or {}
+    try:
+        from packages.core.secrets import apply_env_to_config, load_dotenv
+        load_dotenv(str(PROJECT_ROOT / ".env"))
+        cfg = apply_env_to_config(cfg)
+    except Exception as e:
+        # Don't crash the heartbeat if the secrets module is missing or
+        # broken; we still want the body composed and printed for cron mail
+        # capture, even if the send path can't authenticate.
+        print(f"[WARN] env overlay failed: {type(e).__name__}: {e}", file=sys.stderr)
+    return cfg
 
 
 def send_heartbeat(body: str, *, dry_run: bool, force_send: bool = False) -> int:
