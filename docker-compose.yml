@@ -56,6 +56,14 @@ services:
       # base compose so the same image works for paper, shadow, and stage3
       # runs without rebuilding.
       - ./config_overlays:/app/config_overlays:ro
+      # Host-managed audit / observability scripts (heartbeat, audit
+      # checkpoint, etc.). Mounted read-only so docker cp-style hotpatches
+      # survive container recreation without an image rebuild. Added
+      # 2026-05-23 after the heartbeat env-overlay fix needed to ship
+      # immediately on Sat morning. Trade-off: every tools/ change is now
+      # picked up on the next ``docker compose up`` automatically -- which
+      # is the desired behaviour for audit-only files.
+      - ./tools:/app/tools:ro
 
     healthcheck:
       test: ["CMD", "python", "/app/tools/health_check.py",
