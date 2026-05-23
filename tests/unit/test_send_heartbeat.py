@@ -205,11 +205,68 @@ def test_collect_last_audit_extracts_verdict(tmp_path: Path):
     (diag / "audit_checkpoint_20260518_143000.md").write_text(
         "# Audit Checkpoint\n\n**Audit verdict: GREEN -- nothing blocking trade**\n"
     )
-    with patch.object(hb, "DIAG_DIR", diag):
+    with patch.object(hb, "DIAG_DIR", diag), \
+         patch.object(hb, "AUDIT_DIR", tmp_path / "no_such_audit_dir"):
         out = hb.collect_last_audit()
     assert out["ok"] is True
     assert out["verdict"] == "GREEN"
     assert out["timestamp"] == "20260518_143000"
+    assert out["age_minutes"] >= 0
+
+
+def test_collect_last_audit_finds_new_layout(tmp_path: Path):
+    """The trader VM writes checkpoints to logs/audit/YYYY-MM-DD/checkpoint_HHMM.md
+    -- not the legacy logs/diagnostics/audit_checkpoint_*.md path. The
+    Friday 2026-05-22 silent-hang incident hid this gap from the operator
+    because the heartbeat's audit collector was looking at the wrong directory."""
+    audit = tmp_path / "audit"
+    day = audit / "2026-05-22"
+    day.mkdir(parents=True)
+    (day / "checkpoint_1223.md").write_text(
+        "# Audit Checkpoint -- 12:23 IST  2026-05-22\n\n**Verdict:** GREEN\n"
+    )
+    with patch.object(hb, "AUDIT_DIR", audit), \
+         patch.object(hb, "DIAG_DIR", tmp_path / "no_such_diag"):
+        out = hb.collect_last_audit()
+    assert out["ok"] is True
+    assert out["verdict"] == "GREEN"
+    assert "2026-05-22" in out["timestamp"]
+    assert "12:23" in out["timestamp"]
+
+
+def test_collect_last_audit_picks_newest_across_layouts(tmp_path: Path):
+    legacy = tmp_path / "diag"
+    legacy.mkdir()
+    (legacy / "audit_checkpoint_20260518_143000.md").write_text(
+        "# Audit\n**Verdict:** GREEN\n"
+    )
+    new = tmp_path / "audit" / "2026-05-22"
+    new.mkdir(parents=True)
+    new_file = new / "checkpoint_1223.md"
+    new_file.write_text("# Audit\n**Verdict:** AMBER\n")
+    import os, time
+    os.utime(new_file, (time.time() + 60, time.time() + 60))
+    with patch.object(hb, "AUDIT_DIR", tmp_path / "audit"), \
+         patch.object(hb, "DIAG_DIR", legacy):
+        out = hb.collect_last_audit()
+    assert out["verdict"] == "AMBER"
+
+
+def test_compose_body_flags_stale_audit():
+    """A >90 min audit age during market hours indicates the hourly
+    checkpoint cron has stopped -- the silent-hang signal."""
+    health = {"ok": True, "uptime_seconds": 3600, "open_positions": 0,
+              "_file_age_seconds": 30, "last_cycle": "2026-05-22T12:23:11"}
+    audit_stale = {"ok": True, "verdict": "GREEN", "timestamp": "2026-05-22 12:23",
+                   "age_minutes": 670.0, "file": "logs/audit/2026-05-22/checkpoint_1223.md"}
+    body = hb.compose_body(
+        now_ist=__import__("datetime").datetime(2026, 5, 22, 23, 35),
+        health=health, last_eod={"ok": False, "reason": "x"},
+        audit=audit_stale, spool={"ok": True, "depth": 0},
+        disk={"ok": True, "pct": 30.0, "free_gb": 30.0, "total_gb": 45.0},
+    )
+    assert "STALE" in body
+    assert "audit cron may be hung" in body
 
 
 def test_collect_spool_depth_counts_json_files(tmp_path: Path):

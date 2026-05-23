@@ -138,28 +138,55 @@ def collect_last_eod() -> dict:
     return out
 
 
+AUDIT_DIR = PROJECT_ROOT / "logs" / "audit"
+
+
 def collect_last_audit() -> dict:
-    """Latest audit checkpoint -- the markdown file in
-    logs/diagnostics/audit_checkpoint_*.md. We pluck the verdict line
-    (GREEN / AMBER / RED) without parsing the whole report.
+    """Latest audit checkpoint.
+
+    Searches both locations for compatibility:
+    * ``logs/audit/YYYY-MM-DD/checkpoint_HHMM.md`` (current daemon, since 2026-05-15)
+    * ``logs/diagnostics/audit_checkpoint_YYYYMMDD_HHMMSS.md`` (legacy)
+
+    Returns the verdict (GREEN / AMBER / RED), the file's age in
+    minutes, and a stale-flag if the latest checkpoint is older than
+    90 minutes during likely market hours. The age is the strongest
+    silent-failure signal we have -- if the daemon hung mid-session
+    its hourly audit cron will stop emitting checkpoints and the age
+    will keep climbing.
     """
-    if not DIAG_DIR.exists():
-        return {"ok": False, "reason": "no logs/diagnostics dir"}
-    audit_files = sorted(DIAG_DIR.glob("audit_checkpoint_*.md"))
-    if not audit_files:
-        return {"ok": False, "reason": "no audit_checkpoint_*.md files yet"}
-    latest = audit_files[-1]
+    candidates: list[Path] = []
+    if AUDIT_DIR.exists():
+        candidates.extend(AUDIT_DIR.glob("*/checkpoint_*.md"))
+    if DIAG_DIR.exists():
+        candidates.extend(DIAG_DIR.glob("audit_checkpoint_*.md"))
+    if not candidates:
+        return {"ok": False, "reason": "no audit checkpoint files yet"}
+
+    latest = max(candidates, key=lambda p: p.stat().st_mtime)
     text = latest.read_text(encoding="utf-8", errors="replace")
     import re as _re
-    # Verdict appears as something like "**Audit verdict: GREEN**" or
-    # "## RED:" depending on the version of the script -- match any of
-    # the three colour-words appearing in a bold context.
-    m = _re.search(r"\*\*[^*]*\b(GREEN|AMBER|RED)\b[^*]*\*\*", text)
+    m = _re.search(r"\*\*Verdict:\*\*\s*(GREEN|AMBER|RED)", text)
+    if not m:
+        m = _re.search(r"\*\*[^*]*\b(GREEN|AMBER|RED)\b[^*]*\*\*", text)
     verdict = m.group(1) if m else "UNKNOWN"
-    # Time-stamp from filename: audit_checkpoint_YYYYMMDD_HHMMSS.md
+
+    age_minutes = (datetime.now().timestamp() - latest.stat().st_mtime) / 60.0
     ts_m = _re.search(r"audit_checkpoint_(\d{8}_\d{6})", latest.name)
-    ts = ts_m.group(1) if ts_m else "?"
-    return {"ok": True, "file": latest.name, "verdict": verdict, "timestamp": ts}
+    if ts_m:
+        ts = ts_m.group(1)
+    else:
+        ts_m2 = _re.search(r"checkpoint_(\d{4})\.md", latest.name)
+        parent = latest.parent.name
+        ts = f"{parent} {ts_m2.group(1)[:2]}:{ts_m2.group(1)[2:]}" if ts_m2 else parent
+
+    return {
+        "ok": True,
+        "file": str(latest.relative_to(PROJECT_ROOT)) if PROJECT_ROOT in latest.parents else latest.name,
+        "verdict": verdict,
+        "timestamp": ts,
+        "age_minutes": age_minutes,
+    }
 
 
 def collect_spool_depth() -> dict:
@@ -239,9 +266,21 @@ def compose_body(now_ist: datetime,
     else:
         lines.append(f"- **Last EOD:** unavailable -- {last_eod.get('reason', 'unknown')}")
 
-    # Audit
+    # Audit -- age is the silent-hang signal. >90 min during market hours
+    # means the hourly audit cron has stopped emitting (the exact failure
+    # mode that hit Friday 2026-05-22 12:23 IST -> 23:35 IST = 11h silent).
     if audit.get("ok"):
-        lines.append(f"- **Latest audit:** {audit['verdict']} at {audit['timestamp']}")
+        age_m = audit.get("age_minutes")
+        if age_m is not None:
+            if age_m > 90:
+                age_flag = f" STALE ({age_m:.0f} min old -- audit cron may be hung)"
+            elif age_m > 60:
+                age_flag = f" ({age_m:.0f} min old)"
+            else:
+                age_flag = f" ({age_m:.0f} min old)"
+        else:
+            age_flag = ""
+        lines.append(f"- **Latest audit:** {audit['verdict']} at {audit['timestamp']}{age_flag}")
     else:
         lines.append(f"- **Latest audit:** unavailable -- {audit.get('reason', 'unknown')}")
 
