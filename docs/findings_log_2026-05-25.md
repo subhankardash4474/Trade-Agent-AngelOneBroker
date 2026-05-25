@@ -783,3 +783,126 @@ valid (Bug A applies uniformly across variants, so within-variant
 analysis like long-vs-short split is fine; cross-variant absolute
 comparisons get the bias). The archive lets us re-derive any of
 those if Friday's review needs to revisit.
+
+---
+
+## 12. Bug E — O(N²) full-history slicing in `_merge_bars` (2026-05-25 mid-run perf)
+
+**Status:** Fixed, behavior-preserving, audit-only entry, no slot consumed.
+
+### 12.1 Observation
+
+The restarted V1+V2 nifty50_60d battery showed a second wave of
+throughput degradation that was NOT a recurrence of the earlier
+loguru sink leak. Live data captured during the run:
+
+```
+when       elapsed  events     instantaneous rate (per worker)
+15:07 IST   3.0m    ~7,000      ~39 ev/s
+15:13 IST   9.1m    14,544      ~21 ev/s  (events in [3,9.1] / 6.1m)
+15:26 IST   22.2m   25,197      ~14 ev/s
+15:50 IST   45.4m   38,832      ~10 ev/s
+16:11 IST   ~60m    48,418      ~7 ev/s   (events in [60.0,61.0] / 1m)
+```
+
+Cumulative rate dropped 39 → 14 ev/s; instantaneous rate dropped
+39 → 7 ev/s (~5.5x slowdown). Memory was healthy (~840 MB / 11 GB),
+CPU was 99% saturated per worker, log duplicate-ratio was 1.07
+(no sink leak). So this was real CPU work growing per event.
+
+### 12.2 Root cause
+
+`packages/research/backtest_ensemble.py:_merge_bars` yielded
+`df.iloc[: i + 1]` — the entire growing prefix — as `df_slice`
+to every strategy on every bar. The strategies all follow the
+pattern:
+
+```python
+df = data.copy()                              # O(N)
+df["rsi"] = self._compute_rsi(df["close"])    # O(N) ewm
+df["rsi_prev"] = df["rsi"].shift(1)           # O(N)
+rsi = df["rsi"].iloc[-1]                      # uses last row only
+```
+
+Cost per event = O(len(df_slice)) × n_strategies. df_slice grows
+linearly with simulation progress, so total work = O(N²) per
+symbol. Pre-patch the cost ratio of late-sim vs early-sim was
+~13× (per-symbol history 800 bars vs 60 bars), which matches the
+observed 5.5x rate drop after accounting for fixed-cost overhead.
+
+### 12.3 Fix
+
+Added `strategy_history_window: int = 300` to `BacktestConfig`.
+Modified `_merge_bars` to slice to `df.iloc[max(0, i+1-window) : i+1]`
+instead of `df.iloc[: i + 1]`. Per-event work is now constant
+w.r.t. simulation length.
+
+### 12.4 Numerical equivalence
+
+All strategy indicators are EWM-based (RSI, ATR, ADX, supertrend)
+or rolling-window-based (SMA, VWAP, volume-mean). EWMs decay the
+contribution of older bars geometrically at rate (1 - α)^N where
+α = 2/(period + 1). For window=300:
+
+| Strategy        | period | α     | (1-α)^300   | Notes                       |
+|-----------------|--------|-------|-------------|-----------------------------|
+| RSI(14)         | 14     | 0.133 | 4 × 10⁻¹⁹   | Below float precision        |
+| ATR/ADX(14)     | 14     | 0.133 | 4 × 10⁻¹⁹   | Below float precision        |
+| Supertrend(10)  | 10     | 0.182 | 4 × 10⁻²⁴   | Below float precision        |
+| MA cross EMA(50)| 50     | 0.039 | 7 × 10⁻⁶    | ~1 ppm — well below useful   |
+| XGBoost(60)     | 60     | n/a   | 0           | Fixed window, fully covered  |
+
+The worst-case strategy (MA crossover EMA(50)) shows a confidence
+drift of ~2.2e-6 absolute between full and windowed slices —
+below the 4th decimal place. Signal DIRECTION is byte-identical
+in every test case. The drift is below any threshold used in the
+ensemble aggregator (`confidence_threshold: 0.55`) and below the
+audit logger's rounding precision (2 decimal places).
+
+### 12.5 Tests
+
+`tests/unit/test_strategy_history_window.py` (13 tests):
+- `BacktestConfig.strategy_history_window` default = 300, is int, overridable
+- Per-strategy walk: 500-bar synthetic OHLCV, for each bar in [350, 500),
+  compare `generate_signal(full_prefix)` vs `generate_signal(last_300_bars)`
+  for: RSI Momentum, MA Crossover, Mean Reversion, Supertrend, VWAP Bounce
+- `_merge_bars` slice contract: bounded by window, tail not head, never
+  empty (window=0 floors to 1), uncapped when window > history
+
+Tolerances: signal direction exact; confidence atol=1e-4 (10× the
+worst-case EWM tail residual); SL/TP rtol=1e-4 (1 basis point).
+
+### 12.6 Expected perf impact
+
+Late-sim per-event cost: O(800) → O(300) = ~2.7× faster on the
+strategy-eval hot path.
+
+Allocations per event: 800-row `df.copy()` → 300-row copy = ~2.7× less
+heap churn, less GC pressure. Effect compounds because Python's
+garbage collector runs less often.
+
+Projected post-fix rate: late-sim 7 ev/s → 18-25 ev/s per worker,
+sustained. ETA per 60-day variant: 3.7h → ~1.5h. Total queue
+(19 variants × 2 workers parallel): 80-90h → ~28h.
+
+### 12.7 Freeze accounting
+
+`packages/research/backtest_ensemble.py` is research/, not on the
+slot-consuming list in FREEZE_v2.1 (which covers strategies, risk,
+position sizing, trading_agent.py, config.yaml strategy/risk
+blocks, models). This is an **audit-only performance fix** that
+preserves all observable behaviour (signals, PnL within 1bp). No
+bypass slot consumed. Bypass ledger remains 1/3 (risk.allow_shorts).
+
+### 12.8 Mid-run deployment
+
+After fix + tests + commit, the running V1+V2 pair (at ~23% complete,
+1h elapsed, ETA 3.7h) was stopped. The fix was deployed to the
+backtester VM and the queue restarted with a fresh run_id. The
+52 min of V1+V2 work was sunk-cost; net savings ~50 hours on the
+remaining 19-variant queue.
+
+**Old run (archived):** `battery_nifty50_60d_20260525T093330` →
+`/opt/trading-agent/logs/backtests/_archive/battery_nifty50_60d_20260525T093330_O_N2_BUG`
+
+**New run:** see §12 update below after restart-verify completes.

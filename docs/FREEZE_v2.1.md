@@ -300,6 +300,7 @@ These rows exist so the Friday review can find every commit tagged
 2026-05-25 | TBD-sha | observability: post_freeze_v4_proposal.md + findings_log_2026-05-25.md
 2026-05-25 | TBD-sha | observability: battery V17/V18/V19 + queue priority validation insert
 2026-05-25 | TBD-sha | freeze-bypass: audit 2026-05-25 quick wins (B-1/B-3/B-4/B-5/B-11) — operator tools + SSL hardening + sector-map dedup
+2026-05-25 | TBD-sha | observability: Bug E — backtester _merge_bars O(N²) slice fix (strategy_history_window=300) + 13 equivalence tests
 ```
 
 Audit-only entries cover: `packages/monitoring/alerts.py`, `tests/`,
@@ -362,4 +363,7 @@ NOT frozen — that's an audit-only entry.
 *Authors: Trading Agent dev (Subhanda) + Claude.*
 *Freeze starts: 2026-05-18, evening session. Tag: `freeze-v2.1`.*
 *Last revised: 2026-05-25 (slot #1 consumed for `risk.allow_shorts`
-flag pre-stage; defaults true = no behaviour change; 1/3 slots used).*
+flag pre-stage; defaults true = no behaviour change; 1/3 slots used.
+Late-day audit-only entries: B-1/B-3/B-4/B-5/B-11 quick wins, and
+Bug E backtester O(N²) `_merge_bars` perf fix — neither consume a
+slot; both add tests; behaviour-neutral within float tolerance).*

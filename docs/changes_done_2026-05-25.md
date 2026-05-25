@@ -732,3 +732,120 @@ flag remains the only slot-consuming entry of this freeze window).
 - `tests/unit/test_audit_2026_05_25_quick_wins.py` — NEW, 13 tests
 - `docs/FREEZE_v2.1.md` — ledger row + note added
 - `docs/changes_done_2026-05-25.md` — this section
+
+---
+
+## 11. Bug E — O(N²) full-history slicing in backtester `_merge_bars` (mid-restart perf fix)
+
+### §11.1 Problem
+
+The 2026-05-25 09:33 IST restarted V1+V2 nifty50_60d battery
+(launched after the Phase-A correctness fixes were verified)
+showed a second wave of throughput degradation:
+
+| Wall-clock     | Sim date    | Cumulative rate | Instantaneous rate |
+|----------------|-------------|-----------------|--------------------|
+| t = 3 min      | 2026-02-25  | 39 ev/s         | 39 ev/s            |
+| t = 9.1 min    | 2026-03-02  | 27 ev/s         | ~21 ev/s           |
+| t = 22.2 min   | 2026-03-05  | 19 ev/s         | ~14 ev/s           |
+| t = 45.4 min   | 2026-03-11  | 14 ev/s         | ~10 ev/s           |
+| t = 60 min     | 2026-03-13  | 13 ev/s         | ~7 ev/s (per worker) |
+
+This was NOT a loguru sink leak recurrence — log duplicate-ratio
+was 1.07 (healthy), memory was 840 MB / 11 GB (healthy), CPU was
+99% saturated on both workers (CPU-bound work growing).
+
+### §11.2 Root cause
+
+`packages/research/backtest_ensemble.py:_merge_bars` yielded the
+**entire growing history** (`df.iloc[: i + 1]`) as `df_slice` to
+every strategy on every bar. Each strategy then did `data.copy()`
++ EWM + shift over the full slice — O(N) work per event — but
+only consumed the last 1-20 values. Total work scaled as O(N²)
+per symbol.
+
+### §11.3 Fix
+
+Added `strategy_history_window: int = 300` to `BacktestConfig`.
+Modified `_merge_bars` to slice to the last 300 bars instead of
+the full prefix. Per-event work is now constant w.r.t.
+simulation length.
+
+**Numerical equivalence proof:** for window=300, the EWM
+contribution of dropped older bars is bounded by `(1-α)^300`:
+
+| Strategy        | Period | (1-α)^300   | Verdict                        |
+|-----------------|--------|-------------|--------------------------------|
+| RSI(14)         | 14     | 4 × 10⁻¹⁹   | Below float precision           |
+| ATR/ADX(14)     | 14     | 4 × 10⁻¹⁹   | Below float precision           |
+| Supertrend(10)  | 10     | 4 × 10⁻²⁴   | Below float precision           |
+| MA cross EMA(50)| 50     | 7 × 10⁻⁶    | ~1 ppm, below useful precision  |
+| XGBoost(60)     | 60 fixed| 0          | Fixed feature window, fully covered |
+
+Signal DIRECTION is byte-identical in every test case. Confidence
+drift is below the 4th decimal place. Both are below the
+ensemble's `confidence_threshold: 0.55` and the audit-logger's
+2-decimal rounding.
+
+### §11.4 Tests
+
+`tests/unit/test_strategy_history_window.py` — 13 new tests:
+
+- BacktestConfig default = 300, is int, overridable (3 tests)
+- Per-strategy full-vs-windowed equivalence on 500-bar synthetic
+  OHLCV, walking bars [350, 500) for: RSI, MA crossover, Mean
+  Reversion, Supertrend, VWAP (5 tests)
+- `_merge_bars` slice contract: bounded by window, tail not head,
+  never empty, uncapped when window > history (5 tests)
+
+Tolerances: signal direction exact; confidence atol=1e-4
+(10× worst-case EWM tail); SL/TP rtol=1e-4 (1 bp).
+
+### §11.5 Suite results
+
+```
+$ pytest tests/unit -q                  -> 1235 passed in 43.20s
+$ pytest tests/integration -q           ->  248 passed in 34.18s
+```
+
+Total: **1483 passing** (1222 prior + 13 new + 248 integration),
+zero regressions.
+
+### §11.6 Freeze accounting
+
+`packages/research/backtest_ensemble.py` is in `packages/research/`
+which is NOT on the slot-consuming list in FREEZE_v2.1. This is
+an **audit-only performance fix** that preserves all observable
+behavior (signals, PnL within 1 bp). **No bypass slot consumed.**
+
+**Bypass-slot ledger: still 1/3 used** (only `risk.allow_shorts`
+remains).
+
+### §11.7 Expected perf impact
+
+- Late-sim per-event cost: O(800) → O(300) = ~2.7× faster
+- Allocations per event: ~2.7× less heap churn, less GC pressure
+- Projected post-fix rate: 7 ev/s → 18-25 ev/s sustained per worker
+- ETA per 60-day variant: 3.7h → ~1.5h
+- Total queue (19 variants × 2 workers parallel): 80-90h → ~28h
+- **Net wall-clock savings: ~50-60 hours**
+
+### §11.8 Mid-run deployment
+
+Stopped the running V1+V2 pair (at ~23% complete, 1h elapsed,
+ETA 3.7h on the buggy code). Pushed the fix to origin/main,
+pulled on the backtester VM, archived the buggy run directory,
+restarted the scheduler with a fresh run_id.
+
+**Archived run (buggy code):**
+`/opt/trading-agent/logs/backtests/_archive/battery_nifty50_60d_20260525T093330_O_N2_BUG`
+
+**New run id:** see findings_log §12.8 update after restart-verify.
+
+### §11.9 Files touched in §11
+
+- `packages/research/backtest_ensemble.py` — `strategy_history_window`
+  field + windowed `_merge_bars`
+- `tests/unit/test_strategy_history_window.py` — NEW, 13 tests
+- `docs/findings_log_2026-05-25.md` — §12 added
+- `docs/changes_done_2026-05-25.md` — this §11

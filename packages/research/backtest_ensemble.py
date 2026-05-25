@@ -87,6 +87,27 @@ class BacktestConfig:
     # preserves the existing apples-to-apples comparison for every
     # variant that doesn't opt in.
     allow_shorts: bool = True
+    # 2026-05-25 senior-dev scan, perf finding: _merge_bars used to
+    # yield `df.iloc[: i + 1]` -- the entire growing history -- to
+    # every strategy on every bar. Each strategy then walked the full
+    # slice (df.copy() + ewm() + shift()) to compute indicators whose
+    # outputs only depend on the recent tail (RSI/ATR/ADX/EWM all
+    # converge in ~5 * period bars; XGBoost uses a fixed 60-bar
+    # feature window). Net cost was O(N) per event = O(N^2) per
+    # symbol over the run. Observed in the 2026-05-25 V1+V2 nifty50
+    # restart: 39 ev/s -> 8 ev/s instantaneous over 50 minutes.
+    #
+    # Capping the slice to the last `strategy_history_window` bars
+    # makes per-event work constant w.r.t. simulation length while
+    # preserving numerical equivalence at the last-bar signal (which
+    # is all generate_signal() returns).
+    #
+    # 300 default == 5x XGBoost feature window, ~21x RSI/ATR period,
+    # ~30x supertrend period. Verified numerically equivalent to the
+    # full-history slice by tests/unit/test_strategy_history_window.py.
+    # Configurable so a future strategy with a longer lookback can
+    # opt-up without code change.
+    strategy_history_window: int = 300
 
 
 @dataclass
@@ -647,9 +668,17 @@ class EnsembleBacktester:
             for i in range(len(df)):
                 events.append((df.index[i], symbol, i))
         events.sort(key=lambda t: t[0])
+        # 2026-05-25 perf fix: cap the per-event history slice to the
+        # last `strategy_history_window` bars instead of the unbounded
+        # `df.iloc[: i + 1]`. See BacktestConfig.strategy_history_window
+        # docstring for the full rationale and numerical-equivalence
+        # proof. Per-event work goes from O(i) to O(window) -- net
+        # O(N^2) -> O(N) over the run.
+        window = max(int(self.bt.strategy_history_window), 1)
         for ts, symbol, i in events:
             df = market_data[symbol]
-            yield ts, symbol, df.iloc[i], df.iloc[: i + 1]
+            start = max(0, i + 1 - window)
+            yield ts, symbol, df.iloc[i], df.iloc[start : i + 1]
 
     def _apply_slippage(self, price: float, side: str, *, exit: bool) -> float:
         slip = price * (self.bt.slippage_pct / 100)
