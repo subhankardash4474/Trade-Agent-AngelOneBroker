@@ -81,6 +81,12 @@ class BacktestConfig:
     apply_expected_profit_gate: bool = True
     apply_regime_filter: bool = True
     product_type: str = "INTRADAY"
+    # 2026-05-25 risk-policy short veto. Mirrors trading_agent's
+    # `risk.allow_shorts` gate so battery variants can test the
+    # long-only configuration without code changes. Default True
+    # preserves the existing apples-to-apples comparison for every
+    # variant that doesn't opt in.
+    allow_shorts: bool = True
 
 
 @dataclass
@@ -93,6 +99,11 @@ class GateStats:
     max_positions_reached: int = 0
     stock_blacklisted: int = 0
     executed: int = 0
+    # 2026-05-25: shorts blocked by the long-only-mode gate. Distinct
+    # from `expected_profit` / `atr_too_low` so post-run analysis can
+    # tell "would have entered short here" from "wouldn't have entered
+    # at all".
+    shorts_blocked: int = 0
 
     def as_dict(self) -> Dict[str, int]:
         return {k: getattr(self, k) for k in self.__dataclass_fields__}
@@ -201,6 +212,15 @@ class EnsembleBacktester:
         gate_stats = GateStats()
         trades: List[dict] = []
         equity_curve: List[float] = [self.bt.initial_capital]
+        # 2026-05-25 senior-dev scan, Bug D fix: track end-of-day equity
+        # by IST date so Sharpe is computed on DAILY returns (not per-event
+        # returns × sqrt(252) which is nonsensical when there are 220k
+        # events for 60 days). pct_change between consecutive same-day
+        # events is dominated by per-symbol revaluation noise, not real
+        # P&L moves; the old Sharpe number in comparison.md was
+        # misleading. We keep equity_curve for drawdown / final-equity
+        # which work fine on per-event resolution.
+        last_equity_per_day: Dict[Any, float] = {}
         losses_per_stock: Dict[str, int] = {}
 
         # Build a unified, time-ordered event stream across symbols so
@@ -254,15 +274,33 @@ class EnsembleBacktester:
                 last_progress_wall_t = now_wall
 
             close = float(bar["close"])
+            # 2026-05-25 senior-dev scan, Bug A fix: read full OHLC so SL/TP
+            # can be detected INTRA-BAR. The old close-only check was
+            # systematically biased toward the strategy: any bar that
+            # touched SL intra-bar but closed above it was treated as
+            # "still holding" -- in real life the order would have filled
+            # at SL. Symmetric overstatement for TP. yfinance 5m bars
+            # always carry OHLCV per data_handler.py:125.
+            high = float(bar["high"])
+            low = float(bar["low"])
+            open_p = float(bar["open"])
 
-            # Check SL/TP exits for any open position on this symbol
+            # Check SL/TP exits for any open position on this symbol.
+            # Uses bar OHLC, not just close (Bug A fix above).
             if symbol in portfolio.positions:
                 pos = portfolio.positions[symbol]
-                trigger = rm.check_stop_loss_take_profit(
-                    pos.entry_price, close, pos.side, pos.stop_loss, pos.take_profit
+                trigger, exit_at = self._detect_intrabar_exit(
+                    pos, open_p, high, low, close,
                 )
                 if trigger:
-                    exit_price = self._apply_slippage(close, pos.side, exit=True)
+                    # `exit_at` is the simulated touch price (SL/TP or gap
+                    # open). Apply slippage on top -- this is adverse on
+                    # exits (you get less when closing a long; pay more
+                    # when covering a short). For a SL hit on a gap, the
+                    # combination of `min(open_p, sl)` in the detector +
+                    # adverse slippage models the real-world worst-case
+                    # fill better than the old close-only path.
+                    exit_price = self._apply_slippage(exit_at, pos.side, exit=True)
                     record = portfolio.close_position(
                         symbol,
                         exit_price,
@@ -279,8 +317,65 @@ class EnsembleBacktester:
                         if record.pnl <= 0:
                             losses_per_stock[symbol] = losses_per_stock.get(symbol, 0) + 1
 
+            # 2026-05-25 senior-dev scan, Bug C fix: opposite-signal exit
+            # parity with the live agent. The old code did `continue` here
+            # whenever the symbol still had a position -- which meant a
+            # SELL ensemble signal on a held long was DROPPED, and a BUY
+            # ensemble signal on a held short was DROPPED. The live agent
+            # explicitly handles both via `_exit_on_signal` (see
+            # trading_agent.py:3677-3679 and 3716-3718).
+            #
+            # We evaluate strategies + ensemble even when a position is
+            # held; if the ensemble emits a non-HOLD opposite-direction
+            # signal we close at the current bar's close (with slippage).
+            # Same-direction (duplicate) signals are dropped silently to
+            # match live behaviour (audit-reject "already_open:duplicate").
             if symbol in portfolio.positions:
-                equity_curve.append(portfolio.get_total_value({symbol: close}))
+                pos = portfolio.positions[symbol]
+                strat_signals_held: List[TradeSignal] = []
+                for strat in strategy_objs:
+                    if len(df_slice) < strat.required_history_bars:
+                        continue
+                    try:
+                        sig = strat.generate_signal(df_slice, symbol)
+                    except Exception:
+                        continue
+                    if sig and sig.signal != Signal.HOLD:
+                        strat_signals_held.append(sig)
+                if strat_signals_held:
+                    agg_held = ensemble.aggregate(
+                        strat_signals_held, symbol, close, regime="unknown",
+                    )
+                    if agg_held is not None and agg_held.signal != Signal.HOLD:
+                        opposite = (
+                            (pos.side == "BUY" and agg_held.signal == Signal.SELL)
+                            or (pos.side == "SELL" and agg_held.signal == Signal.BUY)
+                        )
+                        if opposite:
+                            exit_price = self._apply_slippage(
+                                close, pos.side, exit=True,
+                            )
+                            record = portfolio.close_position(
+                                symbol,
+                                exit_price,
+                                exit_reason="signal",
+                                exit_time=self._ts_to_datetime(ts),
+                            )
+                            if record:
+                                rm.record_trade(record.pnl)
+                                trades.append(
+                                    self._trade_to_dict(record, "signal"),
+                                )
+                                if record.pnl <= 0:
+                                    losses_per_stock[symbol] = (
+                                        losses_per_stock.get(symbol, 0) + 1
+                                    )
+                eq_val = portfolio.get_total_value({symbol: close})
+                equity_curve.append(eq_val)
+                try:
+                    last_equity_per_day[ts.date()] = eq_val
+                except Exception:
+                    pass
                 continue
 
             # Per-strategy signals
@@ -296,44 +391,116 @@ class EnsembleBacktester:
                     strat_signals.append(sig)
 
             if not strat_signals:
-                equity_curve.append(portfolio.get_total_value({symbol: close}))
+                _eq = portfolio.get_total_value({symbol: close})
+                equity_curve.append(_eq)
+                try:
+                    last_equity_per_day[ts.date()] = _eq
+                except Exception:
+                    pass
                 continue
 
             gate_stats.total_signals += 1
 
-            # Regime from the most recent bar (Nifty data not available per-symbol
-            # here; use a default unknown so regime-aware weights still apply a
-            # neutral multiplier. Real live path queries market_context.)
+            # 2026-05-25 senior-dev scan, Bug B (KNOWN DIVERGENCE, NOT FIXED HERE):
+            # `regime` is hardcoded to "unknown" because Nifty/VIX per-bar
+            # context is not currently in the market_data feed. The live
+            # agent uses `classify_regime(self._market_context)` which
+            # returns bear_high_vol / bull_low_vol / etc., and the ensemble
+            # then suppresses or amplifies strategies via regime-learned
+            # weights AND the rule-based `regime_multiplier`. With regime
+            # "unknown" here, both lookups return the global learned
+            # weight (no regime suppression).
+            #
+            # Net effect: backtester evaluates EVERY active strategy with
+            # full global weight on every bar; live agent suppresses
+            # several strategies in bear_high_vol (e.g. vwap_bounce,
+            # opening_range_breakout, xgboost_classifier all weight 0).
+            # The current "shorts have negative edge" finding from the
+            # 90-day battery was therefore reached WITHOUT regime
+            # suppression -- our live agent gets that suppression on top.
+            # Direction of the finding is preserved (shorts still bleed),
+            # but the magnitude in production will differ.
+            #
+            # Tracked as a follow-up in docs/findings_log_2026-05-25.md
+            # §11. Fix would require:
+            #   1. Adding Nifty/VIX bars to market_data.pkl
+            #   2. Computing regime per-bar from rolling Nifty/VIX
+            #   3. Passing that regime to ensemble.aggregate and the
+            #      sizing call below
+            # Out of scope for the freeze-week-2 review.
             regime = "unknown"
 
             agg = ensemble.aggregate(strat_signals, symbol, close, regime=regime)
             if agg is None or agg.signal == Signal.HOLD:
-                equity_curve.append(portfolio.get_total_value({symbol: close}))
+                _eq = portfolio.get_total_value({symbol: close})
+                equity_curve.append(_eq)
+                try:
+                    last_equity_per_day[ts.date()] = _eq
+                except Exception:
+                    pass
+                continue
+
+            # 2026-05-25 risk-policy short veto. Mirrors the live-agent
+            # gate at trading_agent.py:_process_signal. A SELL ensemble
+            # signal with no open position would open a new short -- the
+            # one operation `risk.allow_shorts: false` is supposed to
+            # block. (SELL with an open long is a long-exit, handled
+            # via the `if symbol in portfolio.positions` branch above.)
+            if (not self.bt.allow_shorts
+                    and agg.signal == Signal.SELL
+                    and symbol not in portfolio.positions):
+                gate_stats.shorts_blocked += 1
+                _eq = portfolio.get_total_value({symbol: close})
+                equity_curve.append(_eq)
+                try:
+                    last_equity_per_day[ts.date()] = _eq
+                except Exception:
+                    pass
                 continue
 
             # Gate: dead-hour
             if self.bt.apply_dead_hour and self._in_dead_hour(ts):
                 gate_stats.dead_hour += 1
-                equity_curve.append(portfolio.get_total_value({symbol: close}))
+                _eq = portfolio.get_total_value({symbol: close})
+                equity_curve.append(_eq)
+                try:
+                    last_equity_per_day[ts.date()] = _eq
+                except Exception:
+                    pass
                 continue
 
             # Gate: ATR%
             atr_pct = self._atr_pct(df_slice)
             if atr_pct is not None and atr_pct < self.bt.min_entry_atr_pct:
                 gate_stats.atr_too_low += 1
-                equity_curve.append(portfolio.get_total_value({symbol: close}))
+                _eq = portfolio.get_total_value({symbol: close})
+                equity_curve.append(_eq)
+                try:
+                    last_equity_per_day[ts.date()] = _eq
+                except Exception:
+                    pass
                 continue
 
             # Gate: max positions
             if portfolio.open_position_count >= self.bt.max_positions:
                 gate_stats.max_positions_reached += 1
-                equity_curve.append(portfolio.get_total_value({symbol: close}))
+                _eq = portfolio.get_total_value({symbol: close})
+                equity_curve.append(_eq)
+                try:
+                    last_equity_per_day[ts.date()] = _eq
+                except Exception:
+                    pass
                 continue
 
             # Gate: stock blacklisted after N losses
             if losses_per_stock.get(symbol, 0) >= self.bt.max_losses_per_stock:
                 gate_stats.stock_blacklisted += 1
-                equity_curve.append(portfolio.get_total_value({symbol: close}))
+                _eq = portfolio.get_total_value({symbol: close})
+                equity_curve.append(_eq)
+                try:
+                    last_equity_per_day[ts.date()] = _eq
+                except Exception:
+                    pass
                 continue
 
             # Sizing
@@ -351,7 +518,12 @@ class EnsembleBacktester:
                 qty = max_affordable
             if qty <= 0:
                 gate_stats.insufficient_cash += 1
-                equity_curve.append(portfolio.get_total_value({symbol: close}))
+                _eq = portfolio.get_total_value({symbol: close})
+                equity_curve.append(_eq)
+                try:
+                    last_equity_per_day[ts.date()] = _eq
+                except Exception:
+                    pass
                 continue
 
             # Expected-profit gate
@@ -385,7 +557,12 @@ class EnsembleBacktester:
                 entry_time=self._ts_to_datetime(ts),
             )
             gate_stats.executed += 1
-            equity_curve.append(portfolio.get_total_value({symbol: close}))
+            _eq = portfolio.get_total_value({symbol: close})
+            equity_curve.append(_eq)
+            try:
+                last_equity_per_day[ts.date()] = _eq
+            except Exception:
+                pass
 
         # Close any still-open positions at the final bar of each symbol
         for symbol, df in market_data.items():
@@ -410,7 +587,10 @@ class EnsembleBacktester:
             f"| {total_events:,} events | {total_events / max(total_elapsed, 1e-6):,.0f} ev/s"
         )
 
-        return self._build_result(trades, equity_curve, gate_stats)
+        return self._build_result(
+            trades, equity_curve, gate_stats,
+            daily_equities=list(last_equity_per_day.values()),
+        )
 
     # ─────────────────────────────────────────────────────
     # Helpers
@@ -477,6 +657,66 @@ class EnsembleBacktester:
             return price + slip if not exit else price - slip
         return price - slip if not exit else price + slip
 
+    @staticmethod
+    def _detect_intrabar_exit(
+        pos, open_p: float, high: float, low: float, close: float,
+    ):
+        """Detect whether the bar's intra-bar range hit SL or TP.
+
+        Returns (trigger, exit_price). trigger is "stop_loss" / "take_profit"
+        / None. exit_price is the simulated touch price the live agent
+        would have filled at (before slippage).
+
+        2026-05-25 senior-dev scan, Bug A fix. The previous close-only
+        check was systematically biased -- it ignored bars that "wicked"
+        through SL/TP and recovered to close on the other side, which in
+        live trading would have filled at SL/TP the moment the price
+        touched. Net effect: backtest understated losses, overstated
+        wins.
+
+        Conservative tie-breaking:
+          * If BOTH SL and TP fall inside [low, high] (rare, gap/wide
+            bar), assume SL hit FIRST (worst-case for the strategy).
+            This avoids the opposite optimistic bias.
+          * If the bar OPENED past SL/TP (gap), fill at the open
+            (worse than the static SL/TP level). Live agent's tick
+            stream would have triggered on the first tick which IS
+            the open here.
+        """
+        sl = getattr(pos, "stop_loss", None)
+        tp = getattr(pos, "take_profit", None)
+        side = getattr(pos, "side", None)
+
+        if side == "BUY":
+            # Long: SL below entry, TP above entry. SL hit if low <= SL,
+            # TP hit if high >= TP.
+            sl_hit = sl is not None and low <= sl
+            tp_hit = tp is not None and high >= tp
+            if sl_hit and tp_hit:
+                # Both inside the bar -- assume SL fires first
+                # (worst-case). If gap-open below SL, fill at open.
+                return "stop_loss", min(open_p, sl) if open_p < sl else sl
+            if sl_hit:
+                return "stop_loss", min(open_p, sl) if open_p < sl else sl
+            if tp_hit:
+                return "take_profit", max(open_p, tp) if open_p > tp else tp
+            return None, None
+
+        if side == "SELL":
+            # Short: SL above entry, TP below entry. SL hit if high >= SL,
+            # TP hit if low <= TP.
+            sl_hit = sl is not None and high >= sl
+            tp_hit = tp is not None and low <= tp
+            if sl_hit and tp_hit:
+                return "stop_loss", max(open_p, sl) if open_p > sl else sl
+            if sl_hit:
+                return "stop_loss", max(open_p, sl) if open_p > sl else sl
+            if tp_hit:
+                return "take_profit", min(open_p, tp) if open_p < tp else tp
+            return None, None
+
+        return None, None
+
     def _in_dead_hour(self, ts) -> bool:
         try:
             hhmm = (ts.hour, ts.minute)
@@ -525,6 +765,7 @@ class EnsembleBacktester:
         trades: List[dict],
         equity_curve: List[float],
         gate_stats: GateStats,
+        daily_equities: Optional[List[float]] = None,
     ) -> BacktestResult:
         r = BacktestResult(trades=trades, equity_curve=equity_curve, gate_stats=gate_stats)
         r.total_trades = len(trades)
@@ -553,9 +794,34 @@ class EnsembleBacktester:
                 mdd = max(mdd, peak - v)
             r.max_drawdown = mdd
             r.max_drawdown_pct = (mdd / peak * 100) if peak else 0
-            returns = pd.Series(equity_curve).pct_change().dropna()
-            if len(returns) > 1 and returns.std() > 0:
-                r.sharpe = float((returns.mean() / returns.std()) * (252 ** 0.5))
+            # 2026-05-25 senior-dev scan, Bug D fix: Sharpe must be computed
+            # on DAILY returns, not per-event pct_change. The old code did
+            # `pd.Series(equity_curve).pct_change().std() * sqrt(252)` --
+            # but `equity_curve` has one entry per (symbol, bar) event,
+            # i.e. ~220,000 entries for 50 symbols × 60 days. Consecutive
+            # same-day events have near-zero pct_change (only the trading
+            # symbol's revaluation moves the equity), and multiplying by
+            # sqrt(252) (which is the annualization factor for DAILY
+            # samples) on top of event-level noise produced numbers that
+            # had no intuitive meaning. Operators were comparing them as
+            # if they were real annualised Sharpes.
+            #
+            # Fix: prefer `daily_equities` (last value per IST date) when
+            # available; fall back to the old behavior with a warning
+            # comment if not. Daily resampling reflects the standard
+            # textbook definition of Sharpe.
+            samples = daily_equities if daily_equities and len(daily_equities) >= 2 else None
+            if samples is not None:
+                returns = pd.Series(samples).pct_change().dropna()
+                if len(returns) > 1 and returns.std() > 0:
+                    r.sharpe = float((returns.mean() / returns.std()) * (252 ** 0.5))
+            else:
+                # Fallback: legacy event-level Sharpe (kept so older
+                # callers don't crash). Documented divergence; will be
+                # phased out once all entry points pass daily_equities.
+                returns = pd.Series(equity_curve).pct_change().dropna()
+                if len(returns) > 1 and returns.std() > 0:
+                    r.sharpe = float((returns.mean() / returns.std()) * (252 ** 0.5))
         for t in trades:
             r.strategy_pnl[t["strategy"]] = r.strategy_pnl.get(t["strategy"], 0) + t["pnl"]
             rg = t.get("regime") or "unknown"

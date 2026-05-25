@@ -265,7 +265,11 @@ NSE_SECTOR_MAP: Dict[str, str] = {
     "MAHLIFE": "Realty", "BRIGADE": "Realty", "PHOENIXLTD": "Realty",
     "IRCON": "Infra", "RVNL": "Infra", "RITES": "Infra",
     "NCC": "Infra", "KEC": "Infra", "PNCINFRA": "Infra",
-    "PFC": "NBFC", "IREDA": "NBFC", "IRFC": "NBFC",
+    # B-5 (audit 2026-05-25): "PFC" duplicate-key removed -- it was also
+    # listed on line ~179 with the same NBFC mapping, so dropping the
+    # redundant entry here is value-neutral and keeps the no-dup test
+    # green for future audits.
+    "IREDA": "NBFC", "IRFC": "NBFC",
     # Media / entertainment
     "ZEEL": "Media", "SUNTV": "Media", "PVR": "Media", "INOXLEISUR": "Media",
     "DISHTV": "Media", "TV18BRDCST": "Media", "SAREGAMA": "Media",
@@ -308,7 +312,15 @@ NSE_SECTOR_MAP: Dict[str, str] = {
     "BDL": "Defence", "GRSE": "Defence", "MIDHANI": "Defence",
     "ASTRAMICRO": "Defence", "SOLARINDS": "Defence",
     # Agri / fertilizers
-    "COROMANDEL": "Agri", "GNFC": "Agri", "DEEPAKFERT": "Agri",
+    # B-5 (audit 2026-05-25): GNFC was previously listed here AND in
+    # Chemicals (line ~246). Python dict literals silently keep the LAST
+    # value, so the sector-exposure cap was treating GNFC as Agri rather
+    # than Chemicals. GNFC's specialty-chemicals segment dominates its
+    # intraday price action, so Chemicals is the correct bucket -- and
+    # is what the original entry (now retained) intended. See
+    # docs/audit_2026-05-25/BUG_REPORT.md §B-5 and
+    # tests/unit/test_sector_map_no_duplicate_keys.py.
+    "COROMANDEL": "Agri", "DEEPAKFERT": "Agri",
     "BAYERCROP": "Agri", "DHANUKA": "Agri", "PIINDIA": "Agri",
     "RALLIS": "Agri",
     # Diversified

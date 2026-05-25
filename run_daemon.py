@@ -37,15 +37,23 @@ from loguru import logger
 
 # Corporate proxy / self-signed-cert workaround.
 #
-# DEFAULT = bypass ENABLED (matches historical behaviour, keeps corp-network
-# laptops working out of the box). To OPT INTO secure SSL verification --
-# strongly recommended for cloud VMs (OCI / AWS / DigitalOcean / any public
-# host) -- set TRADER_DISABLE_SSL_VERIFY=false in the deployment .env.
+# B-3 (audit 2026-05-25): polarity flipped. DEFAULT IS NOW SECURE (verify
+# enabled). To opt OUT (e.g. behind a corporate MITM proxy with a private
+# CA), set TRADER_DISABLE_SSL_VERIFY=true in the local .env. The cloud VM
+# docker-compose.yml already sets this to "false" explicitly, so cloud
+# posture is unchanged. The previous default of "true" silently trusted
+# any certificate on every laptop run.
 #
-# Silently trusting any cert on a public box is a real security regression;
-# the cloud .env.production.example flips this to "false" explicitly.
-_ssl_bypass = os.environ.get("TRADER_DISABLE_SSL_VERIFY", "true").lower()
+# When the bypass IS enabled we now log a WARNING at startup so misuse is
+# visible in `logs/trading_agent_*.log` rather than silent.
+_ssl_bypass = os.environ.get("TRADER_DISABLE_SSL_VERIFY", "false").lower()
 if _ssl_bypass in ("1", "true", "yes"):
+    logger.warning(
+        "TRADER_DISABLE_SSL_VERIFY is ENABLED — every HTTPS call is now "
+        "trusting any certificate without verification. This is ONLY safe "
+        "behind a corporate MITM proxy with a known private CA. Unset this "
+        "env var (or set =false) in production / cloud deployments."
+    )
     os.environ.setdefault("CURL_CA_BUNDLE", "")
     os.environ.setdefault("REQUESTS_CA_BUNDLE", "")
     try:
@@ -116,7 +124,12 @@ def _write_idle_heartbeat(config_path: str) -> None:
         "running": False,
         "open_positions": [],
         "open_position_count": 0,
-        "cash": float(config.get("initial_capital", 0.0)),
+        # B-11 (audit 2026-05-25): the actual config key is
+        # `capital.initial_balance`, not top-level `initial_capital`. The
+        # old read was always None → cash always 0.0 in the off-hours
+        # health.json, which fed a false "starved daemon" signal to the
+        # watchdog and the heartbeat email.
+        "cash": float((config.get("capital") or {}).get("initial_balance", 0.0)),
         "daily_pnl": 0.0,
         "daily_trades": 0,
     }

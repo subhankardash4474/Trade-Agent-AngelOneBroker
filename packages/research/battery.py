@@ -420,6 +420,33 @@ VARIANTS = [
         ("backtest_gates.apply_dead_hour", False),                  # no dead-hour block
         ("backtest_gates.apply_expected_profit_gate", False),       # no profit-gate logic
     ]),
+
+    # ── Tier 7: long-only candidates (2026-05-25) ──
+    # The 2026-05-18 90d × 228-stock pre-speed-patch battery showed the
+    # short side losing on 339+ trades regardless of trend-filter setting
+    # (V1 shorts -Rs 379 / V2 shorts -Rs 398). The cheapest possible
+    # frozen-engine fix is `risk.allow_shorts: false`. These variants
+    # test whether the long-side edge is independently profitable:
+    #
+    #   * V17 ~= V1-longs-only  -> shipped config, shorts off
+    #   * V18 ~= V4-longs-only  -> 3% trend filter, shorts off
+    #   * V19 ~= V2-longs-only  -> filters off, shorts off
+    #
+    # Compare V17 PnL to V1's long-only-slice (computed offline from
+    # V1's trades.json) to confirm the gate behaves exactly as
+    # "drop SELL signals before order placement" -- a sanity check
+    # on the new code path.
+    ("V17_long_only_shipped", [
+        ("risk.allow_shorts", False),
+    ]),
+    ("V18_long_only_threshold_3pct", [
+        ("risk.allow_shorts", False),
+        *_trend_all(3.0),
+    ]),
+    ("V19_long_only_filters_off", [
+        ("risk.allow_shorts", False),
+        *_trend_all(None),
+    ]),
 ]
 
 
@@ -453,6 +480,10 @@ def _bt_config(cfg: dict) -> BacktestConfig:
         apply_dead_hour=bool(bt_gates.get("apply_dead_hour", True)),
         apply_expected_profit_gate=bool(bt_gates.get("apply_expected_profit_gate", True)),
         product_type=cfg.get("execution", {}).get("product_type", "INTRADAY"),
+        # 2026-05-25 short-veto flag from `risk.allow_shorts`. Default True
+        # so every variant that doesn't explicitly opt in retains the
+        # current behaviour (longs + shorts both allowed in backtest).
+        allow_shorts=bool(cfg.get("risk", {}).get("allow_shorts", True)),
     )
 
 
@@ -548,10 +579,25 @@ def _run_variant_in_subprocess(
     # RELIANCE @ ...") all become visible while the variant is running.
     # enqueue=True because numpy/pandas may emit from threads under the
     # hood; the queue prevents log-line interleaving from racing.
+    #
+    # 2026-05-25 throughput-degradation fix:
+    # ProcessPoolExecutor REUSES worker subprocesses across tasks. The
+    # next variant scheduled to this worker calls _run_variant_in_subprocess
+    # again -- and loguru.add() is ADDITIVE. Without removing the previous
+    # variant's sink on completion, every subsequent variant's log lines
+    # were duplicated into ALL previously-opened sinks. By the 5th
+    # variant per worker the per-log-line disk I/O was 5x, dropping
+    # throughput from ~21 ev/s to ~7 ev/s during the
+    # battery_nifty50_60d_20260522T085929 run. The arithmetic-progression
+    # log file sizes were the smoking gun:
+    #     V1.log=772K, V3.log=583K, V5.log=394K, V7.log=206K, V9.log=18K
+    #     (diff = 188K per cumulative variant, matching V9's emit rate)
+    # Fix: capture the sink id, wrap the work in try/finally, remove
+    # the sink unconditionally when the variant exits.
     workers_dir = out_root / "workers"
     workers_dir.mkdir(parents=True, exist_ok=True)
     worker_log = workers_dir / f"{name}.log"
-    logger.add(
+    worker_sink_id = logger.add(
         str(worker_log),
         level="INFO",
         enqueue=True,
@@ -567,62 +613,73 @@ def _run_variant_in_subprocess(
         rotation="50 MB",
         retention=3,
     )
-    logger.info(f"[WORKER] starting variant {name}")
+    try:
+        logger.info(f"[WORKER] starting variant {name}")
 
-    # Watchdog must be installed AFTER the log sink (it reads the log's
-    # mtime as the heartbeat) and BEFORE the heavy work (so it covers
-    # market_data unpickle, feature load, model load, and the bt.run
-    # loop). Disabled when BATTERY_WATCHDOG_SILENCE_MIN=0.
-    _spawn_progress_watchdog(
-        worker_log=worker_log,
-        variant_name=name,
-        max_silence_sec=_watchdog_silence_sec(),
-    )
+        # Watchdog must be installed AFTER the log sink (it reads the log's
+        # mtime as the heartbeat) and BEFORE the heavy work (so it covers
+        # market_data unpickle, feature load, model load, and the bt.run
+        # loop). Disabled when BATTERY_WATCHDOG_SILENCE_MIN=0.
+        _spawn_progress_watchdog(
+            worker_log=worker_log,
+            variant_name=name,
+            max_silence_sec=_watchdog_silence_sec(),
+        )
 
-    market_data = _load_market_data_cache(out_root)
-    if market_data is None:
-        raise RuntimeError(f"market_data.pkl missing in {out_root}")
-    logger.info(f"[WORKER] {name}: market_data loaded ({len(market_data)} symbols)")
+        market_data = _load_market_data_cache(out_root)
+        if market_data is None:
+            raise RuntimeError(f"market_data.pkl missing in {out_root}")
+        logger.info(f"[WORKER] {name}: market_data loaded ({len(market_data)} symbols)")
 
-    cfg = _build_variant_config(base_cfg, overrides)
-    (out_root / "configs" / f"{name}.yaml").write_text(
-        yaml.safe_dump(cfg, sort_keys=False), encoding="utf-8"
-    )
+        cfg = _build_variant_config(base_cfg, overrides)
+        (out_root / "configs" / f"{name}.yaml").write_text(
+            yaml.safe_dump(cfg, sort_keys=False), encoding="utf-8"
+        )
 
-    bt_cfg = _bt_config(cfg)
-    bt = EnsembleBacktester(cfg, bt_cfg)
-    strategies = cfg.get("strategies", {}).get("active")
-    logger.info(f"[WORKER] {name}: backtester initialized, starting bt.run()")
+        bt_cfg = _bt_config(cfg)
+        bt = EnsembleBacktester(cfg, bt_cfg)
+        strategies = cfg.get("strategies", {}).get("active")
+        logger.info(f"[WORKER] {name}: backtester initialized, starting bt.run()")
 
-    t0 = time.time()
-    result = bt.run(
-        symbols=symbols, interval=interval, days=days,
-        strategies=strategies, market_data=market_data,
-    )
-    elapsed = time.time() - t0
-    logger.info(
-        f"[WORKER] {name}: bt.run() complete in {elapsed:.1f}s | "
-        f"trades={result.total_trades} pnl=Rs {result.total_pnl:+.2f} "
-        f"WR={result.win_rate:.1f}% PF={result.profit_factor:.2f}"
-    )
+        t0 = time.time()
+        result = bt.run(
+            symbols=symbols, interval=interval, days=days,
+            strategies=strategies, market_data=market_data,
+        )
+        elapsed = time.time() - t0
+        logger.info(
+            f"[WORKER] {name}: bt.run() complete in {elapsed:.1f}s | "
+            f"trades={result.total_trades} pnl=Rs {result.total_pnl:+.2f} "
+            f"WR={result.win_rate:.1f}% PF={result.profit_factor:.2f}"
+        )
 
-    payload = {
-        "variant": name,
-        "overrides": overrides,
-        "elapsed_sec": round(elapsed, 1),
-        "summary": _summary_row(name, result),
-        "gate_stats": result.gate_stats.as_dict(),
-        "strategy_pnl": result.strategy_pnl,
-        "regime_pnl": result.regime_pnl,
-        "trades": result.trades,
-    }
-    # Persist per-variant result here so a worker crash mid-run still
-    # leaves a complete record (parent's comparison.md write is the only
-    # thing that becomes inconsistent, and that's a single-writer file).
-    (out_root / "results" / f"{name}.json").write_text(
-        json.dumps(payload, indent=2, default=str), encoding="utf-8"
-    )
-    return name, payload
+        payload = {
+            "variant": name,
+            "overrides": overrides,
+            "elapsed_sec": round(elapsed, 1),
+            "summary": _summary_row(name, result),
+            "gate_stats": result.gate_stats.as_dict(),
+            "strategy_pnl": result.strategy_pnl,
+            "regime_pnl": result.regime_pnl,
+            "trades": result.trades,
+        }
+        # Persist per-variant result here so a worker crash mid-run still
+        # leaves a complete record (parent's comparison.md write is the only
+        # thing that becomes inconsistent, and that's a single-writer file).
+        (out_root / "results" / f"{name}.json").write_text(
+            json.dumps(payload, indent=2, default=str), encoding="utf-8"
+        )
+        return name, payload
+    finally:
+        # ALWAYS remove the per-variant sink before the worker process
+        # is reused for the next variant. Best-effort: a remove() failure
+        # here would be a loguru internal bug -- swallow it so the next
+        # variant's add() still happens. The cumulative-sink leak this
+        # prevents is the bug described in the header comment above.
+        try:
+            logger.remove(worker_sink_id)
+        except Exception:
+            pass
 
 
 def _find_latest_incomplete_run() -> str | None:

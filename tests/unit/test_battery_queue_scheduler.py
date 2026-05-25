@@ -237,12 +237,43 @@ class TestDockerArgvComposition:
     def test_bind_mounts_match_launch_battery_sh(self):
         # The mount layout is fragile -- a typo here ends with the
         # battery unable to read its universe file (exact bug we hit
-        # on first deploy). Pin the three mount strings.
+        # on first deploy). Pin the four mount strings (logs, data,
+        # tests/fixtures, packages).
         argv = q.build_docker_run_argv(self._job(), "rid", "img")
         v_pairs = [argv[i + 1] for i, a in enumerate(argv) if a == "-v"]
         assert any("/logs:/app/logs" in v for v in v_pairs)
         assert any("/data:/app/data" in v for v in v_pairs)
         assert any("/tests/fixtures:/app/tests/fixtures:ro" in v for v in v_pairs)
+        # 2026-05-25 packages mount: lets host-side code changes take
+        # effect on the next scheduler-spawned container without a full
+        # image rebuild. Read-only so a stray edit can't crash a worker
+        # mid-stream.
+        assert any("/packages:/app/packages:ro" in v for v in v_pairs)
+
+    def test_fresh_run_passes_run_id_not_resume(self):
+        # Default (resuming=False) MUST emit --run-id, NEVER --resume.
+        # Sending --resume on a fresh run would fail with
+        # "directory not found" (battery.py:1023).
+        argv = q.build_docker_run_argv(self._job(), "rid", "img")
+        post = argv[argv.index("tools/run_battery.py"):]
+        assert "--run-id" in post
+        assert "--resume" not in post
+        assert post[post.index("--run-id") + 1] == "rid"
+
+    def test_resume_passes_resume_not_run_id(self):
+        # 2026-05-25 bug fix: scheduler must pass --resume (not --run-id)
+        # when continuing an existing run. The two flags are mutually
+        # exclusive on the harness side; --run-id alone makes the harness
+        # treat the existing folder as a fresh run and re-execute every
+        # variant (re-downloading market_data and overwriting result
+        # JSONs on completion).
+        argv = q.build_docker_run_argv(
+            self._job(), "battery_xyz_T1", "img", resuming=True,
+        )
+        post = argv[argv.index("tools/run_battery.py"):]
+        assert "--resume" in post
+        assert "--run-id" not in post
+        assert post[post.index("--resume") + 1] == "battery_xyz_T1"
 
 
 # ──────────────────────── run_id derivation ────────────────────────

@@ -548,6 +548,35 @@ class TradingAgent:
             str(k): float(v) for k, v in raw_map.items()
         }
 
+        # Risk-policy short veto (2026-05-25, freeze-week-2 finding).
+        # ────────────────────────────────────────────────────────────
+        # `risk.allow_shorts` is a higher-level kill switch on the SHORT
+        # SIDE that lives in the *risk* namespace (vs the existing
+        # `execution.enable_short_selling` which lives in the execution
+        # namespace and gates broker-level short capability).
+        #
+        # Why two layers, not one:
+        #   - `execution.enable_short_selling`: capability-level. "Can the
+        #     broker connector even place SELL-to-open orders?" Default
+        #     False; live config set True 2026-04-30 to allow shorts in
+        #     bear regimes.
+        #   - `risk.allow_shorts`: policy-level. "Should the strategy take
+        #     short trades AT ALL?" Default True for backwards-compat.
+        #     Setting False is the cheapest possible long-only experiment
+        #     given freeze-v2.1 evidence that the short side has
+        #     structurally negative edge (see docs/findings_log_2026-05-25.md
+        #     §3.2 for the 339+ short trades over 90d that confirm this).
+        #
+        # Effective short-open permission =
+        #   risk.allow_shorts AND execution.enable_short_selling AND
+        #   regime in execution.short_selling_regimes
+        #
+        # The new gate fires *before* the existing capability/regime
+        # gates and uses its own audit reason ("allow_shorts:false") so
+        # operators can grep for it independently.
+        risk_cfg_for_shorts = self.config.get("risk", {}) or {}
+        self._allow_shorts: bool = bool(risk_cfg_for_shorts.get("allow_shorts", True))
+
         # Short-selling controls. Feature-gated: default OFF. When ON, SELL
         # signals on symbols with no open position open a SHORT (intraday
         # MIS only — squared off at intraday_exit_time).
@@ -746,6 +775,10 @@ class TradingAgent:
             "blacklist",
             "cooldown",  # exit cooldown is its own mechanism
             "shorts_disabled",  # config flag — only changes on config edit
+            # 2026-05-25 long-only-mode flag (`risk.allow_shorts`); same
+            # reasoning as `shorts_disabled` -- blocking on a config flag
+            # shouldn't outlive a re-flip of that flag.
+            "allow_shorts",
         )
 
         # 2026-05-15 Cooldown persistence. The three maps above live only in
@@ -2753,9 +2786,17 @@ class TradingAgent:
             return
 
         try:
+            import os as _os
             import requests as _req
             sess = _req.Session()
-            sess.verify = False
+            # B-3 (audit 2026-05-25): respect TRADER_DISABLE_SSL_VERIFY
+            # instead of hard-coding verify=False. Default secure (verify
+            # enabled); only bypassed when explicitly set in the local .env.
+            # Same env-flag semantics as main.py / run_daemon.py / scanner.
+            _bypass = _os.environ.get("TRADER_DISABLE_SSL_VERIFY", "false").lower() in (
+                "1", "true", "yes",
+            )
+            sess.verify = not _bypass
             sess.headers.update({"User-Agent": "Mozilla/5.0"})
             _chart_url = "https://query1.finance.yahoo.com/v8/finance/chart/{ticker}"
 
@@ -3514,7 +3555,11 @@ class TradingAgent:
         prefix = reason.split(":", 1)[0]
         skip_reasons = getattr(
             self, "_rejection_cooldown_skip_reasons",
-            ("already_open", "blacklist", "cooldown", "shorts_disabled"),
+            # 2026-05-25: include "allow_shorts" so a long-only-mode block
+            # doesn't seed a per-symbol direction cooldown that would
+            # outlast a flag flip back to allow_shorts=true.
+            ("already_open", "blacklist", "cooldown",
+             "shorts_disabled", "allow_shorts"),
         )
         return prefix in skip_reasons
 
@@ -3647,6 +3692,20 @@ class TradingAgent:
 
         if signal.signal == Signal.SELL:
             if pos is None:
+                # Risk-policy gate (2026-05-25): freeze-week-2 finding shows
+                # the short side has structurally negative edge across both
+                # filter-on (V1) and filter-off (V2) variants on 339+ short
+                # trades over 90 days (-Rs 379 / -Rs 398 respectively).
+                # `risk.allow_shorts: false` (default True) blocks every
+                # new short before the capability/regime gates fire.
+                # See docs/findings_log_2026-05-25.md §3 for evidence.
+                if not getattr(self, "_allow_shorts", True):
+                    logger.info(
+                        f"[ALLOW-SHORTS] Skipping new SHORT for {symbol}: "
+                        "risk.allow_shorts=false (long-only mode)"
+                    )
+                    self._audit_reject(signal, current_price, "allow_shorts:false")
+                    return
                 # Consider opening a SHORT. Guarded by feature flag + regime.
                 if not self._enable_short_selling:
                     logger.debug(f"SELL signal for {symbol} ignored (shorts disabled)")

@@ -1,0 +1,107 @@
+# freeze-v2.1 battery queue — backtester VM scheduler config.
+#
+# Edit and reload by restarting the systemd unit:
+#     sudo systemctl restart battery-scheduler
+# The scheduler reads this file fresh on every (re)start, so adding new
+# jobs is just "edit + restart".
+#
+# Each job:
+#   * MUST have a unique `name`. The run_id is derived as
+#     `battery_<name>_<utc_ts>` the first time we launch it.
+#   * Inherits the defaults baked into tools/run_battery.py (interval
+#     defaults to 5m, workers to 1) unless overridden here.
+#   * Survives a VM reboot: the scheduler resumes incomplete runs via
+#     the battery harness's own run_id-folder mechanism, and marks
+#     completed jobs in data/battery_queue_state.json so they aren't
+#     re-run.
+#   * Optional `variants:` (list of variant names) runs ONLY that subset
+#     of `packages/research/battery.py:VARIANTS`. Omit to run all.
+#
+# To force a job to re-run (e.g. after editing universe file), delete
+# its entry from data/battery_queue_state.json and restart the unit.
+#
+# 2026-05-19 reorder rationale: nifty50_60d moved to slot #1 so the
+# scheduler produces its first variant evidence in ~12-18h on the
+# backtester VM (workers=2) instead of ~3-5 days for the v2 universe.
+#
+# 2026-05-25 long-only validation insertion. Slot #2 was the full
+# v2_baseline_90d (~190h on workers=2 for all 19 variants). Replaced
+# with a fast 6-variant 60d × 200-stock run that answers the three
+# decision-affecting questions for the Friday 2026-05-29 review:
+#   1. Does V4's 3% trend filter still win on a mid-cap-heavy universe?
+#      (V1 + V4 control; nifty500_validation_60d slot)
+#   2. Does the cheapest fix — `risk.allow_shorts: false` (V17) — beat
+#      both V1 and V4 on the live-shaped universe?
+#   3. Does V18 (V4 + long-only) stack on top of V4 or cancel it out?
+#   4. Does V19 (filters off + long-only) reproduce V2's edge on a
+#      different time window?
+# Runtime estimate: 6 variants × ~14h ÷ 2 workers = ~42h. Completes
+# Wed/Thu, ahead of Friday review.
+#
+# Full v2_baseline_90d is preserved as slot #3 -- still queued, just
+# runs after the validation evidence is in hand.
+
+schema_version: 1
+
+jobs:
+  # ── 1. Smaller universe, faster turnaround (FIRST EVIDENCE) ─────────
+  # Nifty 50 in 60d on workers=2 ~= 12-18h after the quiet-logger
+  # patch landed 2026-05-19. Use this as the "is the harness even
+  # producing variant rankings?" sanity check before committing the
+  # backtester VM to multi-day v2 runs.
+  - name: nifty50_60d
+    days: 60
+    interval: 5m
+    workers: 2
+    universe-file: tests/fixtures/nifty50_universe.json
+
+  # ── 2. Long-only validation on mid-cap-heavy universe (2026-05-25) ──
+  # Targeted 6-variant run that answers the V4-transfer + long-only
+  # questions for the Friday 2026-05-29 review. See header for rationale.
+  - name: nifty500_v4_long_only_validation_60d
+    days: 60
+    interval: 5m
+    workers: 2
+    universe-file: tests/fixtures/battery_v2_universe.json
+    variants:
+      - V1_baseline_current_shipped
+      - V2_all_filters_off
+      - V4_threshold_3pct
+      - V17_long_only_shipped
+      - V18_long_only_threshold_3pct
+      - V19_long_only_filters_off
+
+  # ── 3. Baseline (matches today's deploy, full v2 universe) ──────────
+  - name: v2_baseline_90d
+    days: 90
+    interval: 5m
+    workers: 2
+    universe-file: tests/fixtures/battery_v2_universe.json
+
+  # ── 4. Walk-forward TRAIN slice ──────────────────────────────────────
+  # First 60 of 90 days. Use to pick the best variant.
+  - name: v2_train_60d
+    days: 90
+    interval: 5m
+    workers: 2
+    universe-file: tests/fixtures/battery_v2_universe.json
+    train-window-days: 60
+
+  # ── 5. Walk-forward HOLDOUT slice ────────────────────────────────────
+  # Last 30 of 90 days. Variants that win on TRAIN must survive HOLDOUT.
+  # If a variant crumbles here, the train win was p-hacked.
+  - name: v2_holdout_30d
+    days: 90
+    interval: 5m
+    workers: 2
+    universe-file: tests/fixtures/battery_v2_universe.json
+    holdout-window-days: 30
+
+  # ── 6. Longer history sanity ─────────────────────────────────────────
+  # 120d uses the same v2 universe but a longer lookback. Useful for
+  # catching regime-dependence of variant rankings.
+  - name: v2_baseline_120d
+    days: 120
+    interval: 5m
+    workers: 2
+    universe-file: tests/fixtures/battery_v2_universe.json

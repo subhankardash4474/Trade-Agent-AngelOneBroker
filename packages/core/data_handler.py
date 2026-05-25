@@ -4,6 +4,7 @@ Manages market data retrieval from AngelOne SmartAPI and Yahoo Finance.
 Supports real-time feeds, OHLCV data, and historical data for backtesting.
 """
 
+import os
 import time
 from abc import ABC, abstractmethod
 from datetime import datetime, timedelta
@@ -15,11 +16,22 @@ import pytz
 import requests
 from loguru import logger
 
-try:
-    import urllib3
-    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-except Exception:
-    pass
+# B-3 (audit 2026-05-25): SSL verification is now config-driven instead
+# of hard-coded off. The previous module-import-time
+# `urllib3.disable_warnings(...)` + `self._session.verify = False`
+# silently neutered TLS for every Yahoo Finance HTTPS call regardless
+# of operator intent. Both are now gated by TRADER_DISABLE_SSL_VERIFY,
+# which defaults to "false" (secure) and is set explicitly by
+# docker-compose.yml on the cloud VM.
+_SSL_BYPASS = os.environ.get("TRADER_DISABLE_SSL_VERIFY", "false").lower() in (
+    "1", "true", "yes",
+)
+if _SSL_BYPASS:
+    try:
+        import urllib3
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+    except Exception:
+        pass
 
 IST = pytz.timezone("Asia/Kolkata")
 
@@ -198,7 +210,7 @@ class YahooFinanceDataSource(DataSource):
 
     def __init__(self):
         self._session = requests.Session()
-        self._session.verify = False
+        self._session.verify = not _SSL_BYPASS
         self._session.headers.update(self._HEADERS)
 
     def _chart_request(self, ticker: str, interval: str = "1d",

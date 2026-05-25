@@ -274,3 +274,225 @@ class TestTradingAgentShortRouting:
         a._exit_on_signal.assert_not_called()
         calls = a.signal_audit.log.call_args_list
         assert any("already_open:duplicate_short" in str(c) for c in calls)
+
+
+# ─────────────────────────────────────────────────────────────
+# Risk-policy short veto: `risk.allow_shorts` (added 2026-05-25)
+# ─────────────────────────────────────────────────────────────
+
+
+class TestRiskAllowShortsGate:
+    """The new `risk.allow_shorts` flag is a higher-level kill switch
+    on the SHORT side that fires BEFORE the existing capability/regime
+    gates. These tests pin the four behaviours that matter:
+
+      1. allow_shorts=True -> behaves identically to before (no regression).
+      2. allow_shorts=False + flat -> SELL signal blocked with a distinct
+         "allow_shorts:false" audit reason (not "shorts_disabled").
+      3. allow_shorts=False does NOT block exits of existing longs (a
+         SELL signal while long must still close the long).
+      4. allow_shorts=False does NOT block covers of existing shorts (a
+         BUY signal while short must still cover the short).
+    """
+
+    def _make_agent_stub(self, *, allow_shorts: bool, shorts_enabled: bool = True,
+                         allowed_regimes=None):
+        """Same shape as TestTradingAgentShortRouting._make_agent_stub but
+        also sets the new `_allow_shorts` attribute. Keep the two stubs
+        independent so existing tests don't see the new attribute and
+        the new tests don't depend on the old fixture."""
+        from unittest.mock import MagicMock
+
+        from trading_agent import TradingAgent
+
+        a = object.__new__(TradingAgent)
+        a._allow_shorts = allow_shorts
+        a._enable_short_selling = shorts_enabled
+        a._short_selling_regimes = allowed_regimes or {
+            "bear_low_vol", "bear_high_vol", "sideways",
+        }
+        a._market_context = {"india_vix": 14.0, "nifty_trend": -1}
+        a.portfolio = MagicMock()
+        a.portfolio.positions = {}
+        a.signal_audit = MagicMock()
+        a._open_new_position = MagicMock()
+        a._exit_on_signal = MagicMock()
+        return a
+
+    def _sell_signal(self):
+        from strategies.base_strategy import Signal, TradeSignal
+
+        return TradeSignal(
+            signal=Signal.SELL, symbol="RELIANCE",
+            price=2500.0, timestamp=None,
+            strategy_name="rsi_momentum", confidence=0.7,
+            stop_loss=2525.0, take_profit=2450.0,
+            contributing_strategies={"rsi_momentum": 1.0},
+        )
+
+    def _buy_signal(self):
+        from strategies.base_strategy import Signal, TradeSignal
+
+        return TradeSignal(
+            signal=Signal.BUY, symbol="RELIANCE",
+            price=2500.0, timestamp=None,
+            strategy_name="rsi_momentum", confidence=0.7,
+            stop_loss=2475.0, take_profit=2550.0,
+            contributing_strategies={"rsi_momentum": 1.0},
+        )
+
+    # 1. Default behaviour preserved when flag is true.
+    def test_allow_shorts_true_passes_through(self):
+        from trading_agent import TradingAgent
+
+        a = self._make_agent_stub(allow_shorts=True, shorts_enabled=True)
+        TradingAgent._process_signal(a, self._sell_signal(), "1234", 2500.0)
+        # Should reach _open_new_position with side=SELL, just like the
+        # legacy flow.
+        a._open_new_position.assert_called_once()
+        kwargs = a._open_new_position.call_args.kwargs
+        assert kwargs.get("side") == "SELL"
+        # Audit must NOT log allow_shorts as a rejection reason.
+        calls = a.signal_audit.log.call_args_list
+        assert not any("allow_shorts" in str(c) for c in calls)
+
+    # 2. Flag false + flat -> blocked with the right audit reason.
+    def test_allow_shorts_false_blocks_new_short(self):
+        from trading_agent import TradingAgent
+
+        a = self._make_agent_stub(allow_shorts=False, shorts_enabled=True)
+        TradingAgent._process_signal(a, self._sell_signal(), "1234", 2500.0)
+        a._open_new_position.assert_not_called()
+        a._exit_on_signal.assert_not_called()
+        calls = a.signal_audit.log.call_args_list
+        assert any("allow_shorts:false" in str(c) for c in calls), \
+            f"Expected 'allow_shorts:false' in audit calls, got: {calls}"
+
+    # 2b. Reason is distinct from the older "shorts_disabled".
+    def test_allow_shorts_reason_distinct_from_shorts_disabled(self):
+        from trading_agent import TradingAgent
+
+        a = self._make_agent_stub(allow_shorts=False, shorts_enabled=True)
+        TradingAgent._process_signal(a, self._sell_signal(), "1234", 2500.0)
+        calls = a.signal_audit.log.call_args_list
+        assert any("allow_shorts:false" in str(c) for c in calls)
+        # "shorts_disabled" is the OTHER flag's reason; with
+        # shorts_enabled=True it must not have fired.
+        assert not any("shorts_disabled" in str(c) for c in calls)
+
+    # 3. Existing long is closed normally even when allow_shorts=False.
+    def test_allow_shorts_false_still_exits_long_on_sell(self):
+        from datetime import datetime
+
+        from core.portfolio import Position
+        from trading_agent import TradingAgent
+
+        a = self._make_agent_stub(allow_shorts=False)
+        a.portfolio.positions = {
+            "RELIANCE": Position(
+                symbol="RELIANCE", side="BUY", entry_price=2500.0,
+                quantity=2, entry_time=datetime.now(),
+            )
+        }
+        TradingAgent._process_signal(a, self._sell_signal(), "1234", 2500.0)
+        # Long-exit path must still fire; gate is scoped to NEW shorts.
+        a._exit_on_signal.assert_called_once()
+        a._open_new_position.assert_not_called()
+        calls = a.signal_audit.log.call_args_list
+        # We did NOT block this -- it's a legitimate exit, not an entry.
+        assert not any("allow_shorts" in str(c) for c in calls)
+
+    # 4. Existing short is covered normally even when allow_shorts=False.
+    def test_allow_shorts_false_still_covers_short_on_buy(self):
+        from datetime import datetime
+
+        from core.portfolio import Position
+        from trading_agent import TradingAgent
+
+        a = self._make_agent_stub(allow_shorts=False)
+        a.portfolio.positions = {
+            "RELIANCE": Position(
+                symbol="RELIANCE", side="SELL", entry_price=2500.0,
+                quantity=10, entry_time=datetime.now(),
+            )
+        }
+        TradingAgent._process_signal(a, self._buy_signal(), "1234", 2500.0)
+        a._exit_on_signal.assert_called_once()
+        a._open_new_position.assert_not_called()
+
+    # 5. allow_shorts=False fires BEFORE the regime gate -- audit reason
+    #    is "allow_shorts:false", not "short_regime:...".
+    def test_allow_shorts_fires_before_regime_check(self):
+        from trading_agent import TradingAgent
+
+        a = self._make_agent_stub(
+            allow_shorts=False, shorts_enabled=True,
+            allowed_regimes={"bear_low_vol"},  # would normally allow
+        )
+        TradingAgent._process_signal(a, self._sell_signal(), "1234", 2500.0)
+        calls = a.signal_audit.log.call_args_list
+        # Exact string check: allow_shorts must short-circuit the gate.
+        assert any("allow_shorts:false" in str(c) for c in calls)
+        assert not any("short_regime" in str(c) for c in calls)
+
+    # 6. The flag is a defensive `getattr` lookup so test fixtures and
+    #    legacy stubs that bypass __init__ (no `_allow_shorts` set)
+    #    behave as if the flag were True. This protects every existing
+    #    test in TestTradingAgentShortRouting from regressing.
+    def test_missing_attribute_defaults_to_allow(self):
+        from unittest.mock import MagicMock
+
+        from trading_agent import TradingAgent
+
+        a = object.__new__(TradingAgent)
+        # NB: NOT setting _allow_shorts deliberately.
+        a._enable_short_selling = True
+        a._short_selling_regimes = {"bear_low_vol"}
+        a._market_context = {"india_vix": 14.0, "nifty_trend": -1}
+        a.portfolio = MagicMock()
+        a.portfolio.positions = {}
+        a.signal_audit = MagicMock()
+        a._open_new_position = MagicMock()
+        a._exit_on_signal = MagicMock()
+        TradingAgent._process_signal(a, self._sell_signal(), "1234", 2500.0)
+        # Should reach _open_new_position despite missing attribute.
+        a._open_new_position.assert_called_once()
+
+
+# ─────────────────────────────────────────────────────────────
+# Backtester gate: `BacktestConfig.allow_shorts` (added 2026-05-25)
+# ─────────────────────────────────────────────────────────────
+
+
+class TestBacktestAllowShortsGate:
+    """The backtester mirrors the live gate so battery variants can
+    test the long-only configuration. Test the dataclass plumbing and
+    the gate-stat increment."""
+
+    def test_default_is_true(self):
+        from research.backtest_ensemble import BacktestConfig
+
+        cfg = BacktestConfig()
+        assert cfg.allow_shorts is True
+
+    def test_gate_stats_includes_shorts_blocked(self):
+        from research.backtest_ensemble import GateStats
+
+        gs = GateStats()
+        assert gs.shorts_blocked == 0
+        gs.shorts_blocked = 5
+        assert gs.as_dict()["shorts_blocked"] == 5
+
+    def test_battery_bt_config_propagates_allow_shorts(self):
+        """Battery's `_bt_config` must read `risk.allow_shorts` from the
+        merged YAML. Default True; explicit False propagates."""
+        from research.battery import _bt_config
+
+        cfg_default = {"risk": {}, "execution": {}, "backtest": {}}
+        assert _bt_config(cfg_default).allow_shorts is True
+
+        cfg_long_only = {
+            "risk": {"allow_shorts": False},
+            "execution": {}, "backtest": {},
+        }
+        assert _bt_config(cfg_long_only).allow_shorts is False

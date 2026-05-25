@@ -17,12 +17,22 @@ import pytz
 import requests as req
 from loguru import logger
 
-# Suppress SSL warnings on corporate networks
-try:
-    import urllib3
-    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-except Exception:
-    pass
+# B-3 (audit 2026-05-25): SSL verification is now config-driven rather
+# than hard-coded off. The previous module-level `verify=False` literal
+# in `_fetch_nse_archive_csv` bypassed the env-var contract documented
+# in main.py / run_daemon.py and made the cloud VM insecure for those
+# specific NSE-archive HTTPS calls even when the operator had explicitly
+# set TRADER_DISABLE_SSL_VERIFY=false. The env var is the single source
+# of truth; default is SECURE (verify enabled).
+_SSL_BYPASS = os.environ.get("TRADER_DISABLE_SSL_VERIFY", "false").lower() in (
+    "1", "true", "yes",
+)
+if _SSL_BYPASS:
+    try:
+        import urllib3
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+    except Exception:
+        pass
 
 
 def _yahoo_chart(symbol: str, session: req.Session, days: int = 25) -> pd.DataFrame:
@@ -35,10 +45,10 @@ def _yahoo_chart(symbol: str, session: req.Session, days: int = 25) -> pd.DataFr
     headers = {"User-Agent": "Mozilla/5.0"}
 
     try:
-        resp = session.get(url, params=params, headers=headers, timeout=10, verify=False)
+        resp = session.get(url, params=params, headers=headers, timeout=10, verify=not _SSL_BYPASS)
         if resp.status_code == 429:
             time.sleep(5)
-            resp = session.get(url, params=params, headers=headers, timeout=10, verify=False)
+            resp = session.get(url, params=params, headers=headers, timeout=10, verify=not _SSL_BYPASS)
         if resp.status_code != 200:
             return pd.DataFrame()
 
@@ -99,7 +109,7 @@ def _fetch_nse_archive_csv(index_name: str) -> List[str]:
         resp = req.get(
             url,
             timeout=15,
-            verify=False,
+            verify=not _SSL_BYPASS,
             headers={"User-Agent": "Mozilla/5.0"},
         )
         if resp.status_code != 200 or len(resp.content) < 1000:
@@ -153,7 +163,7 @@ def _fetch_nse_index_symbols(session: req.Session, index_name: str = "NIFTY 500"
             "Referer": "https://www.nseindia.com/",
         }
         s = req.Session()
-        s.verify = False
+        s.verify = not _SSL_BYPASS
         s.headers.update(headers)
         s.get("https://www.nseindia.com", timeout=5)
         resp = s.get(url, params=params, timeout=10)
@@ -294,7 +304,7 @@ class StockScanner:
             self.universe: List[str] = custom_universe
         elif use_live:
             session = req.Session()
-            session.verify = False
+            session.verify = not _SSL_BYPASS
             live = _fetch_nse_index_symbols(session, "NIFTY 500")
             self.universe = live if live else NSE_UNIVERSE
         else:
@@ -362,7 +372,7 @@ class StockScanner:
         """Fetch current price, volume, and short history for all stocks in the universe."""
         results = []
         session = req.Session()
-        session.verify = False
+        session.verify = not _SSL_BYPASS
         session.headers.update({"User-Agent": "Mozilla/5.0"})
 
         fetched = 0

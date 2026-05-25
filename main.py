@@ -23,12 +23,23 @@ from loguru import logger
 
 # Corporate proxy / self-signed-cert workaround.
 #
-# DEFAULT = bypass ENABLED (matches historical behaviour, keeps corp-network
-# laptops working out of the box). To OPT INTO secure SSL verification --
-# strongly recommended for cloud VMs -- set TRADER_DISABLE_SSL_VERIFY=false
-# in the deployment .env.
-_ssl_bypass = os.environ.get("TRADER_DISABLE_SSL_VERIFY", "true").lower()
+# B-3 (audit 2026-05-25): polarity flipped. DEFAULT IS NOW SECURE (verify
+# enabled). To opt OUT (e.g. behind a corporate MITM proxy with a private
+# CA), set TRADER_DISABLE_SSL_VERIFY=true in the local .env. The cloud VM
+# docker-compose.yml already sets this to "false" explicitly, so cloud
+# posture is unchanged. The previous default of "true" silently trusted
+# any certificate on every laptop run.
+#
+# When the bypass IS enabled we now log a WARNING at startup so misuse is
+# visible in `logs/trading_agent_*.log` rather than silent.
+_ssl_bypass = os.environ.get("TRADER_DISABLE_SSL_VERIFY", "false").lower()
 if _ssl_bypass in ("1", "true", "yes"):
+    logger.warning(
+        "TRADER_DISABLE_SSL_VERIFY is ENABLED — every HTTPS call is now "
+        "trusting any certificate without verification. This is ONLY safe "
+        "behind a corporate MITM proxy with a known private CA. Unset this "
+        "env var (or set =false) in production / cloud deployments."
+    )
     os.environ.setdefault("CURL_CA_BUNDLE", "")
     os.environ.setdefault("REQUESTS_CA_BUNDLE", "")
     try:
@@ -65,6 +76,15 @@ def connect_angelone(config: dict):
 
         if session.get("status"):
             feed_token = api.getfeedToken()
+            # B-4 (audit 2026-05-25): Surface the runtime feed_token to the
+            # config tree. Without this, WebSocketClient._run_angelone (which
+            # reads broker_cfg.get("feed_token", "")) silently boots with an
+            # empty token the first time `data_pipeline.use_websocket: true`
+            # is flipped in live mode -- the WS auth fails and the daemon
+            # falls back to REST polling without raising. Writing it here
+            # keeps the existing return contract and lets every downstream
+            # consumer (WS client, brokers wrapper) pick the value up.
+            config.setdefault("broker", {})["feed_token"] = feed_token
             logger.info(f"AngelOne session established for {broker['client_id']}")
             return api
         else:

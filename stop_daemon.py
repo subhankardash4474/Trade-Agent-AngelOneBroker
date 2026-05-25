@@ -29,14 +29,21 @@ Usage
 Portable — works on Windows, Linux, macOS.
 """
 
+# B-1 (audit 2026-05-25): `from __future__ import annotations` MUST come first,
+# before any other statement (PEP 236). The earlier order interleaved the
+# sys.path bootstrap between the docstring and the future import, so
+# `python stop_daemon.py` raised `SyntaxError: from __future__ imports must
+# occur at the beginning of the file` and the emergency kill switch was
+# unusable. Order is now: docstring → future-import → sys.path bootstrap →
+# regular imports.
+from __future__ import annotations
+
 # Phase 1 sys.path bootstrap -- packages/ is the new home for core, strategies, etc.
 import sys as _sys
 from pathlib import Path as _Path
 _pkg = _Path(__file__).resolve().parent / 'packages'
 if str(_pkg) not in _sys.path:
     _sys.path.insert(0, str(_pkg))
-
-from __future__ import annotations
 
 import argparse
 import os

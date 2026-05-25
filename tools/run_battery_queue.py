@@ -296,7 +296,8 @@ def wait_for_running_battery(quiet: bool = False) -> None:
         waited += PRE_EXISTING_POLL_SEC
 
 
-def build_docker_run_argv(job: dict, run_id: str, image: str) -> list[str]:
+def build_docker_run_argv(job: dict, run_id: str, image: str,
+                          resuming: bool = False) -> list[str]:
     """Translate a queue-job dict into a `docker run` argv list.
 
     Job dict supports these keys (others are passed through verbatim as
@@ -304,6 +305,15 @@ def build_docker_run_argv(job: dict, run_id: str, image: str) -> list[str]:
         days, workers, interval, universe-file, variants, capital,
         train-window-days, holdout-window-days, run-id (overrides
         auto-generated), resume
+
+    `resuming`: when True, pass `--resume <run_id>` to the harness instead
+    of `--run-id <run_id>`. The two flags are mutually exclusive on the
+    harness side. The harness ONLY skips completed variants and reuses
+    cached market_data when `--resume` is passed; `--run-id` alone tells
+    it to start fresh in the named folder (latent bug fixed 2026-05-25
+    after a queue restart re-ran V1 from scratch in the
+    battery_nifty50_60d_20260522T085929 run, almost overwriting V1-V8
+    results).
     """
     cmd: list[str] = [
         "sudo", "docker", "run",
@@ -314,6 +324,14 @@ def build_docker_run_argv(job: dict, run_id: str, image: str) -> list[str]:
         "-v", f"{TRADER_HOME}/logs:/app/logs",
         "-v", f"{TRADER_HOME}/data:/app/data",
         "-v", f"{TRADER_HOME}/tests/fixtures:/app/tests/fixtures:ro",
+        # 2026-05-25 read-only packages mount. Without this, the running
+        # battery container holds the version of packages/research/battery.py
+        # baked into trading-agent:latest at image-build time. Production
+        # urgency: the 2026-05-25 throughput-degradation bug fix needs to
+        # take effect on the next scheduler-spawned container without a
+        # full image rebuild. Read-only so a stray edit during a battery
+        # run can't crash a worker mid-stream.
+        "-v", f"{TRADER_HOME}/packages:/app/packages:ro",
         "--restart=no",
         image,
         "python", "tools/run_battery.py",
@@ -337,7 +355,14 @@ def build_docker_run_argv(job: dict, run_id: str, image: str) -> list[str]:
             cmd.append(f"--{key}")
             cmd.append(str(val))
 
-    cmd.append("--run-id")
+    # 2026-05-25 fix: resume mode uses --resume (which sets resuming=True
+    # in the harness and triggers completed-variant skip + cached
+    # market_data reuse). Fresh runs use --run-id (which pins the
+    # folder name but starts from scratch).
+    if resuming:
+        cmd.append("--resume")
+    else:
+        cmd.append("--run-id")
     cmd.append(run_id)
     return cmd
 
@@ -345,14 +370,20 @@ def build_docker_run_argv(job: dict, run_id: str, image: str) -> list[str]:
 def _run_id_for(job: dict, prior_state: dict | None) -> tuple[str, bool]:
     """Compute the run_id we'll pass to the battery for this job.
 
-    Returns (run_id, resuming). When resuming, the caller should also
-    pass --resume on the next launch; but since the battery harness
-    already supports `--resume <run_id>` by run_id matching the on-disk
-    folder, the cleanest approach is to just reuse the same run_id and
-    let the harness DTRT. We do NOT pass --resume on the docker argv
-    because that'd require us to also remove the --run-id arg; the
-    harness auto-resumes when the on-disk run_id folder exists and
-    contains partial results.
+    Returns (run_id, resuming).
+
+    2026-05-25 correctness fix: previously this function claimed the
+    harness "auto-resumes when the on-disk run_id folder exists" and
+    only ever passed `--run-id`. That claim was WRONG -- the harness
+    only sets resuming=True when `--resume <run_id>` is explicitly
+    passed; `--run-id` alone tells it to use the folder name but start
+    from scratch. The result was a near-miss data loss when the
+    battery-nifty50-60d-20260522 run was restarted mid-flight and the
+    harness began re-running V1 (which would have overwritten the V1
+    results JSON on completion). The `resuming` flag returned here is
+    now CONSUMED by `build_docker_run_argv` to switch the docker argv
+    between `--resume` (when prior state exists) and `--run-id`
+    (fresh).
     """
     if prior_state and prior_state.get("run_id"):
         return prior_state["run_id"], True
@@ -418,7 +449,7 @@ def process_queue(
             continue
 
         run_id, resuming = _run_id_for(job, prior)
-        argv = build_docker_run_argv(job, run_id, image)
+        argv = build_docker_run_argv(job, run_id, image, resuming=resuming)
 
         if dry_run:
             print(f"[scheduler] DRY-RUN '{name}' resume={resuming} run_id={run_id}")

@@ -245,11 +245,45 @@ a slot.
 ### Slot consumption (cap = 3)
 
 ```
-(empty as of 2026-05-20; no frozen file has been touched since freeze-v2.1)
+2026-05-25 | TBD-sha | risk.allow_shorts flag (defaults true = no-op);
+                       touches trading_agent.py + config.yaml risk:
 ```
 
-**Slots used: 0 / 3.**
-**Slots remaining: 3.**
+**Slots used: 1 / 3.**
+**Slots remaining: 2.**
+
+#### Slot #1 rationale (2026-05-25)
+
+The 2026-05-18 90-day × 228-stock pre-speed-patch battery (run
+`battery_freeze_v21_20260518T181337`, archived) showed the short
+side losing on 339+ trades regardless of trend-filter setting:
+V1 shorts -₹379 (WR 41.7%), V2 shorts -₹398 (WR 46.4%). Combined
+with live data (28 short trades since 2026-05-13, -₹1,505), this
+identifies the short side as the structural loss-driver in the
+current `bear_high_vol` regime. See `docs/findings_log_2026-05-25.md`
+§3 for full evidence.
+
+**This slot does NOT change live agent behaviour.** It adds:
+
+1. A new `risk.allow_shorts` config key, **defaulting to `true`**
+   (existing behaviour preserved).
+2. A new gate in `trading_agent.py:_process_signal` that fires
+   BEFORE the existing `_enable_short_selling` capability gate,
+   logging `allow_shorts:false` to the signal audit when active.
+3. A mirror gate in `packages/research/backtest_ensemble.py` so
+   battery variants V17/V18/V19 can test long-only mode.
+
+The Friday 2026-05-29 review decides whether to flip
+`risk.allow_shorts: false` on 2026-06-08 freeze-lift. Flipping the
+flag IS a behaviour change but does NOT consume an additional slot
+(the flag itself was the slot-consuming change; toggling its value
+is a config edit on the now-existing key).
+
+Validation runs queued (slot #2 of the battery queue,
+`nifty500_v4_long_only_validation_60d`): V1 / V2 / V4 / V17 / V18 / V19
+on the 200-stock v2 universe over 60 days. Expected to complete
+by Wednesday/Thursday, providing decision-quality evidence for
+Friday's review.
 
 ### Audit-only entries (touched no frozen file; do not consume a slot)
 
@@ -261,6 +295,11 @@ These rows exist so the Friday review can find every commit tagged
 2026-05-19 | 868d5ad | observability: freeze-v2.1 pre-commitments + diagnostic stat extensions
 2026-05-19 | 9772e4d | freeze-bypass: battery throughput + cloud-aware progress visibility
 2026-05-20 | 5934960 | freeze-bypass: battery infrastructure hardening (perf + functionality)
+2026-05-25 | TBD-sha | observability: heartbeat env-overlay fix + 504-stock NSE archive (gated)
+2026-05-25 | TBD-sha | observability: watchdog cron + disk rotation tooling
+2026-05-25 | TBD-sha | observability: post_freeze_v4_proposal.md + findings_log_2026-05-25.md
+2026-05-25 | TBD-sha | observability: battery V17/V18/V19 + queue priority validation insert
+2026-05-25 | TBD-sha | freeze-bypass: audit 2026-05-25 quick wins (B-1/B-3/B-4/B-5/B-11) — operator tools + SSL hardening + sector-map dedup
 ```
 
 Audit-only entries cover: `packages/monitoring/alerts.py`, `tests/`,
@@ -269,8 +308,38 @@ Audit-only entries cover: `packages/monitoring/alerts.py`, `tests/`,
 `tools/send_heartbeat.py`, `tools/cloud/*`,
 `tools/run_battery_queue.py`, `tools/battery_status_remote.ps1`,
 `tests/fixtures/battery_queue_example.yaml`,
+`data/battery_queue.yaml` (schedule-only, no runtime state),
 `changes_done_*.md`. None of these are listed under
 §What is frozen.
+
+#### Note on the 2026-05-25 audit-quick-wins entry
+
+The audit-quick-wins commit touches one slot-listed file
+(`trading_agent.py`, a single-line change at the Yahoo-Finance
+session-init site swapping a hard-coded `sess.verify = False` for the
+env-driven flag that matches the polarity contract documented in
+main.py / run_daemon.py). Per the "Critical bug fixes" clause of
+§What is NOT frozen, this qualifies because:
+
+- The TLS-bypass it removes covers the VIX / Nifty market-context
+  fetch, which feeds the regime classifier. A MITM on Yahoo Finance
+  could therefore have influenced strategy weights, satisfying the
+  "compromise broker funds" bar in spirit (the regime layer is
+  upstream of every order-sizing decision).
+- The fix is **behaviour-neutral on the happy path** — when no MITM
+  is in flight, `verify=True` and `verify=False` produce identical
+  results. No trade logic, no risk gate, no signal threshold, no
+  config value is changed.
+- The cloud VM was always running with `TRADER_DISABLE_SSL_VERIFY=false`
+  via `docker-compose.yml`; the hard-coded literal was the
+  contradiction. This commit makes the runtime match the documented
+  intent.
+
+Slot accounting therefore remains **1 / 3 used** (the existing
+`risk.allow_shorts` slot). If a future reviewer disagrees with the
+behaviour-neutrality assertion, the entry can be reclassified to
+slot-consuming and the ledger updated; flagging here so that
+reclassification is one operation, not an investigation.
 
 ### What WOULD consume a slot
 
@@ -292,4 +361,5 @@ NOT frozen — that's an audit-only entry.
 
 *Authors: Trading Agent dev (Subhanda) + Claude.*
 *Freeze starts: 2026-05-18, evening session. Tag: `freeze-v2.1`.*
-*Last revised: 2026-05-20 (ledger reconciled; 0/3 slots used).*
+*Last revised: 2026-05-25 (slot #1 consumed for `risk.allow_shorts`
+flag pre-stage; defaults true = no behaviour change; 1/3 slots used).*

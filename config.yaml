@@ -272,6 +272,24 @@ learning:
   auto_suppress_pf_threshold: 0.7
 
 risk:
+  # ── Risk-policy short veto (2026-05-25) ───────────────────────────
+  # Higher-level kill switch on the SHORT side. When `false`, every
+  # SELL signal that would open a NEW short position is dropped before
+  # it reaches the capability/regime gates (see `execution.enable_short_selling`
+  # below). Existing short positions still close normally via SL/TP/trail
+  # /signal-cover — this flag only blocks new shorts being opened.
+  #
+  # Default `true` to preserve current behaviour. Setting to `false`
+  # IS a behaviour change and consumes one freeze-v2.1 bypass slot.
+  #
+  # Evidence for considering a flip to `false` is documented in
+  # docs/findings_log_2026-05-25.md §3.2 and docs/post_freeze_v4_proposal.md
+  # §10. Live agent has traded 100% shorts since 2026-05-13 in the
+  # bear_high_vol regime (28 trades, -Rs 1,505); the 2026-05-18 90d
+  # battery showed the short side losing on 339+ trades regardless of
+  # filter setting.
+  allow_shorts: true
+
   # Position sizing
   # 2026-05-08: dropped 25 -> 15 alongside Rs 100k paper capital. 25% × Rs 100k
   # = Rs 25k/position is over-concentrated; 15% × 100k = Rs 15k is healthier
