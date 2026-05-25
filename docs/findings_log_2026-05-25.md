@@ -904,5 +904,17 @@ remaining 19-variant queue.
 
 **Old run (archived):** `battery_nifty50_60d_20260525T093330` →
 `/opt/trading-agent/logs/backtests/_archive/battery_nifty50_60d_20260525T093330_O_N2_BUG`
+(reached 23.1% in 1h 14m before being stopped; 90 MB archived for forensic
+comparison against post-fix run)
 
-**New run:** see §12 update below after restart-verify completes.
+**New run:** `battery_nifty50_60d_20260525T105637` (started 2026-05-25 16:26 IST,
+commit 7ec02a1 in container).
+
+**Operational gotcha encountered during deploy:**
+The scheduler initially crash-looped with `PermissionError: Operation not
+permitted` on `os.replace()` of `battery_queue_state.json`. Root cause:
+during the manual queue-state reset I `chown`'d the file to 1001:1001
+(intending to match the docker worker UID), but the scheduler systemd unit
+runs as `opc`. Combined with the sticky bit on `/opt/trading-agent/data/`
+(drwxrwxrwt), opc could not rename a file owned by uid 1001. Fix:
+`chown opc:opc` + `restorecon`. Added to ops_runbook common-pitfalls.

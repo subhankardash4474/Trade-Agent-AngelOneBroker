@@ -839,8 +839,21 @@ restarted the scheduler with a fresh run_id.
 
 **Archived run (buggy code):**
 `/opt/trading-agent/logs/backtests/_archive/battery_nifty50_60d_20260525T093330_O_N2_BUG`
+(stopped at 23.1% progress / 1h 14m elapsed; preserved for forensic
+pre/post comparison).
 
-**New run id:** see findings_log §12.8 update after restart-verify.
+**New run id (post-fix):** `battery_nifty50_60d_20260525T105637`
+(restarted 2026-05-25 16:26 IST, scheduler systemd unit + git HEAD 7ec02a1).
+
+**Operational gotcha during deploy:** initial scheduler restart crash-looped
+with `PermissionError: Operation not permitted` because my queue-state reset
+left the file owned by `1001:1001` (the docker worker UID) while the
+scheduler systemd unit runs as `opc`. Combined with the sticky bit on
+`/opt/trading-agent/data/`, opc couldn't rename a file owned by a different
+user. Fix: `chown opc:opc` + `restorecon` on the state file, plus removing
+a leftover `.tmp` file. To prevent recurrence: any future manual state-file
+edit must end with `sudo chown opc:opc <file> && sudo restorecon -v <file>`.
+Added to ops_runbook §Common Pitfalls.
 
 ### §11.9 Files touched in §11
 

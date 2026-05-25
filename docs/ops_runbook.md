@@ -425,6 +425,49 @@ That IP is **wrong**. The Trader VM is `ubuntu@80.225.251.79`, the
 Backtester VM is `opc@80.225.197.125`. Neither is `140.245.10.21` — that
 was a decommissioned IP from an earlier deployment.
 
+### 6.8 `battery-scheduler.service` crash-loops with `PermissionError: Operation not permitted` after manual state-file edit
+
+Hit this during the 2026-05-25 O(N²) perf-fix deploy. Symptom:
+```
+PermissionError: [Errno 1] Operation not permitted:
+  '/opt/trading-agent/data/battery_queue_state.json.tmp'
+  -> '/opt/trading-agent/data/battery_queue_state.json'
+```
+
+Three confluent conditions cause it:
+
+1. `/opt/trading-agent/data/` has the **sticky bit** (`drwxrwxrwt`).
+   Files inside can only be renamed/deleted by their owner.
+2. The scheduler systemd unit runs as **`opc`** (see `journalctl -u
+   battery-scheduler -n 1 --no-pager` — line `Main PID ... CGroup`
+   shows the user implicitly via process UID, or `sudo cat
+   /etc/systemd/system/battery-scheduler.service` shows `User=opc`).
+3. Any `sudo cp` or `sudo chown` of the state file leaves it owned by
+   `root` or some other UID, and the scheduler's `os.replace()` then
+   fails the kernel sticky-dir check.
+
+**Fix** after any manual state-file edit:
+
+```bash
+sudo chown opc:opc /opt/trading-agent/data/battery_queue_state.json
+sudo restorecon -v /opt/trading-agent/data/battery_queue_state.json
+sudo rm -f  /opt/trading-agent/data/battery_queue_state.json.tmp
+sudo systemctl reset-failed battery-scheduler.service
+sudo systemctl restart battery-scheduler.service
+sudo journalctl -u battery-scheduler --since "30 sec ago" --no-pager | tail
+```
+
+**Verify the scheduler is alive AND the container is running:**
+
+```bash
+sudo systemctl is-active battery-scheduler.service                 # → active
+sudo docker ps --filter "name=battery" --format "{{.Names}} {{.Status}}"
+```
+
+If the container takes more than 20s to appear, check the scheduler
+journal — there may be a docker-side error (image missing, port
+collision, etc.) that the systemd unit doesn't surface.
+
 ---
 
 ## 7. Diagnostic flow — when something looks wrong
