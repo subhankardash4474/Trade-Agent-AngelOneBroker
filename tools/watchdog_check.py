@@ -59,10 +59,20 @@ IST = pytz.timezone("Asia/Kolkata")
 HEALTH_FILE = _REPO / "logs" / "health.json"
 STATE_FILE = _REPO / "logs" / "watchdog_state.json"
 
-# Operational thresholds (tuned 2026-05-25 against observed cycle
-# cadence -- heartbeat fires every ~60s, so anything older than 5x
-# that is unambiguous evidence of a hang).
-STALE_SECONDS = 300            # 5 minutes -- threshold for "STALE"
+# Operational thresholds (re-tuned 2026-05-25 11:40 IST after the
+# first live false-positive). Initial guess of 300s was too tight:
+# the daemon's _write_health_json runs INSIDE the [HEARTBEAT] block,
+# which fires every 5 cycles -- not every cycle. Observed live
+# cadence is ~5m20s (cycle 60s * 5 + ~20s overhead per scan), so
+# any threshold <= 320s produces guaranteed false positives at the
+# tail end of every heartbeat interval. We need a buffer of >=2x the
+# heartbeat cadence to absorb scan-time variance + cron jitter.
+#
+# 600s = 2.0x the observed heartbeat cadence. Comfortable margin
+# before the next heartbeat WOULD have fired (so a real hang shows
+# up as TWO consecutive missed heartbeats, not one), still well
+# below the 11h Friday-2026-05-22 hang we're trying to detect.
+STALE_SECONDS = 600            # 10 minutes -- threshold for "STALE"
 ESCALATION_HOURS = 1           # Re-alert every hour while still stale
 TRADING_WINDOW = (dt_time(9, 0), dt_time(16, 0))   # IST
 TRADING_DAYS = (0, 1, 2, 3, 4)  # Mon-Fri
@@ -208,11 +218,24 @@ def _compose_alert(status: str, age_seconds: Optional[float],
 
 def _send_alert(cfg: dict, subject: str, body: str) -> bool:
     """Best-effort send via AlertManager. Failure is logged but doesn't
-    crash the watchdog -- spool will catch it on next AlertManager call."""
+    crash the watchdog -- spool will catch it on next AlertManager call.
+
+    2026-05-25 11:40 IST bug fix: AlertManager.send_alert() returns None
+    (it's intentionally fire-and-forget; per-channel delivery is handled
+    by the spool/retry mechanism inside _send_email_resend etc). The
+    previous code treated None as failure and logged 'alert FAILED'
+    even though the email had already been delivered, AND failed to
+    persist last_alert_unix into the state file -- which meant no
+    recovery alert ever fired. We now return True whenever the dispatch
+    call returned WITHOUT raising. False is reserved for the cases
+    that genuinely indicate the watchdog couldn't even attempt a send
+    (config load failed, AlertManager construction crashed, etc).
+    """
     try:
         from packages.monitoring.alerts import AlertManager
         am = AlertManager(cfg)
-        return am.send_alert(subject, body, level="ERROR")
+        am.send_alert(subject, body, level="ERROR")
+        return True
     except Exception as e:
         logger.error(f"watchdog: alert dispatch failed: {type(e).__name__}: {e}")
         return False

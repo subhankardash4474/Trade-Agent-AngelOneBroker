@@ -1,4 +1,4 @@
-"""Tests for tools/watchdog_check.py -- the 5-min daemon liveness probe.
+﻿"""Tests for tools/watchdog_check.py -- the 5-min daemon liveness probe.
 
 Created 2026-05-25 in response to the 11-hour silent hang on 2026-05-22.
 The watchdog reads logs/health.json and alerts when its mtime is older
@@ -71,9 +71,9 @@ def _weekend_now() -> datetime:
     return IST.localize(datetime(2026, 5, 23, 11, 30))
 
 
-# ────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # Trading-window discriminator
-# ────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 def test_trading_window_includes_weekday_market_hours():
     assert wd._is_trading_window(IST.localize(datetime(2026, 5, 25, 9, 30)))
     assert wd._is_trading_window(IST.localize(datetime(2026, 5, 25, 12, 0)))
@@ -87,12 +87,12 @@ def test_trading_window_excludes_off_hours_and_weekends():
     assert not wd._is_trading_window(IST.localize(datetime(2026, 5, 24, 11, 30)))  # Sun
 
 
-# ────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # State machine: STALE transition + HEALTHY recovery
-# ────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 def test_first_stale_in_window_fires_alert(isolated, monkeypatch):
     now = _trading_window_now()
-    _make_health_file(wd.HEALTH_FILE, age_seconds=600, now=now)  # 10 min stale
+    _make_health_file(wd.HEALTH_FILE, age_seconds=900, now=now)  # 15 min stale
 
     sent = []
 
@@ -117,7 +117,7 @@ def test_repeated_stale_within_escalation_window_does_not_re_alert(isolated, mon
     1-hour escalation boundary passes. This is the rate-limit that keeps
     a 4-hour hang from producing 48 emails."""
     now = _trading_window_now()
-    _make_health_file(wd.HEALTH_FILE, age_seconds=600, now=now)
+    _make_health_file(wd.HEALTH_FILE, age_seconds=900, now=now)
     wd.STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
     wd.STATE_FILE.write_text(json.dumps({
         "last_status": "STALE",
@@ -189,12 +189,12 @@ def test_first_run_clean_state_does_not_alert(isolated, monkeypatch):
     assert sent == []
 
 
-# ────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # Off-hours silencing -- the 'no email at 03:00 IST Sunday' guarantee
-# ────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 def test_stale_outside_trading_window_does_not_alert(isolated, monkeypatch):
     now = _weekend_now()
-    _make_health_file(wd.HEALTH_FILE, age_seconds=600, now=now)
+    _make_health_file(wd.HEALTH_FILE, age_seconds=900, now=now)
     sent = []
     monkeypatch.setattr(wd, "_send_alert", lambda c, s, b: sent.append(s) or True)
     with patch.object(wd, "datetime", _MockDatetime(now)):
@@ -206,9 +206,9 @@ def test_stale_outside_trading_window_does_not_alert(isolated, monkeypatch):
     assert state["last_status"] == "STALE"
 
 
-# ────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # Missing health.json -- worst case (daemon never started)
-# ────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 def test_missing_health_file_treated_as_stale(isolated, monkeypatch):
     sent = []
     monkeypatch.setattr(wd, "_send_alert", lambda c, s, b: sent.append(s) or True)
@@ -219,11 +219,69 @@ def test_missing_health_file_treated_as_stale(isolated, monkeypatch):
     assert "SILENT" in sent[0]
 
 
+def test_stale_threshold_above_heartbeat_cadence(isolated, monkeypatch):
+    """REGRESSION GUARD for the 2026-05-25 11:40 IST false positive.
+
+    The daemon's _write_health_json runs inside the [HEARTBEAT] block,
+    which fires every 5 cycles (~5m20s observed). If STALE_SECONDS is
+    set tighter than that cadence, every healthy daemon will trip the
+    watchdog at the tail end of each heartbeat interval.
+
+    This test pins STALE_SECONDS at >= 2x the observed worst-case
+    heartbeat cadence (~330s). 600s gives a 2x safety margin."""
+    assert wd.STALE_SECONDS >= 600, (
+        f"STALE_SECONDS={wd.STALE_SECONDS} is too tight relative to "
+        "the daemon's 5-cycle heartbeat cadence (~5m20s). Bump to >=600."
+    )
+
+    # And a positive case: a 5-min-old health.json must NOT trip the
+    # watchdog under normal heartbeat cadence.
+    now = _trading_window_now()
+    _make_health_file(wd.HEALTH_FILE, age_seconds=320, now=now)  # 5m20s
+    sent = []
+    monkeypatch.setattr(wd, "_send_alert", lambda c, s, b: sent.append(s) or True)
+    with patch.object(wd, "datetime", _MockDatetime(now)):
+        wd.main()
+    assert sent == [], "5m20s-old health.json must not be flagged stale"
+
+
+def test_alert_send_records_state_when_alertmanager_returns_none(isolated, monkeypatch):
+    """REGRESSION GUARD for the 2026-05-25 11:40 IST 'alert FAILED' bug.
+
+    AlertManager.send_alert is fire-and-forget and returns None. The
+    pre-fix code treated None as failure -> last_alert_unix was never
+    persisted -> no recovery alert ever fired -> escalation logic
+    broken (never triggers because last_alert_unix stayed 0).
+
+    This test injects a fake AlertManager whose send_alert returns
+    None (matching reality) and verifies state is correctly persisted."""
+    now = _trading_window_now()
+    _make_health_file(wd.HEALTH_FILE, age_seconds=900, now=now)
+
+    class FakeAlertManager:
+        def __init__(self, cfg):
+            pass
+        def send_alert(self, title, message, level="info"):
+            return None  # exactly what real AlertManager returns
+
+    fake_module = type("M", (), {"AlertManager": FakeAlertManager})
+    monkeypatch.setitem(__import__("sys").modules, "packages.monitoring.alerts", fake_module)
+    monkeypatch.setattr(wd, "_load_config", lambda: {})
+    with patch.object(wd, "datetime", _MockDatetime(now)):
+        wd.main()
+    state = json.loads(wd.STATE_FILE.read_text(encoding="utf-8"))
+    assert state["last_alert_unix"] > 0, (
+        "send_alert returning None must NOT cause the watchdog to mark "
+        "the alert as failed -- state must record the dispatch attempt"
+    )
+    assert state["last_status"] == "STALE"
+
+
 def test_alert_failure_does_not_crash(isolated, monkeypatch):
     """The watchdog must NEVER crash -- if AlertManager throws, the
     cron exit code stays 0 so cron doesn't spam root@ with stderr."""
     now = _trading_window_now()
-    _make_health_file(wd.HEALTH_FILE, age_seconds=600, now=now)
+    _make_health_file(wd.HEALTH_FILE, age_seconds=900, now=now)
     monkeypatch.setattr(
         wd, "_send_alert",
         lambda c, s, b: (_ for _ in ()).throw(RuntimeError("dispatch broken")),
@@ -238,9 +296,9 @@ def test_alert_failure_does_not_crash(isolated, monkeypatch):
     assert rc == 0
 
 
-# ────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # Helpers: a minimal mock for datetime that lets us control "now"
-# ────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 class _MockDatetime:
     """Drop-in for the `datetime` symbol inside watchdog_check; only
     overrides .now(tz). Other class attributes (timedelta, etc.) are
