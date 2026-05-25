@@ -318,6 +318,16 @@ def build_docker_run_argv(job: dict, run_id: str, image: str,
     cmd: list[str] = [
         "sudo", "docker", "run",
         "-d",                       # detached -- docker daemon owns the process
+        # 2026-05-25 Bug G-5: --rm so the docker daemon removes the
+        # container on exit. Without this, the next launch with the
+        # same run_id (the resume path always reuses the run_id) hits
+        # a name conflict and the scheduler permanently marks the job
+        # "failed". `tools/cloud/launch_battery.sh` already passes
+        # --rm; the queue path was the parity gap. Container exit
+        # logs survive on the docker daemon side for ~docker-events
+        # retention, and the harness writes its own logs to a host
+        # bind-mount so --rm doesn't cost us anything for diagnosis.
+        "--rm",
         "--name", run_id,
         "--no-healthcheck",
         "-e", "BACKTESTER_MODE=1",
@@ -470,21 +480,64 @@ def process_queue(
         # (placed by build_docker_run_argv right after `docker run`); do
         # NOT append it here -- python argparse on the inner script
         # would reject an unrecognized -d at the tail.
-        try:
-            subprocess.run(
-                argv,
-                check=True, capture_output=True, text=True, timeout=60,
-            )
-        except subprocess.CalledProcessError as exc:
-            stderr = (exc.stderr or "").strip()
+        #
+        # 2026-05-25 Bug G-5: launch failures fall into two categories:
+        #   (a) NAME CONFLICT: a stale container with the same run_id
+        #       lingers from a prior launch (pre-G-5 launches didn't
+        #       use --rm; even with --rm, manual `docker stop` without
+        #       `docker rm` leaves a zombie). The container is dead
+        #       but the name is taken. Recoverable: `docker rm -f`
+        #       the zombie and retry once.
+        #   (b) REAL FAILURE: image missing, daemon down, bad mount,
+        #       etc. Mark the job failed and move on.
+        # Without (a), the exact incident from 2026-05-25 happens: the
+        # nifty50_60d resume can't launch because the dead container
+        # from the original failed run holds the name, the scheduler
+        # marks the job permanently failed, the queue grinds to a halt.
+        def _try_launch() -> tuple[int, str]:
+            """Run argv; return (returncode, stderr) without raising."""
+            try:
+                subprocess.run(
+                    argv,
+                    check=True, capture_output=True, text=True, timeout=60,
+                )
+                return 0, ""
+            except subprocess.CalledProcessError as e:
+                return e.returncode, (e.stderr or "").strip()
+
+        rc, stderr = _try_launch()
+        if rc != 0 and "is already in use by container" in stderr:
+            # Zombie container blocking the name. Force-remove and
+            # retry exactly once.
+            print(f"[scheduler] '{name}' launch hit name conflict; "
+                  f"removing zombie container '{run_id}' and retrying...")
+            try:
+                subprocess.run(
+                    ["sudo", "docker", "rm", "-f", run_id],
+                    capture_output=True, text=True, timeout=30,
+                )
+            except subprocess.SubprocessError as rm_err:
+                print(f"[scheduler] docker rm -f failed: {rm_err}",
+                      file=sys.stderr)
+                # Fall through to mark failed below.
+            else:
+                rc, stderr = _try_launch()
+                if rc == 0:
+                    print(f"[scheduler] '{name}' launch retry succeeded "
+                          f"after zombie cleanup")
+
+        if rc != 0:
             print(f"[scheduler] FAIL docker run for '{name}': {stderr}",
                   file=sys.stderr)
             state["jobs"][name] = {
                 **state["jobs"][name],
                 "status": "failed",
                 "finished_at": _utc_iso(),
-                "exit_code": exc.returncode,
+                "exit_code": rc,
                 "error": stderr[-500:],
+                # Distinguish launch failure from run failure so an
+                # operator can see the difference at a glance.
+                "failure_phase": "launch",
             }
             save_state(state, state_path)
             # Keep going -- a single launch failure shouldn't sink the
@@ -502,6 +555,13 @@ def process_queue(
             "status": status,
             "finished_at": finished_at,
             "exit_code": exit_code,
+            # 2026-05-25 Bug G-5: distinguish run-time failure (the
+            # container started but the harness exited non-zero) from
+            # launch-time failure (the docker run command itself
+            # failed). Operators triaging a "failed" job should know
+            # at a glance whether to look at workers/<name>.log or at
+            # the docker daemon.
+            **({"failure_phase": "run"} if status == "failed" else {}),
         }
         save_state(state, state_path)
         print(f"[scheduler] {status.upper()} '{name}' exit={exit_code}")

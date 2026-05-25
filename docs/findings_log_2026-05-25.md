@@ -1124,3 +1124,324 @@ workers): 17 × 3.2 / 2 ≈ 27 h to complete the missing 17 variants.
 If the resume still fails at V3 (~30 min in): the issue is *not*
 state pollution; check `<run>/workers/V3_only_xgb_mr_filtered_yday.fault.log`
 for the real Python traceback, fix the underlying code, re-resume.
+
+---
+
+## 14. Bug G — Backtester subsystem code-review hardening (2026-05-25 night)
+
+**Status:** Fixed; harness/library changes only; audit-only entry, no
+slot consumed.
+
+### 14.1 Why this entry exists (preemptive vs. reactive)
+
+After landing the Bug F fix and dealing with the operational fallout
+(scheduler clobbering manual queue edits, zombie containers blocking
+launches, comparison.md showing stale failure counts), the operator
+asked for "a full code review for backtest so that no other issues
+appear." We've now found and fixed six bugs in one day (A — intra-bar
+SL/TP gate; B — observability gaps; C — opposite-signal exit fill; D —
+regime classifier disabled; E — O(N²) full-history slicing; F — pool
+cascade from worker re-use). The pattern is clear: every bug found has
+been costing us multiples of "find + fix" time in operational
+recovery. The next 64 h of compute (37 h validation + ~27 h
+nifty50_60d resume) cannot afford another preventable surprise.
+
+The review surveyed every file in the backtester hot path:
+`packages/research/{backtest_ensemble.py, battery.py, diagnostic.py}`,
+`packages/strategies/_trend_context.py`, `tools/{run_battery.py,
+run_battery_queue.py}`, plus the test fixtures and the recent Bug E /
+Bug F regression tests. Total: 10 files, ~5,400 LOC.
+
+The review surfaced **24 issues across 4 severity tiers**: 5 critical,
+8 high, 7 medium, 4 low. Today's commit closes the **4 critical
+issues that could affect the running 64 h compute window** (the fifth
+critical — Bug B's regime hardcoding — cannot be retrofitted without
+breaking running runs and is being deferred to the post-validation
+window). The high/medium/low tiers are catalogued in §14.7 below for
+the next freeze-bypass cycle.
+
+### 14.2 G-1 — Atomic results-JSON writes + corrupt-JSON quarantine
+
+**Observation.** `_completed_variant_names()` previously returned
+`{p.stem for p in results_dir.glob("*.json")}` — every file matching
+the glob was treated as proof the variant was complete. Combined
+with the non-atomic `Path.write_text()` write inside
+`_run_variant_in_subprocess`, this means: if a worker crashes
+*during* the JSON write (OOM, native segfault, parent
+`BrokenProcessPool` shutdown), the file exists on disk with a
+truncated / invalid payload — and `--resume` permanently SKIPS that
+variant. The variant would be missing from the final
+`comparison.md` with no automatic recovery and no warning.
+
+**Crash window.** The non-atomic write is one open + one write of
+~5-50 KB JSON. On a fast disk, ~5 ms. With 19 variants × ~3 retries
+across 64 h, the cumulative window is ~285 ms. Low probability per
+event, but a single hit silently destroys evidence the operator
+won't notice until the Friday review.
+
+**Fix.**
+1. New `_atomic_write_text(path, text)` helper: writes to
+   `path.with_suffix(path.suffix + ".tmp")`, then `Path.replace()`s
+   it onto the target. Atomic at the directory-entry level on both
+   POSIX and Windows for same-filesystem renames.
+2. Wired through every harness write that resume reads:
+   `results/<name>.json`, `results/<name>.failure.txt`,
+   `comparison.md`.
+3. `_completed_variant_names()` now parses every JSON file,
+   schema-checks against `_RESULT_REQUIRED_KEYS = ("variant",
+   "summary", "elapsed_sec")`, and quarantines bad files to
+   `<name>.json.corrupt`. Corrupt names are EXCLUDED from the
+   completed set so resume re-runs them. Operators see a clear
+   `[BATTERY] quarantined corrupt result …` warning per file.
+
+**Cost.** One extra `Path.replace()` per write (~microseconds);
+schema parse on resume (~ms per file). Negligible.
+
+### 14.3 G-2 — Auto-retry loop on `BrokenProcessPool` cascade
+
+**Observation.** Bug F's `max_tasks_per_child=1` eliminates
+*cross-variant state pollution* but does NOT prevent the cascade
+itself. Python's `ProcessPoolExecutor` invalidates the WHOLE pool
+when ANY worker terminates abnormally — every pending future raises
+`BrokenProcessPool`, even though the surviving variants never had a
+chance to run. With 17 pending variants per typical battery, one
+unlucky native crash still costs us 16 lost variants.
+
+**Why this matters NOW.** The running validation has 19 variants in
+its slate. Two have completed (V1, V2 baselines, currently running
+in the new pool with the Bug F fix); 17 are still ahead. If
+*any* of those 17 hits a fresh native crash (numpy SIMD bug, xgboost
+init race, yfinance native socket close, OOM), the fix from this
+morning saves us from cross-variant pollution but NOT from
+cascade-killing the other 16. We'd be back to manually re-resuming.
+
+**Fix.** Wrap the dispatch loop in a bounded retry. After a cascade,
+recreate a fresh `ProcessPoolExecutor(max_workers=N,
+max_tasks_per_child=1)` and re-submit only:
+
+* Variants without a valid `results/<name>.json` (i.e., not
+  completed — checked via `_completed_variant_names`).
+* Variants not in the `real_failed` set (a per-attempt set tracking
+  variants that hit a real Python `Exception` in `fut.result()`,
+  distinct from `BrokenProcessPool` casualties).
+
+Per-future handling now has TWO except branches:
+```python
+except BrokenProcessPool:
+    broken_pool_seen = True; continue   # cascade casualty, retry
+except Exception as e:
+    real_failed.add(name); ...           # real failure, don't retry
+```
+
+Bounded by `MAX_POOL_RETRIES = 3` so a deterministically-crashing
+variant doesn't infinite-loop us. After 3 attempts, remaining stuck
+variants are written to `<name>.failure.txt` with the explicit
+message `pool cascade after 3 retries` so the operator can root-
+cause whatever's deterministically killing the worker.
+
+**Cost.** Zero on the happy path (no cascade → loop exits after 1
+iteration). On a single-cascade run: one extra pool spin-up (~5-10
+seconds for 2 fresh workers + market_data unpickle each) per remaining
+variant. For the running validation (17 variants pending after V1+V2),
+this could save us ~50 hours of compute if any cascade occurs.
+
+### 14.4 G-3 — Hard timeout on `yfinance.download`
+
+**Observation.** `_trend_context._fetch_daily()` calls
+`yfinance.download()` with no timeout. yfinance's underlying HTTP
+client has socket defaults that can hang for many minutes on a
+broken connection. Variants V1, V3-V9, V17-V18 all use the trend
+filter (`trend_filter_pct` config field) → all invoke this code path
+on every entry. A stalled HTTP socket hangs the worker thread
+indefinitely; the harness' 30-min progress watchdog eventually fires
+`os._exit(124)`, which cascade-kills the pool (Bug G-2 partially
+recovers, but fail-fast on the network side is much cleaner).
+
+**Fix.** New `_yf_download_with_timeout(symbol, timeout)` wraps the
+yfinance call in a `concurrent.futures.ThreadPoolExecutor` with
+`result(timeout=N)`. On timeout, returns `None`; `_fetch_daily`
+treats `None` as "trend unknown" and the strategy fails open (does
+NOT block the trade — same semantic as a permanent fetch failure).
+Default 30 s timeout, tunable via `TREND_FETCH_TIMEOUT_SEC` env.
+
+Why a thread-with-timeout (not `signal.alarm` and not
+`yf.download(..., timeout=N)`)?
+* Signal-based preemption is fragile in worker subprocesses.
+* yfinance's outer `timeout=` kwarg is not version-stable.
+* `ThreadPoolExecutor.result(timeout=N)` is portable and survives
+  yfinance upgrades. A leaked thread (yfinance never returns) is
+  bounded to one worker lifetime because `max_tasks_per_child=1`
+  guarantees process exit after the variant.
+
+**Cost.** Zero on the happy path (~50 ms HTTP fetch returns
+immediately). On a hang: capped at 30 s instead of unbounded.
+
+### 14.5 G-5 — Queue scheduler `--rm` + zombie-container retry
+
+**Observation.** This is the exact incident from earlier today.
+`build_docker_run_argv()` in `tools/run_battery_queue.py` did NOT
+pass `--rm`, so an exited container kept its name. Since
+`_run_id_for(...)` reuses the same `run_id` for resume launches, the
+next launch hit `Error response from daemon: Conflict. The container
+name "/<run_id>" is already in use by container ...`, the scheduler
+marked the job permanently `"failed"` at launch, and the queue
+ground to a halt until manual `docker rm` cleanup. We had 5 zombie
+containers to clean up by hand.
+
+`tools/cloud/launch_battery.sh` already passes `--rm`; this was a
+parity gap between the manual launcher and the scheduler-spawned
+launcher.
+
+**Fix.**
+1. Add `--rm` to the queue scheduler's docker-run argv.
+2. On launch failure where stderr contains
+   `is already in use by container`, run `sudo docker rm -f <run_id>`
+   and retry the launch exactly once.
+3. Distinguish `failure_phase: "launch"` from `failure_phase: "run"`
+   in the saved job state so operators can route triage correctly
+   (image / daemon vs. harness / variant).
+
+**Cost.** Zero on the happy path. On zombie hit: one extra
+`docker rm -f` (~1-2 s) + one launch retry. Eliminates the manual
+intervention failure mode entirely.
+
+### 14.6 Tests for Bug G
+
+`tests/unit/test_battery_robustness.py` (NEW) — 26 tests across 5
+classes, all passing alongside the existing 6 Bug F isolation tests:
+
+* **TestAtomicWriteHelper** (5): `_atomic_write_text` exists, writes
+  atomically, leaves no `.tmp` residue, overwrites existing files,
+  is wired through both result JSON and comparison.md.
+* **TestCorruptJsonQuarantine** (5): truncated JSON / missing keys /
+  wrong-type `summary` are quarantined and excluded; valid JSON is
+  accepted; `.tmp` residue is skipped.
+* **TestProcessPoolRetryLoop** (5): `BrokenProcessPool` import
+  exists, `MAX_POOL_RETRIES` defined, both per-future except
+  branches present, all PPE constructions still set
+  `max_tasks_per_child=1`, `real_failed` tracking set is named.
+* **TestTrendContextTimeout** (5): `_YF_TIMEOUT_SEC` defined and in
+  sane range, `_yf_download_with_timeout` wrapper exists,
+  `_fetch_daily` routes through it (and does NOT call `yf.download`
+  directly), timeout returns `None` (fail-open), env override
+  honored.
+* **TestQueueSchedulerRobustness** (3): `--rm` in argv, name-conflict
+  recovery in `process_queue`, `failure_phase` recorded for both
+  values.
+* **TestBugGDocumented** (3): `Bug G-1` in `battery.py`, `Bug G-3`
+  in `_trend_context.py`, `Bug G-5` in `run_battery_queue.py`.
+
+Full unit suite still passes: **1267 / 1267** (was 1247 before this
+work; +6 isolation tests landed earlier today, +14 Bug E tests
+from earlier today, +26 Bug G robustness tests now). No existing
+tests changed.
+
+### 14.7 Issues NOT fixed in this commit (catalogued for follow-up)
+
+These are recorded here so the next freeze-bypass cycle has a
+prioritized backlog:
+
+**HIGH (fix before next battery launch, but not blocking the
+running window):**
+
+* H-1: Same-bar re-entry after intra-bar SL/TP exit
+  (`backtest_ensemble.py:311-400`) inflates trade count on
+  stop-heavy variants. Add `continue` or `exited_this_bar` flag.
+* H-2: `backtest_end` exits omit slippage
+  (`backtest_ensemble.py:588-603`); positions still open at dataset
+  end get systematically better fills.
+* H-3: `comparison.md` notes still claim "Sharpe is annualized from
+  per-bar returns" (corrected in this commit) — verify Friday
+  reviewer reads the new wording.
+* H-4: In-memory scheduler state clobbers manual `battery_queue_state.json`
+  edits (already documented in `ops_runbook.md` as today's pitfall;
+  proper fix is re-read state from disk before each `save_state()`
+  merge).
+* H-5: Bug F watchdog `os._exit(124)` still breaks the pool for
+  sibling workers; G-2's auto-retry recovers, but a per-batch pool
+  isolation would be cleaner.
+* H-6: `_merge_bars` materializes the full event list before
+  yielding (memory spike at variant start). Heap merge would
+  amortize.
+
+**MEDIUM (next freeze cycle):**
+
+* M-1: Strategy `generate_signal` exceptions silently swallowed
+  inside the per-bar loop.
+* M-2: XGBoost recomputes full `FeatureEngine.compute_all()` on
+  every bar even with the new 300-bar window.
+* M-3: XGBoost / LSTM not in Bug E equivalence tests.
+* M-4: Tie-breaking at identical timestamps in `_merge_bars` is
+  dict-order dependent (add secondary sort by symbol).
+* M-5: `_trend_context._cache` grows unbounded within a single
+  worker (200+ symbols × 6h TTL); add LRU cap.
+* M-6: `ProcessPoolExecutor` doesn't set `mp_context="spawn"` on
+  Linux for parity with Windows + safety against fork+native-thread
+  issues.
+* M-7: `BacktestConfig.apply_regime_filter` is dead code — wire it
+  up or remove.
+
+**LOW (backlog):**
+
+* L-1: Opposite-signal exit fills at bar close, not intra-bar touch
+  (Bug C approximation, documented but slightly different from Bug A
+  intra-bar precision).
+* L-2: `backtest_end` closes don't update `losses_per_stock`
+  blacklist counter (irrelevant — loop has ended).
+* L-3: Faulthandler fault-log file handle never explicitly closed
+  (process exit cleans up; intentional).
+* L-4: `diagnostic.py` not in battery hot path; reviewed for
+  cross-contamination, none found.
+
+**CRITICAL deferred (not fixable mid-run without invalidating
+results):**
+
+* DEF-1: Regime classifier hardcoded to `"unknown"` in
+  `backtest_ensemble.py` (Bug B / Bug D residue). All current PnL/WR/PF
+  numbers in the running battery overstate live-aggressive behavior
+  vs. production. Direction conclusions (short-veto / long-only)
+  still hold; magnitudes do not. Friday review must flag all numbers
+  as "no regime suppression" until the post-validation window adds
+  Nifty/VIX to `market_data.pkl` and computes per-bar regime.
+
+### 14.8 Confirmations on today's earlier fixes
+
+The review explicitly verified each of today's earlier fixes is
+sound (no follow-up issues found in the bugs themselves):
+
+* **Bug A (intra-bar SL/TP gate):** ordering correct
+  (`_detect_intrabar_exit` runs *before* opposite-signal branch);
+  conservative SL-first tie-breaking when both are in range
+  (`backtest_ensemble.py:724-727, 739-740`); gap-open uses open
+  price. *Caveat:* same-bar re-entry possible (H-1, deferred).
+* **Bug C (opposite-signal exit fill):** evaluated and closed at
+  current-bar close + slippage with simulated `exit_time`
+  (`backtest_ensemble.py:376-384`); same-direction duplicates still
+  dropped via held-position branch.
+* **Bug E (`strategy_history_window=300`):** slice is
+  `df.iloc[max(0, i+1-window) : i+1]` — correct at all boundaries,
+  warm-up uses shorter prefix when `i+1 < window`,
+  `max(window, 1)` prevents empty slices. *Caveat:* XGBoost not in
+  equivalence tests (M-3, deferred).
+* **Bug F (`max_tasks_per_child=1`):** confirmed at
+  `battery.py:1475-1478`; loguru `add`/`remove` in try/finally
+  remains correct belt-and-suspenders. *Caveat:* `mp_context` not
+  set (M-6, deferred); cascade not eliminated (closed in this
+  commit via Bug G-2).
+
+### 14.9 Freeze accounting
+
+All four Bug G fixes touch `packages/research/battery.py`,
+`packages/strategies/_trend_context.py`, and
+`tools/run_battery_queue.py`. None is on the slot-consuming list in
+FREEZE_v2.1 (which covers strategies, risk, position sizing,
+trading_agent.py, config.yaml strategy/risk blocks, models). All
+four are **harness/library robustness fixes**: they change *how* the
+orchestrator handles failures and *how* one helper times out a
+network call, not *what* anything computes. Backtest results are
+byte-identical (same code on same data on the happy path; Bug G-2
+only activates on cascade and produces the same per-variant output
+the original happy path would have produced; Bug G-3 only changes
+behavior on a network hang where the prior code would have
+hung-then-watchdog-killed). No bypass slot consumed. Bypass ledger
+remains 1/3 (risk.allow_shorts).

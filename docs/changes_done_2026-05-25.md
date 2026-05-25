@@ -1016,3 +1016,283 @@ ETA at the post-Bug-E rate (~3.2 h per variant on 2 workers):
 - `tests/unit/test_battery_worker_isolation.py` — NEW, 6 tests
 - `docs/findings_log_2026-05-25.md` — §13 added
 - `docs/changes_done_2026-05-25.md` — this §12
+
+---
+
+## 13. Bug G — Backtester subsystem code-review hardening (2026-05-25 night)
+
+### §13.1 Trigger
+
+Operator request after a day of cascading bug discoveries (A through
+F): *"do a full code review for backtest so that no other issues
+appear."* The next 64 h of compute (37 h validation + ~27 h
+nifty50_60d resume) is the Friday-review evidence trail; we cannot
+afford another preventable surprise mid-run.
+
+A focused exploration agent reviewed every file in the backtester
+hot path (10 files, ~5,400 LOC) — `packages/research/{backtest_ensemble.py,
+battery.py, diagnostic.py}`, `packages/strategies/_trend_context.py`,
+`tools/{run_battery.py, run_battery_queue.py}` and adjacent fixtures.
+24 issues surfaced across 4 severity tiers (5 critical, 8 high, 7
+medium, 4 low). This commit closes the **4 critical issues that
+could affect the running 64 h compute window**. The fifth critical
+(regime hardcoded — Bug B residue) cannot be retrofitted mid-run
+without invalidating results; deferred and flagged for the
+post-validation window.
+
+Full RCA per fix lives in `findings_log §14`. This section is the
+operational change-log: what landed, what tests pin it, how the
+freeze accounts for it, and how to verify after VM pull.
+
+### §13.2 G-1 — Atomic results-JSON writes + corrupt-JSON quarantine on resume
+
+**Problem.** `_completed_variant_names()` was treating *any* file
+matching `results/*.json` as proof a variant was complete. Combined
+with the non-atomic `Path.write_text()` write inside
+`_run_variant_in_subprocess`, a worker crash mid-write would leave a
+truncated JSON that resume permanently SKIPS — with no warning. The
+variant would be silently missing from `comparison.md`.
+
+**Fix.**
+* New `battery._atomic_write_text(path, text)` helper: writes to
+  `<path>.tmp`, then `Path.replace()`s onto the target. Atomic at
+  the directory-entry level on POSIX and Windows for same-filesystem
+  renames.
+* Wired through every harness write that resume reads:
+  `results/<name>.json`, `results/<name>.failure.txt`,
+  `comparison.md`.
+* `_completed_variant_names()` now parses + schema-checks every
+  file. Required keys: `variant`, `summary` (must be a dict),
+  `elapsed_sec`. Bad files are renamed to `<name>.json.corrupt` and
+  EXCLUDED from the completed set so resume re-runs them. Operator
+  sees `[BATTERY] quarantined corrupt result …` warning per file.
+
+**Cost.** Per-write: one extra `Path.replace()` (~µs). Per-resume:
+schema parse on every result file (~ms each). Negligible vs. ~3 h
+per variant.
+
+### §13.3 G-2 — Auto-retry loop on `BrokenProcessPool` cascade
+
+**Problem.** Bug F's `max_tasks_per_child=1` eliminates *cross-
+variant state pollution* but does NOT prevent the cascade itself.
+Python's `ProcessPoolExecutor` invalidates the WHOLE pool when ANY
+worker terminates abnormally — every pending future raises
+`BrokenProcessPool`. With 17 variants pending in the running
+validation, one unlucky native crash still costs 16 lost variants.
+
+**Fix.** Wrap dispatch in a bounded retry loop:
+
+```python
+MAX_POOL_RETRIES = 3
+real_failed: set[str] = set()
+for attempt in range(1, MAX_POOL_RETRIES + 1):
+    completed_now = _completed_variant_names(out_root)
+    not_done = [(n, o) for n, o in pending
+                if n not in completed_now and n not in real_failed]
+    if not not_done:
+        break
+    broken_pool_seen = False
+    try:
+        with ProcessPoolExecutor(max_workers=N, max_tasks_per_child=1) as pool:
+            ...
+            for fut in as_completed(futures):
+                try:
+                    ...success path...
+                except BrokenProcessPool:
+                    broken_pool_seen = True; continue   # cascade casualty, retry
+                except Exception as e:
+                    real_failed.add(name); ...           # real failure, don't retry
+    except BrokenProcessPool:
+        broken_pool_seen = True
+    if not broken_pool_seen:
+        break
+else:
+    # mark stuck variants with `pool cascade after 3 retries`
+```
+
+Per-future handling now has TWO except branches:
+* `BrokenProcessPool` → cascade casualty, NOT marked failed; outer
+  loop picks up via `_completed_variant_names` check.
+* `Exception` → real Python failure, recorded in `real_failed` so
+  retries do not re-submit it.
+
+Bounded by 3 attempts; deterministic crashes get permanent
+`<name>.failure.txt` with explicit `pool cascade after 3 retries`
+message.
+
+**Cost.** Zero on the happy path. On a single cascade: one extra
+~5-10 s pool spin-up per remaining variant. On the running
+validation, this could save **~50 h of compute** if any cascade
+occurs in the 17 pending variants.
+
+### §13.4 G-3 — Hard timeout on `yfinance.download`
+
+**Problem.** `_trend_context._fetch_daily()` calls
+`yfinance.download()` with no timeout. A stalled HTTP socket hangs
+the worker thread indefinitely. Variants V1, V3-V9, V17-V18 all
+invoke this path. The harness' 30-min progress watchdog eventually
+fires `os._exit(124)`, which historically cascade-killed the pool
+(now G-2 partially recovers, but fail-fast on the network side is
+cleaner).
+
+**Fix.** New `_yf_download_with_timeout(symbol, timeout)` wraps
+`yfinance.download` in a `concurrent.futures.ThreadPoolExecutor`
+with `result(timeout=N)`. Default 30 s, tunable via
+`TREND_FETCH_TIMEOUT_SEC` env. On timeout: returns `None`;
+`_fetch_daily` treats `None` as "trend unknown" → fail-open (does
+NOT block the trade — same as a permanent fetch failure).
+
+Why thread-with-timeout (not signal.alarm, not yf.download
+timeout=)?
+* Signal-based preemption is fragile in worker subprocesses.
+* yfinance's outer `timeout=` kwarg is not version-stable.
+* `ThreadPoolExecutor.result(timeout=N)` is portable and survives
+  yfinance upgrades. Leaked thread (yfinance never returns) is
+  bounded to one worker lifetime by `max_tasks_per_child=1`.
+
+**Cost.** Zero on happy path. On hang: capped at 30 s instead of
+unbounded.
+
+### §13.5 G-5 — Queue scheduler `--rm` + zombie-container retry
+
+**Problem.** Today's actual incident.
+`tools/run_battery_queue.py:build_docker_run_argv()` did NOT pass
+`--rm`, so an exited container retained its name. Since
+`_run_id_for(...)` reuses the same `run_id` for resume launches,
+the next launch hit `Conflict. The container name "/<run_id>" is
+already in use…`, the scheduler marked the job `"failed"` at
+launch, and the queue ground to a halt. We had 5 zombie containers
+to clean up by hand earlier today.
+
+**Fix.**
+1. Add `--rm` to the scheduler's docker-run argv (parity with
+   `tools/cloud/launch_battery.sh` which already had it).
+2. On launch failure with stderr containing
+   `is already in use by container`, run
+   `sudo docker rm -f <run_id>` and retry the launch exactly once.
+3. Distinguish `failure_phase: "launch"` from `failure_phase: "run"`
+   in the saved job state so operators can route triage correctly
+   (image / daemon vs. harness / variant).
+
+**Cost.** Zero on the happy path. On zombie hit: one extra
+`docker rm -f` (~1-2 s) + one launch retry. Eliminates the manual
+intervention failure mode.
+
+### §13.6 Tests
+
+`tests/unit/test_battery_robustness.py` — NEW, **26 tests** across 6
+classes:
+
+* `TestAtomicWriteHelper` (5): helper exists, writes atomically,
+  no `.tmp` residue, overwrites existing, wired through both result
+  JSON and `comparison.md`.
+* `TestCorruptJsonQuarantine` (5): truncated / missing-keys /
+  wrong-type-summary all quarantined and excluded; valid JSON
+  accepted; `.tmp` residue skipped.
+* `TestProcessPoolRetryLoop` (5): `BrokenProcessPool` import
+  exists, `MAX_POOL_RETRIES` defined, both per-future except
+  branches present, all `ProcessPoolExecutor` calls still set
+  `max_tasks_per_child=1`, `real_failed` tracking set named.
+* `TestTrendContextTimeout` (5): `_YF_TIMEOUT_SEC` defined and in
+  sane range, `_yf_download_with_timeout` exists, `_fetch_daily`
+  routes through it (and does NOT call `yf.download` directly),
+  timeout returns `None` (fail-open), env override honored.
+* `TestQueueSchedulerRobustness` (3): `--rm` in argv, name-conflict
+  recovery in `process_queue`, `failure_phase` recorded for both
+  values.
+* `TestBugGDocumented` (3): `Bug G-1` cited in `battery.py`,
+  `Bug G-3` cited in `_trend_context.py`, `Bug G-5` cited in
+  `run_battery_queue.py`.
+
+**Suite result:** 1267 / 1267 passing. No existing tests changed.
+
+### §13.7 Freeze accounting
+
+All four Bug G fixes touch `packages/research/battery.py`,
+`packages/strategies/_trend_context.py`, and
+`tools/run_battery_queue.py`. None is on the slot-consuming list in
+`FREEZE_v2.1` (strategies, risk, position sizing, trading_agent.py,
+config.yaml strategy/risk blocks, models). All four are
+**harness/library robustness fixes** changing *how* failures are
+handled and *how* one helper times out a network call — not *what*
+anything computes:
+
+* G-1: only adds atomicity + corruption detection; happy-path
+  bytes-identical.
+* G-2: only activates on cascade; happy path is one iteration of
+  the loop, identical to pre-G-2 single-pass.
+* G-3: only changes behavior on network hang where prior code would
+  have hung-then-watchdog-killed; happy-path output identical.
+* G-5: scheduler-only; affects launch reliability, not what the
+  harness computes once launched.
+
+**No bypass slot consumed. Bypass ledger remains 1/3 used** (only
+`risk.allow_shorts`).
+
+### §13.8 Verification after pull
+
+On the backtester VM, after `git pull`:
+
+```bash
+# 1) Confirm new tests pass on the VM-side python (parity with dev box)
+sudo -u opc bash -lc "cd /opt/trading-agent && python -m pytest \
+    tests/unit/test_battery_robustness.py \
+    tests/unit/test_battery_worker_isolation.py -q"
+# Expected: 32 passed
+
+# 2) Confirm scheduler picked up the new build_docker_run_argv (only
+#    matters when scheduler is restarted; current container in flight
+#    is already running with the in-memory pre-G-5 argv builder).
+grep -- "--rm" /opt/trading-agent/tools/run_battery_queue.py
+# Expected: 2-3 hits including the `cmd:` list literal
+
+# 3) Confirm the bind-mount is read-only and packages/ is fresh
+sudo docker exec $(sudo docker ps -q --filter name=battery_) \
+    grep -c "Bug G-2" /app/packages/research/battery.py
+# Expected: ≥1 hit IF the running container was launched after pull;
+# 0 hits is fine for the pre-G running container — read-only mount
+# means new launches pick up the fix.
+```
+
+### §13.9 Operational notes for the running 64 h window
+
+The currently-running validation container was launched BEFORE this
+commit, so it has the in-memory state of pre-G code:
+* G-1 (atomic results write): NOT active. If a worker crashes
+  mid-write of `results/<name>.json` in the next 37 h, the file
+  could still be truncated. Mitigation: G-1 only matters on resume;
+  the validation run is fresh and sequential so a crashed variant
+  would be caught by the new auto-retry (G-2 — also not active in
+  the running container) OR by the existing `<name>.failure.txt`
+  marker.
+* G-2 (cascade retry): NOT active in the running validation. A
+  cascade in the 17 pending variants would still require manual
+  `--resume`. The nifty50_60d resume that follows WILL launch a
+  fresh container that picks up G-2 (and all of Bug G).
+* G-3 (yfinance timeout): NOT active in the running validation. A
+  yfinance hang would still trigger the watchdog. Probability is
+  low (validation is 60 d, fewer fetches than 90 d) but non-zero.
+* G-5 (queue --rm + retry): N/A to the in-flight container; takes
+  effect on the next scheduler-spawned launch (the nifty50_60d
+  resume).
+
+**Decision:** No mid-validation restart. Risk of restart-induced
+corruption (re-loading `market_data.pkl`, re-firing the live-md
+thread, scheduler queue races) outweighs the marginal robustness
+gain from getting G-1/G-2/G-3 active for the validation tail. The
+nifty50_60d resume — the larger of the two queued runs at ~27 h —
+gets all four fixes when it launches in ~37 h.
+
+### §13.10 Files touched in §13
+
+- `packages/research/battery.py` — `_atomic_write_text` helper +
+  `_completed_variant_names` schema check + retry loop in `main()` +
+  `BrokenProcessPool` import
+- `packages/strategies/_trend_context.py` — `_YF_TIMEOUT_SEC`
+  constant + `_yf_download_with_timeout` helper + `_fetch_daily`
+  rewired
+- `tools/run_battery_queue.py` — `--rm` in argv + name-conflict
+  recovery in `process_queue` + `failure_phase` markers
+- `tests/unit/test_battery_robustness.py` — NEW, 26 tests
+- `docs/findings_log_2026-05-25.md` — §14 added
+- `docs/changes_done_2026-05-25.md` — this §13

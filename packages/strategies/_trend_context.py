@@ -35,6 +35,8 @@ Why the 50-day SMA specifically?
 
 from __future__ import annotations
 
+import concurrent.futures as _cf
+import os
 import threading
 import time
 from typing import Optional
@@ -44,16 +46,66 @@ from loguru import logger
 
 THRESHOLD_PCT = 5.0  # symbol must be within +/- 5% of 50d SMA to trade with trend
 CACHE_TTL_SEC = 6 * 3600
+# 2026-05-25 Bug G-3: hard timeout on the yfinance HTTP call. Without
+# this, a stalled connection (slow Yahoo response, broken DNS, hung
+# socket) hangs the worker thread indefinitely. The battery harness'
+# 30-min progress watchdog would eventually kill the worker, but that
+# triggers a ProcessPoolExecutor cascade-kill of all sibling variants
+# (see Bug F / Bug G-2). 30s is generous for a single ~3-month daily
+# bar pull.
+_YF_TIMEOUT_SEC = float(os.environ.get("TREND_FETCH_TIMEOUT_SEC", "30"))
 _cache: dict[str, dict] = {}
 _lock = threading.Lock()
 
 
-def _fetch_daily(symbol: str) -> Optional[dict]:
-    """Pull 3 months of daily bars from yfinance, compute SMAs."""
-    try:
+def _yf_download_with_timeout(symbol: str, timeout: float) -> "pd.DataFrame | None":
+    """Run `yfinance.download` in a worker thread with a hard timeout.
+
+    Why a thread (not a signal alarm or `yf.download(..., timeout=N)`)?
+    - Signals only work on the main thread of the main interpreter and
+      we're called from worker subprocesses where signal-based
+      preemption is fragile.
+    - `yfinance.download` does not consistently honour an outer
+      `timeout=` kwarg across versions; relying on it would silently
+      regress on a yfinance upgrade.
+    - A `ThreadPoolExecutor` with `result(timeout=N)` is portable and
+      version-stable. If the underlying call is genuinely hung, the
+      future leaks the thread until process exit, but
+      `max_tasks_per_child=1` (Bug F fix) guarantees process exit
+      after this single variant — so the leak is bounded to one
+      worker lifetime.
+    """
+    def _do_fetch() -> "pd.DataFrame | None":
         import yfinance as yf
-        df = yf.download(f"{symbol}.NS", period="3mo", interval="1d",
-                         progress=False, auto_adjust=False)
+        return yf.download(
+            f"{symbol}.NS", period="3mo", interval="1d",
+            progress=False, auto_adjust=False,
+        )
+    try:
+        with _cf.ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="trend-fetch",
+        ) as ex:
+            return ex.submit(_do_fetch).result(timeout=timeout)
+    except _cf.TimeoutError:
+        logger.warning(
+            f"[trend_context] yfinance timed out after {timeout}s for "
+            f"{symbol}; treating as 'trend unknown' (fail-open)."
+        )
+        return None
+
+
+def _fetch_daily(symbol: str) -> Optional[dict]:
+    """Pull 3 months of daily bars from yfinance, compute SMAs.
+
+    Hard-timeouted via `_yf_download_with_timeout` (Bug G-3).
+    Fetch failures (timeout, network error, empty result, parse error)
+    return None and the caller treats the trend as unknown (fail-open
+    so a data-source outage doesn't silently disable the strategy).
+    """
+    try:
+        df = _yf_download_with_timeout(symbol, _YF_TIMEOUT_SEC)
+        if df is None:
+            return None
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
         if df.empty or len(df) < 50:

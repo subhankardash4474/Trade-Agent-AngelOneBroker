@@ -302,6 +302,7 @@ These rows exist so the Friday review can find every commit tagged
 2026-05-25 | TBD-sha | freeze-bypass: audit 2026-05-25 quick wins (B-1/B-3/B-4/B-5/B-11) — operator tools + SSL hardening + sector-map dedup
 2026-05-25 | TBD-sha | observability: Bug E — backtester _merge_bars O(N²) slice fix (strategy_history_window=300) + 13 equivalence tests
 2026-05-25 | TBD-sha | observability: Bug F — battery harness ProcessPoolExecutor cascade-fail fix (max_tasks_per_child=1 + faulthandler diagnostic) + 6 structural tests
+2026-05-25 | TBD-sha | observability: Bug G — backtester subsystem code-review hardening (G-1 atomic results-JSON writes + corrupt-JSON quarantine; G-2 BrokenProcessPool auto-retry loop with MAX_POOL_RETRIES=3; G-3 yfinance hard timeout in _trend_context; G-5 queue scheduler --rm + zombie-container retry + failure_phase markers) + 26 structural tests
 ```
 
 Audit-only entries cover: `packages/monitoring/alerts.py`, `tests/`,
@@ -366,9 +367,13 @@ NOT frozen — that's an audit-only entry.
 *Last revised: 2026-05-25 (slot #1 consumed for `risk.allow_shorts`
 flag pre-stage; defaults true = no behaviour change; 1/3 slots used.
 Late-day audit-only entries: B-1/B-3/B-4/B-5/B-11 quick wins, Bug E
-backtester O(N²) `_merge_bars` perf fix, and Bug F battery harness
+backtester O(N²) `_merge_bars` perf fix, Bug F battery harness
 ProcessPoolExecutor worker-isolation fix (`max_tasks_per_child=1` +
-faulthandler diagnostic) — none consume a slot; all add tests; all
-behaviour-neutral on backtest output [Bug F changes only the
-process-management layer, not the computation; backtest results are
-byte-identical for a given variant config]).*
+faulthandler diagnostic), and Bug G code-review hardening
+(G-1 atomic-write + corrupt-JSON quarantine; G-2 cascade auto-retry;
+G-3 yfinance timeout; G-5 queue scheduler `--rm` + zombie-container
+retry) — none consume a slot; all add tests (45 new across F + G);
+all behaviour-neutral on backtest output [Bug F changes only the
+process-management layer; Bug G fixes only activate on failure paths
+(cascade, corruption, network hang, name conflict) and produce
+byte-identical output to a hypothetically-perfect happy path]).*

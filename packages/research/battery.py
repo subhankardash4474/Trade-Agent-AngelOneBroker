@@ -42,6 +42,7 @@ import threading
 import time
 import traceback
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures.process import BrokenProcessPool
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -694,8 +695,13 @@ def _run_variant_in_subprocess(
         # Persist per-variant result here so a worker crash mid-run still
         # leaves a complete record (parent's comparison.md write is the only
         # thing that becomes inconsistent, and that's a single-writer file).
-        (out_root / "results" / f"{name}.json").write_text(
-            json.dumps(payload, indent=2, default=str), encoding="utf-8"
+        # 2026-05-25 Bug G-1: atomic write so a crash *during* this
+        # call doesn't leave a truncated JSON that resume mis-treats
+        # as "done". The matching reader is `_completed_variant_names`
+        # which schema-checks and quarantines corrupt files.
+        _atomic_write_text(
+            out_root / "results" / f"{name}.json",
+            json.dumps(payload, indent=2, default=str),
         )
         return name, payload
     finally:
@@ -734,12 +740,112 @@ def _find_latest_incomplete_run() -> str | None:
     return None
 
 
+def _atomic_write_text(path: Path, text: str, *, encoding: str = "utf-8") -> None:
+    """Write `text` to `path` atomically.
+
+    Writes to a sibling `.tmp` file, then `Path.replace()`'s it onto the
+    target. On both Windows and POSIX (same-filesystem) this is atomic
+    at the directory-entry level: a concurrent reader sees either the
+    pre-write content or the post-write content, never a torn half.
+
+    Why this matters here (Bug G-1, 2026-05-25):
+    - `results/<variant>.json` was previously written via plain
+      `Path.write_text()`. If the worker process crashed mid-write
+      (OOM, native segfault, the parent's broken-pool fallback path),
+      the file existed on disk with truncated/invalid JSON.
+    - `_completed_variant_names()` treated *any* file matching
+      `results/*.json` as proof the variant was complete, so
+      `--resume` would silently SKIP a variant whose JSON was
+      corrupt. The variant would be missing from the final
+      comparison.md with no automatic recovery.
+    - The same applies to `comparison.md` (the live-status thread can
+      be reading while the per-completion writer is mid-update; lock
+      handles in-process races but operators tailing from off-box can
+      still see torn content).
+
+    The `.tmp` file is best-effort cleaned up on overwrite or process
+    exit; even if a stale `.tmp` lingers, it never carries the real
+    name and is harmless. Cross-filesystem renames (which would
+    silently fall back to copy-then-unlink and break atomicity) are
+    not a concern here -- the workers/, results/, and run-root all
+    live on the same volume by construction.
+    """
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(text, encoding=encoding)
+    tmp.replace(path)
+
+
+# 2026-05-25 Bug G-1: minimum schema a valid result JSON must satisfy
+# before _completed_variant_names() considers the variant complete.
+# Anything missing one of these keys is treated as corrupt and
+# quarantined to <name>.json.corrupt so resume re-runs the variant
+# instead of silently skipping it.
+_RESULT_REQUIRED_KEYS = ("variant", "summary", "elapsed_sec")
+
+
 def _completed_variant_names(out_root: Path) -> set[str]:
-    """Return the set of variant names that have a result JSON on disk."""
+    """Return the set of variant names whose result JSON is present AND parseable.
+
+    2026-05-25 Bug G-1 hardening: previously this returned every file
+    name matching `results/*.json`. A truncated / corrupt result file
+    (worker crashed mid-write under the pre-Bug-G non-atomic write
+    path) was treated as "done" and the variant was permanently
+    skipped on resume. Now we parse and schema-check every file; bad
+    files are renamed to `<name>.json.corrupt` and the variant name
+    is OMITTED from the completed set so resume re-runs it.
+
+    Schema is intentionally minimal: the keys the harness writes
+    (`_run_variant_in_subprocess` line ~656) and that
+    `_meta`/`_write_comparison` actually consume on rehydrate. Adding
+    fields to the payload doesn't break backward compatibility; only
+    *removing* a key listed in `_RESULT_REQUIRED_KEYS` does, and that
+    would be a deliberate refactor anyway.
+    """
     results_dir = out_root / "results"
     if not results_dir.exists():
         return set()
-    return {p.stem for p in results_dir.glob("*.json")}
+
+    completed: set[str] = set()
+    quarantined: list[str] = []
+    for jp in results_dir.glob("*.json"):
+        # Skip our own .tmp scratch files (atomic-write residue) so a
+        # crashed write doesn't trip the schema check.
+        if jp.name.endswith(".tmp"):
+            continue
+        try:
+            payload = json.loads(jp.read_text(encoding="utf-8"))
+            if not isinstance(payload, dict):
+                raise ValueError("top-level not a dict")
+            missing = [k for k in _RESULT_REQUIRED_KEYS if k not in payload]
+            if missing:
+                raise ValueError(f"missing required keys: {missing}")
+            if not isinstance(payload.get("summary"), dict):
+                raise ValueError("summary is not a dict")
+            completed.add(jp.stem)
+        except (json.JSONDecodeError, ValueError, OSError) as e:
+            corrupt = jp.with_suffix(".json.corrupt")
+            try:
+                jp.replace(corrupt)
+                quarantined.append(jp.stem)
+                logger.warning(
+                    f"[BATTERY] quarantined corrupt result {jp.name} -> "
+                    f"{corrupt.name}: {e}. Variant will be re-run on resume."
+                )
+            except OSError as ren_err:
+                # Couldn't rename — log but DON'T add to completed; resume
+                # still won't skip this variant since it's not in the set.
+                logger.warning(
+                    f"[BATTERY] result {jp.name} is corrupt ({e}) but rename "
+                    f"to .corrupt failed ({ren_err}); leaving in place."
+                )
+
+    if quarantined:
+        logger.warning(
+            f"[BATTERY] {len(quarantined)} corrupt result file(s) "
+            f"quarantined; these variants will be re-run on resume: "
+            f"{quarantined}"
+        )
+    return completed
 
 
 def _write_comparison(rows: list, out_path: Path, meta: dict,
@@ -802,14 +908,26 @@ def _write_comparison(rows: list, out_path: Path, meta: dict,
 
     lines.append("\n## Notes\n")
     lines.append("- Same market_data used across all variants -- comparable.")
-    lines.append("- PnL is gross of taxes/STT; Sharpe is annualized from per-bar returns.")
+    # 2026-05-25 Bug G-9 doc fix: Sharpe is computed from daily returns
+    # (last equity per IST date) post Bug-D fix, NOT per-bar returns.
+    # The previous note misled Friday-review readers about the
+    # methodology. The actual computation lives in
+    # `_compute_sharpe_from_equities` and is keyed off IST-date buckets.
+    lines.append("- PnL is gross of taxes/STT; Sharpe is annualized from "
+                 "DAILY returns (last equity per IST date).")
     lines.append("- Expectancy = total_pnl / trades (Rs/trade).")
     if not complete:
         lines.append(
             "- This run is **still in progress**. To resume after a crash:\n"
             f"    `python tools/overnight_backtest_battery.py --resume {meta['run_id']}`"
         )
-    out_path.write_text("\n".join(lines), encoding="utf-8")
+    # 2026-05-25 Bug G-1: atomic write so off-box readers (operators
+    # tailing comparison.md via SSH) can't see torn half-files when
+    # the live-md thread or per-completion writer is mid-update. The
+    # in-process comp_lock already serializes writers within this
+    # process, but a torn read across the SSH boundary is still
+    # possible without the rename-into-place dance.
+    _atomic_write_text(out_path, "\n".join(lines))
 
 
 def _read_active_workers(workers_dir: Path, completed_names: set,
@@ -1260,8 +1378,9 @@ def main() -> int:
             except Exception as e:
                 tb = traceback.format_exc()
                 logger.error(f"[BATTERY] {name} CRASHED: {e}\n{tb}")
-                (out_root / "results" / f"{name}.failure.txt").write_text(
-                    f"{datetime.now().isoformat()}\n{e}\n\n{tb}", encoding="utf-8"
+                _atomic_write_text(
+                    out_root / "results" / f"{name}.failure.txt",
+                    f"{datetime.now().isoformat()}\n{e}\n\n{tb}",
                 )
                 failed.append((name, str(e).splitlines()[0] if str(e) else type(e).__name__))
 
@@ -1332,72 +1451,174 @@ def main() -> int:
         logger.info("[BATTERY] live comparison.md updater started "
                     "(refresh every 60s while variants run)")
 
+        # 2026-05-25 Bug F (mass cascade-fail): nifty50_60d V3 died at
+        # ~30 min in a re-used pool worker; ProcessPoolExecutor saw the
+        # crash and raised BrokenProcessPool for ALL 17 pending variants
+        # (V4-V19), even though only V3 had actually crashed. None of
+        # the others ever ran.
+        #
+        # Root cause hypothesis: cross-variant state pollution in re-used
+        # workers. Module-globals that survive a variant include
+        # trend_context._cache (yfinance daily bars, TTL 6h), yfinance's
+        # internal connection pool, xgboost native handles (model load
+        # failed in V1 — left lib in possibly bad state), and any
+        # numpy/pandas internal caches. V1+V2 ran in fresh workers and
+        # passed; V3+V4 ran in re-used workers (worker A's 2nd task = V3,
+        # worker B's 2nd task = V4) and died at the same elapsed time.
+        #
+        # Fix part 1 (committed 5ac119b): max_tasks_per_child=1 forces a
+        # brand-new subprocess for each variant. Pays a ~15s startup tax
+        # per variant (imports + 90 MB market_data unpickle) for full
+        # state isolation. Eliminates cross-variant state pollution.
+        #
+        # 2026-05-25 Bug G-2 (this commit): max_tasks_per_child=1 stops
+        # cross-variant pollution but does NOT prevent the cascade
+        # itself. If a worker dies abnormally (native segfault, OOM
+        # killer, watchdog SIGKILL, internal pool error), Python
+        # invalidates the WHOLE ProcessPoolExecutor and every pending
+        # future raises BrokenProcessPool. With 17 pending variants
+        # that's still 16 lost jobs from a single bad apple.
+        #
+        # Fix part 2: wrap the dispatch in a retry loop. After a pool
+        # cascade, recreate a fresh pool and re-submit only the variants
+        # that have NOT yet completed (no valid results/<name>.json) and
+        # haven't already failed with a real Python exception. Cap at
+        # MAX_POOL_RETRIES so a deterministically-crashing variant
+        # doesn't infinite-loop us. Each retry uses a fresh pool with
+        # max_tasks_per_child=1, so cumulative state-pollution risk is
+        # zero across retries.
+        #
+        # max_tasks_per_child requires Python 3.11+; container ships 3.11.
+        MAX_POOL_RETRIES = 3
+        # Variants that hit a real Python exception in the worker (NOT
+        # BrokenProcessPool) — we wrote a .failure.txt for them and
+        # must NOT retry them on subsequent attempts (they'd just fail
+        # the same way).
+        real_failed: set[str] = set()
         try:
-            # 2026-05-25 Bug F (mass cascade-fail): nifty50_60d V3 died at
-            # ~30 min in a re-used pool worker; ProcessPoolExecutor saw the
-            # crash and raised BrokenProcessPool for ALL 17 pending variants
-            # (V4-V19), even though only V3 had actually crashed. None of
-            # the others ever ran.
-            #
-            # Root cause hypothesis: cross-variant state pollution in re-used
-            # workers. Module-globals that survive a variant include
-            # trend_context._cache (yfinance daily bars, TTL 6h), yfinance's
-            # internal connection pool, xgboost native handles (model load
-            # failed in V1 — left lib in possibly bad state), and any
-            # numpy/pandas internal caches. V1+V2 ran in fresh workers and
-            # passed; V3+V4 ran in re-used workers (worker A's 2nd task = V3,
-            # worker B's 2nd task = V4) and died at the same elapsed time.
-            #
-            # Fix: max_tasks_per_child=1 forces a brand-new subprocess for
-            # each variant. Pays a ~15s startup tax per variant (imports +
-            # 90 MB market_data unpickle) for full state isolation. With
-            # 19 variants × workers=2 that's ~150s total = ~3 min added to
-            # a ~40h queue. Negligible.
-            #
-            # max_tasks_per_child requires Python 3.11+; container ships 3.11.
-            with ProcessPoolExecutor(
-                max_workers=args.workers,
-                max_tasks_per_child=1,
-            ) as pool:
-                futures = {
-                    pool.submit(
-                        _run_variant_in_subprocess,
-                        name, overrides, base_cfg,
-                        args.symbols, args.interval, args.days,
-                        str(out_root),
-                    ): name
-                    for name, overrides in pending
-                }
-                logger.info(f"[BATTERY] dispatched {len(futures)} variants to worker pool")
+            for attempt in range(1, MAX_POOL_RETRIES + 1):
+                completed_now = _completed_variant_names(out_root)
+                not_done = [
+                    (n, o) for n, o in pending
+                    if n not in completed_now and n not in real_failed
+                ]
+                if not not_done:
+                    break  # everything is either done or really-failed
 
-                for fut in as_completed(futures):
-                    name = futures[fut]
-                    try:
-                        _, payload = fut.result()
-                        summary = payload["summary"]
-                        with comp_lock:
-                            rows.append(summary)
+                if attempt > 1:
+                    logger.warning(
+                        f"[BATTERY] retry attempt {attempt}/{MAX_POOL_RETRIES}: "
+                        f"{len(not_done)} variant(s) still pending after pool "
+                        f"cascade. Recreating fresh ProcessPoolExecutor."
+                    )
+
+                broken_pool_seen = False
+                try:
+                    with ProcessPoolExecutor(
+                        max_workers=args.workers,
+                        max_tasks_per_child=1,
+                    ) as pool:
+                        futures = {
+                            pool.submit(
+                                _run_variant_in_subprocess,
+                                name, overrides, base_cfg,
+                                args.symbols, args.interval, args.days,
+                                str(out_root),
+                            ): name
+                            for name, overrides in not_done
+                        }
                         logger.info(
-                            f"[BATTERY] {name} done in {payload['elapsed_sec']}s | "
-                            f"trades={summary['trades']}  pnl=Rs {summary['pnl']:+.2f}  "
-                            f"WR={summary['win_rate']:.1f}%  PF={summary['profit_factor']:.2f}"
+                            f"[BATTERY] dispatched {len(futures)} variant(s) "
+                            f"to worker pool (attempt {attempt})"
                         )
-                    except Exception as e:
-                        # Capture per-variant failure — DO NOT kill the pool.
-                        # Other workers continue; we just record this one as
-                        # failed and still write the partial comparison.md.
-                        tb = traceback.format_exc()
-                        logger.error(f"[BATTERY] {name} CRASHED in worker: {e}\n{tb}")
-                        (out_root / "results" / f"{name}.failure.txt").write_text(
-                            f"{datetime.now().isoformat()}\n{e}\n\n{tb}", encoding="utf-8"
+
+                        for fut in as_completed(futures):
+                            name = futures[fut]
+                            try:
+                                _, payload = fut.result()
+                                summary = payload["summary"]
+                                with comp_lock:
+                                    rows.append(summary)
+                                logger.info(
+                                    f"[BATTERY] {name} done in {payload['elapsed_sec']}s | "
+                                    f"trades={summary['trades']}  pnl=Rs {summary['pnl']:+.2f}  "
+                                    f"WR={summary['win_rate']:.1f}%  PF={summary['profit_factor']:.2f}"
+                                )
+                            except BrokenProcessPool:
+                                # Pool-wide cascade casualty. Do NOT mark as
+                                # failed here — the variant didn't actually
+                                # run. Outer retry loop will pick it up via
+                                # the _completed_variant_names check.
+                                broken_pool_seen = True
+                                logger.warning(
+                                    f"[BATTERY] {name}: pool cascade casualty "
+                                    f"(attempt {attempt}); will retry in next attempt"
+                                )
+                                # Continue iterating — siblings may still
+                                # raise BrokenProcessPool but a couple may
+                                # actually have completed before the cascade.
+                                continue
+                            except Exception as e:
+                                # Real per-variant Python exception.
+                                # Record permanently and don't retry.
+                                tb = traceback.format_exc()
+                                logger.error(
+                                    f"[BATTERY] {name} CRASHED in worker: {e}\n{tb}"
+                                )
+                                _atomic_write_text(
+                                    out_root / "results" / f"{name}.failure.txt",
+                                    f"{datetime.now().isoformat()}\n{e}\n\n{tb}",
+                                )
+                                real_failed.add(name)
+                                with comp_lock:
+                                    failed.append(
+                                        (name, str(e).splitlines()[0]
+                                         if str(e) else type(e).__name__)
+                                    )
+
+                            # Per-completion comparison.md write — same
+                            # lock as the live thread so we never tear a
+                            # render.
+                            _locked_write(rows, failed)
+                except BrokenProcessPool:
+                    # The with-block itself raised on shutdown (rare —
+                    # usually the per-future result() catches it first).
+                    # Treat the same as broken_pool_seen=True so the loop
+                    # retries.
+                    logger.warning(
+                        f"[BATTERY] ProcessPoolExecutor exited via "
+                        f"BrokenProcessPool on attempt {attempt}; will retry"
+                    )
+                    broken_pool_seen = True
+
+                if not broken_pool_seen:
+                    # No cascade this attempt. Either everything succeeded
+                    # or everything that didn't was a real Python failure.
+                    # Either way, no point retrying.
+                    break
+            else:
+                # Exhausted all retries with cascade still happening. Mark
+                # any remaining un-done variants as cascade-casualties so
+                # the operator can see them in comparison.md.
+                completed_now = _completed_variant_names(out_root)
+                stuck = [
+                    n for n, _ in pending
+                    if n not in completed_now and n not in real_failed
+                ]
+                if stuck:
+                    logger.error(
+                        f"[BATTERY] gave up after {MAX_POOL_RETRIES} "
+                        f"attempt(s); {len(stuck)} variant(s) still not run "
+                        f"due to repeated pool cascades: {stuck}"
+                    )
+                    for n in stuck:
+                        msg = f"pool cascade after {MAX_POOL_RETRIES} retries"
+                        _atomic_write_text(
+                            out_root / "results" / f"{n}.failure.txt",
+                            f"{datetime.now().isoformat()}\n{msg}\n",
                         )
                         with comp_lock:
-                            failed.append(
-                                (name, str(e).splitlines()[0] if str(e) else type(e).__name__)
-                            )
-
-                    # Per-completion comparison.md write — same lock as
-                    # the live thread so we never tear a render.
+                            failed.append((n, msg))
                     _locked_write(rows, failed)
         except KeyboardInterrupt:
             # Shutdown cleanly: with-block will cancel pending futures.
