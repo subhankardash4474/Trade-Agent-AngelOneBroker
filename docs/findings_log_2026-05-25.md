@@ -918,3 +918,209 @@ during the manual queue-state reset I `chown`'d the file to 1001:1001
 runs as `opc`. Combined with the sticky bit on `/opt/trading-agent/data/`
 (drwxrwxrwt), opc could not rename a file owned by uid 1001. Fix:
 `chown opc:opc` + `restorecon`. Added to ops_runbook common-pitfalls.
+
+---
+
+## 13. Bug F — `ProcessPoolExecutor` cascade-fail when worker dies in re-used subprocess (2026-05-25 evening)
+
+**Status:** Fixed; harness change only; audit-only entry, no slot consumed.
+
+### 13.1 Observation
+
+The post-Bug-E `battery_nifty50_60d_20260525T105637` run completed
+**V1 + V2 successfully** (~3.18 h each at the projected post-fix rate)
+with real numbers — first clean post-fix battery output:
+
+| Variant | Trades | WR | PF | PnL |
+|---|---:|---:|---:|---:|
+| V1 baseline shipped | 59 | 39.0% | 0.76 | -Rs 206 |
+| V2 all filters off | 69 | 30.4% | 0.58 | -Rs 399 |
+
+Then the run **mass-failed**: V3-V19 (17 variants) all marked CRASHED in
+`comparison.md` with the identical generic error
+`"A process in the process pool was terminated abruptly while the
+future was running or pending."`
+
+### 13.2 Forensic timeline
+
+```
+20:05:33 IST  V3 last [BATTERY-PROGRESS] line: 17.9% complete, 21 ev/s
+              (V3 had been emitting every 60s for 30 min — perfectly healthy)
+20:06:06 IST  V4 last [BATTERY-PROGRESS] line: 16.9% complete, 21 ev/s
+              (V4 still alive 33 s AFTER V3 stopped — they did NOT die together)
+20:06:19 IST  Orchestrator records BrokenProcessPool, marks all 17 pending
+              variants as CRASHED, exits with code 3
+20:06:20 IST  Container exits (code 3, OOMKilled=false, no kernel signal)
+20:07:11 IST  Scheduler launches next queue job (long-only validation)
+```
+
+So **only V3 actually crashed** — V4 was killed by `ProcessPoolExecutor`
+when it detected V3's worker had died, and V5-V19 **never ran at all**.
+The "17 failed variants" line in comparison.md is an artifact of
+`fut.result()` re-raising `BrokenProcessPool` for every queued future
+once the pool is invalidated.
+
+### 13.3 Crash mode
+
+Evidence narrows the cause sharply:
+
+| Signal | Verdict |
+|---|---|
+| Python traceback in V3's worker log | NONE — log just stops abruptly |
+| OOMKilled flag on container | `false` |
+| Kernel OOM in journalctl --kernel | empty across the death window |
+| Container memory limit | unset (HostConfig.Memory=0) |
+| Watchdog kill (`os._exit(124)`) | not the cause: 30-min limit, only 46s of silence |
+| External SIGTERM (docker stop / systemd) | not in journal |
+
+The worker died **without writing any Python error**, the container
+**was not OOM-killed**, and the kernel **logged no signal**. That
+combination is the classic fingerprint of a **native-code segfault /
+abort / bus error in a C extension** (numpy, pandas, yfinance,
+loguru-via-zmq, xgboost) — Python doesn't get a chance to handle the
+signal, the process just dies.
+
+### 13.4 Why V3 (not V1/V2): re-used worker hypothesis
+
+`ProcessPoolExecutor` REUSES the same worker subprocesses across
+submitted tasks (documented at `battery.py:584`). With max_workers=2
+and 19 variants:
+
+- worker A: V1 → V3 → V5 → ...
+- worker B: V2 → V4 → V6 → ...
+
+V1 and V2 ran in **fresh** workers and passed.
+V3 and V4 ran in **re-used** workers (each on top of V1/V2's leftover
+process state) and died at the same elapsed time (~30 min in).
+
+State that survives variant boundaries inside one worker process:
+
+- `strategies._trend_context._cache` — module-level `dict` of yfinance
+  daily bars, TTL 6h, never explicitly cleared
+- yfinance / urllib3 internal connection pool + cookie jar
+- xgboost native handles (V1's `_load_model` failed due to missing
+  pickle — possibly leaves the C++ side in a half-initialized state)
+- numpy / pandas internal caches (allocator pools, type-checking caches)
+- loguru queue threads (sink leak from previous bugs already proven to
+  exist; we patched it earlier today but other latent leaks may remain)
+
+Any one of these could be the actual segfault trigger. We don't yet
+know which, because the evidence we have only narrows it to
+"native-code crash in something that survived the V1→V3 transition".
+
+### 13.5 Fix
+
+Two changes to `packages/research/battery.py`:
+
+1. **Eliminate worker re-use** (the load-bearing fix):
+   ```python
+   ProcessPoolExecutor(max_workers=args.workers, max_tasks_per_child=1)
+   ```
+   Each variant now runs in a brand-new subprocess. V3 inside a fresh
+   worker is functionally indistinguishable from V1 inside a fresh
+   worker — and V1 passes. Cost: ~15 s startup tax per variant
+   (imports + 90 MB market_data unpickle). For a 19-variant run with
+   workers=2 that's ~150 s = ~3 min added to a ~40 h queue.
+   Negligible.
+
+2. **Diagnostic safety net** (in case a variant somehow crashes anyway):
+   ```python
+   import faulthandler
+   _fault_fp = open(workers_dir / f"{name}.fault.log", "w")
+   faulthandler.enable(file=_fault_fp, all_threads=True)
+   ```
+   At the top of `_run_variant_in_subprocess`, before any heavy work.
+   Any future SIGSEGV/SIGABRT/SIGBUS/SIGFPE/SIGILL will write a
+   Python traceback to `<run>/workers/<variant>.fault.log` BEFORE the
+   process dies. The file is per-variant so concurrent worker deaths
+   don't race on a shared log. Best-effort wrapped in try/except so
+   the diagnostic tooling can never break the run it's instrumenting.
+
+### 13.6 Why this is not a "specific variant" bug
+
+The strongest hypothesis is state-pollution because:
+
+- V3's overrides are tiny (4 trend-filter disables) and structurally
+  similar to V7-V9 (also trend-filter knobs). If V3 had a code bug
+  triggered by its config, V7/V8/V9 would too — but those never ran.
+- V1 already exercises every code path V3 touches, with MORE filters
+  active (V1=defaults=all-on; V3=4-off-2-on); V1 ran 3.18 h cleanly.
+- V4 shows a different config (uniform 3% threshold), exercises a
+  superset of V3's code path, and was killed by cascade not its own
+  fault.
+
+The "data-driven crash on 2026-03-11 at sim time" hypothesis is
+unlikely too: V1 ran the same 60 days of data on the same 48 symbols
+and hit 2026-03-11 fine; V3 hits the same data through the same
+strategies in the same backtester.
+
+If V3 still dies after the fix, faulthandler will tell us *what*
+crashed and we can do a targeted code fix. But max_tasks_per_child=1
+removes the most plausible cause.
+
+### 13.7 Tests
+
+`tests/unit/test_battery_worker_isolation.py` (6 tests):
+
+- `TestProcessPoolMaxTasksPerChild`:
+  - AST walk of `battery.main` finds exactly one `ProcessPoolExecutor`
+    call, asserts `max_tasks_per_child=1` is present as a literal int
+  - Asserts `max_workers` is also explicitly wired (defends against
+    accidental fallback to `os.cpu_count()`)
+- `TestWorkerFaulthandler`:
+  - Source-level: `_run_variant_in_subprocess` imports faulthandler
+    and calls `.enable(...)`
+  - Per-variant fault log path is `<workers_dir>/<name>.fault.log`
+    (no shared-file race)
+  - faulthandler init is wrapped in try/except so a failure can't
+    kill the run
+- `TestDocumentation`:
+  - "Bug F" string present in `battery.py` so the change is grep-able
+
+These are *structural* (source-text / AST) rather than runtime tests
+because spinning up real `ProcessPoolExecutor` subprocesses inside
+pytest is slow, flaky on Windows (spawn-pickling, sys.path), and
+would require a full battery scaffold for what is fundamentally a
+one-line invocation contract.
+
+### 13.8 Expected impact
+
+- V3-V19 of the failed run will resume cleanly when re-queued (or run
+  cleanly on any future battery launch).
+- Future cascade-fails are bounded: a single variant crash now affects
+  at most the ProcessPoolExecutor's pending queue in the same pool;
+  surviving variants in the same batch may still cascade if they
+  share the broken pool — but `max_tasks_per_child=1` makes a single
+  variant's death unlikely to corrupt the pool's bookkeeping. (If we
+  see this in practice, the next iteration is per-batch pools — left
+  for follow-up if needed.)
+- All future native-code crashes will have a real Python traceback in
+  `<run>/workers/<variant>.fault.log` instead of the opaque
+  `BrokenProcessPool` we got this time.
+
+### 13.9 Freeze accounting
+
+`packages/research/battery.py` is research/, not on the slot-consuming
+list in FREEZE_v2.1 (which covers strategies, risk, position sizing,
+trading_agent.py, config.yaml strategy/risk blocks, models). This is
+a **harness fix**: it changes how the orchestrator launches workers,
+not what they compute. Backtest results are byte-identical (each
+variant runs the same code on the same data; only the surrounding
+process-management changes). No bypass slot consumed. Bypass ledger
+remains 1/3 (risk.allow_shorts).
+
+### 13.10 Resume plan for V3-V19
+
+After commit + push + pull, queue a `--resume battery_nifty50_60d_20260525T105637`
+run. The harness's resume logic reads the existing `comparison.md`,
+notes V1+V2 are already DONE, and re-runs only V3-V19 (the 17 marked
+as failed). Same fixed code, same market_data, same configs — the
+only difference is each variant is now in its own subprocess.
+
+If the resume completes cleanly: state-pollution hypothesis confirmed,
+Bug F closed. ETA at the post-Bug-E rate (~3.2 h per variant on 2
+workers): 17 × 3.2 / 2 ≈ 27 h to complete the missing 17 variants.
+
+If the resume still fails at V3 (~30 min in): the issue is *not*
+state pollution; check `<run>/workers/V3_only_xgb_mr_filtered_yday.fault.log`
+for the real Python traceback, fix the underlying code, re-resume.

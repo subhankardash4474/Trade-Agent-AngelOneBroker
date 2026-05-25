@@ -862,3 +862,157 @@ Added to ops_runbook §Common Pitfalls.
 - `tests/unit/test_strategy_history_window.py` — NEW, 13 tests
 - `docs/findings_log_2026-05-25.md` — §12 added
 - `docs/changes_done_2026-05-25.md` — this §11
+
+---
+
+## 12. Bug F — `ProcessPoolExecutor` cascade-fail when worker dies in re-used subprocess (2026-05-25 evening)
+
+### §12.1 Problem
+
+The post-Bug-E `battery_nifty50_60d_20260525T105637` run completed
+**V1 + V2 successfully** (first clean post-fix backtest numbers:
+PF 0.76 / 0.58 — the shipped config IS bleeding, confirming the
+live-trader signal). Then **17 of 19 variants (V3-V19) all marked
+CRASHED in `comparison.md`** with the identical generic error:
+
+```
+A process in the process pool was terminated abruptly while the
+future was running or pending.
+```
+
+Forensics showed:
+- Only V3 *actually crashed* (workers/V3.log ends mid-run with no error;
+  V4 was still emitting progress 33 s after V3 stopped).
+- V5–V19 **never ran** — no worker logs exist for them. They're
+  cascade-marked as failed because `ProcessPoolExecutor` re-raises
+  `BrokenProcessPool` for every pending future once the pool dies.
+- Container did NOT OOM-kill (`OOMKilled=false`, no kernel signal in
+  journalctl, no memory limit set).
+- V3's worker died **without writing any Python error** — classic
+  fingerprint of a native-code segfault / abort that bypasses Python.
+
+### §12.2 Root cause hypothesis
+
+`ProcessPoolExecutor` reuses worker subprocesses across submitted
+tasks. With `max_workers=2`:
+
+- worker A: V1 → V3 → V5 → ...
+- worker B: V2 → V4 → V6 → ...
+
+V1+V2 ran in **fresh** workers, succeeded.
+V3+V4 ran in **re-used** workers (each carrying V1/V2's leftover
+process state) and died at the same elapsed time.
+
+State that survives a variant boundary inside one worker process:
+
+- `strategies._trend_context._cache` — module-level dict (yfinance
+  daily bars, TTL 6 h, never explicitly cleared)
+- yfinance / urllib3 connection pool + cookie jar
+- xgboost native handles (V1's `_load_model` failed due to missing
+  pickle, possibly leaving the C++ side half-initialized)
+- numpy / pandas internal allocator pools, type-checking caches
+- loguru queue threads
+
+Any one of these can trigger a native segfault under specific
+follow-up conditions — and the worker dying mid-task is exactly
+what kills the whole pool.
+
+### §12.3 Fix
+
+Two changes to `packages/research/battery.py`:
+
+1. **`max_tasks_per_child=1`** on the `ProcessPoolExecutor`:
+   ```python
+   with ProcessPoolExecutor(
+       max_workers=args.workers,
+       max_tasks_per_child=1,
+   ) as pool:
+   ```
+   Forces a brand-new subprocess per variant. Eliminates ALL cross-
+   variant native-code state. V3 inside a fresh worker is functionally
+   identical to V1 inside a fresh worker — and V1 passes.
+
+2. **`faulthandler` enabled** in `_run_variant_in_subprocess`:
+   ```python
+   import faulthandler
+   _fault_fp = open(workers_dir / f"{name}.fault.log", "w")
+   faulthandler.enable(file=_fault_fp, all_threads=True)
+   ```
+   Per-variant fault log file. Any future SIGSEGV / SIGABRT / SIGBUS /
+   SIGFPE / SIGILL writes a Python traceback BEFORE the process dies.
+   Best-effort wrapped in try/except so a faulthandler failure cannot
+   kill the run it's instrumenting.
+
+### §12.4 Cost
+
+- Startup tax per fresh worker: ~15 s (imports + 90 MB market_data
+  unpickle from disk).
+- Total for 19-variant run with workers=2: 19 × 15 s ÷ 2 ≈ 150 s
+  ≈ 3 min added to a ~40 h queue. Negligible (~0.13%).
+
+### §12.5 Tests
+
+`tests/unit/test_battery_worker_isolation.py` — 6 new tests:
+
+- `TestProcessPoolMaxTasksPerChild`:
+  - AST-walks `battery.main`, asserts exactly one `ProcessPoolExecutor`
+    call with `max_tasks_per_child=1` literal int kwarg
+  - Asserts `max_workers` is still explicitly wired (defends against
+    `os.cpu_count()` fallback)
+- `TestWorkerFaulthandler`:
+  - `_run_variant_in_subprocess` imports faulthandler + calls `.enable()`
+  - Per-variant fault log path is `<workers>/<name>.fault.log`
+  - Init wrapped in try/except (best-effort)
+- `TestDocumentation`:
+  - "Bug F" string present in `battery.py` for grep-archaeology
+
+Tests are *structural* (AST + source-text), not runtime, because
+spinning up real `ProcessPoolExecutor` subprocesses inside pytest is
+slow, flaky on Windows (spawn-pickling, sys.path), and would require
+a full battery scaffold for what is fundamentally a 1-line invocation
+contract.
+
+### §12.6 Suite results
+
+```
+$ pytest tests/unit -q     -> 1247 passed in 49.61s
+                              (1056 base + 185 battery+strat + 6 new)
+```
+
+Zero regressions.
+
+### §12.7 Freeze accounting
+
+`packages/research/battery.py` is research/, not on the slot-consuming
+list in FREEZE_v2.1 (which covers strategies, risk, position sizing,
+trading_agent.py, config.yaml strategy/risk blocks, models). This is
+a **harness fix** — it changes how the orchestrator launches workers,
+not what they compute. Backtest results are byte-identical (each
+variant runs the same code on the same data; only process management
+changes). **No bypass slot consumed.**
+
+**Bypass-slot ledger: still 1/3 used** (only `risk.allow_shorts`).
+
+### §12.8 Resume plan
+
+After commit + push + pull, queue a `--resume battery_nifty50_60d_20260525T105637`
+job. The harness's resume logic reads existing `comparison.md`, sees
+V1+V2 are DONE, and re-runs only V3-V19 (the 17 marked failed).
+
+ETA at the post-Bug-E rate (~3.2 h per variant on 2 workers):
+17 × 3.2 / 2 ≈ 27 h to complete the missing 17 variants.
+
+**Decision boundary:**
+- If the resume completes cleanly → state-pollution hypothesis confirmed,
+  Bug F closed.
+- If it fails again at V3 (~30 min in) → the issue is *not* state
+  pollution. Read `<run>/workers/V3_only_xgb_mr_filtered_yday.fault.log`
+  for the real Python traceback, fix the underlying code, re-resume.
+
+### §12.9 Files touched in §12
+
+- `packages/research/battery.py` — `max_tasks_per_child=1` +
+  faulthandler init in worker entry point
+- `tests/unit/test_battery_worker_isolation.py` — NEW, 6 tests
+- `docs/findings_log_2026-05-25.md` — §13 added
+- `docs/changes_done_2026-05-25.md` — this §12

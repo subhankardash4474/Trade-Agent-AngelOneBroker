@@ -301,6 +301,7 @@ These rows exist so the Friday review can find every commit tagged
 2026-05-25 | TBD-sha | observability: battery V17/V18/V19 + queue priority validation insert
 2026-05-25 | TBD-sha | freeze-bypass: audit 2026-05-25 quick wins (B-1/B-3/B-4/B-5/B-11) — operator tools + SSL hardening + sector-map dedup
 2026-05-25 | TBD-sha | observability: Bug E — backtester _merge_bars O(N²) slice fix (strategy_history_window=300) + 13 equivalence tests
+2026-05-25 | TBD-sha | observability: Bug F — battery harness ProcessPoolExecutor cascade-fail fix (max_tasks_per_child=1 + faulthandler diagnostic) + 6 structural tests
 ```
 
 Audit-only entries cover: `packages/monitoring/alerts.py`, `tests/`,
@@ -364,6 +365,10 @@ NOT frozen — that's an audit-only entry.
 *Freeze starts: 2026-05-18, evening session. Tag: `freeze-v2.1`.*
 *Last revised: 2026-05-25 (slot #1 consumed for `risk.allow_shorts`
 flag pre-stage; defaults true = no behaviour change; 1/3 slots used.
-Late-day audit-only entries: B-1/B-3/B-4/B-5/B-11 quick wins, and
-Bug E backtester O(N²) `_merge_bars` perf fix — neither consume a
-slot; both add tests; behaviour-neutral within float tolerance).*
+Late-day audit-only entries: B-1/B-3/B-4/B-5/B-11 quick wins, Bug E
+backtester O(N²) `_merge_bars` perf fix, and Bug F battery harness
+ProcessPoolExecutor worker-isolation fix (`max_tasks_per_child=1` +
+faulthandler diagnostic) — none consume a slot; all add tests; all
+behaviour-neutral on backtest output [Bug F changes only the
+process-management layer, not the computation; backtest results are
+byte-identical for a given variant config]).*

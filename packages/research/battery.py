@@ -573,6 +573,29 @@ def _run_variant_in_subprocess(
     """
     out_root = Path(out_root_str)
 
+    # 2026-05-25 Bug F diagnostic: enable C-level fault handler so segfaults
+    # / aborts / bus errors in native code (numpy, pandas, yfinance,
+    # xgboost, etc.) dump a Python traceback before the worker dies. Without
+    # this, the parent's ProcessPoolExecutor sees only the generic
+    # BrokenProcessPool and we can't tell whether it was a kernel kill, an
+    # uncaught native segfault, or an external SIGTERM. Per-variant fault
+    # log lives next to the worker log so it survives the worker's death.
+    #
+    # The file handle MUST stay open for the worker's lifetime (faulthandler
+    # writes directly via fd, not through Python's file object). Stashing it
+    # on the function is acceptable because the worker is single-threaded
+    # at this scope and only one variant runs per call.
+    workers_dir = out_root / "workers"
+    workers_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        import faulthandler as _fh
+        _fault_fp = open(str(workers_dir / f"{name}.fault.log"), "w")
+        _fh.enable(file=_fault_fp, all_threads=True)
+    except Exception:
+        # faulthandler is best-effort — never fail the worker because we
+        # couldn't open the fault log.
+        pass
+
     # Install a per-variant log sink BEFORE doing any heavy work so that
     # market_data.pkl unpickling, feature reload, model loads, and the
     # backtest's per-symbol strategy emissions (e.g. "[vwap_bounce] SELL
@@ -580,9 +603,9 @@ def _run_variant_in_subprocess(
     # enqueue=True because numpy/pandas may emit from threads under the
     # hood; the queue prevents log-line interleaving from racing.
     #
-    # 2026-05-25 throughput-degradation fix:
-    # ProcessPoolExecutor REUSES worker subprocesses across tasks. The
-    # next variant scheduled to this worker calls _run_variant_in_subprocess
+    # 2026-05-25 throughput-degradation fix (loguru sink leak):
+    # ProcessPoolExecutor used to REUSE worker subprocesses across tasks.
+    # The next variant scheduled to this worker calls _run_variant_in_subprocess
     # again -- and loguru.add() is ADDITIVE. Without removing the previous
     # variant's sink on completion, every subsequent variant's log lines
     # were duplicated into ALL previously-opened sinks. By the 5th
@@ -594,8 +617,13 @@ def _run_variant_in_subprocess(
     #     (diff = 188K per cumulative variant, matching V9's emit rate)
     # Fix: capture the sink id, wrap the work in try/finally, remove
     # the sink unconditionally when the variant exits.
-    workers_dir = out_root / "workers"
-    workers_dir.mkdir(parents=True, exist_ok=True)
+    #
+    # 2026-05-25 follow-up: parent now also passes max_tasks_per_child=1
+    # to ProcessPoolExecutor (Bug F fix), so workers are no longer reused
+    # at all -- this finally/remove dance is now belt-and-suspenders rather
+    # than the load-bearing fix it once was. We keep it because (a) it's
+    # cheap, (b) it remains correct if max_tasks_per_child is ever bumped,
+    # and (c) it documents a real prior bug worth not regressing.
     worker_log = workers_dir / f"{name}.log"
     worker_sink_id = logger.add(
         str(worker_log),
@@ -1305,7 +1333,32 @@ def main() -> int:
                     "(refresh every 60s while variants run)")
 
         try:
-            with ProcessPoolExecutor(max_workers=args.workers) as pool:
+            # 2026-05-25 Bug F (mass cascade-fail): nifty50_60d V3 died at
+            # ~30 min in a re-used pool worker; ProcessPoolExecutor saw the
+            # crash and raised BrokenProcessPool for ALL 17 pending variants
+            # (V4-V19), even though only V3 had actually crashed. None of
+            # the others ever ran.
+            #
+            # Root cause hypothesis: cross-variant state pollution in re-used
+            # workers. Module-globals that survive a variant include
+            # trend_context._cache (yfinance daily bars, TTL 6h), yfinance's
+            # internal connection pool, xgboost native handles (model load
+            # failed in V1 — left lib in possibly bad state), and any
+            # numpy/pandas internal caches. V1+V2 ran in fresh workers and
+            # passed; V3+V4 ran in re-used workers (worker A's 2nd task = V3,
+            # worker B's 2nd task = V4) and died at the same elapsed time.
+            #
+            # Fix: max_tasks_per_child=1 forces a brand-new subprocess for
+            # each variant. Pays a ~15s startup tax per variant (imports +
+            # 90 MB market_data unpickle) for full state isolation. With
+            # 19 variants × workers=2 that's ~150s total = ~3 min added to
+            # a ~40h queue. Negligible.
+            #
+            # max_tasks_per_child requires Python 3.11+; container ships 3.11.
+            with ProcessPoolExecutor(
+                max_workers=args.workers,
+                max_tasks_per_child=1,
+            ) as pool:
                 futures = {
                     pool.submit(
                         _run_variant_in_subprocess,
