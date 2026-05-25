@@ -63,13 +63,44 @@ def test_compose_body_handles_fully_unavailable_inputs():
     assert "unavailable" in body
 
 
+def _live_health(**overrides):
+    """Health dict matching the daemon's actual schema (see
+    trading_agent._write_health_json line ~2185).
+
+    Centralised so the schema-drift bug fixed 2026-05-25 doesn't recur
+    in test data: any change to the daemon's writer should land here
+    first and propagate to all compose-body tests at once.
+    """
+    base = {
+        "ok": True,
+        "_file_age_seconds": 30,
+        "ts_unix": 1779000000,
+        "pid": 7,
+        "mode": "paper",
+        "cycle_count": 95,
+        "running": True,
+        "open_positions": [],
+        "open_position_count": 0,
+        "cash": 121443.2,
+        "daily_pnl": 0.0,
+        "daily_trades": 0,
+        "consecutive_losses": 0,
+        "drawdown_pct": 1.26,
+        "drawdown_tier": "NORMAL",
+        "cooldowns": [],
+        "blacklisted": [],
+    }
+    base.update(overrides)
+    return base
+
+
 def test_compose_body_flags_stale_health_file():
     """A health.json older than 5 minutes during market hours is itself
     a failure signal -- the body must say STALE, not UP."""
     now = datetime(2026, 5, 19, 9, 10, tzinfo=IST)
     body = hb.compose_body(
         now_ist=now,
-        health={"ok": True, "_file_age_seconds": 600, "uptime_seconds": 3600, "open_positions": 0},
+        health=_live_health(_file_age_seconds=600),
         last_eod={"ok": False, "reason": "n/a"},
         audit={"ok": False, "reason": "n/a"},
         spool={"ok": True, "depth": 0},
@@ -79,17 +110,64 @@ def test_compose_body_flags_stale_health_file():
 
 
 def test_compose_body_marks_fresh_daemon_as_up():
+    """A fresh health.json should produce 'Daemon: UP' with cycle_count
+    surfaced (NOT a literal 'uptime unknown' string), and the integer
+    open_position_count rendered as a number, NOT the list literal '[]'."""
     now = datetime(2026, 5, 19, 9, 10, tzinfo=IST)
     body = hb.compose_body(
         now_ist=now,
-        health={"ok": True, "_file_age_seconds": 30, "uptime_seconds": 7200, "open_positions": 2},
+        health=_live_health(cycle_count=95, open_position_count=2,
+                            open_positions=[("FOO",), ("BAR",)]),
         last_eod={"ok": False, "reason": "n/a"},
         audit={"ok": False, "reason": "n/a"},
         spool={"ok": True, "depth": 0},
         disk={"ok": True, "pct": 30.0, "free_gb": 10.0, "total_gb": 50.0},
     )
     assert "Daemon:** UP" in body
+    assert "cycle 95" in body
+    assert "mode=paper" in body
     assert "Open positions:** 2" in body
+    # Regression guard: no longer rendering 'uptime unknown' or list literal.
+    assert "uptime unknown" not in body
+    assert "Open positions:** []" not in body
+
+
+def test_compose_body_falls_back_to_open_positions_list_length():
+    """Older health.json may only have the list field, not the int.
+    The composer must compute the count from len() in that case."""
+    now = datetime(2026, 5, 19, 9, 10, tzinfo=IST)
+    h = _live_health(open_positions=[("FOO",), ("BAR",), ("BAZ",)])
+    h.pop("open_position_count")
+    body = hb.compose_body(
+        now_ist=now,
+        health=h,
+        last_eod={"ok": False, "reason": "n/a"},
+        audit={"ok": False, "reason": "n/a"},
+        spool={"ok": True, "depth": 0},
+        disk={"ok": True, "pct": 30.0, "free_gb": 10.0, "total_gb": 50.0},
+    )
+    assert "Open positions:** 3" in body
+
+
+def test_compose_body_surfaces_risk_state_in_morning_email():
+    """Cooldowns / blacklisted symbols carried over from a prior session
+    must appear in the heartbeat -- this is the most actionable bit of
+    information for the operator at 09:10 before the open."""
+    now = datetime(2026, 5, 19, 9, 10, tzinfo=IST)
+    body = hb.compose_body(
+        now_ist=now,
+        health=_live_health(cooldowns=["KEC", "JKTYRE"], consecutive_losses=2,
+                            drawdown_pct=2.45, blacklisted=["FACT"]),
+        last_eod={"ok": False, "reason": "n/a"},
+        audit={"ok": False, "reason": "n/a"},
+        spool={"ok": True, "depth": 0},
+        disk={"ok": True, "pct": 30.0, "free_gb": 10.0, "total_gb": 50.0},
+    )
+    assert "Risk state" in body
+    assert "KEC" in body
+    assert "consec_loss 2" in body
+    assert "DD 2.45%" in body
+    assert "blacklisted=['FACT']" in body
 
 
 def test_compose_body_flags_non_zero_spool_depth():
@@ -99,7 +177,7 @@ def test_compose_body_flags_non_zero_spool_depth():
     now = datetime(2026, 5, 19, 9, 10, tzinfo=IST)
     body = hb.compose_body(
         now_ist=now,
-        health={"ok": True, "_file_age_seconds": 30, "uptime_seconds": 60, "open_positions": 0},
+        health=_live_health(),
         last_eod={"ok": False, "reason": "n/a"},
         audit={"ok": False, "reason": "n/a"},
         spool={"ok": True, "depth": 3},
@@ -115,7 +193,7 @@ def test_compose_body_flags_disk_above_75pct():
     now = datetime(2026, 5, 19, 9, 10, tzinfo=IST)
     body = hb.compose_body(
         now_ist=now,
-        health={"ok": True, "_file_age_seconds": 30, "uptime_seconds": 60, "open_positions": 0},
+        health=_live_health(),
         last_eod={"ok": False, "reason": "n/a"},
         audit={"ok": False, "reason": "n/a"},
         spool={"ok": True, "depth": 0},
@@ -131,7 +209,7 @@ def test_compose_body_includes_followup_callout():
     now = datetime(2026, 5, 19, 9, 10, tzinfo=IST)
     body = hb.compose_body(
         now_ist=now,
-        health={"ok": True, "_file_age_seconds": 30, "uptime_seconds": 60, "open_positions": 0},
+        health=_live_health(),
         last_eod={"ok": False, "reason": "n/a"},
         audit={"ok": False, "reason": "n/a"},
         spool={"ok": True, "depth": 0},
@@ -255,13 +333,11 @@ def test_collect_last_audit_picks_newest_across_layouts(tmp_path: Path):
 def test_compose_body_flags_stale_audit():
     """A >90 min audit age during market hours indicates the hourly
     checkpoint cron has stopped -- the silent-hang signal."""
-    health = {"ok": True, "uptime_seconds": 3600, "open_positions": 0,
-              "_file_age_seconds": 30, "last_cycle": "2026-05-22T12:23:11"}
     audit_stale = {"ok": True, "verdict": "GREEN", "timestamp": "2026-05-22 12:23",
                    "age_minutes": 670.0, "file": "logs/audit/2026-05-22/checkpoint_1223.md"}
     body = hb.compose_body(
         now_ist=__import__("datetime").datetime(2026, 5, 22, 23, 35),
-        health=health, last_eod={"ok": False, "reason": "x"},
+        health=_live_health(), last_eod={"ok": False, "reason": "x"},
         audit=audit_stale, spool={"ok": True, "depth": 0},
         disk={"ok": True, "pct": 30.0, "free_gb": 30.0, "total_gb": 45.0},
     )

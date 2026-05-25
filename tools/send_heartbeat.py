@@ -242,16 +242,56 @@ def compose_body(now_ist: datetime,
     lines.append("")
 
     # Daemon status -- the headline.
+    #
+    # Schema drift note (2026-05-25): the daemon's _write_health_json (see
+    # trading_agent.py near line 2185) writes 'cycle_count' and
+    # 'open_position_count' (an int), and a list 'open_positions'. Earlier
+    # versions of this script read 'uptime_seconds' and 'last_cycle' which
+    # were never produced -- yielding the cosmetic 'Daemon: UP (uptime
+    # unknown)' and a literal '[]' for the position count. This block now
+    # reads what the daemon actually writes.
     if health.get("ok"):
         age = health.get("_file_age_seconds", 0)
         if age > 300:
             lines.append(f"- **Daemon:** STALE -- health.json is {int(age)}s old (>5 min)")
         else:
-            uptime = _format_uptime(health.get("uptime_seconds", 0))
-            lines.append(f"- **Daemon:** UP (uptime {uptime})")
-        lines.append(f"- **Open positions:** {health.get('open_positions', 'unknown')}")
-        if "last_cycle" in health:
-            lines.append(f"- **Last loop cycle:** {health['last_cycle']}")
+            cycle = health.get("cycle_count")
+            mode = health.get("mode", "?")
+            cycle_str = f"cycle {cycle}, mode={mode}" if cycle is not None else f"mode={mode}"
+            lines.append(f"- **Daemon:** UP ({cycle_str})")
+
+        # Position count -- prefer the int field; fall back to len() of the
+        # list field; show 'unknown' only if neither is present.
+        pos_count = health.get("open_position_count")
+        if pos_count is None:
+            pos = health.get("open_positions")
+            pos_count = len(pos) if isinstance(pos, list) else None
+        if pos_count is not None:
+            lines.append(f"- **Open positions:** {pos_count}")
+        else:
+            lines.append(f"- **Open positions:** unknown")
+
+        # Surfacing intra-day risk state in the morning email is high-value:
+        # if a previous session ended with cooldowns/blacklisted symbols
+        # carried over, you see it before the open.
+        cooldowns = health.get("cooldowns") or []
+        blacklisted = health.get("blacklisted") or []
+        consec_loss = health.get("consecutive_losses", 0)
+        cash = health.get("cash")
+        dd_pct = health.get("drawdown_pct")
+        risk_bits = []
+        if cash is not None:
+            risk_bits.append(f"cash Rs {cash:,.0f}")
+        if dd_pct is not None:
+            risk_bits.append(f"DD {dd_pct:.2f}%")
+        if consec_loss:
+            risk_bits.append(f"consec_loss {consec_loss}")
+        if cooldowns:
+            risk_bits.append(f"cooldowns={cooldowns}")
+        if blacklisted:
+            risk_bits.append(f"blacklisted={blacklisted}")
+        if risk_bits:
+            lines.append(f"- **Risk state:** {' | '.join(risk_bits)}")
     else:
         lines.append(f"- **Daemon:** UNREACHABLE -- {health.get('reason', 'unknown')}")
         lines.append("- **Action:** see `docs/freeze_contingencies.md` §C1.a")
