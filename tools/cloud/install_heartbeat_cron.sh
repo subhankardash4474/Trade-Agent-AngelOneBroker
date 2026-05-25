@@ -67,6 +67,39 @@ if [ ! -f "${REPO_DIR}/tools/send_heartbeat.py" ]; then
     exit 1
 fi
 
+# Ensure the log file exists AND is writable by the cron user. On the
+# trader VM, ${REPO_DIR}/logs/ is owned by the in-container 'trader'
+# uid (1001) which on the host happens to be 'ubuntu' (also 1001) --
+# but ${LOG_FILE} itself may not exist yet, and bash's >> redirect
+# needs write access at the moment cron forks the shell. Without this
+# pre-create step, cron silently fails with "Permission denied" before
+# even invoking the heartbeat script. (Diagnosed 2026-05-25 09:10 IST
+# when the first scheduled fire was a no-op for exactly this reason.)
+LOG_FILE_DIR="$(dirname "${LOG_FILE}")"
+if [ ! -d "${LOG_FILE_DIR}" ]; then
+    mkdir -p "${LOG_FILE_DIR}" 2>/dev/null \
+        || ${SUDO_BIN} -n mkdir -p "${LOG_FILE_DIR}" 2>/dev/null \
+        || { echo "ERROR: cannot create ${LOG_FILE_DIR}" >&2; exit 1; }
+fi
+if [ ! -e "${LOG_FILE}" ]; then
+    touch "${LOG_FILE}" 2>/dev/null \
+        || ${SUDO_BIN} -n touch "${LOG_FILE}" 2>/dev/null \
+        || { echo "ERROR: cannot create ${LOG_FILE}" >&2; exit 1; }
+fi
+if [ ! -w "${LOG_FILE}" ]; then
+    # Fall back to making the file group-writable so the cron user can
+    # append to it. Most cloud-init Ubuntu boxes have the cron user in
+    # group adm or have a dedicated group; we use chmod 664 + chown to
+    # the current user so the redirect works.
+    ${SUDO_BIN} -n chown "$(id -un):$(id -gn)" "${LOG_FILE}" 2>/dev/null || true
+    ${SUDO_BIN} -n chmod 664 "${LOG_FILE}" 2>/dev/null || true
+    if [ ! -w "${LOG_FILE}" ]; then
+        echo "WARNING: ${LOG_FILE} is still not writable by $(whoami)." >&2
+        echo "         Cron will silently fail with permission denied." >&2
+        echo "         Run: sudo chown $(whoami) ${LOG_FILE}" >&2
+    fi
+fi
+
 # Determine the schedule line based on the VM's timezone.
 TZ_NAME="$(timedatectl show -p Timezone --value 2>/dev/null || echo "Etc/UTC")"
 case "${TZ_NAME}" in
