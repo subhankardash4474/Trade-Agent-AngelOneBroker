@@ -122,8 +122,28 @@ echo "---STATS---"
 sudo docker stats --no-stream --filter name=battery_ --format '{{.Name}}|{{.CPUPerc}}|{{.MemUsage}}|{{.MemPerc}}' 2>/dev/null
 end container
 
+# 2026-05-25: pick the "latest run" via a 3-tier fallback so we never
+# show a stale folder whose name happens to sort late alphabetically:
+#   1. If a battery_ container is running, use ITS name (run_id) -- the
+#      most accurate signal of what is actually being worked on now.
+#      This dodges the prior bug where a stale battery_v2_baseline_90d
+#      folder (16:46:06 -- killed mid-launch) outranked the live
+#      battery_nifty500_v4_long_only_validation_60d (16:47:51) under
+#      ls | sort -r because v sorts after n.
+#   2. Otherwise pick the most-recently MODIFIED run dir
+#      (ls -1t sorts by mtime) -- captures the post-completion case.
+#   3. Skip the special _archive and archive housekeeping dirs so a
+#      manually-archived run can't bubble back up.
+RUNNING_NAME=`$(sudo docker ps --filter name=battery_ --format '{{.Names}}' 2>/dev/null | head -1)
+if [ -n "`$RUNNING_NAME" ] && [ -d "logs/backtests/`$RUNNING_NAME" ]; then
+    LATEST="`$RUNNING_NAME"
+else
+    LATEST=`$(ls -1t logs/backtests/ 2>/dev/null \
+              | grep -vE '^(_archive|archive|\.|[0-9]{8}T[0-9]{6})' \
+              | head -1)
+fi
+
 emit run
-LATEST=`$(ls -1 logs/backtests/ 2>/dev/null | sort -r | head -1)
 echo "run_id: `$LATEST"
 if [ -n "`$LATEST" ]; then
     RDIR="logs/backtests/`$LATEST"
@@ -137,11 +157,17 @@ if [ -n "`$LATEST" ]; then
     echo "results_failed: `$fail_count"
     pkl_size=`$(sudo stat -c '%s' "`$RDIR/market_data.pkl" 2>/dev/null)
     echo "market_data_pkl_bytes: `$pkl_size"
+    # Surface whether the latest folder matches the running container so
+    # the client can flag mismatches (e.g. archived/stale folders).
+    if [ -n "`$RUNNING_NAME" ] && [ "`$LATEST" = "`$RUNNING_NAME" ]; then
+        echo "matches_active_container: true"
+    else
+        echo "matches_active_container: false"
+    fi
 fi
 end run
 
 emit workers
-LATEST=`$(ls -1 logs/backtests/ 2>/dev/null | sort -r | head -1)
 if [ -n "`$LATEST" ]; then
     RDIR="logs/backtests/`$LATEST"
     if [ -d "`$RDIR/workers" ]; then
@@ -163,7 +189,6 @@ fi
 end workers
 
 emit comparison
-LATEST=`$(ls -1 logs/backtests/ 2>/dev/null | sort -r | head -1)
 if [ -n "`$LATEST" ]; then
     sudo tail -$MaxComparisonLines "logs/backtests/`$LATEST/comparison.md" 2>/dev/null
     # comparison.md may not end with a trailing newline -- ensure one
@@ -318,6 +343,18 @@ if (-not $runMap.run_id) {
     Write-Host "  [NO RUNS YET]" -ForegroundColor Yellow
 } else {
     Write-Host "  run_id              : $($runMap.run_id)"
+    # 2026-05-25: when a battery_* container is running, surface whether
+    # the LATEST run dir is the one being worked on. A "false" here
+    # historically meant a stale folder was being reported (e.g. the
+    # killed-mid-launch v2_baseline_90d folder bubbling up under
+    # alphabetic sort while validation was actually running). The new
+    # 3-tier picker prefers the running container's run_id, so this
+    # should now read 'true' whenever a container is up.
+    if ($runMap.matches_active_container -eq 'true') {
+        Write-Host "  matches container   : yes (live run)" -ForegroundColor Green
+    } elseif ($runMap.matches_active_container -eq 'false') {
+        Write-Host "  matches container   : NO (most-recent dir, no active container OR mismatch)" -ForegroundColor Yellow
+    }
     if ($runMap.started) { Write-Host "  started             : $($runMap.started)" }
     if ($runMap.comparison_last_modified) {
         Write-Host "  comparison updated  : $($runMap.comparison_last_modified)"
@@ -442,13 +479,60 @@ if ($queueLines.Count -eq 0) {
     Write-Host "  [NO QUEUE FILE FOUND]" -ForegroundColor Yellow
 } else {
     Write-Host "  jobs in queue (in order):"
+    Write-Host "    legend: [DONE] completed  [RUN] currently running  [WAIT] pending in state  [QUEUE] not yet started" -ForegroundColor DarkGray
+    # 2026-05-25: render each job with its LIVE status from
+    # battery_queue_state.json so the operator can see at a glance
+    # which job is actually running (not just queue-yaml position).
+    # Previously the queue listing showed ALL jobs in YAML order with
+    # no markers, which hid the fact that nifty50_60d (slot 1) was
+    # paused waiting for the slot-2 validation to finish.
+    $stateBlob = ($stateLines -join "`n")
     $i = 1
     foreach ($jname in $queueLines | Where-Object { $_.Trim() }) {
-        # Mark completed jobs based on state file.
-        $stateBlob = ($stateLines -join "`n")
-        $isDone = $stateBlob -match """$jname""\s*:\s*\{[^}]*""status""\s*:\s*""completed"""
-        $marker = if ($isDone) { '✓' } else { ' ' }
-        Write-Host ("    {0}  {1}. {2}" -f $marker, $i, $jname)
+        # Try to extract this job's state. The state file is JSON; we
+        # use a tolerant regex against the per-job blob so we don't
+        # need a JSON parser remotely.
+        # Pattern: "jname": { ... "status": "...", ... }
+        $jobBlock = ''
+        $statusRe = '"' + [regex]::Escape($jname) + '"\s*:\s*\{([^}]*)\}'
+        if ($stateBlob -match $statusRe) {
+            $jobBlock = $Matches[1]
+        }
+        $status = ''
+        if ($jobBlock -match '"status"\s*:\s*"([^"]+)"') {
+            $status = $Matches[1]
+        }
+        $resuming = ($jobBlock -match '"resuming"\s*:\s*true')
+
+        switch ($status) {
+            'completed' {
+                $marker = '[DONE]  '
+                $color  = 'Green'
+                $note   = ''
+            }
+            'running' {
+                $marker = '[RUN]   '
+                $color  = 'Cyan'
+                $note   = if ($resuming) { ' (resuming)' } else { '' }
+            }
+            'pending' {
+                $marker = '[WAIT]  '
+                $color  = 'Yellow'
+                $note   = if ($resuming) { ' (queued for resume after current run)' }
+                          else { ' (queued; waiting for previous job)' }
+            }
+            'failed' {
+                $marker = '[FAIL]  '
+                $color  = 'Red'
+                $note   = ' (last attempt failed -- check failure_phase in state)'
+            }
+            default {
+                $marker = '[QUEUE] '
+                $color  = 'Gray'
+                $note   = ''
+            }
+        }
+        Write-Host ("    {0}  {1}. {2}{3}" -f $marker, $i, $jname, $note) -ForegroundColor $color
         $i++
     }
 }
