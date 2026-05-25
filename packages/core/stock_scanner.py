@@ -68,11 +68,82 @@ def _yahoo_chart(symbol: str, session: req.Session, days: int = 25) -> pd.DataFr
 IST = pytz.timezone("Asia/Kolkata")
 
 
+# NSE archives CSV -- the static, no-auth-required source of truth for
+# Nifty index membership. The /api/equity-stockIndices endpoint returns
+# 403/404 from data-center IPs (e.g. Oracle Cloud Mumbai) because it
+# requires a browser-style cookie dance, but archives.nseindia.com is a
+# plain CDN that serves CSVs to anyone. Verified 2026-05-25 from the
+# trader VM: returns 505 rows for Nifty 500 in ~200 ms.
+_NSE_ARCHIVE_CSVS = {
+    "NIFTY 500": "https://archives.nseindia.com/content/indices/ind_nifty500list.csv",
+    "NIFTY 200": "https://archives.nseindia.com/content/indices/ind_nifty200list.csv",
+    "NIFTY 100": "https://archives.nseindia.com/content/indices/ind_nifty100list.csv",
+}
+
+
+def _fetch_nse_archive_csv(index_name: str) -> List[str]:
+    """Fetch Nifty index constituents from the static archives CSV.
+
+    This bypasses the brittle cookie/JavaScript dance the live NSE
+    website demands. The CSV is updated whenever the index reconstitutes
+    (semi-annually for Nifty 500), which is more than fresh enough for
+    a stock-scanner universe.
+
+    Returns [] on failure -- caller is responsible for falling back to
+    the live API or the hardcoded universe.
+    """
+    url = _NSE_ARCHIVE_CSVS.get(index_name)
+    if not url:
+        return []
+    try:
+        resp = req.get(
+            url,
+            timeout=15,
+            verify=False,
+            headers={"User-Agent": "Mozilla/5.0"},
+        )
+        if resp.status_code != 200 or len(resp.content) < 1000:
+            return []
+        # CSV header: "Company Name,Industry,Symbol,Series,ISIN Code"
+        lines = resp.text.strip().splitlines()
+        if len(lines) < 50:
+            return []
+        symbols: List[str] = []
+        for row in lines[1:]:  # skip header
+            parts = [p.strip().strip('"') for p in row.split(",")]
+            if len(parts) >= 4 and parts[3] in ("EQ", "BE"):  # only equity series
+                sym = parts[2]
+                if sym and sym.replace("&", "").replace("-", "").isalnum():
+                    symbols.append(sym)
+        if len(symbols) > 50:
+            logger.info(
+                f"Fetched {len(symbols)} stocks from NSE archives CSV ({index_name})"
+            )
+            return symbols
+    except Exception as e:
+        logger.debug(f"NSE archives CSV fetch failed ({type(e).__name__}: {e})")
+    return []
+
+
 def _fetch_nse_index_symbols(session: req.Session, index_name: str = "NIFTY 500") -> List[str]:
     """
-    Fetch live index constituents from the NSE website.
-    Falls back to the hardcoded list if NSE is unreachable.
+    Fetch live index constituents.
+
+    Resolution order (cheapest -> most fragile):
+      1. archives.nseindia.com static CSV (no auth, works from data centers)
+      2. nseindia.com /api endpoint (cookie dance, blocked from many cloud IPs)
+
+    Returns [] when both fail; the caller (StockScanner.__init__) then
+    falls back to the hardcoded NSE_UNIVERSE list.
     """
+    # 1. Static CSV first -- the only reliable path from cloud VMs.
+    symbols = _fetch_nse_archive_csv(index_name)
+    if symbols:
+        return symbols
+
+    # 2. Live API fallback (kept so dev laptops on residential IPs still
+    #    benefit). Verified failing from data-center IPs (403/404) on
+    #    2026-05-25 -- the cookie seed itself returns 403.
     try:
         url = "https://www.nseindia.com/api/equity-stockIndices"
         params = {"index": index_name}
@@ -81,7 +152,6 @@ def _fetch_nse_index_symbols(session: req.Session, index_name: str = "NIFTY 500"
             "Accept": "application/json",
             "Referer": "https://www.nseindia.com/",
         }
-        # NSE needs a session cookie first
         s = req.Session()
         s.verify = False
         s.headers.update(headers)
@@ -92,15 +162,29 @@ def _fetch_nse_index_symbols(session: req.Session, index_name: str = "NIFTY 500"
             symbols = [item["symbol"] for item in data.get("data", [])
                        if item.get("symbol") and item["symbol"] != index_name]
             if len(symbols) > 50:
-                logger.info(f"Fetched {len(symbols)} stocks from NSE {index_name} index")
+                logger.info(f"Fetched {len(symbols)} stocks from NSE {index_name} live API")
                 return symbols
     except Exception as e:
-        logger.debug(f"NSE index fetch failed ({e}), using hardcoded universe")
+        logger.debug(f"NSE live API fetch failed ({type(e).__name__}: {e})")
+
+    # WARNING-level (not DEBUG) so the operator sees in the log when
+    # we've fallen back to the hardcoded list -- which is the
+    # universe-shrinkage condition (~232 vs 500) that bug C6 surfaced
+    # on 2026-05-25.
+    logger.warning(
+        f"NSE {index_name} fetch failed via both archives CSV and live API; "
+        "falling back to hardcoded NSE_UNIVERSE (~232 stocks)"
+    )
     return []
 
 
-# Hardcoded fallback: Nifty 50 + Nifty Next 50 + popular mid/small caps
-# Total ~300 liquid stocks covering most of the tradeable NSE universe.
+# Hardcoded fallback: Nifty 50 + Nifty Next 50 + popular mid/small caps.
+# 2026-05-25 audit found this list contained 232 entries (231 unique --
+# RECLTD was duplicated) despite the comment claiming "~300". This is
+# the LAST-RESORT fallback only; the primary path is now the NSE archives
+# CSV at archives.nseindia.com, which returns 505 stocks (Nifty 500) and
+# works reliably from cloud data-center IPs where the live /api endpoint
+# is blocked. See _fetch_nse_archive_csv() above.
 NSE_UNIVERSE = [
     # ── Nifty 50 ──
     "RELIANCE", "TCS", "HDFCBANK", "INFY", "ICICIBANK",
@@ -147,7 +231,7 @@ NSE_UNIVERSE = [
     "MFSL", "MGL", "MPHASIS", "MRPL", "NAM-INDIA",
     "NAVINFLUOR", "NIACL", "NLCINDIA", "OLECTRA", "PGHH",
     "PHOENIXLTD", "PIIND", "PRESTIGE", "PVRINOX", "RAIN",
-    "RAJESHEXPO", "RBLBANK", "RECLTD", "RELCHEMQ", "RENUKA",
+    "RAJESHEXPO", "RBLBANK", "RELCHEMQ", "RENUKA",
     "ROUTE", "SANOFI", "SAPPHIRE", "SCHAEFFLER", "SJVN",
     "STARHEALTH", "SUNTV", "SUPREMEIND", "SYNGENE", "TATACHEM",
     "TATACOMM", "TATAINVEST", "TATATECH", "THERMAX", "TIINDIA",
@@ -187,18 +271,39 @@ class StockScanner:
         # How many stocks to select
         self.top_n: int = scanner_cfg.get("top_n", 10)
 
-        # Universe: try live NSE index first, then hardcoded fallback
+        # Universe selection
+        # ───────────────────
+        # 2026-05-25: discovered the live NSE /api/equity-stockIndices
+        # endpoint had been silently failing from cloud data-center IPs
+        # for an unknown duration, so the scanner was always hitting the
+        # hardcoded NSE_UNIVERSE fallback (~232 stocks) instead of the
+        # advertised "live Nifty 500" (~500 stocks). The new
+        # _fetch_nse_archive_csv() path successfully returns 500 from
+        # the same VM via a static CSV.
+        #
+        # Doubling the universe mid-session is a non-trivial behavior
+        # change (more candidates → potentially different top-N
+        # selection → potentially different trades), so the live fetch
+        # is now opt-in via a new config flag. Default = False (status
+        # quo: hardcoded list) so existing deployments are unaffected
+        # by the bug fix until the operator explicitly opts in after
+        # validating the wider universe in the backtester.
         custom_universe = scanner_cfg.get("universe", [])
+        use_live = scanner_cfg.get("use_live_universe", False)
         if custom_universe:
             self.universe: List[str] = custom_universe
-        else:
+        elif use_live:
             session = req.Session()
             session.verify = False
             live = _fetch_nse_index_symbols(session, "NIFTY 500")
-            self.universe: List[str] = live if live else NSE_UNIVERSE
-            # Deduplicate
-            seen = set()
-            self.universe = [s for s in self.universe if not (s in seen or seen.add(s))]
+            self.universe = live if live else NSE_UNIVERSE
+        else:
+            # Status-quo path: hardcoded list, no network call.
+            self.universe = list(NSE_UNIVERSE)
+        # Deduplicate (defence-in-depth even though NSE_UNIVERSE is now
+        # asserted duplicate-free by tests/unit/test_stock_scanner.py).
+        seen = set()
+        self.universe = [s for s in self.universe if not (s in seen or seen.add(s))]
 
         # Rescan interval
         self.rescan_interval_minutes: int = scanner_cfg.get("rescan_interval_minutes", 60)

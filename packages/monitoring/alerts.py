@@ -597,11 +597,18 @@ class AlertManager:
         }
 
         last_reason = "unknown"
+        # 2026-05-25: previously hard-coded verify=False, which spammed
+        # the daemon log with InsecureRequestWarning on every alert.
+        # Resend's certificate is publicly issued and verifiable, so
+        # default to verify=True. We fall back to verify=False on the
+        # NEXT attempt only if we got an SSLError (e.g. corporate proxy
+        # MITM rewriting the cert chain). State persists across retries
+        # within a single send so we don't re-pay the SSL handshake cost.
+        verify_tls = True
         for attempt, delay in enumerate(_BACKOFF_DELAYS, start=1):
             if delay:
                 time.sleep(delay)
             try:
-                # verify=False to avoid corporate proxy self-signed cert retries.
                 resp = requests.post(
                     "https://api.resend.com/emails",
                     headers={
@@ -610,7 +617,7 @@ class AlertManager:
                     },
                     data=json.dumps(payload),
                     timeout=10,
-                    verify=False,
+                    verify=verify_tls,
                 )
                 if resp.status_code in (200, 201):
                     if attempt > 1:
@@ -629,6 +636,20 @@ class AlertManager:
                 logger.warning(
                     f"Resend email transient {resp.status_code}, attempt {attempt}/{len(_BACKOFF_DELAYS)}"
                 )
+            except requests.exceptions.SSLError as e:
+                # Corporate proxy / MITM with self-signed CA. Toggle
+                # off verification for the remaining retries in this
+                # send. We log it once at WARNING so the operator can
+                # tell apart "transient TLS error" from "every send is
+                # ignoring the trust chain forever".
+                if verify_tls:
+                    logger.warning(
+                        f"Resend SSL verification failed (likely corporate "
+                        f"proxy); disabling verify for remaining retries: "
+                        f"{type(e).__name__}: {e!s:.120}"
+                    )
+                    verify_tls = False
+                last_reason = f"ssl: {type(e).__name__}: {e!s:.150}"
             except _RETRYABLE_EXCEPTIONS as e:
                 last_reason = f"network: {type(e).__name__}: {e!s:.150}"
                 logger.warning(

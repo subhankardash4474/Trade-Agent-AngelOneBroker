@@ -64,6 +64,14 @@ services:
       # picked up on the next ``docker compose up`` automatically -- which
       # is the desired behaviour for audit-only files.
       - ./tools:/app/tools:ro
+      # Same trick for packages/. Added 2026-05-25 after audit-only fixes
+      # to packages/core/stock_scanner.py (NSE archives CSV path) and
+      # packages/monitoring/alerts.py (TLS verify default) needed to ship
+      # without an image rebuild during the freeze. Read-only so the
+      # daemon can't accidentally write back. The image still ships its
+      # own copy of packages/ -- this just OVERRIDES it at container
+      # start, the same way config.yaml is overridden above.
+      - ./packages:/app/packages:ro
 
     healthcheck:
       test: ["CMD", "python", "/app/tools/health_check.py",

@@ -175,3 +175,42 @@ def test_drain_handles_missing_spool_dir_gracefully(cfg, isolated_spool):
     assert not isolated_spool.exists()
     result = am.drain_failed_alerts()
     assert result == {"sent": 0, "failed": 0, "skipped": 0}
+
+
+def test_resend_uses_tls_verification_by_default(cfg, isolated_spool):
+    """Pre-2026-05-25, Resend was hard-coded to verify=False which spammed
+    the daemon log with InsecureRequestWarning on every alert. The fix
+    flips the default to verify=True; this test guards against silent
+    regression to the insecure default."""
+    am = AlertManager(cfg)
+    with mock.patch(
+        "monitoring.alerts.requests.post", return_value=_ok_response(200)
+    ) as p:
+        ok = am._send_email_resend("subj", "body")
+    assert ok is True
+    assert p.call_count == 1
+    # Each call to requests.post passes verify=<bool> as a kwarg. The
+    # FIRST attempt must use verify=True.
+    first_call_kwargs = p.call_args_list[0].kwargs
+    assert first_call_kwargs.get("verify") is True
+
+
+def test_resend_falls_back_to_unverified_on_ssl_error(cfg, isolated_spool):
+    """If the first attempt raises SSLError (corporate proxy MITM with
+    self-signed CA), subsequent retries must disable verification so the
+    operator's email still goes out. This is the original 'corporate
+    proxy' justification for verify=False -- preserved as a fallback,
+    no longer the default."""
+    am = AlertManager(cfg)
+    side_effects = [
+        requests.exceptions.SSLError("self-signed cert"),
+        _ok_response(200),
+    ]
+    with mock.patch(
+        "monitoring.alerts.requests.post", side_effect=side_effects
+    ) as p:
+        ok = am._send_email_resend("subj", "body")
+    assert ok is True
+    assert p.call_count == 2
+    assert p.call_args_list[0].kwargs.get("verify") is True
+    assert p.call_args_list[1].kwargs.get("verify") is False

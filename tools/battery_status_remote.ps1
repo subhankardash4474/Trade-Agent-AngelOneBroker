@@ -263,7 +263,20 @@ $sched | Where-Object { $_ -notmatch '^---$|^active_since:|^main_pid:' -and $_ -
 
 Write-Host ""
 Write-Host "== ACTIVE BATTERY CONTAINER ======================" -ForegroundColor Cyan
-$psLine = $cont | Where-Object { $_ -and $_ -notmatch '^---' -and $_ -notmatch '\|\s*\d+\.\d+%\|' } | Select-Object -First 1
+# 2026-05-25: rewrote the parser. Previously we relied on the position
+# of the `---STATS---` sentinel implicitly (just splitting on '|' regex
+# heuristics), which caused completed `docker ps` lines to be matched
+# against the active stats and produced spurious "active workers" rows.
+# Now we explicitly track which side of the sentinel each line is on.
+$psSection = New-Object 'System.Collections.Generic.List[string]'
+$statsSection = New-Object 'System.Collections.Generic.List[string]'
+$inStats = $false
+foreach ($cl in $cont) {
+    if ($cl -eq '---STATS---') { $inStats = $true; continue }
+    if (-not $cl) { continue }
+    if ($inStats) { $statsSection.Add($cl) } else { $psSection.Add($cl) }
+}
+$psLine = $psSection | Where-Object { $_ } | Select-Object -First 1
 if (-not $psLine) {
     Write-Host "  [NO BATTERY CONTAINER RUNNING]" -ForegroundColor Yellow
 } else {
@@ -275,7 +288,15 @@ if (-not $psLine) {
         Write-Host "  uptime   : $($parts[2])"
         Write-Host "  image    : $($parts[3])"
     }
-    $statsLine = $cont | Where-Object { $_ -and $_ -notmatch '^---' -and $_ -ne $psLine } | Select-Object -First 1
+    # docker stats may emit one line PER container; pick the row whose
+    # first column matches the docker-ps name we just rendered, falling
+    # back to the first stats row if the names don't match (e.g. older
+    # docker-compose project).
+    $containerName = ($psLine -split '\|')[0]
+    $statsLine = $statsSection | Where-Object { $_ -like "$containerName|*" } | Select-Object -First 1
+    if (-not $statsLine) {
+        $statsLine = $statsSection | Select-Object -First 1
+    }
     if ($statsLine) {
         $sp = $statsLine -split '\|'
         if ($sp.Count -ge 4) {
