@@ -304,6 +304,7 @@ These rows exist so the Friday review can find every commit tagged
 2026-05-25 | TBD-sha | observability: Bug F — battery harness ProcessPoolExecutor cascade-fail fix (max_tasks_per_child=1 + faulthandler diagnostic) + 6 structural tests
 2026-05-25 | TBD-sha | observability: Bug G — backtester subsystem code-review hardening (G-1 atomic results-JSON writes + corrupt-JSON quarantine; G-2 BrokenProcessPool auto-retry loop with MAX_POOL_RETRIES=3; G-3 yfinance hard timeout in _trend_context; G-5 queue scheduler --rm + zombie-container retry + failure_phase markers) + 26 structural tests
 2026-05-26 | TBD-sha | observability: Bug G self-audit fixes — G-1.A (orphan results JSON masks failure.txt on resume; reader now treats sibling .failure.txt as authoritative) + G-3.A (ThreadPoolExecutor with-block shutdown(wait=True) defeated the timeout; rewritten to try/finally with shutdown(wait=False, cancel_futures=True)). NOT deployed to VM during validation tail; runs on origin/main only until post-Friday review.
+2026-05-26 | TBD-sha | observability: Bug H — `models/xgboost_model.pkl` was never copied onto the backtester VM AND no `models/` bind-mount existed in either `tools/run_battery_queue.py:build_docker_run_argv` or `tools/cloud/launch_battery.sh`. Result: every battery run since image build 2026-05-22 was silently executing without xgboost (strategy fail-open). Fix: bind-mount `${TRADER_HOME}/models:/app/models:ro` in both launchers, scp the production model file (sha256 fc17fcb5efce..., mtime 2026-05-14) from trader VM to backtester host, test-asserted in test_battery_queue_scheduler.py. Deployment IS authorized for this entry (user directive 2026-05-26 "deploy all the fix"; the nifty500_v4_long_only_validation_60d run is being restarted with xgboost ACTIVE so all variants are apples-to-apples with the trader daemon). Bug G self-audit fixes (G-1.A + G-3.A) ride along on the same `git pull` since they're already on origin/main. No bypass slot consumed — strategy/risk code untouched; this is a deployment-environment fix.
 ```
 
 Audit-only entries cover: `packages/monitoring/alerts.py`, `tests/`,
@@ -377,4 +378,12 @@ retry) — none consume a slot; all add tests (45 new across F + G);
 all behaviour-neutral on backtest output [Bug F changes only the
 process-management layer; Bug G fixes only activate on failure paths
 (cascade, corruption, network hang, name conflict) and produce
-byte-identical output to a hypothetically-perfect happy path]).*
+byte-identical output to a hypothetically-perfect happy path].
+2026-05-26 audit-only entries: Bug G self-audit (G-1.A + G-3.A;
+behaviour-neutral failure-handling corrections), Bug H — backtester
+`models/` bind-mount + production model file staged on backtester
+host (deployment-environment fix; xgboost was silently disabled on
+the backtester since image build 2026-05-22 — the
+nifty500_v4_long_only_validation_60d run is being restarted with
+xgboost active to produce an apples-to-apples baseline for the
+2026-05-29 review).*

@@ -249,6 +249,14 @@ class TestDockerArgvComposition:
         # image rebuild. Read-only so a stray edit can't crash a worker
         # mid-stream.
         assert any("/packages:/app/packages:ro" in v for v in v_pairs)
+        # 2026-05-26 models mount: trading-agent:latest was built without
+        # `models/xgboost_model.pkl` baked in. Without this bind-mount
+        # every variant logs `[XGB-HEALTH] XGBoost model not found ...
+        # Strategy will return HOLD`, which silently turned the
+        # nifty500_v4_long_only_validation_60d run into a "shipped MINUS
+        # xgboost" study. Read-only so a worker can never corrupt the
+        # production model file.
+        assert any("/models:/app/models:ro" in v for v in v_pairs)
 
     def test_fresh_run_passes_run_id_not_resume(self):
         # Default (resuming=False) MUST emit --run-id, NEVER --resume.

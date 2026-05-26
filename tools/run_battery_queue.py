@@ -342,6 +342,20 @@ def build_docker_run_argv(job: dict, run_id: str, image: str,
         # full image rebuild. Read-only so a stray edit during a battery
         # run can't crash a worker mid-stream.
         "-v", f"{TRADER_HOME}/packages:/app/packages:ro",
+        # 2026-05-26 read-only models mount. The trading-agent:latest
+        # image was built (2026-05-22) without `models/xgboost_model.pkl`
+        # baked in -- discovered during the nifty500_v4_long_only_60d
+        # validation run when every variant logged
+        # `[XGB-HEALTH] XGBoost model not found at models/xgboost_model.pkl.
+        # Strategy will return HOLD`. The result was a 60-day validation
+        # where xgboost_classifier silently returned HOLD on every cycle,
+        # so V1 = "shipped MINUS xgboost" rather than the actual shipped
+        # baseline. Bind-mount fixes the gap without an image rebuild:
+        # the trader VM has a known-good copy of the production model
+        # (sha256 fc17fcb5efce..., mtime 2026-05-14) which is staged on
+        # this host at /opt/trading-agent/models/. Read-only so a
+        # mid-run worker can never write/corrupt the model file.
+        "-v", f"{TRADER_HOME}/models:/app/models:ro",
         "--restart=no",
         image,
         "python", "tools/run_battery.py",

@@ -1393,3 +1393,165 @@ consumed. Bypass ledger remains 1/3 (still only
 - `docs/findings_log_2026-05-25.md` — §15 added
 - `docs/changes_done_2026-05-25.md` — this §14
 - `docs/FREEZE_v2.1.md` — audit-only entry extended
+
+---
+
+## 15. Bug H — XGBoost model missing from backtester (silent strategy disable)
+
+### §15.0 What happened (one-paragraph TL;DR)
+
+A 2026-05-26 audit triggered by today's live -Rs 453 loss
+(three xgboost_classifier BUY trades stopped out in
+`bear_low_vol` regime) discovered that the
+`nifty500_v4_long_only_validation_60d` run on the backtester VM was
+silently executing **without xgboost**. The
+`/opt/trading-agent/models/` directory on the backtester host is
+empty (mtime 2026-05-18 — has been empty for 8 days), and the
+trading-agent:latest image (built 2026-05-22) did not bake the
+`xgboost_model.pkl` either. Every variant in the run logged
+`[XGB-HEALTH] XGBoost model not found at models/xgboost_model.pkl.
+Strategy will return HOLD` and produced trade results from the
+remaining 5 strategies only. **V1 in this run is NOT the shipped
+baseline; it is "shipped minus xgboost".** This invalidates the
+straight-line comparison the Friday 2026-05-29 review was going to
+draw between V1/V2/V4/V17/V18/V19 PnLs and the live daemon's
+recent performance.
+
+### §15.1 How the gap was created
+
+* The Dockerfile copies `packages/`, `tools/`, `config.yaml`, etc.,
+  into the image but **not** `models/`. The `models/` directory is
+  created empty at image build time by `mkdir -p models/` in the
+  Dockerfile (so the `Path(models/xgboost_model.pkl).parent`
+  resolution doesn't fail), but nothing populates it.
+* On the trader VM the bootstrap pipeline writes
+  `/opt/trading-agent/models/xgboost_model.pkl` directly to the
+  host (it's a training artifact from
+  `tools/research/training_pipeline.py`), and the trader's
+  docker-compose bind-mounts `models/` into the container.
+* The backtester VM, conversely, has neither a bake-into-image
+  path NOR a bind-mount. The `models/` directory exists on the
+  host (owned by uid 1001) but has been empty since the VM was
+  provisioned.
+* The `xgboost_classifier` strategy is **fail-open**: missing
+  model degrades to `return HOLD` with a warning, no exception.
+  That's intentional defence against operator mistakes during
+  active trading, but it means a missing model is silent at the
+  harness level (no crash, no scheduler alarm) and the only
+  external signal is the warning line in the variant's worker log.
+
+### §15.2 Detection chain
+
+The warning was visible (and is now archived) in every variant's
+worker log from the start of the validation run:
+* `logs/backtests/battery_nifty500_v4_long_only_validation_60d_20260525T164751/workers/V1_baseline_current_shipped.log` (V1 — completed)
+* `…/V2_all_filters_off.log` (V2 — completed)
+* `…/V4_threshold_3pct.log` (V4 — was at 2.3%)
+* `…/V17_long_only_shipped.log` (V17 — was at 1.7%)
+
+The detection path was: today's live -Rs 453 loss → audit of the
+trader daemon → confirmation that xgboost_classifier was the
+strategy responsible → cross-check of the backtester results to
+"what does the same regime look like in our 60d validation" →
+discovered the missing-model warning. **Lesson: the
+`battery_status_remote.ps1` summary should surface
+`grep -c '\[XGB-HEALTH\] XGBoost model not found'` from each
+worker log so this can't repeat silently.** (Captured as a
+post-Friday todo, not part of today's fix.)
+
+### §15.3 Fix
+
+Two parts, both audit-only (no strategy/risk change):
+
+**§15.3.a Bind-mount `models/` read-only into every battery
+container.**
+* `tools/run_battery_queue.py:build_docker_run_argv` — added
+  ```
+  "-v", f"{TRADER_HOME}/models:/app/models:ro",
+  ```
+  next to the existing `packages` mount. Read-only so a stray
+  pickle.dump (e.g. a worker that imports the training pipeline
+  by accident) can never overwrite the production model file.
+* `tools/cloud/launch_battery.sh` — same mount added, plus the
+  pre-existing `packages/` mount that was already in the
+  scheduler argv but missing from the manual operator script
+  (pre-existing parity gap, fixed in the same commit).
+* `tests/unit/test_battery_queue_scheduler.py` — extended the
+  `test_run_argv_includes_required_mounts` test with an
+  `assert any("/models:/app/models:ro" in v for v in v_pairs)`
+  line so a future refactor that drops the mount fails CI.
+
+**§15.3.b Stage the model file onto the backtester host.**
+* `scp ubuntu@<trader-vm>:/opt/trading-agent/models/xgboost_model.pkl
+   opc@<backtester-vm>:/tmp/`
+* `sudo mv /tmp/xgboost_model.pkl /opt/trading-agent/models/`
+* Verify sha256 = `fc17fcb5efceb7297af277c5a1fd854937286e361366bca0d2d803d36d022995`
+  matches the trader-side file (rules out network corruption).
+
+### §15.4 Probability + cost (Bug G framework)
+
+* **Probability of recurrence (without fix):** 100% (the gap is
+  structural — every battery container ever spawned has been
+  affected since image build 2026-05-22).
+* **Magnitude of damage:** Every variant in the
+  `nifty500_v4_long_only_validation_60d` run misrepresents the
+  shipped baseline. V1 = -5.62% appears as a "shipped is losing
+  money" result, but the actual shipped daemon includes xgboost
+  which under current regimes is independently a loss-generator
+  (verified today: -Rs 453 from 3 xgboost trades). The combined
+  shipped baseline is almost certainly worse than -5.62%.
+* **Detection cost without the bind-mount:** Operator has to
+  grep every worker log every run. Easy to miss; was missed for
+  8 days.
+* **Fix cost:** 2 lines of code (mount string × 2 scripts), one
+  test line, one model file scp. Total dev time ~15 minutes.
+
+### §15.5 Operational rollout (this run)
+
+Per user's explicit go-ahead 2026-05-26 14:08 IST:
+1. Phase 1 (this commit) — code change + test + push to origin.
+2. Phase 2 (separate operational step, logged in real-time):
+   a. Stop `battery-scheduler.service`.
+   b. `scp` model trader→backtester, verify sha256.
+   c. `git pull` on backtester — moves from cb76f0e to HEAD
+      (picks up §14 audit fix AND this §15 bind-mount).
+   d. `docker stop` the active container (V4 at 2.3%, V17 at
+      1.7% — discardable).
+   e. Rename `results/V1_baseline_current_shipped.json` →
+      `results/V1_baseline_current_shipped.NO_XGBOOST.json.archive`
+      and the same for V2. Preserves the no-xgboost data for
+      reference, makes both variants invisible to
+      `_completed_variant_names()` so resume re-runs them.
+   f. Restart `battery-scheduler.service` — harness resumes the
+      run dir, sees V1/V2/V4/V17/V18/V19 all uncompleted,
+      schedules all 6 with workers=2.
+3. Phase 3 (verification gate) — at the first variant
+   completion (~6-12 h), tail the worker log for
+   `[XGB-HEALTH] OK` (model loaded successfully). If the warning
+   reappears, abort and replan; do not burn another 30 h on a
+   broken setup.
+
+### §15.6 Freeze accounting
+
+* Bind-mount addition: harness/dev-tooling, no
+  strategy/risk computation changed. **No bypass slot.**
+* Model file deployment: production artifact previously
+  shipped on the trader VM, now also staged on the backtester
+  VM. Read-only mount means the backtester cannot mutate it.
+  Identical to the trader's model bit-for-bit (sha256 verified).
+  **No bypass slot.**
+* `git pull` on backtester also brings §14 audit fix.
+  Already accounted for in §14 — still audit-only, no slot.
+
+Bypass ledger remains **1/3** (still only `risk.allow_shorts`).
+
+### §15.7 Files touched in §15
+
+* `tools/run_battery_queue.py` — `+1` mount line
+* `tools/cloud/launch_battery.sh` — `+2` mount lines
+  (`packages` parity + `models`)
+* `tests/unit/test_battery_queue_scheduler.py` — `+8` lines
+  (assert + comment) on the existing mount-list test
+* `docs/findings_log_2026-05-25.md` — §16 added
+* `docs/changes_done_2026-05-25.md` — this §15
+* `docs/FREEZE_v2.1.md` — audit-only entry extended

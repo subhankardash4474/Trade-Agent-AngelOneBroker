@@ -107,6 +107,8 @@ ssh "${SSH_OPTS[@]}" "${SSH_USER}@${BACKTESTER_VM_HOST}" "bash -lc '
         -v ${TRADER_HOME}/logs:/app/logs \
         -v ${TRADER_HOME}/data:/app/data \
         -v ${TRADER_HOME}/tests/fixtures:/app/tests/fixtures:ro \
+        -v ${TRADER_HOME}/packages:/app/packages:ro \
+        -v ${TRADER_HOME}/models:/app/models:ro \
         trading-agent:latest \
         python tools/run_battery.py ${REMOTE_ARGS}
 

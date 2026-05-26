@@ -1642,3 +1642,143 @@ deploy it"), this audit-fix commit is pushed to origin/main but
   wedge indefinitely).
 * Post-validation, both audit fixes get pulled with the rest of
   the post-Friday tail of changes.
+
+---
+
+## 16. Bug H — Backtester silently ran without XGBoost (2026-05-26 afternoon)
+
+### 16.1 Discovery context
+
+Today's live trader VM took a -Rs 453 daily loss from three
+`xgboost_classifier` BUY trades (HFCL, TATAINVEST, TATACHEM) that
+opened in the `bear_low_vol` regime and all stopped out within the
+first 15 minutes. The trader VM logs confirmed xgboost was both
+the strategy responsible and the only voice the regime was
+weighting at 5.0× in this market.
+
+That triggered an obvious cross-check: "what does the
+`nifty500_v4_long_only_validation_60d` backtester run say about
+shipped behaviour in this regime?" The answer was supposed to be
+V1's PnL. The actual answer turned out to be: **V1 in that run
+isn't shipped behaviour. It's shipped MINUS xgboost.**
+
+### 16.2 Failure mode
+
+Every variant's worker log carries the line:
+
+```
+[XGB-HEALTH] XGBoost model not found at models/xgboost_model.pkl.
+Strategy will return HOLD.
+```
+
+`xgboost_classifier.load_or_train` is fail-open by design (a
+missing artifact during live trading must not crash the daemon),
+so a missing model gives you a strategy that returns HOLD on
+every cycle, a quiet warning at startup, and no scheduler alarm.
+The validation ran for ~16 hours and completed V1 / V2 before any
+operator noticed.
+
+The artifact `models/xgboost_model.pkl` was missing because:
+
+1. The Dockerfile creates `models/` empty (so the strategy's
+   path resolution doesn't fail) but does not COPY a model file.
+   This is the same image used on the trader VM.
+2. The trader VM bootstrap pipeline writes the model to
+   `/opt/trading-agent/models/xgboost_model.pkl` on the host,
+   then docker-compose bind-mounts `models/` into the container.
+   So the trader runs with xgboost active.
+3. The backtester VM has the host directory `models/` (empty,
+   uid 1001, mtime 2026-05-18) but no bootstrap step ever
+   populated it, and the queue scheduler's
+   `build_docker_run_argv` did not declare a `models/` mount.
+
+So the backtester container had an empty `/app/models/`, the
+strategy fell through to fail-open, and every backtest in this
+run effectively turned xgboost off.
+
+### 16.3 What's affected
+
+* `nifty500_v4_long_only_validation_60d_20260525T164751`:
+  V1 (-Rs 562, -5.62%) and V2 (-Rs 1167, -11.54%) are **xgboost-off
+  results**, not shipped baselines. Renamed on disk to
+  `.NO_XGBOOST.json.archive` to preserve the data without leaving
+  them in `_completed_variant_names`.
+* V4 / V17 (in flight at 2.3% and 1.7%, respectively) — killed,
+  will re-run from scratch with xgboost active.
+* V18 / V19 — never started; will pick up the corrected
+  environment when scheduled.
+* `nifty50_60d_20260525T105637` — older run, predates the
+  validation insert. Same gap applies (model missing). The
+  resume queued after the validation will inherit the corrected
+  environment automatically — every variant gets re-run with
+  xgboost. **No corrective action needed on that queue item; the
+  scheduler resume already plans to re-execute V3-V19 there.**
+* All `_archive/` runs from May 18-25 — same gap, but those
+  results were already discarded or are flagged as
+  speed-patch-era data. No fix needed; they were never
+  decision-grade.
+
+### 16.4 Fix
+
+* `tools/run_battery_queue.py:build_docker_run_argv` — added
+  `-v {TRADER_HOME}/models:/app/models:ro`. Read-only because
+  the model file is a production artifact; a worker must never
+  rewrite it during a run.
+* `tools/cloud/launch_battery.sh` — same mount, plus the
+  pre-existing `packages/` mount that had drifted (manual
+  launches were running with image-baked code from
+  2026-05-22). Both mounts now identical between the two
+  launch paths.
+* `tests/unit/test_battery_queue_scheduler.py` — extended
+  `test_run_argv_includes_required_mounts` with the
+  `models:/app/models:ro` assertion. 29 tests still pass; 4
+  battery_robustness tests still pass. Total: 59 / 59.
+
+### 16.5 Rollout (2026-05-26 14:30 IST onward)
+
+Step-by-step is documented in `changes_done_2026-05-25.md` §15.5.
+Verification gate is at the first variant completion (~6-12 h
+after restart): the worker log must contain
+`[XGB-HEALTH] OK — 31 features` instead of "model not found". If
+the warning reappears, the bind-mount didn't take effect (most
+likely cause: a stale `git pull` or a docker daemon caching the
+old container spec) and the next 30 hours of compute would be
+wasted again. Hard-stop on that condition.
+
+### 16.6 Process lesson
+
+The warning was visible from variant launch but no automated
+surface saw it. The `battery_status_remote.ps1` summary script
+shows variant progress, queue state, ETA — but does not grep
+worker logs for known fail-open warnings. **Post-Friday todo**
+(not part of this fix, captured in `docs/post_freeze_v4_proposal.md`):
+
+> Add a "fail-open warning census" section to
+> `battery_status_remote.ps1`. Lines to count per worker log:
+>   * `\[XGB-HEALTH\] XGBoost model not found`
+>   * `\[trend_context\] yfinance timed out`
+>   * `\[(BATTERY|RESULTS)\] .*invalid|corrupt`
+>
+> Surface them with the same prominence as the
+> per-variant progress %. Any non-zero count blocks the run from
+> being declared "decision-grade".
+
+This kind of silent fail-open is exactly the failure mode
+freeze-v2.1 was supposed to catch via "audit before deploy", and
+it slipped through because the audit lens was pointed at *code
+changes* not *deployment state*. Worth a separate think after
+Friday on whether the freeze ledger should track "VM-side
+artifact state" as a first-class column.
+
+### 16.7 Probability-weighted cost (Bug G framework)
+
+* P(recurrence without fix): 1.0 (it's structural — happens every
+  battery container launch).
+* Magnitude: every variant's PnL silently misrepresents the
+  shipped baseline. The validation run was on the critical path
+  for the Friday 2026-05-29 review.
+* Time-cost: 30 hours of compute (V1 + V2 + part of V4/V17)
+  effectively wasted, plus the operator audit time it took to
+  diagnose.
+* Fix cost: 4 lines of code, 1 test line, 1 file copy. ~15 min
+  dev time + ~10 min VM ops.
