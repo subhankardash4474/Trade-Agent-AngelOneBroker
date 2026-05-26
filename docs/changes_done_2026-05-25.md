@@ -1611,3 +1611,85 @@ on the trader. Slot count is unchanged.
 * `docs/findings_log_2026-05-25.md` — §17 added (Bug I full detail).
 * `docs/changes_done_2026-05-25.md` — this §16 (Bug I mirror).
 * No source code, no tests, no config. No VM-side deploy.
+
+---
+
+## 17. `risk.allow_shorts: false` — DEPLOY CONFIRMED (2026-05-26 15:20 IST)
+
+After the operator manually reconciled the trader VM hot-fixes (Bug I,
+§16), the slot-1 `risk.allow_shorts: false` deploy was completed in
+the same session. This is the activation step that the 2026-05-25
+pre-stage (slot 1/3, see §1) was always going to consume.
+
+### §17.1 Sequence
+
+1. Operator ran the manual rebuild (committed the 5 hot-fixes to a
+   feature branch, pulled main, restarted container). Container came
+   back healthy at `2026-05-26T09:38 UTC ≈ 15:08 IST` with code at
+   `73c26bf` (Bug H). `_trend_context.py` now contains the G-3.A
+   audit fix, verified live in the trader container.
+2. Operator SSH'd in and ran:
+   ```
+   sudo cp /opt/trading-agent/config.yaml /opt/trading-agent/config.yaml.bak_<ts>
+   sudo sed -i -E 's/^(\s*allow_shorts:\s+)true\s*$/\1false/' \
+       /opt/trading-agent/config.yaml
+   sudo grep allow_shorts /opt/trading-agent/config.yaml
+   # -> allow_shorts: false
+   cd /opt/trading-agent && sudo docker compose restart trader
+   ```
+3. Post-restart verification, run by the operator inside the
+   container:
+   ```
+   sudo docker exec trader python3 -c \
+     "import yaml; print('allow_shorts =', \
+      yaml.safe_load(open('/app/config.yaml'))['risk'].get('allow_shorts'))"
+   # -> allow_shorts = False
+   ```
+4. Daemon boot log (last lines):
+   ```
+   2026-05-26 15:19:55 | INFO  | Agent started (poll=60s, instruments=169)
+   2026-05-26 15:19:55 | INFO  | India VIX updated: 16.26
+   2026-05-26 15:19:55 | INFO  | Nifty trend: BELOW 200 EMA (Nifty=23911)
+   2026-05-26 15:19:55 | WARN  | Trading blocked: Consecutive losses: 3 (limit: 3)
+   ```
+   Container status: `Up About a minute (healthy)`.
+
+### §17.2 Effective from
+
+The flag is read in `TradingAgent.__init__` at process startup. The
+2026-05-26 15:19:55 IST restart is the activation moment. Today's
+remaining 10 minutes of market are in the 3-loss-daily-limit lockout
+anyway, so the first market-side test of the flag is the next session
+open at **2026-05-27 09:15 IST**.
+
+### §17.3 What it actually blocks
+
+`risk.allow_shorts: false` causes `TradingAgent` to drop any
+`SELL`-side ensemble signal before it reaches the position-sizing /
+order-placement stage. `BUY`-side signals are unaffected. The
+2026-05-18 90d × 228-stock battery showed `risk.allow_shorts: true`
+losing -Rs 379 (V1) / -Rs 398 (V2) on the short side specifically;
+this flag removes that loss vector at the source. **It does NOT
+address today's actual loss path (xgboost LONGS hitting stop_loss);
+that's a separate analysis pending V1/V4/V17 results from the
+in-flight validation run.**
+
+### §17.4 Freeze accounting
+
+Slot 1 of 3 was reserved 2026-05-25 in §1 for this change. The flag
+is now live; the reservation is fulfilled. **Slots used remains 1/3**
+(no additional consumption from today's deploy — slot was already
+counted).
+
+### §17.5 Files touched on the trader VM
+
+* `/opt/trading-agent/config.yaml` — `allow_shorts: true → false`
+  on line 291.
+* `/opt/trading-agent/config.yaml.bak_<ts>` — backup of the
+  pre-flip state. Identical except for that one line.
+
+### §17.6 Files touched in the repo (this commit)
+
+* `docs/changes_done_2026-05-25.md` — this §17 (deploy confirmation).
+* `docs/FREEZE_v2.1.md` — ledger entry updated from "pre-staged" to
+  "LIVE on trader VM as of 2026-05-26 15:19:55 IST".

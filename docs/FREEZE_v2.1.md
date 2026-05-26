@@ -247,6 +247,12 @@ a slot.
 ```
 2026-05-25 | TBD-sha | risk.allow_shorts flag (defaults true = no-op);
                        touches trading_agent.py + config.yaml risk:
+2026-05-26 | LIVE    | risk.allow_shorts ACTIVATED on trader VM at
+                       15:19:55 IST. config.yaml flipped true -> false,
+                       container restarted, daemon verified reading
+                       `allow_shorts = False`. First market-side test:
+                       2026-05-27 09:15 IST open. No additional slot
+                       consumed (this is the activation of slot 1).
 ```
 
 **Slots used: 1 / 3.**
