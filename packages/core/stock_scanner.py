@@ -420,12 +420,33 @@ class StockScanner:
                 vol_ratio = vol_today / avg_volume if avg_volume > 0 else 0
 
                 # RSI (14)
+                # F-89: when the 14-bar window has zero downward movement
+                # (e.g. limit-up day), ``loss.replace(0, np.nan)`` makes
+                # ``rs`` NaN and propagates to ``rsi_val``. NaN-NaN
+                # comparisons are False, so the "skip extreme RSI" gate
+                # below silently passed NaN-RSI symbols. Align with
+                # FeatureEngine + RSI strategy (C-30) flat-window
+                # overrides: all-up -> 100, all-down -> 0, truly flat -> 50.
                 if len(df) >= 15:
                     delta = df["close"].diff()
-                    gain = delta.where(delta > 0, 0.0).ewm(com=13, min_periods=14).mean()
-                    loss = (-delta.where(delta < 0, 0.0)).ewm(com=13, min_periods=14).mean()
+                    gain_raw = delta.where(delta > 0, 0.0)
+                    loss_raw = -delta.where(delta < 0, 0.0)
+                    gain = gain_raw.ewm(com=13, min_periods=14).mean()
+                    loss = loss_raw.ewm(com=13, min_periods=14).mean()
                     rs = gain / loss.replace(0, np.nan)
                     rsi_val = float((100 - 100 / (1 + rs)).iloc[-1])
+                    if not np.isfinite(rsi_val):
+                        # Inspect the last 14 raw deltas to decide which
+                        # flat-window override applies.
+                        recent = delta.iloc[-14:].dropna()
+                        if recent.empty or (recent == 0).all():
+                            rsi_val = 50.0
+                        elif (recent >= 0).all():
+                            rsi_val = 100.0
+                        elif (recent <= 0).all():
+                            rsi_val = 0.0
+                        else:
+                            rsi_val = 50.0
                 else:
                     rsi_val = 50.0
 

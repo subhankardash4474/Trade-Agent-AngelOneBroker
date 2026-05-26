@@ -118,8 +118,16 @@ def save_trailing_states(
             for sym, ts in trailing_stops_by_symbol.items()
         },
     }
+    # C-29 (audit 2026-05-26): see cooldown_persistence for rationale.
     try:
-        _atomic_write_json(path, payload)
+        from core.file_lock import file_lock as _file_lock
+        with _file_lock(path, timeout=2.0):
+            _atomic_write_json(path, payload)
+    except (TimeoutError, ImportError):
+        try:
+            _atomic_write_json(path, payload)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"[TRAIL-PERSIST] save failed (post-fallback): {exc!r}")
     except Exception as exc:  # noqa: BLE001 - persistence must not raise
         logger.warning(f"[TRAIL-PERSIST] save failed: {exc!r}")
 

@@ -8,7 +8,7 @@ from __future__ import annotations
 import re
 import sys
 from collections import defaultdict
-from pathlib import Path
+from pathlib import Path  # F-98: `re` import retained -- still used by per-field re.search calls below.
 
 ROOT = Path(__file__).resolve().parent.parent
 PM_DIR = ROOT / "logs" / "postmortem"
@@ -23,14 +23,8 @@ def main() -> None:
     by_strategy: dict[str, list[dict]] = defaultdict(list)
     by_flag: dict[str, int] = defaultdict(int)
 
-    trade_re = re.compile(
-        r"## (\S+) (BUY|SELL)\s+([^\n]*)\n.*?Strategy:\*\* `([^`]+)`.*?"
-        r"Realised:\*\* Rs ([+\-][\d,\.]+)"
-        r"(?:.*?Capture:\*\* ([\-\d.]+)%)?"
-        r"(?:.*?money on table:\*\* Rs ([+\-]?[\d,\.]+))?"
-        r"(?:.*?pct_vs_sma50.*?\(([+\-][\d.]+)%\))?",
-        re.DOTALL,
-    )
+    # F-98: the previously-compiled `trade_re` regex was never used
+    # (the loop below parses each section field-by-field). Removed.
 
     for f in files:
         text = f.read_text(encoding="utf-8")

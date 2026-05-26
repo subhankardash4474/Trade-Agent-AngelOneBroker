@@ -25,6 +25,10 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+# F-19: packages/ must be on sys.path for bare-host invocations.
+_PKG = ROOT / "packages"
+if str(_PKG) not in sys.path:
+    sys.path.insert(0, str(_PKG))
 
 from loguru import logger
 
@@ -51,7 +55,13 @@ def main() -> None:
     db = Database(db_path)
     dh = DataHandler(cfg)
 
-    initial_capital = float(cfg.get("trading", {}).get("initial_capital", 50000))
+    # F-18: previously this read `trading.initial_capital` (default 50_000),
+    # which does not exist in config.yaml -- the real key is
+    # `capital.initial_balance` (default 100_000). Without this fix the
+    # Portfolio gets re-seeded with the wrong baseline, corrupting cash
+    # accounting after a manual close. Mirrors the C-4 fix applied to
+    # tools/close_position.py during the 2026-05-26 audit sweep.
+    initial_capital = float(cfg.get("capital", {}).get("initial_balance", 100_000))
     portfolio = Portfolio(initial_balance=initial_capital, database=db)
 
     # Print current state

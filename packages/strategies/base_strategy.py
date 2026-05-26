@@ -82,14 +82,28 @@ class BaseStrategy(ABC):
 
     @staticmethod
     def _atr(data: pd.DataFrame, period: int = 14) -> float:
-        """Compute ATR(period) from OHLCV data. Returns 0 on failure."""
+        """Compute ATR(period) from OHLCV data. Returns 0 on failure.
+
+        F-45 (audit 2026-05-27): switched from a simple rolling mean of
+        the true-range series to ``tr.ewm(span=period, adjust=False).mean()``
+        so this helper produces the SAME value as
+        ``FeatureEngine._add_volatility_features`` and the ATR used by
+        the ADX/Supertrend computations. Pre-fix, a strategy that
+        consulted ``self._atr(df)`` for SL sizing got an SMA-ATR while
+        the rest of the pipeline (regime classifier, conviction-aware
+        ATR gate, dist_from_supertrend_atr feature) used EWM-ATR --
+        same name, different numbers (typically EWM is more responsive
+        to a recent volatility shock). The divergence was responsible
+        for inconsistent SL placement vs the gating that decided
+        whether to take the trade at all.
+        """
         try:
             tr = pd.concat([
                 data["high"] - data["low"],
                 (data["high"] - data["close"].shift()).abs(),
                 (data["low"] - data["close"].shift()).abs(),
             ], axis=1).max(axis=1)
-            val = tr.rolling(period).mean().iloc[-1]
+            val = tr.ewm(span=period, adjust=False).mean().iloc[-1]
             return float(val) if not pd.isna(val) else 0.0
         except Exception:
             return 0.0

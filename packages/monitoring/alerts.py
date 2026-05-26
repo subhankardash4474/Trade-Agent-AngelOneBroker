@@ -259,19 +259,33 @@ def _sanitize_filename(s: str) -> str:
 def _spool_failed_alert(payload: dict, reason: str) -> Optional[Path]:
     """Persist a failed alert payload to disk so it can be replayed later.
     Returns the path written, or None if spool itself failed.
+
+    F-60: previously used ``path.write_text(...)`` directly. A crash
+    (or container kill) mid-write produced a truncated JSON spool file
+    that ``drain_failed_alerts()`` skipped as corrupt
+    (``skipped`` counter), permanently losing the alert. Write via a
+    sibling ``.tmp.<pid>`` then ``os.replace`` -- atomic on both
+    Windows and POSIX -- mirroring the persistence-module convention.
     """
     try:
         _FAILED_ALERTS_DIR.mkdir(parents=True, exist_ok=True)
         ts = datetime.now(IST).strftime("%Y-%m-%dT%H%M%S")
         title_slug = _sanitize_filename(payload.get("subject", "alert"))
         path = _FAILED_ALERTS_DIR / f"{ts}_{title_slug}_{uuid.uuid4().hex[:6]}.json"
-        path.write_text(
-            json.dumps(
-                {**payload, "spooled_at": ts, "reason": reason},
-                ensure_ascii=False, indent=2,
-            ),
-            encoding="utf-8",
+        body = json.dumps(
+            {**payload, "spooled_at": ts, "reason": reason},
+            ensure_ascii=False, indent=2,
         )
+        tmp = path.with_suffix(path.suffix + f".tmp.{os.getpid()}")
+        try:
+            tmp.write_text(body, encoding="utf-8")
+            os.replace(tmp, path)
+        finally:
+            if tmp.exists():
+                try:
+                    tmp.unlink()
+                except OSError:
+                    pass
         logger.warning(f"[ALERT-SPOOL] {payload.get('subject')} -> {path.name} ({reason})")
         return path
     except Exception as e:
@@ -361,13 +375,44 @@ class AlertManager:
 
     def _record_send(self, fingerprint: str, title: str) -> None:
         """Stamp this fingerprint with `now` and GC expired entries.
-        We don't keep an unbounded log -- entries past 24h are dropped to
-        cap the file size (a busy day might emit 200 alerts)."""
+
+        B-8 (audit 2026-05-25): the read-modify-write block below races
+        across processes (two daemons overlapping during deploy can each
+        read the same state, then each write back missing the other's
+        update, resulting in a duplicate alert). Wrap in a cross-process
+        advisory file_lock so the RMW is serialised. Lock timeout is
+        short (2s) so a stuck lock can never block the alert path for
+        long — worst case we fall through without dedup, which is the
+        safer failure mode (an extra email is better than no email).
+        """
         if self._dedup_ttl_minutes <= 0:
             return
-        state = self._load_dedup_state()
+        try:
+            from core.file_lock import file_lock as _file_lock
+        except ImportError:
+            _file_lock = None
+
         now = int(time.time())
         cutoff = now - max(24 * 3600, self._dedup_ttl_minutes * 60 * 2)
+
+        if _file_lock is not None:
+            try:
+                with _file_lock(self._dedup_state_path, timeout=2.0):
+                    state = self._load_dedup_state()
+                    state = {fp: ts for fp, ts in state.items() if ts >= cutoff}
+                    state[fingerprint] = now
+                    self._save_dedup_state(state)
+                return
+            except TimeoutError:
+                logger.debug(
+                    f"[DEDUP] file_lock timeout on {self._dedup_state_path}; "
+                    f"falling through without dedup (alert WILL be sent)."
+                )
+            except Exception as e:
+                logger.debug(f"[DEDUP] file_lock failed ({e}); falling through")
+
+        # Fallback path (no lock): unchanged legacy behaviour.
+        state = self._load_dedup_state()
         state = {fp: ts for fp, ts in state.items() if ts >= cutoff}
         state[fingerprint] = now
         self._save_dedup_state(state)
@@ -386,7 +431,17 @@ class AlertManager:
         full_message = f"[{timestamp}] [{level.upper()}] {title}\n{message}"
 
         log_fn = {"info": logger.info, "warning": logger.warning, "error": logger.error}.get(level, logger.info)
-        log_fn(f"ALERT: {title} - {message}")
+        # F-88: previously logged the FULL alert body at INFO/WARN/ERROR.
+        # Tracebacks, credentials accidentally embedded by upstream
+        # formatters, and PII from broker error envelopes all ended up
+        # in the daemon log (which is rotated and synced off-host). Cap
+        # the in-log body to a short preview; the full message still
+        # goes out by email and lands in the failed-alert spool on send
+        # failure, both of which are operator-controlled artefacts.
+        preview = message if len(message) <= 200 else (message[:197] + "...")
+        # Strip newlines for single-line readability in `grep ALERT`.
+        preview = preview.replace("\n", " | ")
+        log_fn(f"ALERT: {title} - {preview}")
 
         if not self.enabled:
             return
@@ -492,9 +547,22 @@ class AlertManager:
                 msg.attach(MIMEText(body, "plain", "utf-8"))
                 msg.attach(MIMEText(html, "html", "utf-8"))
 
+                # B-10 (audit 2026-05-25): SMTP login MUST receive a plain
+                # email address, not a display-formatted sender like
+                # "Trading Agent <agent@example.com>". The previous code
+                # passed `sender` straight to `login()`, which most SMTP
+                # servers reject (501 syntax error, "username must be an
+                # address"). Use `smtp_user` if explicitly configured;
+                # otherwise extract the address part from `sender` via
+                # `parseaddr` so the existing single-key config keeps
+                # working without operator action.
+                from email.utils import parseaddr
+                smtp_user = self._email_cfg.get("smtp_user") \
+                    or parseaddr(self._email_cfg["sender"])[1] \
+                    or self._email_cfg["sender"]
                 with smtplib.SMTP(self._email_cfg["smtp_server"], self._email_cfg["smtp_port"], timeout=15) as server:
                     server.starttls()
-                    server.login(self._email_cfg["sender"], self._email_cfg["password"])
+                    server.login(smtp_user, self._email_cfg["password"])
                     server.send_message(msg)
                 if attempt > 1:
                     logger.info(f"Email alert sent on attempt {attempt}: {subject}")

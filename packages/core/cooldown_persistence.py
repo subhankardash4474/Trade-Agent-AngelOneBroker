@@ -142,8 +142,26 @@ def save_cooldown_state(
             if side
         },
     }
+    # C-29 (audit 2026-05-26): wrap the write in a cross-process file
+    # lock to serialise overlapping daemon restarts (the atomic temp+
+    # rename keeps the file on disk consistent but does not prevent a
+    # later writer from clobbering an earlier writer's update).
     try:
-        _atomic_write_json(path, payload)
+        from core.file_lock import file_lock as _file_lock
+        with _file_lock(path, timeout=2.0):
+            _atomic_write_json(path, payload)
+    except TimeoutError:
+        # Best-effort fallback: write without the lock so a stuck lock
+        # does not lose protective state forever.
+        try:
+            _atomic_write_json(path, payload)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"[COOLDOWN-PERSIST] save failed (post-timeout): {exc!r}")
+    except ImportError:
+        try:
+            _atomic_write_json(path, payload)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"[COOLDOWN-PERSIST] save failed (no file_lock): {exc!r}")
     except Exception as exc:  # noqa: BLE001 - persistence must not raise
         logger.warning(f"[COOLDOWN-PERSIST] save failed: {exc!r}")
 

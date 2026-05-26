@@ -104,7 +104,10 @@ def run_agent(args):
         config = yaml.safe_load(f)
 
     if args.paper:
-        config["broker"]["mode"] = "paper"
+        # F-31: previously this chain-subscripted ``config["broker"]``,
+        # crashing with KeyError if a minimal config omitted the broker
+        # section entirely. Use setdefault to fail safely instead.
+        config.setdefault("broker", {})["mode"] = "paper"
 
     smart_api = connect_angelone(config)
 

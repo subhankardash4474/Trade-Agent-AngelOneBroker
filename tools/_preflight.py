@@ -26,12 +26,33 @@ def banner(title: str) -> None:
     print(f"\n=== {title} ===")
 
 
+def _stop_paths() -> list[Path]:
+    """F-04: return every path the daemon / supervisor / launch script
+    treats as a kill-switch. ``logs/STOP`` is the daemon's canonical
+    location (config: ``operations.emergency_stop_path``). The legacy
+    ``EMERGENCY_STOP`` at repo root is also recognised by the
+    PowerShell supervisor and the Stage-3 launch script.
+    """
+    paths = [ROOT / "EMERGENCY_STOP"]
+    try:
+        cfg = yaml.safe_load(CONFIG_PATH.read_text(encoding="utf-8")) or {}
+        stop = (cfg.get("operations") or {}).get("emergency_stop_path") or "logs/STOP"
+        paths.append(ROOT / stop)
+    except Exception:
+        paths.append(ROOT / "logs" / "STOP")
+    return paths
+
+
 def section_emergency_stop() -> int:
-    banner("EMERGENCY_STOP file")
-    if (ROOT / "EMERGENCY_STOP").exists():
-        print("BLOCKING: EMERGENCY_STOP file exists -- daemon will refuse to start.")
+    banner("Kill-switch file")
+    present = [p for p in _stop_paths() if p.exists()]
+    if present:
+        for p in present:
+            print(f"BLOCKING: kill-switch present at {p} -- daemon will refuse to start.")
         return 1
-    print("OK: no EMERGENCY_STOP file")
+    print("OK: no kill-switch file present at any known path")
+    for p in _stop_paths():
+        print(f"      watched: {p}")
     return 0
 
 
@@ -46,7 +67,12 @@ def section_config() -> int:
     # Mode is set via CLI flag (`--paper` / `--live`) on `run_daemon.py`,
     # not in YAML, so we just note that.
     print("mode               : (set via --paper/--live on run_daemon.py CLI)")
-    print(f"initial_capital    : Rs {c.get('backtest', {}).get('initial_capital', '?')}")
+    # F-95: previously this printed ``backtest.initial_capital`` (default
+    # Rs 10_000) which has nothing to do with the live paper/live book
+    # size. The live agent reads ``capital.initial_balance`` (default
+    # Rs 100_000); show that so the pre-flight matches operator
+    # expectations.
+    print(f"initial_capital    : Rs {c.get('capital', {}).get('initial_balance', '?')}")
     risk = c.get("risk", {})
     print(f"max_drawdown_pct   : {risk.get('max_drawdown_pct', '?')}")
     print(f"daily_loss_limit   : {risk.get('daily_loss_limit_pct', '?')}")

@@ -50,7 +50,15 @@ scanner:
   min_avg_volume: 500000            # minimum 5-lakh avg daily volume (liquidity)
   min_atr_pct: 1.0                  # at least 1% daily range (enough movement to profit)
   rescan_interval_minutes: 30       # re-scan every 30 min to rotate into new opportunities
-  universe: []                      # empty = tries live NSE Nifty 500, falls back to ~300 hardcoded
+  universe: []                      # empty = tries live NSE Nifty 500, falls back to ~232 hardcoded list
+  # C-26 (audit 2026-05-26): documented for visibility. When false (default),
+  # the scanner skips the brittle live NSE API + new archive-CSV fetch and
+  # uses the hardcoded ~232-stock list directly. Setting this to true enables
+  # the `_fetch_nse_archive_csv` path which returns ~504 stocks for Nifty 500
+  # via the static archives CDN (works from data-center IPs, no cookies).
+  # Flipping this IS a behaviour change — universe shape directly drives
+  # signal breadth and sector caps — and therefore consumes a freeze slot.
+  use_live_universe: false
   # 2026-05-04: Pre-market warm-up. Scanning 500 stocks takes ~3 min, so if
   # we wait until 09:15 the opening drive is already half over by the time
   # we have a watchlist. This kicks off the heavy scan N min before the bell
@@ -636,7 +644,14 @@ execution:
   retry_attempts: 3
   retry_delay_seconds: 2
   slippage_tolerance_pct: 0.1
-  commission_pct: 0.03
+  # C-27 (audit 2026-05-26): DEAD KNOB — kept for backwards compat with
+  # callers that pass it to Portfolio(commission_pct=...) but charge math
+  # exclusively uses `packages/core/charges.py` (compute_one_leg /
+  # compute_round_trip) which model Zerodha-style brokerage + STT + GST +
+  # exchange charges + SEBI fee + stamp duty per leg. Tuning this number
+  # has NO effect on live P&L, paper P&L, or ensemble backtest P&L. To
+  # actually change cost modelling, edit `packages/core/charges.py`.
+  commission_pct: 0.03  # dead — see comment above
   # Shadow mode: when true, no orders are placed but signal intent is logged.
   # Useful to validate a new config against live market data before going
   # live for real. Works with any broker mode.
@@ -734,7 +749,11 @@ backtest:
   start_date: "2023-01-01"
   end_date: "2026-03-29"
   initial_capital: 10000.0
-  commission_pct: 0.03
+  # C-27 (audit 2026-05-26): DEAD KNOB — backtest_ensemble.BacktestConfig
+  # accepts this for backwards-compat but the Portfolio it constructs uses
+  # `core.charges` for charge math. Editing this value does NOT change
+  # backtest P&L. See note under execution.commission_pct above.
+  commission_pct: 0.03  # dead — see comment above
   slippage_pct: 0.05
 
 monitoring:

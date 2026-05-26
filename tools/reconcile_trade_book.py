@@ -313,6 +313,21 @@ def main() -> int:
     day_iso = args.date or _today_iso()
     ignore = {s.strip().upper() for s in args.ignore_symbols.split(",") if s.strip()}
 
+    # F-20: AngelOne's `tradeBook` endpoint returns ONLY today's fills.
+    # Previously a `--date` not equal to today silently dropped every
+    # broker row and reported spurious mismatches (DB had trades,
+    # broker side was empty). Fail fast with a clear message instead.
+    if day_iso != _today_iso():
+        print(
+            f"[reconcile] FATAL: AngelOne tradeBook returns ONLY today's "
+            f"fills.\n  Cannot reconcile historical date {day_iso} -- the "
+            f"broker side would be empty, producing fake mismatches.\n  "
+            f"Run on the same day as the trades, or use an archived "
+            f"trade-book export.",
+            file=sys.stderr,
+        )
+        return 78
+
     try:
         report = reconcile(
             db_path=Path(args.db),

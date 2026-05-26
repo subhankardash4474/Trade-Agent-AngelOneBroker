@@ -17,7 +17,14 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
+# F-19: ensure both repo root and packages/ are on sys.path so the
+# `from core.*`, `from monitoring.*` imports below resolve when this
+# script is invoked from a bare host shell (not just inside the Docker
+# image where PYTHONPATH=/app/packages is baked in).
 sys.path.insert(0, str(ROOT))
+_PKG = ROOT / "packages"
+if str(_PKG) not in sys.path:
+    sys.path.insert(0, str(_PKG))
 
 import yaml  # noqa: E402
 

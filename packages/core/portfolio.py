@@ -366,8 +366,22 @@ class Portfolio:
                             f"Position already open for {symbol} (in DB) — refusing duplicate"
                         )
                         return False
-                except Exception:
-                    pass
+                except Exception as db_exc:
+                    # F-36: previously this was a bare ``except: pass`` which
+                    # silently disabled the duplicate guard whenever SQLite
+                    # threw a transient error. The DB PRIMARY KEY would
+                    # still catch the duplicate at INSERT time, BUT in the
+                    # meantime risk sizing would already have committed
+                    # cash for a position that ultimately failed to persist.
+                    # Fail closed: refuse the open and log loudly so the
+                    # operator notices DB health is degraded.
+                    logger.error(
+                        f"[F-36] DB read failed during duplicate check for "
+                        f"{symbol}: {type(db_exc).__name__}: {db_exc}. "
+                        f"REFUSING to open position; resolve DB health "
+                        f"before retrying."
+                    )
+                    return False
 
             cost = price * quantity
             # Realistic entry-side charges. For a SHORT (side="SELL") entry
@@ -457,6 +471,58 @@ class Portfolio:
             # a daemon kill between events would leave the DB with stale cash
             # — see _restore_positions docstring.
             self._persist_state_after_event()
+            return True
+
+    def adjust_position_quantity(self, symbol: str, new_quantity: int) -> bool:
+        """F-09 (audit 2026-05-27): shrink an open position to a smaller
+        quantity. Used when a flatten order returns PARTIALLY_FILLED:
+        the broker closed `filled_qty` shares, the residual is still
+        open, and the in-memory state must reflect that smaller residual
+        so the next exit cycle does not double-flatten.
+
+        Returns True on success, False if the position is gone or the
+        new quantity is invalid.
+        """
+        with self._pos_lock:
+            pos = self.positions.get(symbol)
+            if pos is None:
+                logger.warning(
+                    f"[ADJUST-QTY] no open position for {symbol}; ignoring."
+                )
+                return False
+            try:
+                nq = int(new_quantity)
+            except (TypeError, ValueError):
+                logger.warning(
+                    f"[ADJUST-QTY] {symbol}: invalid new_quantity={new_quantity!r}"
+                )
+                return False
+            if nq <= 0:
+                logger.warning(
+                    f"[ADJUST-QTY] {symbol}: new_quantity={nq} <= 0; "
+                    f"call close_position instead."
+                )
+                return False
+            if nq >= pos.quantity:
+                logger.info(
+                    f"[ADJUST-QTY] {symbol}: requested {nq} >= current "
+                    f"{pos.quantity}; no-op."
+                )
+                return False
+            old_qty = pos.quantity
+            pos.quantity = nq
+            try:
+                if hasattr(self, "_db") and self._db is not None:
+                    self._db.update_position_quantity(symbol, nq)
+            except Exception as exc:
+                # DB persistence is best-effort; in-memory truth is
+                # what the next exit cycle reads.
+                logger.warning(
+                    f"[ADJUST-QTY] {symbol}: DB persist failed: {exc}"
+                )
+            logger.info(
+                f"[ADJUST-QTY] {symbol}: quantity {old_qty} -> {nq}"
+            )
             return True
 
     def close_position(
@@ -598,11 +664,20 @@ class Portfolio:
     def _maybe_persist_trade(self, record: "TradeRecord") -> bool:
         """Insert a trade row into the trades table iff not already present.
 
-        Returns True if a new row was inserted, False if a duplicate was
-        detected and skipped. Idempotent: trading_agent.py also persists
-        via `_store_trade_to_db()`; whichever runs first wins, the second
-        no-ops here. Existence check is on (symbol, exit_time) which is
-        unique enough in practice (microsecond timestamps).
+        Returns True on successful (or already-present) persist, False on
+        error. The double-call from trading_agent.py is harmless because
+        Database.store_trade() does its own (symbol, exit_time) existence
+        check.
+
+        B-14 (audit 2026-05-25): the previous implementation opened its
+        own raw `sqlite3` connection (reaching into `self._db._db_path`)
+        to do an extra pre-check. That bypassed the `Database` connection
+        pool / pragmas / transaction semantics and created a second
+        writer on the same SQLite file, which under Python 3.14's
+        stricter sqlite3 threading rules occasionally raised
+        `ProgrammingError`. Since `store_trade()` is already idempotent
+        on the same primary key, the raw block was pure overhead. We
+        now route exclusively through the `Database` API.
         """
         if self._db is None:
             return False
@@ -613,21 +688,6 @@ class Portfolio:
             if v is not None and hasattr(v, "isoformat"):
                 d[key] = v.isoformat()
         try:
-            import sqlite3
-            db_path = getattr(self._db, "_db_path", None) \
-                or getattr(self._db, "db_path", None) \
-                or getattr(self._db, "path", None)
-            if db_path:
-                conn = sqlite3.connect(db_path)
-                try:
-                    exists = conn.execute(
-                        "SELECT 1 FROM trades WHERE symbol=? AND exit_time=? LIMIT 1",
-                        (d["symbol"], d["exit_time"]),
-                    ).fetchone()
-                finally:
-                    conn.close()
-                if exists:
-                    return False
             self._db.store_trade(d)
             return True
         except Exception as e:
@@ -753,7 +813,10 @@ class Portfolio:
             "avg_pnl": round(total_pnl / len(pnls), 2),
             "max_win": round(max(wins), 2) if wins else 0.0,
             "max_loss": round(min(losses), 2) if losses else 0.0,
-            "profit_factor": round(gross_profit / gross_loss, 2) if gross_loss > 0 else float("inf"),
+            # F-35: cap at the same 999.99 sentinel `trade_analyzer.py` uses
+            # (B-15) so JSON exports / API consumers never see `Infinity`,
+            # which strict JSON cannot represent.
+            "profit_factor": round(gross_profit / gross_loss, 2) if gross_loss > 0 else 999.99,
             "avg_win": round(sum(wins) / len(wins), 2) if wins else 0.0,
             "avg_loss": round(sum(losses) / len(losses), 2) if losses else 0.0,
             "sharpe_ratio": round(sharpe, 2),

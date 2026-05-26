@@ -4,7 +4,7 @@ Captures momentum from the first 15-minute range breakout.
 One of the most reliable intraday setups for Indian markets.
 """
 
-from datetime import time as dtime
+from datetime import datetime, time as dtime, timedelta
 from typing import Any, Dict, Optional
 
 import numpy as np
@@ -13,6 +13,19 @@ from loguru import logger
 
 from strategies._trend_context import is_against_trend
 from strategies.base_strategy import BaseStrategy, Signal, TradeSignal
+
+
+def _range_end_time(open_time: dtime, range_minutes: int) -> dtime:
+    """Compute opening-range end time, tolerant of range_minutes >= 60.
+
+    C-12 (audit 2026-05-26): the previous implementation did
+    `dtime(hour, minute + range_minutes)` which raises ValueError when
+    `minute + range_minutes >= 60` (i.e. operator configures
+    `range_minutes: 60+`). Use timedelta arithmetic so the strategy
+    accepts any positive range duration up to end of day.
+    """
+    base = datetime.combine(datetime.today(), open_time)
+    return (base + timedelta(minutes=int(range_minutes))).time()
 
 
 class OpeningRangeBreakout(BaseStrategy):
@@ -70,10 +83,7 @@ class OpeningRangeBreakout(BaseStrategy):
             return None
 
         # Bars within the opening range period
-        range_end_time = dtime(
-            self.MARKET_OPEN.hour,
-            self.MARKET_OPEN.minute + self.range_minutes,
-        )
+        range_end_time = _range_end_time(self.MARKET_OPEN, self.range_minutes)
         range_bars = today_data[
             (today_data.index.time >= self.MARKET_OPEN) &
             (today_data.index.time < range_end_time)
@@ -96,6 +106,18 @@ class OpeningRangeBreakout(BaseStrategy):
 
         range_high, range_low = opening_range
         range_size = range_high - range_low
+        # C-11 (audit 2026-05-26): on a halted / circuit-locked stock the
+        # opening range can be exactly flat (high == low). The confidence
+        # math below divides by `range_size` so the previous code raised
+        # ZeroDivisionError, killing the strategy for the entire scan cycle
+        # on that symbol. Fail-soft to HOLD with an explicit reason instead.
+        if range_size <= 0:
+            return self._make_signal(
+                Signal.HOLD, symbol, df,
+                metadata={"reason": "flat_opening_range",
+                          "range_high": round(range_high, 2),
+                          "range_low": round(range_low, 2)},
+            )
         current_price = float(df["close"].iloc[-1])
         prev_price = float(df["close"].iloc[-2])
 
@@ -123,10 +145,7 @@ class OpeningRangeBreakout(BaseStrategy):
         # Ensure we're past the opening range period
         if hasattr(df.index, 'time'):
             current_time = df.index[-1].time()
-            range_end = dtime(
-                self.MARKET_OPEN.hour,
-                self.MARKET_OPEN.minute + self.range_minutes,
-            )
+            range_end = _range_end_time(self.MARKET_OPEN, self.range_minutes)
             if current_time < range_end:
                 return self._make_signal(Signal.HOLD, symbol, df, metadata={**metadata, "reason": "within_range_period"})
 

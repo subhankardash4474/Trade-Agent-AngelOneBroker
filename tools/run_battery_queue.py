@@ -70,15 +70,14 @@ import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
 
 try:
     import yaml
-except ImportError:
+except ImportError as _import_err:
     print("[FATAL] PyYAML is required for the queue scheduler. "
           "Install via `pip install pyyaml` or rely on the image which "
           "already has it.", file=sys.stderr)
-    raise SystemExit(2)
+    raise SystemExit(2) from _import_err
 
 # Path bootstrap so the scheduler works from any cwd (systemd may invoke
 # it from /).
@@ -150,7 +149,7 @@ def load_queue(queue_path: Path) -> list[dict]:
     try:
         raw = yaml.safe_load(queue_path.read_text(encoding="utf-8"))
     except yaml.YAMLError as exc:
-        raise SystemExit(f"[FATAL] queue file has invalid YAML: {exc!r}")
+        raise SystemExit(f"[FATAL] queue file has invalid YAML: {exc!r}") from exc
 
     if not isinstance(raw, dict):
         raise SystemExit("[FATAL] queue file must be a YAML mapping at root.")
@@ -416,27 +415,86 @@ def _run_id_for(job: dict, prior_state: dict | None) -> tuple[str, bool]:
 
 
 def wait_for_container_exit(container_name: str, log_dir: Path) -> int:
-    """Block until the named container terminates. Returns its exit code."""
+    """Block until the named container terminates. Returns its exit code.
+
+    F-17: previously, when the container had already been ``--rm``'d
+    between two polls, ``docker inspect`` failed with
+    ``CalledProcessError`` and this function returned ``0`` (treating
+    a vanished container as a successful run). That caused a crashed
+    battery to be marked ``completed``, breaking resume / retry and
+    polluting validation results.
+
+    The fix: switch to ``docker wait`` for the authoritative exit code
+    (it prints the integer exit code on stdout and blocks until the
+    container terminates -- even if ``--rm`` is set). Only fall back
+    to ``docker inspect`` (and finally an explicit failure sentinel)
+    if ``docker wait`` itself errors out.
+    """
     log_dir.mkdir(parents=True, exist_ok=True)
-    while True:
+    # `docker wait` blocks until the container terminates and prints
+    # the integer exit code. It works even with --rm because the daemon
+    # already knows the exit status by the time it removes the container.
+    try:
+        out = subprocess.check_output(
+            ["sudo", "docker", "wait", container_name],
+            text=True, stderr=subprocess.STDOUT, timeout=24 * 3600,
+        ).strip()
+        # docker wait may print multiple lines if called for multiple
+        # containers; we always pass one name, but be defensive.
+        first = out.splitlines()[0].strip() if out else ""
         try:
-            out = subprocess.check_output(
-                ["sudo", "docker", "inspect",
-                 "--format", "{{.State.Status}}|{{.State.ExitCode}}",
-                 container_name],
-                text=True, stderr=subprocess.STDOUT, timeout=15,
-            ).strip()
-            status, exit_code = out.split("|", 1)
-            if status not in ("running", "created", "restarting"):
-                return int(exit_code)
-        except subprocess.CalledProcessError:
-            # Container was --rm-cleaned up; treat as success unless we
-            # know otherwise. Caller will verify via state inspection.
-            return 0
-        except subprocess.TimeoutExpired:
-            print(f"[scheduler] docker inspect timed out on "
-                  f"'{container_name}'; retrying.", file=sys.stderr)
-        time.sleep(POLL_INTERVAL_SEC)
+            return int(first)
+        except ValueError:
+            pass
+    except subprocess.TimeoutExpired:
+        print(f"[scheduler] docker wait timed out on '{container_name}'.",
+              file=sys.stderr)
+    except subprocess.CalledProcessError as exc:
+        # Most likely: the container is already gone. Fall through to the
+        # inspect-based recovery below to try one last attempt to learn
+        # the true exit code; if everything has been cleaned up,
+        # surface failure rather than masking it as success.
+        print(f"[scheduler] docker wait failed for '{container_name}': "
+              f"{(exc.stderr or '').strip() or exc}", file=sys.stderr)
+
+    # Recovery path: try `docker inspect` once. If the container is
+    # truly gone (no state, no exit code recoverable), we MUST NOT
+    # silently report success -- return a sentinel non-zero so the
+    # job is marked failed and the operator can re-queue.
+    try:
+        out = subprocess.check_output(
+            ["sudo", "docker", "inspect",
+             "--format", "{{.State.Status}}|{{.State.ExitCode}}",
+             container_name],
+            text=True, stderr=subprocess.STDOUT, timeout=15,
+        ).strip()
+        status, exit_code = out.split("|", 1)
+        if status not in ("running", "created", "restarting"):
+            return int(exit_code)
+        # Still running but `docker wait` failed -- poll until terminal.
+        while True:
+            time.sleep(POLL_INTERVAL_SEC)
+            try:
+                out = subprocess.check_output(
+                    ["sudo", "docker", "inspect",
+                     "--format", "{{.State.Status}}|{{.State.ExitCode}}",
+                     container_name],
+                    text=True, stderr=subprocess.STDOUT, timeout=15,
+                ).strip()
+                status, exit_code = out.split("|", 1)
+                if status not in ("running", "created", "restarting"):
+                    return int(exit_code)
+            except subprocess.CalledProcessError:
+                # Container vanished without us seeing the exit code --
+                # treat as failure (NOT success). See F-17 above.
+                print(f"[scheduler] container '{container_name}' vanished "
+                      f"between polls; recording as FAILED (exit=125).",
+                      file=sys.stderr)
+                return 125  # docker convention for "container failure"
+    except subprocess.CalledProcessError:
+        print(f"[scheduler] container '{container_name}' inspect failed; "
+              f"recording as FAILED (exit=125).", file=sys.stderr)
+        return 125
 
 
 # ───────────────────────── orchestrator ─────────────────────────
@@ -508,7 +566,11 @@ def process_queue(
         # nifty50_60d resume can't launch because the dead container
         # from the original failed run holds the name, the scheduler
         # marks the job permanently failed, the queue grinds to a halt.
-        def _try_launch() -> tuple[int, str]:
+        # F-96: bind the loop variable ``argv`` via a default argument
+        # so this closure is correct under any refactor that defers /
+        # re-invokes it across iterations. Today the call is synchronous
+        # within the same iteration so behaviour is unchanged.
+        def _try_launch(argv=argv) -> tuple[int, str]:
             """Run argv; return (returncode, stderr) without raising."""
             try:
                 subprocess.run(

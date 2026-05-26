@@ -52,12 +52,10 @@ try:
 except Exception:
     pass
 
-from core.charges import compute_round_trip
 from core.data_handler import DataHandler
 from strategies.ensemble import EnsembleModel
 from core.features import FeatureEngine
 from core.portfolio import Portfolio
-from core.regime import classify_regime
 from core.risk_manager import RiskManager
 from strategies import STRATEGY_REGISTRY
 from strategies.base_strategy import BaseStrategy, Signal, TradeSignal
@@ -81,6 +79,12 @@ class BacktestConfig:
     apply_expected_profit_gate: bool = True
     apply_regime_filter: bool = True
     product_type: str = "INTRADAY"
+    # B-7 / C-21 (audit 2026-05-26): seed the paper-order RNG so
+    # repeated runs of the same variant produce byte-identical fill
+    # ledgers. Leave as None for legacy stochastic behaviour. Battery
+    # variants set this to their own deterministic value so threshold
+    # sweeps compare apples-to-apples on slippage / partial-fill noise.
+    paper_seed: Optional[int] = None
     # 2026-05-25 risk-policy short veto. Mirrors trading_agent's
     # `risk.allow_shorts` gate so battery variants can test the
     # long-only configuration without code changes. Default True
@@ -187,6 +191,14 @@ class EnsembleBacktester:
         battery runner reuse the same data across many config variants
         without hitting yfinance for each run.
         """
+        # B-7 / C-21 (audit 2026-05-26): apply the paper-order seed exactly
+        # once, at the start of the run, so every variant in a battery sweep
+        # walks the same slippage/partial-fill trajectory when given the
+        # same seed. Idempotent when paper_seed is None.
+        if self.bt.paper_seed is not None:
+            from core.execution import _set_paper_seed
+            _set_paper_seed(self.bt.paper_seed)
+
         # Normalize interval, strip any user-supplied .NS suffix (data handler adds it)
         interval = self._INTERVAL_ALIASES.get(interval, interval)
         symbols = [s[:-3] if s.upper().endswith(".NS") else s for s in symbols]
@@ -559,7 +571,20 @@ class EnsembleBacktester:
                 )
                 if not worth:
                     gate_stats.expected_profit += 1
-                    equity_curve.append(portfolio.get_total_value({symbol: close}))
+                    # F-72 (audit 2026-05-27): every other gate branch
+                    # updates BOTH equity_curve AND last_equity_per_day
+                    # so the per-day equity snapshot stays current.
+                    # The expected-profit branch updated only the
+                    # curve, leaving last_equity_per_day stale -- any
+                    # daily-Sharpe / per-day-pct computation downstream
+                    # then attributed the next bar's equity change to
+                    # the wrong day. Mirror the other branches.
+                    _eq = portfolio.get_total_value({symbol: close})
+                    equity_curve.append(_eq)
+                    try:
+                        last_equity_per_day[ts.date()] = _eq
+                    except Exception:
+                        pass
                     continue
 
             # Execute
@@ -589,12 +614,25 @@ class EnsembleBacktester:
         for symbol, df in market_data.items():
             if symbol in portfolio.positions and not df.empty:
                 last_close = float(df["close"].iloc[-1])
+                # F-67 (audit 2026-05-27): every other exit path in the
+                # backtester runs the price through ``_apply_slippage``
+                # so the simulated fill reflects realistic execution
+                # cost. The end-of-backtest flatten omitted slippage
+                # entirely, exiting at the exact last close. On a
+                # multi-month run with hundreds of held positions at
+                # the final bar (sweeps, long-tail trailing stops),
+                # this systematically over-reported P&L by ~one
+                # round-trip slippage per residual position. Apply
+                # the same slippage convention so the final equity
+                # number is honest.
+                pos = portfolio.positions[symbol]
+                exit_at = self._apply_slippage(last_close, pos.side, exit=True)
                 # Final-bar timestamp for each symbol — keeps holding_minutes
                 # internally consistent with the simulated session.
                 last_ts = df.index[-1]
                 record = portfolio.close_position(
                     symbol,
-                    last_close,
+                    exit_at,
                     exit_reason="backtest_end",
                     exit_time=self._ts_to_datetime(last_ts),
                 )
@@ -681,7 +719,23 @@ class EnsembleBacktester:
             yield ts, symbol, df.iloc[i], df.iloc[start : i + 1]
 
     def _apply_slippage(self, price: float, side: str, *, exit: bool) -> float:
-        slip = price * (self.bt.slippage_pct / 100)
+        # F-26 (audit 2026-05-27): the previous formula was deterministic
+        # (every fill at exactly ``price * slippage_pct/100``), so the
+        # `paper_seed` knob set in __init__ was a no-op. The live paper
+        # path (execution._paper_order) samples slippage U(0, tolerance)
+        # via the module-level ``_paper_rng``; the backtester now mirrors
+        # that distribution so backtest <-> paper parity holds AND so
+        # ``paper_seed`` actually produces reproducible runs across
+        # invocations. When ``paper_seed`` is None we fall back to the
+        # deterministic formula to preserve pre-fix battery results.
+        if self.bt.paper_seed is None:
+            slip_pct = self.bt.slippage_pct / 100
+        else:
+            from core.execution import _paper_rng
+            # U(0, slippage_pct) matches _paper_order's
+            # ``_paper_rng.uniform(0.0, self.slippage_tolerance)``.
+            slip_pct = _paper_rng.uniform(0.0, self.bt.slippage_pct) / 100
+        slip = price * slip_pct
         if side == "BUY":
             return price + slip if not exit else price - slip
         return price - slip if not exit else price + slip

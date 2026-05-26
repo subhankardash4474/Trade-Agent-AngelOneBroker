@@ -98,9 +98,21 @@ def apply_env_to_config(config: Dict) -> Dict:
         modules will decide if that's fatal — e.g. live mode will fail later).
     """
     applied = []
+    skipped_placeholder = []
     for env_name, path in ENV_MAP:
         env_val = os.environ.get(env_name)
         if env_val is None or env_val == "":
+            continue
+        # B-12 (audit 2026-05-25): the previous code happily overwrote a
+        # real config value with whatever string was in the env var,
+        # including the literal placeholders shipped in `.env.example`
+        # (`ANGELONE_API_KEY=YOUR_ANGELONE_API_KEY` etc.). An operator
+        # who `cp .env.example .env` and then forgot to fill it in would
+        # silently corrupt their live broker credentials with the
+        # placeholder strings. Treat placeholder-looking env values the
+        # same way we treat placeholder yaml values: ignore them.
+        if _is_placeholder(env_val):
+            skipped_placeholder.append(env_name)
             continue
         current = _get_deep(config, path)
         # Overwrite if current is missing or a placeholder
@@ -114,6 +126,12 @@ def apply_env_to_config(config: Dict) -> Dict:
 
     if applied:
         logger.info(f"Applied {len(applied)} env overrides to config: {applied}")
+    if skipped_placeholder:
+        logger.warning(
+            f"[secrets] Skipped {len(skipped_placeholder)} env vars whose "
+            f"VALUE looks like a placeholder (likely a copy of "
+            f".env.example without real fill-in): {skipped_placeholder}"
+        )
 
     return config
 

@@ -119,7 +119,17 @@ _CACHE_TTL = 30
 def _range_to_cutoff(choice: str):
     if choice == "All time":
         return None
-    now = datetime.now()
+    # F-63: previously used naive ``datetime.now()`` which is host-local.
+    # On a UTC cloud VM between 00:00-05:30 UTC, "Today" rendered the
+    # PREVIOUS IST trading day and hid today's trades. The rest of the
+    # stack (DB timestamps, portfolio, alerts) is IST-aware -- this
+    # cutoff must match.
+    try:
+        import pytz
+        ist = pytz.timezone("Asia/Kolkata")
+        now = datetime.now(ist).replace(tzinfo=None)  # naive IST for SQL comparison
+    except Exception:
+        now = datetime.now()
     return {
         "Last 24 hours": now - timedelta(hours=24),
         "Last 7 days": now - timedelta(days=7),
@@ -271,7 +281,13 @@ def render_header(equity_df: pd.DataFrame, trades_df: pd.DataFrame, positions: l
 
 
 def is_market_open() -> bool:
-    """NSE hours roughly 09:15 - 15:30 IST, Mon-Fri."""
+    """NSE hours roughly 09:15 - 15:30 IST, Mon-Fri, excluding holidays.
+
+    F-86: previously checked weekday + hours only and ignored NSE
+    holidays. Dashboard showed "MARKET OPEN" on, e.g., Buddha Purnima,
+    making the operator misread daemon silence as a fault. Pull the
+    canonical holiday set from data_handler.
+    """
     try:
         import pytz
         now = datetime.now(pytz.timezone("Asia/Kolkata"))
@@ -279,6 +295,16 @@ def is_market_open() -> bool:
         now = datetime.now()
     if now.weekday() >= 5:
         return False
+    try:
+        # Lazy import keeps the dashboard runnable even if the data layer
+        # is mid-refactor; missing import just falls back to the previous
+        # weekday+hours check.
+        from core.data_handler import NSE_HOLIDAYS  # type: ignore[attr-defined]
+        # NSE_HOLIDAYS stores ISO strings "YYYY-MM-DD".
+        if now.strftime("%Y-%m-%d") in NSE_HOLIDAYS:
+            return False
+    except Exception:
+        pass
     open_t = now.replace(hour=9, minute=15, second=0, microsecond=0)
     close_t = now.replace(hour=15, minute=30, second=0, microsecond=0)
     return open_t <= now <= close_t
@@ -309,9 +335,15 @@ def render_kpis(equity_df: pd.DataFrame, trades_df: pd.DataFrame, positions: lis
         win_rate = wins / total * 100 if total > 0 else 0.0
 
         # today's P&L
+        # F-63: use IST date so the "Today" bucket matches the trading
+        # session, not the cloud VM's local clock.
         today_pnl = 0.0
         if "exit_time" in trades_df.columns:
-            today = datetime.now().date()
+            try:
+                import pytz
+                today = datetime.now(pytz.timezone("Asia/Kolkata")).date()
+            except Exception:
+                today = datetime.now().date()
             ex = pd.to_datetime(trades_df["exit_time"], errors="coerce")
             today_pnl = float(trades_df.loc[ex.dt.date == today, "pnl"].sum())
 
@@ -618,7 +650,17 @@ def tab_risk(equity_df: pd.DataFrame, trades_df: pd.DataFrame):
 
         gross_profit = float(pnls[pnls > 0].sum())
         gross_loss = float(abs(pnls[pnls <= 0].sum()))
-        profit_factor = gross_profit / gross_loss if gross_loss > 0 else float("inf")
+        # F-87: cap PF at the same 999.99 sentinel used by
+        # trade_analyzer (B-15) and portfolio (F-35). The dashboard
+        # rendering below still shows the ∞ glyph for the exact
+        # sentinel value so operators recognise the "no losses"
+        # condition at a glance.
+        if gross_loss > 0:
+            profit_factor = gross_profit / gross_loss
+        elif gross_profit > 0:
+            profit_factor = 999.99
+        else:
+            profit_factor = 0.0
         avg_pnl = float(pnls.mean())
 
         wins = pnls[pnls > 0]
@@ -633,7 +675,7 @@ def tab_risk(equity_df: pd.DataFrame, trades_df: pd.DataFrame):
     r2.metric("Sharpe Ratio", f"{sharpe:.2f}")
     r3.metric(
         "Profit Factor",
-        "\u221E" if profit_factor == float("inf") else f"{profit_factor:.2f}",
+        "\u221E" if profit_factor >= 999.99 else f"{profit_factor:.2f}",
     )
     r4.metric("Expectancy / trade", fmt_money(expectancy))
 

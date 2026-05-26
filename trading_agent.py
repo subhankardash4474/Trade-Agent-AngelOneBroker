@@ -10,7 +10,7 @@ import sys
 import threading
 import time
 from datetime import datetime, time as dtime, timedelta, date
-from typing import Any, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import pandas as pd
 import pytz
@@ -30,6 +30,13 @@ from strategies.ensemble import EnsembleModel
 from core.execution import ExecutionEngine
 from core.features import FeatureEngine
 from core.portfolio import Portfolio
+
+if TYPE_CHECKING:
+    # B-17 (audit 2026-05-25): forward-ref `pos: "Position"` at line ~3848
+    # raised F821 because Position was never imported. Type-only import so
+    # this is zero-runtime cost and behaviour-neutral; satisfies static
+    # analysis (mypy/ruff) without touching the frozen runtime hot path.
+    from core.portfolio import Position  # noqa: F401
 from core.market_safety import (
     check_circuit_risk,
     check_data_quality,
@@ -1056,7 +1063,14 @@ class TradingAgent:
         Returns:
             (effective_balance, historical_peak) — peak may be None on first run.
         """
-        mode = self.config.get("execution", {}).get("mode", "paper").lower()
+        # F-06: previously this read ``self.config["execution"]["mode"]``,
+        # but the mode lives under ``broker.mode`` (matching
+        # ``ExecutionEngine.mode``). The wrong key always returned
+        # "paper", so live sessions silently skipped the broker-funds
+        # lookup and fell back to the DB snapshot / ``capital.initial_balance``.
+        # Risk sizing, drawdown tiers, and daily loss limits then ran on
+        # the wrong equity for the entire live session.
+        mode = self.config.get("broker", {}).get("mode", "paper").lower()
 
         # Live mode: query broker funds directly
         if mode == "live" and smart_api is not None:
@@ -1107,9 +1121,15 @@ class TradingAgent:
 
         # Staleness check: if the last snapshot is older than 14 days, something
         # is off (agent hasn't run in 2 weeks). Warn the user but still continue.
+        # F-30: previously this used ``datetime.now()`` (naive, host-local
+        # TZ) against ``last_ts`` (parsed from IST iso strings written by
+        # the daemon). On a UTC cloud VM near IST midnight this could
+        # under-/over-report age by a day. Normalize to IST on both sides.
         try:
             last_dt = datetime.fromisoformat(str(last_ts).replace("Z", ""))
-            age_days = (datetime.now() - last_dt).days
+            if last_dt.tzinfo is None:
+                last_dt = IST.localize(last_dt)
+            age_days = (datetime.now(IST) - last_dt).days
             if age_days > 14:
                 logger.warning(
                     f"Last equity snapshot is {age_days} days old ({last_ts}). "
@@ -1329,7 +1349,14 @@ class TradingAgent:
             outer loop — a transient LTP failure must not crash the agent.
         """
         slice_seconds = 15
-        if total_seconds <= slice_seconds or not self.portfolio.positions:
+        # F-29 (audit 2026-05-27): the empty-book branch used to sleep
+        # the FULL `total_seconds` in one shot with no STOP poll, so a
+        # stop dropped while flat could take up to a full poll_interval
+        # to be honoured (and the WS reconnect/auth/keepalive threads
+        # kept running in the meantime). Slice the sleep regardless of
+        # book state so the operator gets the same ~slice_seconds upper
+        # bound on STOP latency whether the book is empty or full.
+        if total_seconds <= slice_seconds:
             time.sleep(total_seconds)
             return
 
@@ -1338,8 +1365,14 @@ class TradingAgent:
             chunk = min(slice_seconds, total_seconds - slept)
             time.sleep(chunk)
             slept += chunk
+            # F-29: STOP poll runs on every slice, even with an empty
+            # book (the original guard short-circuited on
+            # `not portfolio.positions`).
+            if self._emergency_stop_file_present():
+                self._running = False
+                return
             if not self.portfolio.positions:
-                continue
+                continue  # nothing to fast-exit; loop back for next STOP poll
             try:
                 held = [s for s in self.portfolio.positions.keys()]
                 if not held:
@@ -1448,6 +1481,17 @@ class TradingAgent:
         background thread (which would silently kill all subsequent
         ticks).
         """
+        # C-2 (audit 2026-05-26): drop ticks immediately if the kill switch
+        # has fired. Without this, the WS background thread keeps driving
+        # `_check_position_exits` (and therefore broker-side modify/cancel
+        # calls) after the operator triggers STOP, until the main loop next
+        # wakes. We use the lightweight existence check + the `_running`
+        # latch the main loop sets; the heavy alert/flatten work is the
+        # main loop's responsibility on its next iteration.
+        if not self._running or self._emergency_stop_file_present():
+            self._running = False
+            return
+
         try:
             symbol = tick["symbol"]
             price = tick["ltp"]
@@ -1892,6 +1936,24 @@ class TradingAgent:
                 pass
         return critical_ok
 
+    def _emergency_stop_file_present(self) -> bool:
+        """Lightweight stop-file existence check, side-effect-free.
+
+        C-1 / C-2 (audit 2026-05-26): used from `_fast_exits_sleep` and
+        `_on_tick` for low-latency STOP detection without re-triggering
+        the alert/flatten path on every slice or tick. The heavy work
+        lives in `_check_emergency_stop()` and runs at most once thanks
+        to the `_emergency_stop_triggered` latch below.
+        """
+        path = getattr(self, "_emergency_stop_path", None)
+        if not path:
+            return False
+        try:
+            return bool(os.path.exists(path))
+        except OSError as e:
+            logger.debug(f"emergency_stop check FS error (ignored): {e}")
+            return False
+
     def _check_emergency_stop(self) -> bool:
         """File-based kill switch.
 
@@ -1900,21 +1962,26 @@ class TradingAgent:
         never raises — file-system errors are logged and treated as a
         no-op so a flaky FS doesn't accidentally shut us down.
 
+        C-1 / C-2 (audit 2026-05-26): hardened with a one-shot latch
+        (`_emergency_stop_triggered`) so this method is safe to call
+        from the WS tick thread AND the fast-exits sleep slice AND the
+        main loop without re-sending alerts or re-attempting flatten.
+
         Operator UX:
             $ touch logs/STOP        # halt at start of next cycle
             $ rm logs/STOP           # remove before next start
         """
-        path = getattr(self, "_emergency_stop_path", None)
-        if not path:
-            return False
-        try:
-            if not os.path.exists(path):
-                return False
-        except OSError as e:
-            logger.debug(f"emergency_stop check FS error (ignored): {e}")
+        if not self._emergency_stop_file_present():
             return False
 
-        # Found. Log + alert + (optionally) flatten + flag exit.
+        # Latch: heavy side effects (alert, flatten) run exactly once,
+        # even though we now poll from multiple call sites for latency.
+        if getattr(self, "_emergency_stop_triggered", False):
+            self._running = False
+            return True
+        self._emergency_stop_triggered = True
+
+        path = getattr(self, "_emergency_stop_path", None)
         logger.critical(
             f"[EMERGENCY-STOP] Stop file detected at {path}. "
             f"Halting agent at end of this cycle."
@@ -3057,6 +3124,22 @@ class TradingAgent:
         ensemble_acts = 0
 
         for instrument in self.instruments:
+            # F-08 (audit 2026-05-27): a STOP file dropped mid-cycle
+            # previously had to wait for the entire instrument loop to
+            # complete (and any signals it produced to be processed)
+            # before being honoured. On a large watchlist or after a
+            # net hiccup that slowed each LTP / signal call, this was
+            # 60+ seconds of "we know we're supposed to stop but we're
+            # still placing orders". Poll the kill-switch between
+            # instruments so a STOP aborts within one symbol-iteration.
+            if self._emergency_stop_file_present():
+                self._running = False
+                logger.warning(
+                    "[EMERGENCY-STOP] mid-cycle STOP detected; aborting "
+                    "remaining instrument loop. Main loop will handle "
+                    "alert + optional flatten."
+                )
+                return
             symbol = instrument["symbol"]
             token = instrument.get("token", "")
             price = current_prices.get(symbol)
@@ -3348,12 +3431,30 @@ class TradingAgent:
 
         Cached per-symbol for the day since yesterday's close doesn't change
         intraday. We derive it from the most recent daily candle we can find.
+
+        F-05: previously called ``get_historical_data(symbol, token=None,
+        interval="1d", bars=3)`` -- but ``DataHandler.get_historical_data``
+        accepts ``(symbol, interval, start_date, end_date)`` only. Every
+        call raised ``TypeError``, was caught by the bare ``except``, and
+        returned ``None``. The downstream circuit-limit guard treated
+        ``prev_close is None`` as "skip", so the guard never ran in
+        production. Fix: pass a 10-day window and derive the previous
+        close from the second-to-last bar.
         """
         cached = self._prev_close_cache.get(symbol)
         if cached is not None:
             return cached
         try:
-            df = self.data_handler.get_historical_data(symbol, token=None, interval="1d", bars=3)
+            # 10 calendar days back gives ~7 trading days -- enough headroom
+            # for a long weekend / NSE holiday block while keeping the
+            # fetch cheap.
+            now = datetime.now(IST)
+            df = self.data_handler.get_historical_data(
+                symbol,
+                interval="1d",
+                start_date=now - timedelta(days=10),
+                end_date=now,
+            )
             if df is not None and not df.empty and len(df) >= 2:
                 prev = float(df.iloc[-2]["close"])
                 self._prev_close_cache[symbol] = prev
@@ -3382,11 +3483,20 @@ class TradingAgent:
         # 1. Circuit-band check
         prev_close = self._get_previous_close(symbol)
         if prev_close:
-            # Pull day high/low if we have it (optional — still meaningful without)
+            # Pull day high/low if we have it (optional — still meaningful without).
+            # F-05: previously called with `token=None, bars=2` -- invalid
+            # kwargs on DataHandler.get_historical_data, which raised
+            # TypeError and silently fell through to None. Day high/low
+            # is no longer computed because the data_handler signature
+            # only accepts (symbol, interval, start_date, end_date).
             day_high = day_low = None
             try:
+                now = datetime.now(IST)
                 df = self.data_handler.get_historical_data(
-                    symbol, token=None, interval="1d", bars=2
+                    symbol,
+                    interval="1d",
+                    start_date=now - timedelta(days=3),
+                    end_date=now,
                 )
                 if df is not None and not df.empty:
                     today = df.iloc[-1]
@@ -3803,7 +3913,20 @@ class TradingAgent:
                 symbol=symbol, token=token, transaction_type=exit_side,
                 quantity=quantity, price=price, tag=tag,
             )
-            flatten_ok = bool(order and order.get("status") in ("FILLED", "PLACED"))
+            # F-09 (audit 2026-05-27): the entry path accepts
+            # PARTIALLY_FILLED and sizes the in-memory position to the
+            # filled qty. The exit path used to treat PARTIALLY_FILLED
+            # as a hard failure, log "POSITION IS NAKED", and leave the
+            # in-memory position untouched -- even though part of it
+            # was actually closed at the broker. Result: the agent
+            # thinks N shares are open when only N-k remain. The next
+            # exit would retry on the full N, double-flatten the
+            # remaining k, and end up SHORT by k. We now accept partial
+            # fills as a partial exit and re-attempt the residual via
+            # the residual-flatten queue (best-effort; the SL is
+            # already cancelled so the residual is naked but quantified).
+            status = order.get("status") if order else None
+            flatten_ok = status in ("FILLED", "PLACED", "PARTIALLY_FILLED")
             if not flatten_ok:
                 if cancel_ok and sl_existed:
                     logger.critical(
@@ -3824,6 +3947,52 @@ class TradingAgent:
                 return None, None
 
             filled_price = order.get("filled_price") or price
+            try:
+                filled_qty = int(order.get("filled_quantity") or quantity)
+            except (TypeError, ValueError):
+                filled_qty = quantity
+
+            if status == "PARTIALLY_FILLED" and filled_qty < quantity:
+                # F-09: down-size the open position to reflect what
+                # was actually closed; the residual stays in the
+                # portfolio and will be picked up by the next exit
+                # cycle (SL/TP/signal/safety). Alert loudly: a
+                # partial flatten with the broker SL already
+                # cancelled means the residual is unprotected until
+                # we re-arm or close it.
+                residual = quantity - filled_qty
+                logger.critical(
+                    f"[SAFE-EXIT-PARTIAL] {symbol}: flatten partial "
+                    f"{filled_qty}/{quantity} (residual {residual} naked). "
+                    f"Down-sizing in-memory position; next cycle will "
+                    f"re-attempt flatten on the residual. tag={tag}."
+                )
+                try:
+                    self.alert_manager.send_alert(
+                        f"WARNING: Partial flatten on {symbol}",
+                        f"{symbol}: requested {quantity}, broker filled "
+                        f"{filled_qty}. Residual {residual} share(s) are "
+                        f"OPEN AND NAKED (SL was cancelled before flatten). "
+                        f"Daemon will retry on next exit cycle. tag={tag} "
+                        f"reason={exit_reason}.",
+                        level="warning",
+                    )
+                except Exception:
+                    pass
+                try:
+                    self.portfolio.adjust_position_quantity(symbol, filled_qty)
+                except AttributeError:
+                    # If adjust_position_quantity isn't implemented yet,
+                    # fall back to recording the partial close at the
+                    # accounting level and proceed; safer to lose some
+                    # bookkeeping precision than to double-flatten.
+                    logger.warning(
+                        f"[SAFE-EXIT-PARTIAL] portfolio lacks "
+                        f"adjust_position_quantity(); residual {residual} "
+                        f"may be double-counted. Manual reconcile needed."
+                    )
+                return order, None
+
             record = self.portfolio.close_position(symbol, filled_price, exit_reason=exit_reason)
             if record is None:
                 return order, None
@@ -4813,12 +4982,16 @@ class TradingAgent:
         except Exception as e:
             logger.error(f"Tick purge failed: {e}")
 
-        # Cap in-memory candle history at 500 candles per symbol/interval
+        # Cap in-memory candle history at 500 candles per symbol/interval.
+        # B-13 / C-15 (audit 2026-05-26): delegate to TickAggregator.cap_history
+        # which takes its internal lock — prevents the race against the
+        # WebSocket thread's process_tick that the previous direct
+        # `self.tick_aggregator._history` mutation had.
         max_history = 500
-        for interval_hist in self.tick_aggregator._history.values():
-            for symbol, candles in interval_hist.items():
-                if len(candles) > max_history:
-                    interval_hist[symbol] = candles[-max_history:]
+        try:
+            self.tick_aggregator.cap_history(max_history)
+        except Exception as e:
+            logger.warning(f"tick_aggregator.cap_history failed (non-fatal): {e}")
 
     def _snapshot_equity(self):
         """Record current equity to database for curve tracking."""

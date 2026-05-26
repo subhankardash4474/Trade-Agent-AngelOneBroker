@@ -47,6 +47,16 @@ def main() -> None:
     if not DB.exists():
         raise SystemExit(f"DB not found: {DB}")
 
+    # F-77: this is a destructive one-shot tool (DELETE FROM trades + INSERT
+    # INTO open_positions). Take a timestamped backup BEFORE mutation so a
+    # mistaken invocation is recoverable. Auto-backup is unconditional;
+    # if disk space is a concern, prune older `.bak.*` files manually.
+    import shutil
+    backup_stamp = datetime.now(IST).strftime("%Y%m%d_%H%M%S")
+    backup_path = DB.with_suffix(f".db.bak.{backup_stamp}")
+    shutil.copy2(DB, backup_path)
+    print(f"[F-77] Auto-backed up DB to {backup_path} before destructive surgery.")
+
     c = sqlite3.connect(DB)
     c.row_factory = sqlite3.Row
     try:

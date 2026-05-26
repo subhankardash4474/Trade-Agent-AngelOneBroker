@@ -35,13 +35,38 @@ def _env_float(name: str, default: float) -> float:
     """Read a TRADING_CHARGES_<NAME> env override, fall back to default.
 
     Bad values (non-numeric) silently fall back; we never want a typo to
-    crash the daemon at import time."""
+    crash the daemon at import time.
+
+    F-93: previously a parse error was a complete silent revert -- an
+    operator hot-patching ``TRADING_CHARGES_STT_INTRADAY_SELL=0.00025x``
+    (typo) would get the hardcoded default with no warning. Emit a
+    loud one-shot warning so the operator notices their override was
+    discarded. The daemon still continues with the safe default to
+    preserve the no-crash guarantee.
+    """
     raw = os.environ.get(f"TRADING_CHARGES_{name}")
     if raw is None:
         return default
     try:
         return float(raw)
     except (TypeError, ValueError):
+        # Defer the import to keep this module dependency-free for
+        # tests that import charges in isolation.
+        try:
+            from loguru import logger as _logger  # type: ignore[import-not-found]
+            _logger.warning(
+                f"[charges] TRADING_CHARGES_{name}={raw!r} is not a valid "
+                f"float -- using default {default}. Fix your env var or "
+                f"trades will be priced against the wrong rate."
+            )
+        except Exception:
+            # Last-resort fallback: print to stderr.
+            import sys
+            print(
+                f"[charges][WARN] TRADING_CHARGES_{name}={raw!r} is not a "
+                f"valid float -- using default {default}",
+                file=sys.stderr,
+            )
         return default
 
 

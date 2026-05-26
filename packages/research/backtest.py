@@ -37,7 +37,27 @@ class BacktestEngine:
         self.start_date = bt_cfg.get("start_date", "2025-01-01")
         self.end_date = bt_cfg.get("end_date", "2026-03-29")
         self.initial_capital = bt_cfg.get("initial_capital", 10000.0)
+        # F-103 (audit 2026-05-27): `commission_pct` is preserved here
+        # for backwards compatibility with older configs but it has
+        # been DEAD since the move to the per-leg ``packages.core.charges``
+        # engine. Portfolio receives it and stores it on
+        # ``self.commission_pct`` but every PnL path computes charges
+        # via ``compute_round_trip`` (STT + exchange txn + SEBI + GST +
+        # stamp + DP) which ignores the flat percentage. Loud, one-shot
+        # warning so an operator who tunes this knob expecting a fee
+        # change discovers immediately that it does nothing.
         self.commission_pct = bt_cfg.get("commission_pct", 0.03)
+        if (
+            "commission_pct" in bt_cfg
+            and abs(self.commission_pct - 0.03) > 1e-9
+        ):
+            logger.warning(
+                f"[BACKTEST] `backtest.commission_pct={self.commission_pct}` "
+                f"is configured but IGNORED. Charges are computed by the "
+                f"per-leg engine in packages/core/charges.py "
+                f"(STT/exchange/SEBI/GST/stamp/DP). Adjust those env vars "
+                f"(e.g. STT_INTRADAY_PCT) instead."
+            )
         self.slippage_pct = bt_cfg.get("slippage_pct", 0.05)
 
         self.data_handler = DataHandler(config)
@@ -162,10 +182,21 @@ class BacktestEngine:
                 timestamps.append(current_time)
 
         # Close any remaining positions at last available prices
+        # F-67 (audit 2026-05-27): every other exit in this engine
+        # applies the configured slippage (lines 127, 141, 154). The
+        # backtest-end flatten omitted it, so the final equity over-
+        # reported by ~one round-trip slippage per residual position.
+        # Apply the same convention here.
         for symbol in list(portfolio.positions.keys()):
             if symbol in market_data and not market_data[symbol].empty:
                 last_price = float(market_data[symbol]["close"].iloc[-1])
-                record = portfolio.close_position(symbol, last_price, exit_reason="backtest_end")
+                slippage = last_price * (self.slippage_pct / 100)
+                pos = portfolio.positions[symbol]
+                exit_at = (
+                    last_price + slippage if pos.side == "SELL"
+                    else last_price - slippage
+                )
+                record = portfolio.close_position(symbol, exit_at, exit_reason="backtest_end")
                 if record:
                     risk_manager.record_trade(record.pnl)
 

@@ -148,6 +148,14 @@ class XGBoostClassifier(BaseStrategy):
     def _load_model(self):
         if os.path.exists(self.model_path):
             try:
+                # B-19 (audit 2026-05-25): pickle.load executes arbitrary
+                # code. Only load from operator-trusted paths (the
+                # `models/` directory under the repo root). The startup
+                # log line below makes the source path visible for audit.
+                abs_path = os.path.abspath(self.model_path)
+                logger.info(
+                    f"[security] Loading XGBoost model from trusted path: {abs_path}"
+                )
                 with open(self.model_path, "rb") as f:
                     self._model = pickle.load(f)
                 logger.info(f"XGBoost model loaded from {self.model_path}")
@@ -242,7 +250,26 @@ class XGBoostClassifier(BaseStrategy):
             return self._make_signal(Signal.HOLD, symbol, df, metadata={"reason": "no_features"})
 
         latest = df[available_cols].iloc[[-1]].copy()
-        latest = latest.fillna(0)
+        # C-10 (audit 2026-05-26): on the warmup row (insufficient history for
+        # rolling indicators like RSI/MACD/BBANDS), feature values are NaN.
+        # The previous `latest.fillna(0)` silently turned those into numeric
+        # zeros and fed them to the model — but the model interprets 0 as a
+        # real feature value (often strongly bearish for normalized features
+        # whose neutral baseline is far from 0), producing spurious
+        # high-confidence signals on instruments where the features are
+        # literally unknown. Fail-soft to HOLD with an explicit reason so
+        # the audit trail makes the source visible.
+        nan_count = int(latest.isna().sum(axis=1).iloc[0])
+        if nan_count > 0:
+            nan_cols = [c for c in available_cols if pd.isna(latest[c].iloc[0])]
+            return self._make_signal(
+                Signal.HOLD, symbol, df,
+                metadata={
+                    "reason": "nan_features",
+                    "nan_count": nan_count,
+                    "nan_cols": nan_cols[:8],
+                },
+            )
 
         try:
             proba = self._model.predict_proba(latest)[0]
@@ -256,10 +283,32 @@ class XGBoostClassifier(BaseStrategy):
             # downstream consumer.
             prob_up = float(proba[1]) if len(proba) > 1 else float(proba[0])
             prob_down = float(proba[0]) if len(proba) > 1 else 1.0 - float(proba[0])
-            predicted_class = 1 if prob_up > prob_down else 0
+            # F-83: on exact ties (prob_up == prob_down), the previous
+            # rule (``1 if prob_up > prob_down else 0``) silently routed
+            # to class 0 (DOWN), letting the SELL branch fire if
+            # prob_down >= threshold. The LSTM strategy already HOLDs
+            # on ties; align XGBoost so a 50/50 model has no directional
+            # bias and is consistent across the ensemble.
+            if prob_up == prob_down:
+                predicted_class = -1  # sentinel: tie -> HOLD
+            else:
+                predicted_class = 1 if prob_up > prob_down else 0
         except Exception as e:
             logger.error(f"XGBoost prediction error: {e}")
             return self._make_signal(Signal.HOLD, symbol, df, metadata={"reason": f"prediction_error: {e}"})
+
+        if predicted_class == -1:
+            # F-83: tie -> HOLD. Surface it in metadata so backtest
+            # diagnostics can count tie-suppressions distinctly from
+            # below-threshold HOLDs.
+            return self._make_signal(
+                Signal.HOLD, symbol, df,
+                metadata={
+                    "prob_up": round(prob_up, 4),
+                    "prob_down": round(prob_down, 4),
+                    "reason": "prob_tie",
+                },
+            )
 
         price = float(df["close"].iloc[-1])
         atr = float(df["atr"].iloc[-1]) if "atr" in df.columns and not pd.isna(df["atr"].iloc[-1]) else price * 0.01

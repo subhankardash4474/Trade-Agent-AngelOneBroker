@@ -238,9 +238,20 @@ class FeatureEngine:
             cum_vol = volume.cumsum()
         df["vwap"] = cum_tp_vol / cum_vol.replace(0, np.nan)
 
-        # OBV (On-Balance Volume) — vectorized
+        # OBV (On-Balance Volume) — vectorized, session-reset.
+        # F-85 (audit 2026-05-27): previously cumsum spanned every bar
+        # in the frame which, for multi-day windows, mixed yesterday's
+        # accumulation/distribution into today's reading. VWAP above
+        # already groups by calendar date for the same reason; OBV is
+        # equally a session-bounded indicator (volume-flow within one
+        # trading day). Group by date when the index supports it so
+        # OBV restarts at session open.
         direction = np.sign(close.diff())
-        df["obv"] = (direction * volume).fillna(0).cumsum()
+        per_bar = (direction * volume).fillna(0)
+        if hasattr(df.index, "date"):
+            df["obv"] = per_bar.groupby(df.index.date).cumsum()
+        else:
+            df["obv"] = per_bar.cumsum()
 
         # Volume ratio (current bar vs 20-period average)
         vol_ma20 = volume.rolling(20).mean()
@@ -283,9 +294,16 @@ class FeatureEngine:
     def _add_derived_features(df: pd.DataFrame) -> pd.DataFrame:
         close, high, low, opn = df["close"], df["high"], df["low"], df["open"]
 
-        # Distance from day high / low (as % of price)
-        rolling_high = high.rolling(78).max()  # ~1 day on 5m candles
-        rolling_low = low.rolling(78).min()
+        # Distance from day high / low (as % of price).
+        # F-44 (audit 2026-05-27): NSE cash session is 09:15-15:30 IST =
+        # 6h15 = 375 min = exactly 75 five-minute candles. The previous
+        # window of 78 leaked ~15 min of the prior session's prints
+        # into today's "day high/low", which moved breakout / mean-rev
+        # decisions near the open. 75 is the right number for 5-min
+        # bars; this remains an approximation for other intervals
+        # (better: groupby session date, deferred).
+        rolling_high = high.rolling(75).max()
+        rolling_low = low.rolling(75).min()
         df["dist_from_high_pct"] = (rolling_high - close) / close * 100
         df["dist_from_low_pct"] = (close - rolling_low) / close * 100
 

@@ -472,6 +472,23 @@ class Database:
             conn.execute("DELETE FROM open_positions WHERE symbol=?", (symbol,))
         logger.debug(f"Removed open position: {symbol}")
 
+    def update_position_quantity(self, symbol: str, new_quantity: int) -> None:
+        """F-09 (audit 2026-05-27): persist a partial-fill exit's
+        residual quantity to the open_positions row. Called by
+        ``Portfolio.adjust_position_quantity`` after a flatten order
+        returns PARTIALLY_FILLED so that a subsequent restart sees
+        the correct residual instead of the original (now incorrect)
+        full quantity.
+        """
+        with self._conn() as conn:
+            conn.execute(
+                "UPDATE open_positions SET quantity=? WHERE symbol=?",
+                (int(new_quantity), symbol),
+            )
+        logger.debug(
+            f"Updated open position quantity: {symbol} -> {new_quantity}"
+        )
+
     def save_order(self, order: dict) -> None:
         """
         Persist a single order to the audit ledger. Uses INSERT OR REPLACE

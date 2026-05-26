@@ -485,6 +485,15 @@ def _bt_config(cfg: dict) -> BacktestConfig:
         # so every variant that doesn't explicitly opt in retains the
         # current behaviour (longs + shorts both allowed in backtest).
         allow_shorts=bool(cfg.get("risk", {}).get("allow_shorts", True)),
+        # F-64 (audit 2026-05-27): plumb `backtest.paper_seed` through to
+        # the BacktestConfig. The dataclass has had a `paper_seed` field
+        # since C-21 but the battery harness never set it, so every
+        # variant got `paper_seed=None` -> deterministic-mean slippage
+        # (see F-26 fix in backtest_ensemble.py). With this plumbing,
+        # setting `backtest.paper_seed: 42` in a base or override config
+        # gives reproducible runs whose slippage now samples from the
+        # same U(0, slippage_pct) distribution the paper executor uses.
+        paper_seed=cfg.get("backtest", {}).get("paper_seed"),
     )
 
 
@@ -661,8 +670,12 @@ def _run_variant_in_subprocess(
         logger.info(f"[WORKER] {name}: market_data loaded ({len(market_data)} symbols)")
 
         cfg = _build_variant_config(base_cfg, overrides)
-        (out_root / "configs" / f"{name}.yaml").write_text(
-            yaml.safe_dump(cfg, sort_keys=False), encoding="utf-8"
+        # F-71: parity with the serial path -- atomic write so a worker
+        # crash mid-write cannot leave a half-truncated config that
+        # later runs / reviewers parse-fail or skip.
+        _atomic_write_text(
+            out_root / "configs" / f"{name}.yaml",
+            yaml.safe_dump(cfg, sort_keys=False),
         )
 
         bt_cfg = _bt_config(cfg)
@@ -1362,8 +1375,12 @@ def main() -> int:
             try:
                 cfg = _build_variant_config(base_cfg, overrides)
 
-                (out_root / "configs" / f"{name}.yaml").write_text(
-                    yaml.safe_dump(cfg, sort_keys=False), encoding="utf-8"
+                # F-71: same atomic-write rationale as the results JSON
+                # below — a half-written variant config is worse than no
+                # config at all (downstream readers parse-fail or skip).
+                _atomic_write_text(
+                    out_root / "configs" / f"{name}.yaml",
+                    yaml.safe_dump(cfg, sort_keys=False),
                 )
 
                 bt_cfg = _bt_config(cfg)
@@ -1394,8 +1411,16 @@ def main() -> int:
                     "regime_pnl": result.regime_pnl,
                     "trades": result.trades,
                 }
-                (out_root / "results" / f"{name}.json").write_text(
-                    json.dumps(payload, indent=2, default=str), encoding="utf-8"
+                # F-71 (audit 2026-05-27): serial mode previously used
+                # plain `.write_text(...)` here while the parallel mode
+                # already used `_atomic_write_text` (see line ~1602).
+                # Asymmetric durability: a crash mid-write in serial mode
+                # left a half-truncated JSON that ``_already_done`` later
+                # mistook for a complete variant and skipped on resume.
+                # Unify on the atomic helper.
+                _atomic_write_text(
+                    out_root / "results" / f"{name}.json",
+                    json.dumps(payload, indent=2, default=str),
                 )
                 rows.append(_summary_row(name, result))
 

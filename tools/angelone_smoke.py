@@ -29,6 +29,11 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
+# F-19: packages/ must be on sys.path for bare-host invocations
+# (Dockerfile bakes PYTHONPATH=/app/packages, host shells do not).
+_PKG = ROOT / "packages"
+if str(_PKG) not in sys.path:
+    sys.path.insert(0, str(_PKG))
 
 import yaml  # noqa: E402
 

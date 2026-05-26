@@ -1,7 +1,13 @@
 """
 XGBoost Model Training
 Trains a gradient-boosted classifier to predict short-term price direction.
-Uses time-series cross-validation to avoid look-ahead bias.
+
+F-100 (audit 2026-05-27): the previous module docstring claimed
+"time-series cross-validation" but no CV is implemented; training is a
+single chronological train/test split produced upstream by
+`prepare_dataset.py`, with early stopping done on a chronological tail
+slice of the training set (carved out below, F-22 fix). The TEST set
+remains a strict held-out for final metrics only.
 """
 
 import argparse
@@ -81,8 +87,43 @@ def train_xgboost(
         scale_pos_weight=scale_pos_weight,
     )
 
+    # F-22 (audit 2026-05-27): early stopping previously evaluated on
+    # X_test and we then reported held-out metrics on the same X_test --
+    # the test set was effectively used to pick `best_iteration`, so
+    # those metrics were optimistic (selection-bias leakage). Carve a
+    # CHRONOLOGICAL tail slice of X_train as the early-stopping
+    # validation set. The order in X_train is preserved by
+    # prepare_dataset; we take the last `val_frac` rows as the
+    # validation slice. The official X_test stays untouched for the
+    # final held-out report below.
+    val_frac = 0.15
+    n_train = len(X_train)
+    n_val = max(1, int(n_train * val_frac))
+    if n_val >= n_train:
+        # Pathologically small training set -- fall back to using the
+        # test set but warn loudly so it's not silent.
+        logger.warning(
+            f"[XGB-TRAIN] training set too small for a {val_frac:.0%} "
+            f"validation tail ({n_train} rows); early stopping will "
+            f"peek at the official test set. Held-out metrics below "
+            f"will be optimistic."
+        )
+        X_fit, y_fit = X_train, y_train
+        eval_set = [(X_test, y_test)]
+    else:
+        X_fit = X_train.iloc[: n_train - n_val]
+        y_fit = y_train.iloc[: n_train - n_val]
+        X_val = X_train.iloc[n_train - n_val :]
+        y_val = y_train.iloc[n_train - n_val :]
+        eval_set = [(X_val, y_val)]
+        logger.info(
+            f"Early-stopping validation: chronological tail "
+            f"{n_val} rows of train ({val_frac:.0%}); "
+            f"fit on {len(X_fit)} rows; test set untouched."
+        )
+
     logger.info("Training XGBoost model (with early stopping)...")
-    model.fit(X_train, y_train, eval_set=[(X_test, y_test)], verbose=False)
+    model.fit(X_fit, y_fit, eval_set=eval_set, verbose=False)
     best_iter = getattr(model, "best_iteration", None)
     if best_iter is not None:
         logger.info(f"Best iteration: {best_iter}")
@@ -136,26 +177,48 @@ def train_xgboost(
                 calibrated = CalibratedClassifierCV(
                     model, method=calibration_method, cv="prefit"
                 )
-            # Fit on the held-out test set so calibration sees data the
-            # booster didn't train on. NOTE: this means Brier on the same
-            # test set is in-sample for the calibrator -- we accept that
-            # in exchange for keeping the original 80/20 split intact.
-            # Calibrator only learns a 1D mapping so over-fit risk is low.
-            calibrated.fit(X_test, y_test)
-            y_proba_cal = calibrated.predict_proba(X_test)[:, 1]
+            # C-23 (audit 2026-05-26): split the held-out test set so the
+            # calibrator FIT and the calibrator EVAL never see the same
+            # rows. Pre-fix, both `calibrated.fit(X_test, y_test)` and
+            # the Brier evaluation `brier_score_loss(y_test, ...)` ran
+            # on the same set, so the reported Brier was in-sample for
+            # the calibrator. Operators trying to decide between
+            # `method=isotonic` vs `method=sigmoid` were comparing
+            # apples to apples but both apples were rotten — neither
+            # number generalises. We now use a chronological 50/50
+            # split (first half = calib fit, second half = calib eval)
+            # to preserve the time-ordering guarantee while still giving
+            # the calibrator ~40k rows to learn the 1D mapping from.
+            half = max(1, len(X_test) // 2)
+            X_calib_fit, y_calib_fit = X_test[:half], y_test[:half]
+            X_calib_eval, y_calib_eval = X_test[half:], y_test[half:]
+            calibrated.fit(X_calib_fit, y_calib_fit)
+            y_proba_cal = calibrated.predict_proba(X_calib_eval)[:, 1]
             y_pred_cal = (y_proba_cal >= 0.5).astype(int)
-            brier_cal = brier_score_loss(y_test, y_proba_cal)
-            logloss_cal = log_loss(y_test, y_proba_cal)
-            auc_cal = roc_auc_score(y_test, y_proba_cal)
+            brier_cal = brier_score_loss(y_calib_eval, y_proba_cal)
+            logloss_cal = log_loss(y_calib_eval, y_proba_cal)
+            auc_cal = roc_auc_score(y_calib_eval, y_proba_cal)
+            # Recompute the RAW baseline on the SAME eval slice so the
+            # before/after comparison is apples-to-apples (not raw on full
+            # X_test vs calibrated on second half).
+            y_proba_raw_eval = model.predict_proba(X_calib_eval)[:, 1]
+            auc_raw_eval = roc_auc_score(y_calib_eval, y_proba_raw_eval)
+            brier_raw_eval = brier_score_loss(y_calib_eval, y_proba_raw_eval)
+            logloss_raw_eval = log_loss(y_calib_eval, y_proba_raw_eval)
             logger.info(
-                f"CALIBRATED XGBoost on test set:\n"
-                f"  AUC:     {auc_cal:.4f}  (was {auc_raw:.4f})\n"
-                f"  Brier:   {brier_cal:.4f}  (was {brier_raw:.4f})\n"
-                f"  LogLoss: {logloss_cal:.4f}  (was {logloss_raw:.4f})"
+                f"CALIBRATED XGBoost on held-out eval slice "
+                f"({len(X_calib_eval)} rows):\n"
+                f"  AUC:     {auc_cal:.4f}  (raw_eval {auc_raw_eval:.4f})\n"
+                f"  Brier:   {brier_cal:.4f}  (raw_eval {brier_raw_eval:.4f})\n"
+                f"  LogLoss: {logloss_cal:.4f}  (raw_eval {logloss_raw_eval:.4f})"
             )
+            # Re-target the AUC sanity check at the eval-only baseline so
+            # we're comparing on the same rows.
+            auc_raw_for_check = auc_raw_eval
             # Sanity: AUC must not collapse (calibration is monotonic so
-            # AUC should be ~equal). If it drops by >0.02 something's off.
-            if auc_cal < auc_raw - 0.02:
+            # AUC should be ~equal). If it drops by >0.02 vs the SAME-slice
+            # raw baseline, something is off.
+            if auc_cal < auc_raw_for_check - 0.02:
                 logger.error(
                     "Calibration collapsed AUC by >2pp -- check data leakage. "
                     "Falling back to raw model."

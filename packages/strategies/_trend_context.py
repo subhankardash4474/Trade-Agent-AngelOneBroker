@@ -46,6 +46,14 @@ from loguru import logger
 
 THRESHOLD_PCT = 5.0  # symbol must be within +/- 5% of 50d SMA to trade with trend
 CACHE_TTL_SEC = 6 * 3600
+# F-48 (audit 2026-05-27): on a fetch failure we previously cached the
+# None result for the FULL 6h positive-TTL, so a single transient
+# yfinance hiccup at market open silently disabled the trend filter
+# for the entire session (combined with the default fail-open path,
+# that admits every counter-trend entry until market close). Use a
+# short negative TTL so we retry within minutes of the outage clearing
+# while still bounding yfinance pressure on a persistent failure.
+_NEGATIVE_CACHE_TTL_SEC = float(os.environ.get("TREND_NEG_TTL_SEC", "300"))
 # 2026-05-25 Bug G-3: hard timeout on the yfinance HTTP call. Without
 # this, a stalled connection (slow Yahoo response, broken DNS, hung
 # socket) hangs the worker thread indefinitely. The battery harness'
@@ -54,6 +62,21 @@ CACHE_TTL_SEC = 6 * 3600
 # (see Bug F / Bug G-2). 30s is generous for a single ~3-month daily
 # bar pull.
 _YF_TIMEOUT_SEC = float(os.environ.get("TREND_FETCH_TIMEOUT_SEC", "30"))
+# C-14 (audit 2026-05-26): hard cap on cache size to bound memory in
+# long-running battery workers (200+ symbols × dozens of variants without
+# this leaked into the gigabytes; same failure class as B-9 DataHandler
+# cache). LRU-ish eviction by oldest fetched_at; eviction triggers only
+# when we exceed the cap so the steady state is still O(symbols_in_use).
+_CACHE_MAX_ENTRIES = int(os.environ.get("TREND_CACHE_MAX_ENTRIES", "2000"))
+# C-13 (audit 2026-05-26): fail-closed mode. When set to "1"/"true", a
+# fetch failure (timeout, empty response, network error) is treated as
+# "trend unknown -> block the trade" instead of the fail-open default.
+# Operators running live should consider flipping this on (combined with
+# a healthy yfinance / NSE archive fallback) so a data outage doesn't
+# silently disable the trend filter and admit counter-trend entries.
+_FAIL_CLOSED = os.environ.get("TREND_FILTER_FAIL_CLOSED", "false").lower() in (
+    "1", "true", "yes", "on",
+)
 _cache: dict[str, dict] = {}
 _lock = threading.Lock()
 
@@ -149,6 +172,21 @@ def _fetch_daily(symbol: str) -> Optional[dict]:
         return None
 
 
+def _evict_oldest_locked() -> None:
+    """Evict the oldest cache entries while holding `_lock`.
+
+    C-14 (audit 2026-05-26): keeps `len(_cache) <= _CACHE_MAX_ENTRIES` by
+    dropping the lowest `fetched_at` entries first. Cheap because we only
+    pay the sort when we actually cross the cap.
+    """
+    if len(_cache) <= _CACHE_MAX_ENTRIES:
+        return
+    overflow = len(_cache) - _CACHE_MAX_ENTRIES
+    victims = sorted(_cache.items(), key=lambda kv: kv[1].get("fetched_at", 0.0))[:overflow]
+    for key, _ in victims:
+        _cache.pop(key, None)
+
+
 def get_trend(symbol: str, *, force_refresh: bool = False) -> Optional[dict]:
     """Return cached trend dict for symbol, fetching if stale.
 
@@ -158,11 +196,22 @@ def get_trend(symbol: str, *, force_refresh: bool = False) -> Optional[dict]:
     now = time.time()
     with _lock:
         cached = _cache.get(symbol)
-        if not force_refresh and cached and (now - cached["fetched_at"]) < CACHE_TTL_SEC:
-            return cached["data"]
+        if not force_refresh and cached is not None:
+            age = now - cached["fetched_at"]
+            ttl = (
+                CACHE_TTL_SEC
+                if cached.get("data") is not None
+                else _NEGATIVE_CACHE_TTL_SEC
+            )
+            if age < ttl:
+                return cached["data"]
     data = _fetch_daily(symbol)
     with _lock:
+        # F-48: still cache the negative result so we don't hammer
+        # yfinance during a sustained outage, but the negative TTL
+        # is much shorter than the positive one (see constants).
         _cache[symbol] = {"fetched_at": now, "data": data}
+        _evict_oldest_locked()
     return data
 
 
@@ -172,10 +221,19 @@ def is_against_trend(symbol: str, side: str, *, threshold_pct: float = THRESHOLD
     SHORT against +X% above 50d SMA -> blocked.
     LONG against -X% below 50d SMA  -> blocked.
 
-    Fail-open: if we can't fetch trend data, returns False (don't block).
+    By default fail-open: if we can't fetch trend data, returns False so a
+    yfinance outage doesn't silently disable the strategy. Set
+    `TREND_FILTER_FAIL_CLOSED=true` to invert (block the trade when trend
+    is unknown). C-13 (audit 2026-05-26).
     """
     trend = get_trend(symbol)
     if trend is None or trend.get("pct_vs_sma50") is None:
+        if _FAIL_CLOSED:
+            logger.warning(
+                f"[trend_context] trend unknown for {symbol}; fail-closed "
+                f"mode active -> blocking {side}"
+            )
+            return True
         return False
     pct = trend["pct_vs_sma50"]
     if side.upper() == "SELL":

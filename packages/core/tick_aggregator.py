@@ -5,6 +5,7 @@ configurable intervals (1m, 5m, 15m). Fires callbacks when
 a new candle completes.
 """
 
+import threading
 from collections import defaultdict
 from datetime import datetime, timedelta
 from typing import Callable, Dict, List, Optional
@@ -94,38 +95,47 @@ class TickAggregator:
             iv: defaultdict(list) for iv in self.intervals
         }
         self.on_candle_close: Optional[Callable] = None
+        # C-15 (audit 2026-05-26): the WebSocket thread calls process_tick()
+        # while the main thread can call flush_all() / cap_history() /
+        # get_candle_history() concurrently. Without a lock, list.append
+        # and slice-reassignment on the same `_history[iv][sym]` list can
+        # drop a candle or raise mid-iteration. Single re-entrant lock is
+        # enough — every mutating path holds it for the duration of the
+        # mutation; read paths take a brief snapshot under the lock.
+        self._lock: threading.RLock = threading.RLock()
 
     def process_tick(self, symbol: str, price: float, volume: float = 0,
                      timestamp: Optional[datetime] = None):
         """Process a single tick and update all candle builders."""
         now = timestamp or datetime.now(IST)
 
-        for interval in self.intervals:
-            builder = self._builders[interval][symbol]
-            period_seconds = INTERVAL_SECONDS.get(interval, 300)
+        with self._lock:
+            for interval in self.intervals:
+                builder = self._builders[interval][symbol]
+                period_seconds = INTERVAL_SECONDS.get(interval, 300)
 
-            candle_start = self._get_candle_start(now, period_seconds)
-            prev_start = self._candle_starts[interval].get(symbol)
+                candle_start = self._get_candle_start(now, period_seconds)
+                prev_start = self._candle_starts[interval].get(symbol)
 
-            if prev_start is not None and candle_start != prev_start:
-                # Period boundary crossed — close the current candle
-                if not builder.is_empty:
-                    candle = builder.to_dict()
-                    candle["timestamp"] = prev_start
-                    candle["symbol"] = symbol
-                    candle["interval"] = interval
-                    self._history[interval][symbol].append(candle)
+                if prev_start is not None and candle_start != prev_start:
+                    # Period boundary crossed — close the current candle
+                    if not builder.is_empty:
+                        candle = builder.to_dict()
+                        candle["timestamp"] = prev_start
+                        candle["symbol"] = symbol
+                        candle["interval"] = interval
+                        self._history[interval][symbol].append(candle)
 
-                    if self.on_candle_close:
-                        try:
-                            self.on_candle_close(symbol, interval, candle)
-                        except Exception as e:
-                            logger.error(f"Candle close callback error: {e}")
+                        if self.on_candle_close:
+                            try:
+                                self.on_candle_close(symbol, interval, candle)
+                            except Exception as e:
+                                logger.error(f"Candle close callback error: {e}")
 
-                builder.reset()
+                    builder.reset()
 
-            builder.add_tick(price, volume)
-            self._candle_starts[interval][symbol] = candle_start
+                builder.add_tick(price, volume)
+                self._candle_starts[interval][symbol] = candle_start
 
     @staticmethod
     def _get_candle_start(now: datetime, period_seconds: int) -> datetime:
@@ -137,7 +147,8 @@ class TickAggregator:
 
     def get_candle_history(self, symbol: str, interval: str, limit: int = 200) -> pd.DataFrame:
         """Get historical candles built from ticks."""
-        candles = self._history.get(interval, {}).get(symbol, [])
+        with self._lock:
+            candles = list(self._history.get(interval, {}).get(symbol, []))
         if not candles:
             return pd.DataFrame()
 
@@ -148,25 +159,64 @@ class TickAggregator:
 
     def get_current_candle(self, symbol: str, interval: str) -> Optional[dict]:
         """Get the in-progress candle (not yet closed)."""
-        builder = self._builders.get(interval, {}).get(symbol)
-        if builder and not builder.is_empty:
-            candle = builder.to_dict()
-            candle["symbol"] = symbol
-            candle["interval"] = interval
-            candle["timestamp"] = self._candle_starts.get(interval, {}).get(symbol)
-            return candle
+        with self._lock:
+            builder = self._builders.get(interval, {}).get(symbol)
+            if builder and not builder.is_empty:
+                candle = builder.to_dict()
+                candle["symbol"] = symbol
+                candle["interval"] = interval
+                candle["timestamp"] = self._candle_starts.get(interval, {}).get(symbol)
+                return candle
         return None
 
     def flush_all(self):
-        """Force-close all open candles (e.g., at market close)."""
-        for interval in self.intervals:
-            for symbol, builder in self._builders[interval].items():
-                if not builder.is_empty:
-                    candle = builder.to_dict()
-                    candle["timestamp"] = self._candle_starts[interval].get(symbol)
-                    candle["symbol"] = symbol
-                    candle["interval"] = interval
-                    self._history[interval][symbol].append(candle)
-                    if self.on_candle_close:
-                        self.on_candle_close(symbol, interval, candle)
-                    builder.reset()
+        """Force-close all open candles (e.g., at market close).
+
+        F-50: previously, if the registered ``on_candle_close`` callback
+        raised (e.g. a DB write failure during shutdown), the exception
+        would propagate out of ``flush_all`` and the remaining open
+        candles would never be closed. Wrap the callback in the same
+        try/except guard that ``process_tick`` uses. We still append to
+        ``_history`` first so the candle is recorded even if the
+        downstream persistence step fails.
+        """
+        with self._lock:
+            for interval in self.intervals:
+                for symbol, builder in self._builders[interval].items():
+                    if not builder.is_empty:
+                        candle = builder.to_dict()
+                        candle["timestamp"] = self._candle_starts[interval].get(symbol)
+                        candle["symbol"] = symbol
+                        candle["interval"] = interval
+                        self._history[interval][symbol].append(candle)
+                        if self.on_candle_close:
+                            try:
+                                self.on_candle_close(symbol, interval, candle)
+                            except Exception as e:
+                                logger.error(
+                                    f"Candle close callback error on "
+                                    f"flush_all for {symbol} {interval}: {e}"
+                                )
+                        builder.reset()
+
+    def cap_history(self, max_per_symbol: int) -> int:
+        """Trim each per-symbol candle history to at most `max_per_symbol`.
+
+        B-13 (audit 2026-05-26): replaces the previous practice of
+        `trading_agent._periodic_cleanup` reaching into `self._history`
+        and reassigning slices directly — that mutation was not done
+        under the lock so it raced with `process_tick`. Exposing a single
+        threadsafe method removes the encapsulation break and the race
+        in one go. Returns the number of candles dropped (for the
+        periodic cleanup log).
+        """
+        if max_per_symbol <= 0:
+            return 0
+        dropped = 0
+        with self._lock:
+            for interval in self.intervals:
+                for symbol, candles in self._history[interval].items():
+                    if len(candles) > max_per_symbol:
+                        dropped += len(candles) - max_per_symbol
+                        self._history[interval][symbol] = candles[-max_per_symbol:]
+        return dropped

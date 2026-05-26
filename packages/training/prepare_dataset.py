@@ -192,11 +192,22 @@ def prepare_dataset(
             day_index = featured.index.tz_localize(None).normalize() if (
                 hasattr(featured.index, "tz_localize")
             ) else pd.DatetimeIndex(featured.index).normalize()
+            # F-24 (audit 2026-05-27): the daily Nifty/VIX context comes
+            # from end-of-day CLOSES. Tagging an intraday 09:30 bar
+            # with TODAY'S daily close is a lookahead -- the model
+            # learns "if today's regime will be bull_low_vol then BUY",
+            # which is unavailable at decision time. Shift the lookup
+            # by ONE trading day so today's 09:30 bar gets yesterday's
+            # closed daily context, matching how the live agent reads
+            # `_market_context` (which is yesterday's daily print
+            # forward-filled into today's session).
+            ctx_shifted = market_ctx.copy()
+            ctx_shifted.index = ctx_shifted.index + pd.Timedelta(days=1)
             # P1 #8 (2026-05-17): align default with serve path (0 = neutral).
-            featured["nifty_trend"] = market_ctx["nifty_trend"].reindex(
+            featured["nifty_trend"] = ctx_shifted["nifty_trend"].reindex(
                 day_index, method="ffill"
             ).fillna(0).astype(int).values
-            featured["india_vix"] = market_ctx["india_vix"].reindex(
+            featured["india_vix"] = ctx_shifted["india_vix"].reindex(
                 day_index, method="ffill"
             ).fillna(15.0).astype(float).values
         else:
@@ -274,11 +285,24 @@ def prepare_dataset(
             test = sorted_idx[sorted_idx.index >= cutoff]
             logger.info(f"Time-based split cutoff: {cutoff} "
                         f"(train={len(train)}, test={len(test)})")
-        except Exception as exc:  # noqa: BLE001 - fall back to row split if index unusable
-            logger.warning(f"Time-based split failed ({exc!r}); using row-index split.")
-            split_idx = int(len(combined) * 0.8)
-            train = combined.iloc[:split_idx]
-            test = combined.iloc[split_idx:]
+        except Exception as exc:  # noqa: BLE001 - see fail-hard rationale
+            # F-70 (audit 2026-05-27): previously caught ANY exception
+            # here and silently fell back to a row-index split -- which
+            # is exactly the leakage path P1 #7 was supposed to
+            # eliminate (same calendar day's SYMBOL_A in train +
+            # SYMBOL_B in test). Fail loudly so the operator fixes the
+            # index (e.g. ensure all symbols share a tz-aware
+            # DatetimeIndex) before shipping a leaky model. The
+            # `degenerate case` branch below still handles the
+            # single-row / no-timestamp legitimate case explicitly.
+            raise RuntimeError(
+                f"[prepare_dataset] Time-based split failed ({exc!r}). "
+                f"Refusing to silently fall back to row-index split, "
+                f"which would re-introduce the cross-symbol calendar "
+                f"leakage P1 #7 eliminated. Fix the index (sortable, "
+                f"tz-consistent DatetimeIndex across all symbols) and "
+                f"re-run."
+            )
     else:
         # Degenerate case (no timestamp index, or single row): row split.
         split_idx = int(len(combined) * 0.8)

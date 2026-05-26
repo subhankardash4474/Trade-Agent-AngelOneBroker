@@ -40,6 +40,34 @@ from loguru import logger
 IST = pytz.timezone("Asia/Kolkata")
 
 
+def _trading_days_between(start: date, end: date) -> int:
+    """Count trading days strictly between `start` and `end` (exclusive).
+
+    C-25 (audit 2026-05-26): excludes weekends and NSE holidays. Symmetric
+    in the sense that the count of trading days from Mon -> Wed is 1
+    (Tuesday), not 2 calendar days. Returns 0 when start >= end.
+
+    The holiday set is looked up via data_handler.NSE_HOLIDAYS — kept here
+    as a local import to avoid a circular dependency between
+    `event_calendar` and `data_handler`.
+    """
+    if start >= end:
+        return 0
+    try:
+        from core.data_handler import NSE_HOLIDAYS as _NSE_HOLIDAYS
+    except Exception:
+        _NSE_HOLIDAYS = set()  # fail open: count weekdays only
+
+    from datetime import timedelta as _td
+    count = 0
+    cur = start + _td(days=1)
+    while cur < end:
+        if cur.weekday() < 5 and cur.strftime("%Y-%m-%d") not in _NSE_HOLIDAYS:
+            count += 1
+        cur += _td(days=1)
+    return count
+
+
 @dataclass(frozen=True)
 class Event:
     symbol: str
@@ -184,9 +212,14 @@ class EventCalendar:
     ) -> Tuple[bool, Optional[Event]]:
         """Return (True, event) if entering ``symbol`` today is blacked out.
 
-        Blackout window = [event - blackout_days_before, event + blackout_days_after]
-        (inclusive on both ends). Days are *calendar* days for simplicity --
-        weekends naturally fall away because no trading happens then.
+        Blackout window measured in *trading days* (C-25, audit 2026-05-26).
+        Pre-fix the window was measured in calendar days, so an event on
+        Monday with `blackout_days_before=1` correctly blocked Sunday (a
+        non-trading day) but DID NOT block Friday — the trading day that
+        actually matters. We now count weekdays back/forward, excluding
+        Saturdays, Sundays, and NSE holidays. The configuration knob's
+        meaning therefore changes: "1 trading day before" now blocks the
+        previous trading session, which is the operator's intent.
 
         Returns (False, None) when:
           * the calendar is empty
@@ -197,12 +230,23 @@ class EventCalendar:
         events = self._events_by_symbol.get(symbol.upper(), [])
         if not events:
             return False, None
+
         for ev in events:
-            delta_days = (ev.event_date - today).days
-            in_pre  = (0 <= delta_days <= self.blackout_days_before)
-            in_post = (-self.blackout_days_after <= delta_days < 0)
-            if in_pre or in_post:
+            if ev.event_date == today:
                 return True, ev
+            if today < ev.event_date:
+                # `delta` is trading days STRICTLY between today and event.
+                # "1 trading day before" means delta == 0 (today is the
+                # session immediately preceding the event). So the
+                # operator's `blackout_days_before=1` => block iff
+                # `delta < 1`. Generalise to strict `<`.
+                delta = _trading_days_between(today, ev.event_date)
+                if delta < self.blackout_days_before:
+                    return True, ev
+            else:  # today > ev.event_date
+                delta = _trading_days_between(ev.event_date, today)
+                if delta < self.blackout_days_after:
+                    return True, ev
         return False, None
 
     # ── Introspection (for audit/checkpoint) ─────────────────────────

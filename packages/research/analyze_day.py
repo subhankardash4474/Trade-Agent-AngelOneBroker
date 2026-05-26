@@ -28,6 +28,12 @@ import sqlite3
 import sys
 from collections import defaultdict
 from dataclasses import dataclass, field
+
+try:
+    import pytz as _pytz
+    _IST = _pytz.timezone("Asia/Kolkata")
+except Exception:
+    _IST = None
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
 
@@ -325,6 +331,57 @@ def _fmt_row(label: str, n: int, wins: int, pnl: float, extra: str = "") -> str:
     return f"  {label:<24} n={n:>3}  wins={wins:>3}  win%={wr:>5.1f}  pnl=Rs{pnl:>+9.2f}{extra}"
 
 
+def _compute_equity_metrics(equity: List[dict]) -> tuple[Optional[float], Optional[float]]:
+    """F-104 (audit 2026-05-27): derive (daily-Sharpe, max-DD%) from the
+    persisted equity_curve rows. Pre-fix this function did not exist
+    and `analyze_day` loaded equity but threw it away, leaving the
+    operator with PER-TRADE metrics only (no portfolio-level risk
+    feel). Returns (None, None) on too-little data or malformed rows
+    so the report can show "n/a" cleanly.
+    """
+    if not equity or len(equity) < 2:
+        return None, None
+    try:
+        equities = [float(r.get("equity") or 0.0) for r in equity if r.get("equity") is not None]
+        if len(equities) < 2:
+            return None, None
+        # Daily Sharpe: pct-changes across the equity snapshots in the
+        # window, annualised at 252 (preserving the convention used by
+        # the trade analyzer / backtest engine). Cheap, biased on a
+        # single trading day, but consistent with the other reports.
+        import math as _math
+        diffs = []
+        prev = equities[0]
+        for cur in equities[1:]:
+            if prev > 0:
+                diffs.append((cur - prev) / prev)
+            prev = cur
+        if len(diffs) < 2:
+            sharpe = None
+        else:
+            mean = sum(diffs) / len(diffs)
+            var = sum((d - mean) ** 2 for d in diffs) / len(diffs)
+            std = _math.sqrt(var) if var > 0 else 0.0
+            sharpe = (mean / std * _math.sqrt(252)) if std > 0 else None
+        # Max drawdown %: standard high-water-mark scan over the
+        # equity series.
+        peak = equities[0]
+        max_dd = 0.0
+        for v in equities:
+            if v > peak:
+                peak = v
+            if peak > 0:
+                dd = (peak - v) / peak * 100
+                if dd > max_dd:
+                    max_dd = dd
+        return (
+            round(sharpe, 3) if sharpe is not None else None,
+            round(max_dd, 2) if max_dd > 0 else None,
+        )
+    except Exception:
+        return None, None
+
+
 def build_report(
     date_label: str,
     trades: List[dict],
@@ -335,6 +392,20 @@ def build_report(
 ) -> str:
     if not trades:
         return f"# Gap Report — {date_label}\n\nNo trades in the window.\n"
+
+    # F-104: enrich the per-trade stats with portfolio-level metrics.
+    sharpe_daily, max_dd_pct = _compute_equity_metrics(equity)
+    stats.sharpe_daily = sharpe_daily
+    stats.max_drawdown_pct = max_dd_pct
+
+    sharpe_line = (
+        f"- Daily Sharpe (eq curve): **{stats.sharpe_daily:.2f}**"
+        if stats.sharpe_daily is not None else "- Daily Sharpe (eq curve): n/a"
+    )
+    dd_line = (
+        f"- Max drawdown (eq curve): **{stats.max_drawdown_pct:.2f}%**"
+        if stats.max_drawdown_pct is not None else "- Max drawdown (eq curve): n/a"
+    )
 
     lines = [
         f"# Gap Report — {date_label}",
@@ -351,6 +422,8 @@ def build_report(
         f"- Expectancy/trade: **Rs {stats.expectancy:+.2f}**",
         f"- Breakeven WR needed (at current R:R): **{stats.breakeven_wr:.0f}%**",
         f"- Total charges: Rs {stats.total_charges:.2f}",
+        sharpe_line,
+        dd_line,
         "",
     ]
 
@@ -494,7 +567,18 @@ def main():
     p.add_argument("--quiet", action="store_true", help="Don't print report, just save")
     args = p.parse_args()
 
-    end_date = datetime.fromisoformat(args.date).date() if args.date else datetime.now().date()
+    # C-24 (audit 2026-05-26): default to IST today, not host-local today.
+    # On UTC cloud VMs `datetime.now().date()` returns yesterday between
+    # 18:30 UTC and 23:59 UTC (i.e. 00:00 IST and 05:29 IST), causing the
+    # EOD post-close run to analyse the previous trading day instead of
+    # the one that just closed. Falls back to host-local when pytz is
+    # unavailable (tests that mock datetime in restricted envs).
+    if args.date:
+        end_date = datetime.fromisoformat(args.date).date()
+    elif _IST is not None:
+        end_date = datetime.now(_IST).date()
+    else:
+        end_date = datetime.now().date()
     start_date = end_date - timedelta(days=args.days - 1)
     start_iso = start_date.strftime("%Y-%m-%dT00:00:00")
     end_iso = (end_date + timedelta(days=1)).strftime("%Y-%m-%dT00:00:00")

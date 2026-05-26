@@ -41,6 +41,19 @@ class WebSocketClient:
         # Map symbol -> token for subscription
         self._subscriptions: Dict[str, str] = {}
 
+        # F-10 (audit 2026-05-27): broker WS payloads expose CUMULATIVE
+        # session volume (`vol_traded_today` on Angel, `volume_traded` on
+        # Kite), but the tick aggregator does ``self.volume += tick_vol``
+        # per tick which expects PER-TICK DELTA. Without delta-ing here,
+        # every 1-min candle gets the running session total summed across
+        # however many ticks fired in that minute → candle volume can
+        # be 10-100x the actual minute's traded volume, corrupting VWAP,
+        # OBV, volume-ratio filters, and any volume-aware strategy. We
+        # track last-seen cumulative per symbol and emit the delta.
+        # A decrease (cum < last) is treated as a new session start
+        # (broker reset, day rollover) and we re-baseline silently.
+        self._last_cum_volume: Dict[str, float] = {}
+
     def subscribe(self, instruments: List[dict]):
         """Register instruments for tick subscription (additive).
 
@@ -59,10 +72,21 @@ class WebSocketClient:
         old ``subscribe`` is upsert-only, so a position close left its
         symbol in ``_subscriptions`` forever -- the broker happily kept
         sending ticks for closed names, wasting bandwidth and the agent's
-        WS-thread CPU."""
+        WS-thread CPU.
+
+        F-11 (audit 2026-05-27): previously the in-memory map was
+        updated but NEVER pushed to the live socket; the broker kept
+        sending ticks for removed symbols (and not sending ticks for
+        added ones) until the next reconnect. We now best-effort push
+        a delta to the live socket. If the broker SDK doesn't expose
+        a delta-subscribe API we log and fall through; the new state
+        will still take effect on the next reconnect.
+        """
         new_map: Dict[str, str] = {}
         for inst in instruments:
             new_map[inst["symbol"]] = str(inst.get("token", ""))
+        old_tokens = set(self._subscriptions.values())
+        new_tokens = set(new_map.values())
         removed = sorted(set(self._subscriptions) - set(new_map))
         added = sorted(set(new_map) - set(self._subscriptions))
         self._subscriptions = new_map
@@ -71,12 +95,85 @@ class WebSocketClient:
                 f"WebSocket subscriptions replaced: "
                 f"+{added} -{removed} (now {sorted(self._subscriptions)})"
             )
+            # F-11: push deltas to the live socket if connected.
+            self._apply_subscription_delta(
+                add_tokens=list(new_tokens - old_tokens),
+                remove_tokens=list(old_tokens - new_tokens),
+            )
 
     def unsubscribe(self, symbol: str) -> bool:
         """P1 #14 (2026-05-17): surgically drop a symbol from subscriptions.
 
-        Returns True if the symbol was present and removed."""
-        return self._subscriptions.pop(symbol, None) is not None
+        Returns True if the symbol was present and removed.
+
+        F-11 (audit 2026-05-27): also pushes the removal to the live
+        socket so the broker stops streaming ticks for the closed
+        symbol immediately, not on next reconnect.
+        """
+        token = self._subscriptions.pop(symbol, None)
+        if token is None:
+            return False
+        self._apply_subscription_delta(add_tokens=[], remove_tokens=[token])
+        return True
+
+    def _apply_subscription_delta(
+        self,
+        add_tokens: List[str],
+        remove_tokens: List[str],
+    ) -> None:
+        """F-11: best-effort delta-subscribe / unsubscribe on the live
+        socket. The broker SDK surfaces differ between Angel and Kite;
+        each branch is wrapped so a failure (SDK not present, no live
+        socket yet, method renamed in a future SDK) is logged but does
+        not break the calling control path. State already updated by
+        caller; on next reconnect the full new set is sent regardless.
+        """
+        ws = self._ws
+        if ws is None:
+            return  # not connected yet; reconnect will pick up new state
+        add_tokens = [str(t) for t in add_tokens if t]
+        remove_tokens = [str(t) for t in remove_tokens if t]
+        if not add_tokens and not remove_tokens:
+            return
+        try:
+            if self._broker == "angelone":
+                exchange = self._config.get("market", {}).get("exchange", "NSE")
+                exchange_code = 1 if exchange == "NSE" else 2
+                correlation_id = "trading_agent_ws"
+                if add_tokens:
+                    token_list = [{"exchangeType": exchange_code, "tokens": add_tokens}]
+                    ws.subscribe(correlation_id, 3, token_list)
+                if remove_tokens:
+                    token_list = [{"exchangeType": exchange_code, "tokens": remove_tokens}]
+                    try:
+                        ws.unsubscribe(correlation_id, 3, token_list)
+                    except AttributeError:
+                        # Older SmartApi versions lack unsubscribe; the
+                        # surplus stream will drop on next reconnect.
+                        logger.debug(
+                            f"[WS] SmartApi has no unsubscribe(); "
+                            f"{remove_tokens} will stop on next reconnect"
+                        )
+            elif self._broker == "kite":
+                if add_tokens:
+                    int_tokens = [int(t) for t in add_tokens]
+                    ws.subscribe(int_tokens)
+                    try:
+                        ws.set_mode(ws.MODE_FULL, int_tokens)
+                    except Exception:
+                        pass
+                if remove_tokens:
+                    int_tokens = [int(t) for t in remove_tokens]
+                    try:
+                        ws.unsubscribe(int_tokens)
+                    except Exception as exc:
+                        logger.debug(f"[WS] kite unsubscribe failed: {exc}")
+            # simulation branch: no live socket to update.
+        except Exception as exc:
+            logger.warning(
+                f"[WS] live subscription delta apply failed ({exc}); "
+                f"new state will take effect on next reconnect"
+            )
 
     def start(self):
         """Start the WebSocket connection in a background thread."""
@@ -248,10 +345,15 @@ class WebSocketClient:
             if not symbol:
                 return
 
+            # F-10: vol_traded_today is CUMULATIVE session volume.
+            # Convert to per-tick delta so the aggregator's running sum
+            # produces the correct per-candle volume.
+            cum_vol = float(message.get("vol_traded_today", 0))
             tick = {
                 "symbol": symbol,
                 "ltp": float(message.get("last_traded_price", 0)) / 100,
-                "volume": float(message.get("vol_traded_today", 0)),
+                "volume": self._cumulative_to_delta(symbol, cum_vol),
+                "cum_volume_session": cum_vol,  # retained for diagnostics
                 "bid": float(message.get("best_bid_price", 0)) / 100,
                 "ask": float(message.get("best_ask_price", 0)) / 100,
                 "open": float(message.get("open_price_day", 0)) / 100,
@@ -353,10 +455,14 @@ class WebSocketClient:
             if not symbol:
                 return
 
+            # F-10: KiteTicker also exposes cumulative `volume_traded`.
+            # Same delta conversion as the Angel path.
+            cum_vol = float(tick_data.get("volume_traded", 0))
             tick = {
                 "symbol": symbol,
                 "ltp": float(tick_data.get("last_price", 0)),
-                "volume": float(tick_data.get("volume_traded", 0)),
+                "volume": self._cumulative_to_delta(symbol, cum_vol),
+                "cum_volume_session": cum_vol,
                 "bid": float(tick_data.get("depth", {}).get("buy", [{}])[0].get("price", 0)),
                 "ask": float(tick_data.get("depth", {}).get("sell", [{}])[0].get("price", 0)),
                 "open": float(tick_data.get("ohlc", {}).get("open", 0)),
@@ -432,6 +538,35 @@ class WebSocketClient:
             time.sleep(0.5)
 
     # ── Helpers ──────────────────────────────────────────────
+
+    def _cumulative_to_delta(self, symbol: str, cum_volume: float) -> float:
+        """F-10: convert cumulative session volume to per-tick delta.
+
+        Returns the volume traded since the previous tick for ``symbol``.
+        First tick of a session returns 0 (we have no baseline yet).
+        A drop (cum < last) is treated as a session reset and we
+        re-baseline. Output is clamped to >= 0 so a noisy quote that
+        slightly under-reports cumulative doesn't push negative volume
+        into the aggregator.
+        """
+        try:
+            cur = float(cum_volume)
+        except (TypeError, ValueError):
+            return 0.0
+        if cur < 0:
+            return 0.0
+        last = self._last_cum_volume.get(symbol)
+        self._last_cum_volume[symbol] = cur
+        if last is None or cur < last:
+            return 0.0  # baseline (or session reset)
+        return max(0.0, cur - last)
+
+    def reset_session_volume_baseline(self) -> None:
+        """F-10: force re-baseline on day rollover.
+
+        Called by the daemon at session start; ensures yesterday's
+        tail-tick cumulative isn't used as today's baseline."""
+        self._last_cum_volume.clear()
 
     def _token_to_symbol(self, token) -> Optional[str]:
         """Map a broker tick token back to its tradingsymbol.

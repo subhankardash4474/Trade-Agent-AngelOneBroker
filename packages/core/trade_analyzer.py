@@ -210,7 +210,21 @@ class TradeAnalyzer:
             stats["_gross_losses"] = 0.0
             stats["_pnl_list"] = []
 
+        # F-12 (audit 2026-05-27): also rebuild per-regime accumulators.
+        # `_regime_stats` was loaded from `regime_weights` (summary only)
+        # in _load_state with _gross_wins=_gross_losses=0, _pnl_list=[].
+        # Without replaying the trades table into the per-regime stats
+        # too, the very next trade close would push PF=∞ or PF=0 into
+        # the regime weighter and wrongly suppress/credit strategies in
+        # that regime. Reset the regime accumulators only (keep the
+        # learned_weight summary intact); replay below repopulates.
+        for r_stats in self._regime_stats.values():
+            r_stats["_gross_wins"] = 0.0
+            r_stats["_gross_losses"] = 0.0
+            r_stats["_pnl_list"] = []
+
         n_trades_replayed = 0
+        has_regime_col = "regime" in trades_df.columns
         for _, row in trades_df.iterrows():
             strategy = row.get("strategy") or "unknown"
             try:
@@ -223,6 +237,15 @@ class TradeAnalyzer:
             stats = self._update_profit_factor(stats, pnl)
             stats = self._update_sharpe(stats, pnl)
             self._strategy_stats[strategy] = stats
+            # F-12: replay into per-regime accumulator as well.
+            if has_regime_col:
+                regime = row.get("regime") or "unknown"
+                r_stats = self._regime_stats.get((strategy, regime))
+                if r_stats is None:
+                    r_stats = self._empty_stats()
+                r_stats = self._update_profit_factor(r_stats, pnl)
+                r_stats = self._update_sharpe(r_stats, pnl)
+                self._regime_stats[(strategy, regime)] = r_stats
             n_trades_replayed += 1
 
         # Phantom-row detection: rows in DB that the trades table no
@@ -948,6 +971,14 @@ class TradeAnalyzer:
 
     @staticmethod
     def _update_profit_factor(stats: dict, pnl: float) -> dict:
+        # F-62: a single malformed trade row with NaN PnL would poison
+        # both `_gross_wins` (via `pnl > 0` -> False, so the else branch
+        # ran) AND `_gross_losses` (via `abs(NaN) -> NaN`), making PF
+        # NaN forever and breaking auto-suppress comparisons (`pf < 0.7`
+        # with NaN is False) and JSON export. Guard at the top: skip
+        # non-finite PnL entirely.
+        if not math.isfinite(pnl):
+            return stats
         gw = stats.get("_gross_wins", 0.0)
         gl = stats.get("_gross_losses", 0.0)
         if pnl > 0:
@@ -956,11 +987,28 @@ class TradeAnalyzer:
             gl += abs(pnl)
         stats["_gross_wins"] = gw
         stats["_gross_losses"] = gl
-        stats["profit_factor"] = round(gw / gl, 3) if gl > 0 else float("inf") if gw > 0 else 0.0
+        # B-15 / C-17 (audit 2026-05-26): never emit `float("inf")`. Strict
+        # JSON has no representation for infinity, so downstream consumers
+        # (audit checkpoints, EOD diagnostics export, cloud sync) crash on
+        # serialization of an all-wins strategy. Cap at a finite sentinel
+        # (999.99) -- still trivially distinguishable from any real PF and
+        # safe to compare numerically without isinstance checks.
+        if gl > 0:
+            stats["profit_factor"] = round(gw / gl, 3)
+        elif gw > 0:
+            stats["profit_factor"] = 999.99
+        else:
+            stats["profit_factor"] = 0.0
         return stats
 
     def _update_sharpe(self, stats: dict, pnl: float) -> dict:
         """Compute rolling Sharpe ratio with exponential decay on older trades."""
+        # F-62: NaN PnL appended here propagates through every Sharpe
+        # recomputation (np.average with NaN -> NaN, sqrt(NaN) -> NaN)
+        # and stays in `_pnl_list` forever. Skip silently rather than
+        # taint the entire strategy's stats.
+        if not math.isfinite(pnl):
+            return stats
         pnl_list = stats.get("_pnl_list", [])
         pnl_list.append(pnl)
         n = len(pnl_list)

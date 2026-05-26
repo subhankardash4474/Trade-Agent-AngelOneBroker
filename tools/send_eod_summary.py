@@ -23,6 +23,12 @@ from __future__ import annotations
 import os
 import ssl
 import sys
+from pathlib import Path
+
+# F-75: absolute paths only -- this tool is also invoked by cron / docker
+# exec from working directories that are not the repo root.
+ROOT = Path(__file__).resolve().parent.parent
+CONFIG_PATH = ROOT / "config.yaml"
 
 # Match the SSL workaround in run_daemon.py so urllib3 / yfinance won't
 # fail on the same self-signed cert paths the daemon avoids.
@@ -46,7 +52,7 @@ def main() -> int:
     logger.add(sys.stderr, level="INFO",
                format="<green>{time:HH:mm:ss}</green> | <level>{level: <8}</level> | {message}")
 
-    with open("config.yaml", "r") as f:
+    with open(CONFIG_PATH, encoding="utf-8") as f:
         config = yaml.safe_load(f)
     # Force paper mode — we never want this script to touch a real broker.
     config.setdefault("broker", {})["mode"] = "paper"
@@ -57,7 +63,7 @@ def main() -> int:
 
     logger.info("Instantiating TradingAgent (paper mode, will NOT start trading loop)...")
     agent = TradingAgent(
-        config_path="config.yaml",
+        config_path=str(CONFIG_PATH),
         smart_api=None,
         reset_balance=False,
     )
@@ -70,14 +76,20 @@ def main() -> int:
     agent._maybe_send_eod_summary()
 
     if agent._eod_summary_sent:
+        # F-94: previously this referenced `robust.alerts.email.recipient`,
+        # which is not a real key. The actual config path is
+        # `monitoring.alerts.email.recipient`.
         logger.info("[OK] EOD summary fired. Check the configured alert channel "
-                    "(email recipient in config.yaml -> robust.alerts.email.recipient).")
+                    "(email recipient in config.yaml -> "
+                    "monitoring.alerts.email.recipient).")
         return 0
     else:
+        # F-94: similarly, the real config key is `robustness.eod_summary_time`,
+        # not `robust.eod_summary_time`.
         logger.warning("[WARN] EOD summary was NOT fired. Most likely the time "
                        "guard rejected (current time < eod_summary_time in config). "
-                       "Lower 'robust.eod_summary_time' or set it to '00:00' to "
-                       "force-send and re-run.")
+                       "Lower 'robustness.eod_summary_time' or set it to '00:00' "
+                       "to force-send and re-run.")
         return 2
 
 

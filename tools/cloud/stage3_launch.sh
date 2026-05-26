@@ -96,26 +96,34 @@ else
     ok "no daemon currently running"
 fi
 
-# 1.4 -- EMERGENCY_STOP file present (kill-switch ARMED)
-# Note: at LAUNCH time the file must be REMOVED so the daemon can start.
+# 1.4 -- kill-switch file present (ARMED)
+# F-04: the daemon honours `operations.emergency_stop_path` (default
+# `logs/STOP`). The legacy `EMERGENCY_STOP` at repo root is kept as an
+# additional alias so older runbooks remain valid. Both files are
+# treated as the kill-switch by the supervisor and pre-flight.
+# At LAUNCH time both files must be REMOVED so the daemon can start.
 # But pre-flight time is BEFORE launch -- we want the file to exist as
-# evidence the kill-switch is set up and the operator knows where to find
-# it. Operator removes it right before pressing GO.
-if [[ -f EMERGENCY_STOP ]]; then
-    ok "EMERGENCY_STOP file exists (kill-switch armed)"
-    echo "    REMINDER: remove this file IMMEDIATELY before launch:"
-    echo "        rm $ROOT/EMERGENCY_STOP"
+# evidence the kill-switch is set up and the operator knows where to
+# find it. Operator removes it right before pressing GO.
+STOP_LOGS="logs/STOP"
+STOP_LEGACY="EMERGENCY_STOP"
+mkdir -p logs
+if [[ -f "$STOP_LOGS" || -f "$STOP_LEGACY" ]]; then
+    [[ -f "$STOP_LOGS"   ]] && ok "kill-switch armed at $STOP_LOGS (canonical, honoured by daemon)"
+    [[ -f "$STOP_LEGACY" ]] && ok "kill-switch armed at $STOP_LEGACY (legacy alias)"
+    echo "    REMINDER: remove BOTH files IMMEDIATELY before launch:"
+    echo "        rm $ROOT/$STOP_LOGS $ROOT/$STOP_LEGACY"
     if [[ "$DRY_RUN" == "true" ]]; then
-        warn "dry-run: file will NOT be removed. Real launch needs manual removal."
+        warn "dry-run: files will NOT be removed. Real launch needs manual removal."
     fi
 else
-    warn "EMERGENCY_STOP file is NOT present."
+    warn "kill-switch is NOT present."
     echo "    For Stage 3, we recommend ARMING it before launch so the"
-    echo "    operator has a one-keystroke kill (touch EMERGENCY_STOP)."
-    echo "    Creating an empty one now:"
+    echo "    operator has a one-keystroke kill (touch $STOP_LOGS)."
+    echo "    Creating empty kill-switch files at BOTH paths now:"
     if [[ "$DRY_RUN" != "true" ]]; then
-        touch EMERGENCY_STOP
-        ok "EMERGENCY_STOP file created (armed)"
+        touch "$STOP_LOGS" "$STOP_LEGACY"
+        ok "kill-switch armed at $STOP_LOGS + $STOP_LEGACY"
     fi
 fi
 
@@ -187,8 +195,12 @@ if [[ "$DRY_RUN" == "true" ]]; then
     exit 0
 fi
 
-if [[ -f EMERGENCY_STOP ]]; then
-    fail "EMERGENCY_STOP still present -- daemon will refuse to start. Remove it manually if you really want to go live, then re-run this script."
+# F-04: refuse to launch if EITHER kill-switch path is still set.
+if [[ -f "$STOP_LOGS" ]]; then
+    fail "$STOP_LOGS still present -- daemon will refuse to start. Remove it manually if you really want to go live, then re-run this script."
+fi
+if [[ -f "$STOP_LEGACY" ]]; then
+    fail "$STOP_LEGACY (legacy) still present -- daemon will refuse to start. Remove it manually if you really want to go live, then re-run this script."
 fi
 
 # -----------------------------------------------------------------------------
@@ -211,7 +223,7 @@ echo "---"
 banner "Stage 3 launch complete"
 echo "  Container:   trader-stage3"
 echo "  Live logs:   docker compose -f docker-compose.yml -f docker-compose.stage3.yml logs -f trader"
-echo "  Kill switch: touch $ROOT/EMERGENCY_STOP   (daemon flattens + halts)"
+echo "  Kill switch: touch $ROOT/logs/STOP   (daemon halts; flattens only if operations.emergency_stop_flatten=true)"
 echo "  Hard stop:   docker compose -f docker-compose.yml -f docker-compose.stage3.yml down"
 echo "  Mid-session monitoring: tail -f $ROOT/logs/trading_agent_$(date +%Y-%m-%d).log"
 echo

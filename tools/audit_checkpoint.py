@@ -885,9 +885,30 @@ def run_and_save(
     delta = _build_delta(_previous_checkpoint(now), data)
     md = _render_markdown(now, data, delta)
 
-    json_path.write_text(json.dumps(data, indent=2, default=str), encoding="utf-8")
-    md_path.write_text(md, encoding="utf-8")
+    # F-76: write atomically so the audit skill / heartbeat / dashboards
+    # never read a partially-written checkpoint. Mirror the temp+replace
+    # pattern used by the persistence modules.
+    _atomic_write_text(json_path, json.dumps(data, indent=2, default=str))
+    _atomic_write_text(md_path, md)
     return md_path, json_path
+
+
+def _atomic_write_text(path: Path, text: str) -> None:
+    """Write ``text`` to ``path`` via a sibling ``.tmp.<pid>`` file +
+    ``os.replace``, so concurrent readers never see a partial file.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + f".tmp.{os.getpid()}")
+    try:
+        tmp.write_text(text, encoding="utf-8")
+        os.replace(tmp, path)
+    finally:
+        # Clean up the tmp file if replace failed for any reason.
+        if tmp.exists():
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
 
 
 # ── Module-level CLI fallback (for tests / manual smoke) ────────────────

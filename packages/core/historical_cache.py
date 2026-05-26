@@ -47,6 +47,7 @@ DataSource directly are unaffected. Opt-in only.
 """
 from __future__ import annotations
 
+import os
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, Protocol
@@ -194,7 +195,16 @@ class HistoricalCache:
             return pd.DataFrame() if df is None else df
 
         try:
-            df.to_parquet(path, compression="snappy")
+            # C-18 (audit 2026-05-26): atomic write so two concurrent
+            # battery workers writing the same key can't race and leave
+            # a half-written parquet that subsequent reads then fail
+            # to parse (resulting in either a silent refetch loop or
+            # corrupt bars feeding a backtest variant — money-affecting
+            # via bad config decisions). Write to a tmp sibling, then
+            # `os.replace` which is atomic on both POSIX and Windows.
+            tmp_path = path.with_suffix(path.suffix + f".tmp.{os.getpid()}")
+            df.to_parquet(tmp_path, compression="snappy")
+            os.replace(tmp_path, path)
             logger.debug(
                 f"[HistoricalCache] STORE {symbol} {interval} "
                 f"{start_date.date()}->{end_date.date()} "
@@ -207,6 +217,12 @@ class HistoricalCache:
                 f"[HistoricalCache] failed to write parquet (continuing "
                 f"without cache): {path} ({e})"
             )
+            # Clean up dangling tmp if the write itself failed mid-flight.
+            try:
+                if 'tmp_path' in locals() and tmp_path.exists():
+                    tmp_path.unlink()
+            except OSError:
+                pass
 
         return df
 
@@ -271,8 +287,26 @@ class HistoricalCache:
         # and avoids silly cache-misses from sub-second timestamp differences.
         # Callers wanting intra-day caching (rare for backtests) should
         # extend this to include time.
-        start_iso = start_date.strftime("%Y%m%d")
-        end_iso = end_date.strftime("%Y%m%d")
+        #
+        # F-51 (audit 2026-05-27): IST-normalise the date BEFORE
+        # formatting. Two callers asking for "2026-05-25 IST" with
+        # one passing a naive datetime and the other a UTC-aware
+        # datetime previously produced DIFFERENT filenames
+        # (``20260525`` vs ``20260524`` if UTC is the prior IST day),
+        # silently doubling the cache footprint and missing each
+        # other's hits. Convention across this codebase: naive ->
+        # interpret as IST; aware -> astimezone(IST).
+        def _ist_yyyymmdd(d: datetime) -> str:
+            if d.tzinfo is not None:
+                return d.astimezone(IST).strftime("%Y%m%d")
+            try:
+                return IST.localize(d).strftime("%Y%m%d")
+            except Exception:
+                # Fallback: don't crash the cache path on weird inputs.
+                return d.strftime("%Y%m%d")
+
+        start_iso = _ist_yyyymmdd(start_date)
+        end_iso = _ist_yyyymmdd(end_date)
         d = self._cache_dir / symbol / interval
         d.mkdir(parents=True, exist_ok=True)
         return d / f"{start_iso}_{end_iso}.parquet"

@@ -29,6 +29,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import os
 import sqlite3
 import sys
 from datetime import datetime, timedelta
@@ -160,14 +161,57 @@ def load_trades(day_iso: str) -> list[dict]:
     return [dict(zip(cols, r)) for r in rows]
 
 
+# F-74: yfinance.download() has no timeout parameter and can hang
+# indefinitely on a stalled Yahoo endpoint. The post-mortem can call
+# this 2 * N times per day (intraday + daily for every closed trade),
+# so a single hang stalls the entire EOD pipeline.
+#
+# Wrap both fetches in a worker thread with a join-timeout. On
+# timeout we return None and the caller treats the trade as
+# bar-data-unavailable, matching its existing fallback path.
+import threading
+
+_YF_TIMEOUT_SEC = int(os.environ.get("POSTMORTEM_YF_TIMEOUT_SEC", "20") or 20)
+
+
+def _run_with_timeout(fn, timeout: float):
+    """Run ``fn()`` in a daemon thread; return its result or None on
+    timeout. Any exception inside ``fn`` is logged and treated as None.
+    """
+    result_box: dict[str, object] = {}
+
+    def _target():
+        try:
+            result_box["result"] = fn()
+        except Exception as exc:  # noqa: BLE001
+            result_box["error"] = exc
+
+    t = threading.Thread(target=_target, daemon=True)
+    t.start()
+    t.join(timeout=timeout)
+    if t.is_alive():
+        print(f"  [WARN] yfinance call exceeded {timeout:.0f}s -- treating as no-data",
+              file=sys.stderr)
+        return None
+    if "error" in result_box:
+        print(f"  [WARN] yfinance call raised {type(result_box['error']).__name__}: "
+              f"{result_box['error']} -- treating as no-data", file=sys.stderr)
+        return None
+    return result_box.get("result")
+
+
 def fetch_intraday_bars(symbol: str, entry_dt: datetime, exit_dt: datetime) -> Optional[pd.DataFrame]:
     """Fetch 5-min bars covering the trade's lifetime. Yahoo limits 5m to ~60d."""
     days_back = max(2, (datetime.now(IST).date() - entry_dt.date()).days + 2)
     days_back = min(days_back, 59)
     period = f"{days_back}d"
-    df = yf.download(f"{symbol}.NS", period=period, interval="5m",
-                     progress=False, auto_adjust=False)
-    if df.empty:
+    # F-74: wrap the blocking call in a thread+timeout shield.
+    df = _run_with_timeout(
+        lambda: yf.download(f"{symbol}.NS", period=period, interval="5m",
+                            progress=False, auto_adjust=False),
+        _YF_TIMEOUT_SEC,
+    )
+    if df is None or df.empty:
         return None
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
@@ -185,9 +229,12 @@ def fetch_intraday_bars(symbol: str, entry_dt: datetime, exit_dt: datetime) -> O
 
 def fetch_daily_context(symbol: str) -> Optional[dict]:
     """50d SMA, 30d return for trend-mismatch flagging."""
-    df = yf.download(f"{symbol}.NS", period="3mo", interval="1d",
-                     progress=False, auto_adjust=False)
-    if df.empty:
+    df = _run_with_timeout(
+        lambda: yf.download(f"{symbol}.NS", period="3mo", interval="1d",
+                            progress=False, auto_adjust=False),
+        _YF_TIMEOUT_SEC,
+    )
+    if df is None or df.empty:
         return None
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
@@ -285,7 +332,10 @@ def analyse_trade(trade: dict,
         elif side == "BUY" and daily["pct_vs_sma50"] < -5:
             flags.append("[TREND-MISMATCH-LONG]")
     if mae_value < 0:
-        sl_distance_per_share = abs(mfe_price - mae_price) / max(qty, 1)
+        # F-97: the previously-computed ``sl_distance_per_share`` was
+        # never used. Removed to avoid implying a NEAR-SL heuristic
+        # that is not actually applied. The recovery flag below remains
+        # based on PnL magnitude only.
         if mae_value < -0.5 * abs(pnl_actual) and pnl_actual > 0:
             flags.append("[NEAR-SL-RECOVERY]")
     if result["session_count"] > 1:

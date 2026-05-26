@@ -57,6 +57,21 @@ class RSIMomentum(BaseStrategy):
 
     @staticmethod
     def _compute_rsi(series: pd.Series, period: int) -> pd.Series:
+        """RSI with the flat-window overrides that match FeatureEngine.
+
+        C-30 (audit 2026-05-26): keep this in sync with
+        `FeatureEngine._add_momentum_features` so the rule-strategy and
+        the ML feature pipeline agree on RSI semantics. The previous
+        implementation left RSI = NaN on flat windows where avg_loss was
+        exactly 0; downstream the NaN compared as falsy and ambiguous
+        between "warmup" and "flat all-up". The overrides below
+        disambiguate:
+            avg_loss == 0 AND avg_gain > 0   -> all-up window  -> 100
+            avg_gain == 0 AND avg_loss > 0   -> all-down       ->   0
+            avg_gain == 0 AND avg_loss == 0  -> truly flat     ->  50
+        Behavior unchanged on healthy data; only the degenerate cases
+        differ.
+        """
         delta = series.diff()
         gain = delta.where(delta > 0, 0.0)
         loss = -delta.where(delta < 0, 0.0)
@@ -66,6 +81,12 @@ class RSIMomentum(BaseStrategy):
 
         rs = avg_gain / avg_loss.replace(0, np.nan)
         rsi = 100.0 - (100.0 / (1.0 + rs))
+        flat_up = (avg_loss == 0) & (avg_gain > 0)
+        flat_down = (avg_gain == 0) & (avg_loss > 0)
+        flat_flat = (avg_loss == 0) & (avg_gain == 0)
+        rsi = rsi.where(~flat_up, 100.0)
+        rsi = rsi.where(~flat_down, 0.0)
+        rsi = rsi.where(~flat_flat, 50.0)
         return rsi
 
     def generate_signal(self, data: pd.DataFrame, symbol: str) -> TradeSignal:

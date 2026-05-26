@@ -33,12 +33,31 @@ function Write-Sup($msg) {
     Write-Host $line
 }
 
-# Find the python interpreter that has all our deps installed. Prefer the
-# project venv if present, fall back to the system python that's been used
-# all session.
-$Python = "C:\Users\subhanda\AppData\Local\Programs\Python\Python314\python.exe"
+# F-78: prefer the project venv, then any python on PATH, then the
+# historic hardcoded path as a last-resort fallback. Previously the
+# hardcoded developer path was tried first, which means any other
+# machine (CI, another laptop, the cloud VM) would launch the wrong
+# interpreter unless the venv happened to exist.
 $VenvPython = Join-Path $ProjectRoot ".venv\Scripts\python.exe"
-if (Test-Path $VenvPython) { $Python = $VenvPython }
+$Python = $null
+if (Test-Path $VenvPython) {
+    $Python = $VenvPython
+} else {
+    $pythonOnPath = Get-Command python -ErrorAction SilentlyContinue
+    if ($pythonOnPath) {
+        $Python = $pythonOnPath.Source
+    } else {
+        # Last-resort fallback to the legacy developer path; warn loudly.
+        $LegacyPython = "C:\Users\subhanda\AppData\Local\Programs\Python\Python314\python.exe"
+        if (Test-Path $LegacyPython) {
+            $Python = $LegacyPython
+            Write-Host "[WARN] Using legacy developer python path: $Python"
+        } else {
+            Write-Host "[FATAL] No python interpreter found (no .venv, no python on PATH)."
+            exit 1
+        }
+    }
+}
 
 $DaemonScript = Join-Path $ProjectRoot "run_daemon.py"
 if (-not (Test-Path $DaemonScript)) {
@@ -46,7 +65,12 @@ if (-not (Test-Path $DaemonScript)) {
     exit 1
 }
 
-$EmergencyStop = Join-Path $ProjectRoot "EMERGENCY_STOP"
+# F-04: the daemon honours operations.emergency_stop_path (default
+# `logs/STOP`). The legacy `EMERGENCY_STOP` at repo root is kept as
+# an additional path so historic runbooks continue to work. Supervisor
+# halts when EITHER file is present.
+$StopFileLogs   = Join-Path $ProjectRoot "logs\STOP"
+$StopFileLegacy = Join-Path $ProjectRoot "EMERGENCY_STOP"
 $RestartDelaySeconds = 30
 $RestartCount = 0
 $MaxRestartsPerHour = 10  # safety: stop flapping if we restart > 10x/hr
@@ -57,9 +81,14 @@ Write-Sup "[SUPERVISOR-START] PID=$PID. Python=$Python. Daemon=$DaemonScript."
 
 while ($true) {
 
-    # Pre-launch checks
-    if (Test-Path $EmergencyStop) {
-        Write-Sup "[SUPERVISOR-STOP] EMERGENCY_STOP file present at $EmergencyStop. Exiting supervisor."
+    # Pre-launch checks (F-04: honour both the daemon's canonical
+    # `logs/STOP` and the legacy repo-root `EMERGENCY_STOP`).
+    if (Test-Path $StopFileLogs) {
+        Write-Sup "[SUPERVISOR-STOP] Kill-switch present at $StopFileLogs (config: operations.emergency_stop_path). Exiting supervisor."
+        exit 0
+    }
+    if (Test-Path $StopFileLegacy) {
+        Write-Sup "[SUPERVISOR-STOP] Legacy kill-switch present at $StopFileLegacy. Exiting supervisor."
         exit 0
     }
 

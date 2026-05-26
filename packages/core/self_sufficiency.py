@@ -62,6 +62,10 @@ from typing import Any, Dict, Optional
 
 import pytz
 
+# F-55: cross-process advisory lock for ledger RMW (matches the C-29
+# pattern in cooldown / runtime / trailing-stop persistence).
+from core.file_lock import file_lock
+
 logger = logging.getLogger(__name__)
 
 IST = pytz.timezone("Asia/Kolkata")
@@ -177,22 +181,51 @@ class SelfSufficiencyTracker:
             )
             self._ledger = {}
 
+    def _write_ledger_locked(self) -> None:
+        """Atomic write helper. CALLER MUST already hold ``file_lock``
+        on ``self.ledger_path`` to serialize with other processes.
+        """
+        path = Path(self.ledger_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        # NamedTemporaryFile in same directory so os.replace is atomic on
+        # Win and POSIX. delete=False because we hand control to os.replace().
+        with tempfile.NamedTemporaryFile(
+            "w", encoding="utf-8", dir=path.parent,
+            prefix=".self_suff_", suffix=".tmp", delete=False,
+        ) as tf:
+            json.dump(self._ledger, tf, indent=2)
+            tmp_name = tf.name
+        os.replace(tmp_name, path)
+
     def _persist(self) -> None:
-        """Atomic write: temp file in same directory, then rename."""
+        """Atomic write: temp file in same directory, then rename.
+
+        F-55: wraps the write in the same cross-process ``file_lock``
+        used by cooldown / runtime / trailing-stop persistence (C-29
+        sweep). This path is used for non-RMW writes (initial seed,
+        external set_*); per-pnl-delta callers should use
+        ``record_realised_pnl`` which does a locked read-modify-write.
+        """
         if not self.enabled:
             return
         path = Path(self.ledger_path)
         path.parent.mkdir(parents=True, exist_ok=True)
-        # NamedTemporaryFile in same directory so os.replace is atomic on Win
-        # and POSIX. delete=False because we hand control to os.replace().
         try:
-            with tempfile.NamedTemporaryFile(
-                "w", encoding="utf-8", dir=path.parent,
-                prefix=".self_suff_", suffix=".tmp", delete=False,
-            ) as tf:
-                json.dump(self._ledger, tf, indent=2)
-                tmp_name = tf.name
-            os.replace(tmp_name, path)
+            with file_lock(path, timeout=2.0):
+                self._write_ledger_locked()
+        except TimeoutError:
+            # Failed to acquire the cross-process lock within the budget.
+            # Fall back to an unlocked write so a stuck peer does not
+            # silently drop ledger updates. This is the same fail-open
+            # policy used by the C-29 persistence modules.
+            logger.warning(
+                f"[SELF-SUFF] file_lock timeout on {path}; "
+                "writing without cross-process serialization."
+            )
+            try:
+                self._write_ledger_locked()
+            except Exception as e:
+                logger.warning(f"[SELF-SUFF] Failed to persist ledger (fallback): {e}")
         except Exception as e:
             logger.warning(f"[SELF-SUFF] Failed to persist ledger: {e}")
 
@@ -203,13 +236,50 @@ class SelfSufficiencyTracker:
         what the broker actually credited or debited). The trading agent
         passes the same number it logs to ``trades.csv`` so the two
         sources are always reconcilable.
+
+        F-55: do the entire read-modify-write inside ONE
+        ``file_lock`` acquisition so concurrent writers' deltas are
+        not lost. The lock is on a sibling ``.lock`` file (see
+        ``packages/core/file_lock.py``) so it never blocks os.replace.
         """
         if not self.enabled:
             return
-        cur = float(self._ledger.get("cumulative_realised_inr", 0.0) or 0.0)
-        self._ledger["cumulative_realised_inr"] = cur + float(pnl_inr)
-        self._ledger["last_update"] = datetime.now(IST).isoformat()
-        self._persist()
+        path = Path(self.ledger_path)
+        try:
+            with file_lock(path, timeout=2.0):
+                # Refresh the in-memory ledger from disk inside the lock so
+                # concurrent writers' deltas are not lost.
+                if path.exists():
+                    try:
+                        on_disk = json.loads(path.read_text(encoding="utf-8"))
+                        if isinstance(on_disk, dict):
+                            self._ledger = on_disk
+                    except Exception as e:
+                        logger.warning(
+                            f"[SELF-SUFF] Could not re-read ledger inside lock: "
+                            f"{e}; using in-memory copy."
+                        )
+                cur = float(self._ledger.get("cumulative_realised_inr", 0.0) or 0.0)
+                self._ledger["cumulative_realised_inr"] = cur + float(pnl_inr)
+                self._ledger["last_update"] = datetime.now(IST).isoformat()
+                self._write_ledger_locked()
+        except TimeoutError:
+            logger.warning(
+                f"[SELF-SUFF] record_realised_pnl file_lock timeout on {path}; "
+                "applying delta without cross-process serialization "
+                "(may lose concurrent updates)."
+            )
+            cur = float(self._ledger.get("cumulative_realised_inr", 0.0) or 0.0)
+            self._ledger["cumulative_realised_inr"] = cur + float(pnl_inr)
+            self._ledger["last_update"] = datetime.now(IST).isoformat()
+            try:
+                self._write_ledger_locked()
+            except Exception as e:
+                logger.warning(f"[SELF-SUFF] Failed to persist ledger (fallback): {e}")
+        except Exception as e:
+            logger.warning(
+                f"[SELF-SUFF] record_realised_pnl failed: {e}; ledger may be stale."
+            )
 
     def days_since_deployment(self) -> int:
         if not self._ledger:
@@ -218,7 +288,12 @@ class SelfSufficiencyTracker:
             deployed = date.fromisoformat(self._ledger.get("deployed_on", ""))
         except Exception:
             return 0
-        delta = (date.today() - deployed).days
+        # C-16 (audit 2026-05-26): use IST today, matching how `deployed_on`
+        # was originally seeded (`datetime.now(IST).date()` in `load()`).
+        # Pre-fix, `date.today()` returned the UTC date on cloud VMs, so
+        # the day count was wrong near IST midnight (off by one) and cost-
+        # burn / runway math reported the wrong calendar day.
+        delta = (datetime.now(IST).date() - deployed).days
         return max(0, delta)
 
     def status(self) -> SelfSufficiencyStatus:

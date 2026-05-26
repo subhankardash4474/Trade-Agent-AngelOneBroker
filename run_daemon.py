@@ -248,7 +248,9 @@ def run_once(config_path: str, paper: bool, interval: int, dashboard: bool,
         )
 
     if paper:
-        config["broker"]["mode"] = "paper"
+        # F-31: safe chain-subscript -- a minimal/empty config that omits
+        # the broker: section would crash with KeyError otherwise.
+        config.setdefault("broker", {})["mode"] = "paper"
     elif live:
         # Loud log line so a tail of the daemon stdout makes it obvious
         # this run is touching real money. We do NOT short-circuit on a
@@ -257,7 +259,8 @@ def run_once(config_path: str, paper: bool, interval: int, dashboard: bool,
         logger.warning("=" * 60)
         logger.warning("[E2E] --live: broker.mode -> 'live' (REAL MONEY)")
         logger.warning("=" * 60)
-        config["broker"]["mode"] = "live"
+        # F-31: same safe chain-subscript as the paper branch above.
+        config.setdefault("broker", {})["mode"] = "live"
 
     smart_api = None
     if config.get("broker", {}).get("mode") != "paper":
@@ -297,8 +300,17 @@ def main():
     parser.add_argument("--paper", action="store_true", help="Force paper trading mode")
     parser.add_argument("--dashboard", action="store_true", help="Enable CLI dashboard")
     parser.add_argument("--interval", type=int, default=60, help="Poll interval in seconds")
-    parser.add_argument("--market-hours-only", action="store_true", default=True,
-                        help="Only run during market hours (default: True)")
+    # F-32: previously ``action="store_true", default=True`` meant the
+    # flag could never be disabled from the CLI (passing it and omitting
+    # it both yielded True). BooleanOptionalAction supports both
+    # ``--market-hours-only`` and ``--no-market-hours-only``.
+    parser.add_argument(
+        "--market-hours-only",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Only run during market hours. Use --no-market-hours-only to "
+             "run 24/7 (testing, shadow mode, non-market monitoring).",
+    )
     parser.add_argument(
         "--reset-balance", action="store_true",
         help="Ignore DB equity history and start from config.initial_balance. "

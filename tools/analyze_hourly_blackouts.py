@@ -194,7 +194,8 @@ def main() -> int:
         cand_net = sum(h["net"] for h in candidates)
         cand_gw = sum(h["gross_win"] for h in candidates)
         cand_gl = sum(h["gross_loss"] for h in candidates)
-        kept_trades = total_trades - cand_trades
+        # F-98: previously assigned `kept_trades = total_trades - cand_trades`
+        # but never used. Removed.
         # Reconstruct portfolio PF if these trades had not happened.
         port_gw = sum(h["gross_win"] for h in hourly)
         port_gl = sum(h["gross_loss"] for h in hourly)
@@ -231,7 +232,9 @@ def main() -> int:
         "3. Walk-forward backtest with the proposed blackouts enabled. Use "
         f"`tools/run_battery.py --train-window-days 60 --holdout-window-days 30`.",
         "4. If holdout PF improves: add the blackouts to `config.yaml` under "
-        "`risk.entry_blackout_hours` (key TBD) + ship behind a feature flag.",
+        "`robustness.dead_hour_blocks` (existing-but-empty list) + ship "
+        "behind a feature flag. (F-99: previous text suggested `risk."
+        "entry_blackout_hours` which is not a real config key.)",
         "5. Re-validate live for 5 trading days (Phase A re-check).",
     ])
     lines.append("")

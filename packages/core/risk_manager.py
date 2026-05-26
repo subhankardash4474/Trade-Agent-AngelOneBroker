@@ -354,7 +354,15 @@ class RiskManager:
 
         # Market regime
         self.max_vix: float = risk_cfg.get("max_vix", 25.0)
-        self.require_nifty_above_200ema: bool = risk_cfg.get("require_nifty_above_200ema", True)
+        # B-16 (audit 2026-05-25): align code default with the value
+        # `config.yaml` ships (False). Pre-fix the code defaulted to True
+        # while the YAML defaulted to False, so any caller that constructed
+        # RiskManager with an EMPTY risk block (e.g. some unit fixtures and
+        # the future `backtest_ensemble.run` paths that override risk dict)
+        # would silently block all longs whenever Nifty closed below its
+        # 200 EMA — exactly today's regime. The single visible source of
+        # truth is now config.yaml's `risk.require_nifty_above_200ema`.
+        self.require_nifty_above_200ema: bool = risk_cfg.get("require_nifty_above_200ema", False)
 
         # Intraday time exit
         self.intraday_exit_time: str = risk_cfg.get("intraday_exit_time", "15:15")
@@ -462,7 +470,17 @@ class RiskManager:
             return False, f"Circuit breaker: {self.state.breaker_reason}"
 
         # Daily loss limit
-        daily_limit = self._initial_balance * (self.daily_loss_limit_pct / 100)
+        # F-33 (audit 2026-05-27): previously anchored to the boot-time
+        # ``_initial_balance``. After months of compounding (say 1L -> 3L),
+        # a "3% daily limit" should mean 3% of TODAY's account, not 3% of
+        # the long-forgotten initial deposit. The honest anchor is the
+        # high-water mark (max(initial, peak_balance)) -- it grows with
+        # the account, never shrinks during drawdowns (so a bad day
+        # doesn't accidentally trip the gate just because equity dipped),
+        # and matches the way regulators and prop desks read "X% per
+        # day" risk policy.
+        anchor = max(self._initial_balance, self.state.peak_balance)
+        daily_limit = anchor * (self.daily_loss_limit_pct / 100)
         if self.state.daily_pnl <= -daily_limit:
             self._activate_breaker(f"Daily loss limit hit: ₹{self.state.daily_pnl:.2f} (limit: -₹{daily_limit:.2f})")
             return False, self.state.breaker_reason
@@ -479,8 +497,8 @@ class RiskManager:
             )
             return False, self.state.breaker_reason
 
-        # Weekly loss limit
-        weekly_limit = self._initial_balance * (self.weekly_loss_limit_pct / 100)
+        # Weekly loss limit  (F-33: same high-water-mark anchor as daily)
+        weekly_limit = anchor * (self.weekly_loss_limit_pct / 100)
         if self.state.weekly_pnl <= -weekly_limit:
             self._activate_breaker(f"Weekly loss limit hit: ₹{self.state.weekly_pnl:.2f}")
             return False, self.state.breaker_reason
@@ -666,7 +684,28 @@ class RiskManager:
         risk_per_share = abs(price - stop_loss_price) if stop_loss_price is not None else 0
         if risk_per_share > 0:
             shares_by_risk = int(risk_amount / risk_per_share)
-            return max(1, min(shares_by_risk, max_shares_by_value))
+            # F-34 (audit 2026-05-27): the previous `max(1, min(...))`
+            # forced a minimum of 1 share even when the math said 0
+            # (risk budget too small for even one share at this SL
+            # distance). Forcing 1 share secretly exceeds the per-trade
+            # risk budget by an unknown multiple (sometimes 5-10x for a
+            # high-priced + tight-SL pair like RELIANCE with a 0.3% SL
+            # on a Rs 50k account). Honour the math: if zero shares are
+            # affordable at the budgeted risk, return 0 and let the
+            # orchestrator skip this trade. Risk budget is the ceiling,
+            # not a suggestion.
+            sized = min(shares_by_risk, max_shares_by_value)
+            if sized <= 0:
+                logger.info(
+                    f"[POSITION-SIZE] risk budget too small for any "
+                    f"shares at price={price:.2f} sl={stop_loss_price:.2f} "
+                    f"risk_per_share={risk_per_share:.2f} "
+                    f"risk_amount={risk_amount:.2f}. Skipping trade "
+                    f"(prev behaviour forced 1 share and silently "
+                    f"exceeded the per-trade risk budget)."
+                )
+                return 0
+            return sized
 
         # P1 #10 (2026-05-17) -- LIVE-MODE SAFETY: when BOTH stop_loss_price
         # and atr are missing (or atr<=0), we have NO meaningful risk-per-share

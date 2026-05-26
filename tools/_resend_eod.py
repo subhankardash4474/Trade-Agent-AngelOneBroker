@@ -10,6 +10,10 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
+# F-19: packages/ must be on sys.path for bare-host invocations.
+_PKG = ROOT / "packages"
+if str(_PKG) not in sys.path:
+    sys.path.insert(0, str(_PKG))
 
 import yaml
 from datetime import datetime

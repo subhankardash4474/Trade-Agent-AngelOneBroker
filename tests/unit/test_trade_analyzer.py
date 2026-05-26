@@ -320,9 +320,12 @@ class TestAccumulatorRehydrate:
             a1.record_trade(_make_trade_record("supertrend_follow", pnl=pnl, hour=10 + i))
             self._seed_trade(db, "supertrend_follow", pnl, idx=i)
         pf_initial = a1.get_scorecard()["supertrend_follow"]["profit_factor"]
-        # 3 wins, no losses -> PF = inf, but auto-suppress check uses
-        # `pf < 0.7` so inf is safe.
-        assert pf_initial == float("inf")
+        # B-15 / C-17 (audit 2026-05-26): zero-loss windows now yield the
+        # 999.99 finite sentinel instead of `float("inf")` so the value is
+        # JSON-serialisable. The auto-suppress comparison (`pf < 0.7`)
+        # works on either representation, but downstream exports need
+        # finite numbers.
+        assert pf_initial == 999.99
 
         # Restart
         a2 = TradeAnalyzer(config, db)

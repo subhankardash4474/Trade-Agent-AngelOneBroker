@@ -36,6 +36,14 @@ if _SSL_BYPASS:
 IST = pytz.timezone("Asia/Kolkata")
 
 # NSE holidays (2025-2026). Update annually or fetch from NSE website.
+# B-6 (audit 2026-05-25): the hardcoded calendar covers 2025 + 2026 only.
+# Without proactive maintenance, the first request after 2026-12-25 falls
+# off the end of the set and `is_trading_day()` returns True for every
+# 2027 holiday, causing the daemon to attempt scans/trades on holidays
+# (broker rejects with cascading errors). `_holiday_coverage_years` makes
+# the supported range explicit; `is_known_holiday_year()` lets callers
+# (run_daemon, market_safety) fail-closed when asked about a year we
+# haven't curated yet. Update annually.
 NSE_HOLIDAYS = {
     # 2025
     "2025-02-26", "2025-03-14", "2025-03-31", "2025-04-10", "2025-04-14",
@@ -48,6 +56,20 @@ NSE_HOLIDAYS = {
     "2026-08-15", "2026-08-17", "2026-10-02", "2026-10-09", "2026-10-20",
     "2026-10-21", "2026-11-24", "2026-12-25",
 }
+
+# Years for which `NSE_HOLIDAYS` is authoritative. Derived from the set
+# above so this stays in sync automatically when the next year is added.
+_HOLIDAY_COVERAGE_YEARS = {int(s.split("-", 1)[0]) for s in NSE_HOLIDAYS}
+
+
+def is_known_holiday_year(year: int) -> bool:
+    """True iff the operator has curated the NSE holiday list for this year.
+
+    Callers asking about a year outside coverage should NOT assume "no
+    holidays" — they should either skip the day defensively or surface a
+    loud warning so the operator updates `NSE_HOLIDAYS`. B-6.
+    """
+    return int(year) in _HOLIDAY_COVERAGE_YEARS
 
 ANGELONE_INTERVALS = {
     "1min": "ONE_MINUTE",
@@ -329,10 +351,21 @@ class DataHandler:
     Fallback: Yahoo Finance (for simulation/backtest).
     """
 
+    # B-9 (audit 2026-05-25): hard cap on the historical-data cache. The
+    # previous unbounded dict accumulated every (symbol, interval, start, end)
+    # tuple ever requested, and on a long-running daemon (or any battery run
+    # that iterates over multiple windows) climbed to GB-scale RSS before
+    # being noticed. Cap is a tunable env var; default 256 covers a Nifty 500
+    # scan x 1 window x 2 intervals comfortably.
+    _CACHE_MAX_ENTRIES = int(os.environ.get("DATA_HANDLER_CACHE_MAX_ENTRIES", "256"))
+
     def __init__(self, config: dict, smart_api=None):
         self._config = config
         self._market_config = config.get("market", {})
         self._cache: Dict[str, pd.DataFrame] = {}
+        # B-9: track insertion order for cheap FIFO eviction without
+        # importing an OrderedDict.
+        self._cache_order: List[str] = []
 
         self._yahoo = YahooFinanceDataSource()
         self._angelone: Optional[AngelOneDataSource] = None
@@ -364,7 +397,12 @@ class DataHandler:
         is_intraday = interval in ("1min", "5min", "15min", "30min", "1h")
         cache_key = f"{symbol}_{interval}_{start_date.date()}_{end_date.date()}"
         if use_cache and not is_intraday and cache_key in self._cache:
-            return self._cache[cache_key]
+            # F-52: return a defensive copy on cache hit. Previously this
+            # returned the cached DataFrame by reference -- any caller
+            # that mutated it (added columns, fillna(inplace=True),
+            # sliced+reassigned) silently corrupted the cache for every
+            # subsequent caller in the same process.
+            return self._cache[cache_key].copy()
 
         df = pd.DataFrame()
         for attempt in range(3):
@@ -384,9 +422,28 @@ class DataHandler:
             df = self._yahoo.get_historical_data(symbol, interval, start_date, end_date)
 
         if not df.empty and use_cache and not is_intraday:
-            self._cache[cache_key] = df
+            self._cache_put(cache_key, df)
 
         return df
+
+    def _cache_put(self, key: str, df: pd.DataFrame) -> None:
+        """Insert into the historical cache, evicting oldest if over cap.
+
+        B-9 (audit 2026-05-25): the previous implementation `self._cache[key] = df`
+        was unbounded. On long-running daemons / battery sweeps with many
+        (symbol, window) tuples this leaked memory until OOM. FIFO is fine
+        because the access pattern is "scan a universe, never look back".
+        """
+        if key in self._cache:
+            try:
+                self._cache_order.remove(key)
+            except ValueError:
+                pass
+        self._cache[key] = df
+        self._cache_order.append(key)
+        while len(self._cache_order) > self._CACHE_MAX_ENTRIES:
+            victim = self._cache_order.pop(0)
+            self._cache.pop(victim, None)
 
     def get_ltp(self, symbol: str, token: str = "", retries: int = 2) -> Optional[float]:
         """Get last traded price with retry on transient failures."""
@@ -431,6 +488,18 @@ class DataHandler:
         now = datetime.now(IST)
         if now.weekday() >= 5:  # Saturday/Sunday
             return False
+        if not is_known_holiday_year(now.year):
+            # B-6 (audit 2026-05-25): warn loudly when the holiday calendar
+            # has not been updated for the current year. We keep returning
+            # True (don't break automation) but the operator will see this
+            # in trading_agent_*.log every cycle until they extend
+            # NSE_HOLIDAYS — and the warning text spells out the fix.
+            logger.warning(
+                f"[holiday-calendar] NSE_HOLIDAYS has no entries for {now.year}; "
+                f"is_market_open() cannot rule out a holiday today. Update "
+                f"packages/core/data_handler.py:NSE_HOLIDAYS with this year's "
+                f"NSE schedule."
+            )
         if now.strftime("%Y-%m-%d") in NSE_HOLIDAYS:
             return False
         trading_hours = self._market_config.get("trading_hours", {})
@@ -440,6 +509,7 @@ class DataHandler:
 
     def clear_cache(self):
         self._cache.clear()
+        self._cache_order.clear()
 
     def download_historical_for_backtest(
         self,

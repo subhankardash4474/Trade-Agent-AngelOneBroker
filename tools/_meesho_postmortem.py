@@ -49,9 +49,9 @@ def main() -> None:
     for ts, row in upto.iterrows():
         time_str = ts.strftime("%H:%M") if hasattr(ts, "strftime") else str(ts)[:16]
         pnl_low = (ENTRY_PRICE - row["Low"]) * QTY  # max favourable for SHORT
-        marker = ""
-        if abs(row["Low"] - row["Low"]) < 0.01 and row["Low"] < ENTRY_PRICE:
-            marker = ""
+        # F-98: dead-store loop removed -- ``marker`` was assigned twice
+        # without ever being printed. The condition ``row["Low"] -
+        # row["Low"]`` is also tautologically zero.
         print(f"  {time_str:<10} {row['Open']:>8.2f} {row['High']:>8.2f} {row['Low']:>8.2f} "
               f"{row['Close']:>8.2f}  {pnl_low:>+15.2f}")
         bar_lows.append((ts, row["Low"], row["Close"], row["High"]))

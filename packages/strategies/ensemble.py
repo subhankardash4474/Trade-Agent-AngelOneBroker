@@ -244,10 +244,18 @@ class EnsembleModel:
             "total_strategies": len(signals),
         }
 
+        # F-84: count UNIQUE strategy names, not raw vote count. If the
+        # orchestrator ever registers the same strategy twice (mis-config,
+        # A/B wiring, drift after a refactor), `len(buy_signals)` could
+        # satisfy `min_strategies_agree` without true multi-strategy
+        # consensus. Counting distinct names is defence-in-depth.
+        buy_unique = len({s.strategy_name for s in buy_signals})
+        sell_unique = len({s.strategy_name for s in sell_signals})
+
         # BUY consensus
         if (buy_confidence >= self.confidence_threshold
                 and buy_confidence > sell_confidence
-                and len(buy_signals) >= self.min_strategies_agree):
+                and buy_unique >= self.min_strategies_agree):
 
             # Use the best stop-loss and take-profit from contributing signals
             stop_loss = self._best_stop_loss(buy_signals, current_price, side="BUY")
@@ -273,10 +281,10 @@ class EnsembleModel:
                 contributing_strategies=contributions,
             )
 
-        # SELL consensus
+        # SELL consensus  (F-84: unique-strategy count, see above)
         if (sell_confidence >= self.confidence_threshold
                 and sell_confidence > buy_confidence
-                and len(sell_signals) >= self.min_strategies_agree):
+                and sell_unique >= self.min_strategies_agree):
 
             stop_loss = self._best_stop_loss(sell_signals, current_price, side="SELL")
             take_profit = self._best_take_profit(sell_signals, current_price, side="SELL")

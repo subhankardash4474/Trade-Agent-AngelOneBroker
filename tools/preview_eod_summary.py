@@ -13,6 +13,11 @@ from __future__ import annotations
 import os
 import ssl
 import sys
+from pathlib import Path
+
+# F-75: absolute paths only -- callers may not be in repo root.
+ROOT = Path(__file__).resolve().parent.parent
+CONFIG_PATH = ROOT / "config.yaml"
 
 os.environ.setdefault("CURL_CA_BUNDLE", "")
 os.environ.setdefault("REQUESTS_CA_BUNDLE", "")
@@ -35,13 +40,13 @@ def main() -> int:
     logger.add(sys.stderr, level="WARNING",
                format="<green>{time:HH:mm:ss}</green> | <level>{level: <8}</level> | {message}")
 
-    with open("config.yaml", "r") as f:
+    with open(CONFIG_PATH, encoding="utf-8") as f:
         config = yaml.safe_load(f)
     config.setdefault("broker", {})["mode"] = "paper"
 
     from trading_agent import TradingAgent
     agent = TradingAgent(
-        config_path="config.yaml",
+        config_path=str(CONFIG_PATH),
         smart_api=None,
         reset_balance=False,
     )

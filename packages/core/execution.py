@@ -4,6 +4,8 @@ Handles order placement via AngelOne/Kite SmartAPI with bracket orders,
 trailing stop-loss updates, partial fill handling, and retry logic.
 """
 
+import os
+import random as _random_module
 import time
 import uuid
 from datetime import datetime
@@ -13,6 +15,39 @@ import pytz
 from loguru import logger
 
 IST = pytz.timezone("Asia/Kolkata")
+
+
+# B-7 (audit 2026-05-25): paper-order slippage and partial-fill draws used the
+# global `random` module, which has its own implicit state seeded from /dev/
+# urandom at process start. Two consequences:
+#   1. Backtests are NOT reproducible — replaying the same config + data
+#      yields different fills each run.
+#   2. The battery harness can't compare variants apples-to-apples.
+#
+# Module-level `_paper_rng` (a dedicated random.Random instance) plus
+# `EXECUTION_PAPER_SEED` env var fixes both. When the env var is unset we
+# fall back to the legacy random behaviour (urandom-seeded) so live paper
+# users see no behaviour change unless they opt in.
+_PAPER_SEED_ENV = "EXECUTION_PAPER_SEED"
+_paper_rng = _random_module.Random()
+_seed_value_raw = os.environ.get(_PAPER_SEED_ENV)
+if _seed_value_raw is not None:
+    try:
+        _paper_rng.seed(int(_seed_value_raw))
+    except ValueError:
+        _paper_rng.seed(_seed_value_raw)
+
+
+def _set_paper_seed(seed: Optional[int]) -> None:
+    """Test/Backtest hook: re-seed (or unseed) the paper-order RNG.
+
+    Called by `backtest_ensemble.BacktestConfig.seed` and by unit tests
+    that need deterministic fills (B-7). Passing `None` re-randomises.
+    """
+    if seed is None:
+        _paper_rng.seed()
+    else:
+        _paper_rng.seed(int(seed))
 
 
 # Strings that AngelOne / Kite are known (or likely) to emit as a stringy
@@ -360,8 +395,12 @@ class ExecutionEngine:
         now = datetime.now(IST)
 
         # Slippage: BUY fills slightly higher, SELL slightly lower
-        import random
-        slip_pct = random.uniform(0.0, self.slippage_tolerance) / 100
+        # B-7 (audit 2026-05-25): use the seedable module RNG (`_paper_rng`)
+        # instead of the global `random` so backtests are reproducible and
+        # battery variants can be compared apples-to-apples. Live paper
+        # behaviour unchanged when EXECUTION_PAPER_SEED is unset (the RNG
+        # is urandom-seeded at module load).
+        slip_pct = _paper_rng.uniform(0.0, self.slippage_tolerance) / 100
         if tx_type == "BUY":
             filled_price = round(price * (1 + slip_pct), 2)
         else:
@@ -378,10 +417,10 @@ class ExecutionEngine:
             self.partial_fill_prob > 0
             and order_type == "LIMIT"
             and quantity > 1
-            and random.random() < self.partial_fill_prob
+            and _paper_rng.random() < self.partial_fill_prob
         ):
             min_ratio = max(0.0, min(1.0, self.partial_fill_min_ratio))
-            filled_ratio = random.uniform(min_ratio, 1.0)
+            filled_ratio = _paper_rng.uniform(min_ratio, 1.0)
             filled_quantity = max(1, int(quantity * filled_ratio))
             if filled_quantity < quantity:
                 status = "PARTIALLY_FILLED"
@@ -991,6 +1030,27 @@ class ExecutionEngine:
             return False
         try:
             response = self._api.cancelOrder(order_id, variety)
+            # F-16: previously this treated ANY truthy response as success.
+            # AngelOne returns dicts where ``status`` may be the string
+            # "false" -- which is truthy in Python. The result was that
+            # failed SL cancels were reported as success, our internal
+            # tracking dropped the SL order, and an orphan SL-M remained
+            # live at the broker (reverse-fill risk on next entry / EOD
+            # square-off). Mirror the same _interpret_broker_status
+            # parsing already used by modify_stop_loss above.
+            if isinstance(response, dict):
+                if not _interpret_broker_status(response.get("status")):
+                    logger.error(
+                        f"Failed to cancel order {order_id}: broker rejected "
+                        f"with status={response.get('status')!r} "
+                        f"message={response.get('message')!r}"
+                    )
+                    return False
+                logger.info(
+                    f"Order {order_id} cancelled "
+                    f"(broker status={response.get('status')!r})"
+                )
+                return True
             if response:
                 logger.info(f"Order {order_id} cancelled")
                 return True
