@@ -303,6 +303,7 @@ These rows exist so the Friday review can find every commit tagged
 2026-05-25 | TBD-sha | observability: Bug E — backtester _merge_bars O(N²) slice fix (strategy_history_window=300) + 13 equivalence tests
 2026-05-25 | TBD-sha | observability: Bug F — battery harness ProcessPoolExecutor cascade-fail fix (max_tasks_per_child=1 + faulthandler diagnostic) + 6 structural tests
 2026-05-25 | TBD-sha | observability: Bug G — backtester subsystem code-review hardening (G-1 atomic results-JSON writes + corrupt-JSON quarantine; G-2 BrokenProcessPool auto-retry loop with MAX_POOL_RETRIES=3; G-3 yfinance hard timeout in _trend_context; G-5 queue scheduler --rm + zombie-container retry + failure_phase markers) + 26 structural tests
+2026-05-26 | TBD-sha | observability: Bug G self-audit fixes — G-1.A (orphan results JSON masks failure.txt on resume; reader now treats sibling .failure.txt as authoritative) + G-3.A (ThreadPoolExecutor with-block shutdown(wait=True) defeated the timeout; rewritten to try/finally with shutdown(wait=False, cancel_futures=True)). NOT deployed to VM during validation tail; runs on origin/main only until post-Friday review.
 ```
 
 Audit-only entries cover: `packages/monitoring/alerts.py`, `tests/`,

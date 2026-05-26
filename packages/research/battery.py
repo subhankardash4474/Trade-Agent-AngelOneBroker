@@ -800,10 +800,34 @@ def _completed_variant_names(out_root: Path) -> set[str]:
     fields to the payload doesn't break backward compatibility; only
     *removing* a key listed in `_RESULT_REQUIRED_KEYS` does, and that
     would be a deliberate refactor anyway.
+
+    2026-05-26 Bug G-1 follow-up (audit fix): a `<name>.failure.txt`
+    next to a `<name>.json` is treated as authoritative -- the variant
+    is OMITTED from the completed set even if the JSON parses cleanly.
+    Why: the worker writes results/<name>.json at the end of bt.run(),
+    THEN returns the payload. If the return / pickle / shutdown path
+    raises (rare but possible -- e.g. a non-pickleable object reaches
+    the IPC channel, an OOM in the framework's pickle buffer, a
+    SIGKILL between the JSON write and the return), the parent's
+    `except Exception` branch records a `<name>.failure.txt` for an
+    orphan JSON. The original reader was structurally blind to this:
+    it saw the JSON, marked the variant complete, and the next
+    `--resume` silently skipped the variant the operator was trying
+    to retry. failure.txt presence wins -- if the variant has both,
+    something went wrong and resume must re-run.
     """
     results_dir = out_root / "results"
     if not results_dir.exists():
         return set()
+
+    # Variants with a recorded failure -- regardless of whether a JSON
+    # also exists. The .failure.txt suffix is two-component; Path.stem
+    # only strips one suffix so we slice by string length.
+    failure_suffix = ".failure.txt"
+    failed_names: set[str] = set()
+    for fp in results_dir.glob(f"*{failure_suffix}"):
+        if fp.name.endswith(failure_suffix):
+            failed_names.add(fp.name[: -len(failure_suffix)])
 
     completed: set[str] = set()
     quarantined: list[str] = []
@@ -811,6 +835,16 @@ def _completed_variant_names(out_root: Path) -> set[str]:
         # Skip our own .tmp scratch files (atomic-write residue) so a
         # crashed write doesn't trip the schema check.
         if jp.name.endswith(".tmp"):
+            continue
+        # Orphan-JSON masking guard (Bug G-1 audit fix): if a sibling
+        # .failure.txt exists, the parent recorded this variant as
+        # failed regardless of how complete the JSON looks. Trust the
+        # failure record; resume must re-run.
+        if jp.stem in failed_names:
+            logger.info(
+                f"[BATTERY] {jp.name} has a sibling {jp.stem}{failure_suffix}; "
+                f"treating variant as INCOMPLETE so resume re-runs it."
+            )
             continue
         try:
             payload = json.loads(jp.read_text(encoding="utf-8"))

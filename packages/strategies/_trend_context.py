@@ -74,6 +74,22 @@ def _yf_download_with_timeout(symbol: str, timeout: float) -> "pd.DataFrame | No
       `max_tasks_per_child=1` (Bug F fix) guarantees process exit
       after this single variant — so the leak is bounded to one
       worker lifetime.
+
+    2026-05-26 Bug G-3 audit fix: this function used to use
+    ``with _cf.ThreadPoolExecutor(...) as ex:`` for cleanup. That is
+    WRONG -- `Executor.__exit__` calls ``shutdown(wait=True)``, which
+    blocks until every running task completes. When the inner
+    ``yf.download`` is genuinely hung (the exact case this whole
+    helper exists to defend against), the timeout would fire
+    correctly, but the with-block's __exit__ would then block
+    FOREVER waiting for the hung thread to finish. The function
+    never returns, the worker hangs, the watchdog eventually fires,
+    and the ProcessPoolExecutor cascades -- exactly the failure mode
+    G-3 was supposed to prevent. The fix below uses an explicit
+    try/finally with ``shutdown(wait=False, cancel_futures=True)`` so
+    the function returns within ``timeout`` seconds even when the
+    fetch thread is stuck. The hung thread leaks, but max_tasks_per_child=1
+    guarantees process exit (and thread reaping) after the variant.
     """
     def _do_fetch() -> "pd.DataFrame | None":
         import yfinance as yf
@@ -81,17 +97,25 @@ def _yf_download_with_timeout(symbol: str, timeout: float) -> "pd.DataFrame | No
             f"{symbol}.NS", period="3mo", interval="1d",
             progress=False, auto_adjust=False,
         )
+    ex = _cf.ThreadPoolExecutor(
+        max_workers=1, thread_name_prefix="trend-fetch",
+    )
     try:
-        with _cf.ThreadPoolExecutor(
-            max_workers=1, thread_name_prefix="trend-fetch",
-        ) as ex:
-            return ex.submit(_do_fetch).result(timeout=timeout)
+        return ex.submit(_do_fetch).result(timeout=timeout)
     except _cf.TimeoutError:
         logger.warning(
             f"[trend_context] yfinance timed out after {timeout}s for "
             f"{symbol}; treating as 'trend unknown' (fail-open)."
         )
         return None
+    finally:
+        # wait=False is critical: a hung yf.download must not block
+        # this caller. cancel_futures=True is best-effort -- it only
+        # cancels tasks that haven't started yet, but since we
+        # submitted exactly one task and result() already started it,
+        # this is a no-op in practice. Kept for forward-compat with
+        # any future refactor that submits more than one task.
+        ex.shutdown(wait=False, cancel_futures=True)
 
 
 def _fetch_daily(symbol: str) -> Optional[dict]:

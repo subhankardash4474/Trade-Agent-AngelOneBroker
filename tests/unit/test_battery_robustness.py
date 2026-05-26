@@ -203,6 +203,82 @@ class TestCorruptJsonQuarantine:
         assert "v_good" in completed
         assert good.exists(), "Valid file must NOT be quarantined."
 
+    def test_orphan_json_with_failure_txt_excluded(self, tmp_path: Path):
+        """A `<name>.failure.txt` next to a `<name>.json` is
+        AUTHORITATIVE — the variant must be EXCLUDED from `completed`
+        so resume re-runs it, even when the JSON is otherwise valid.
+
+        Audit fix on top of Bug G-1 (2026-05-26). Failure mode:
+        worker writes results/<name>.json successfully, then crashes
+        on return / pickle / shutdown; parent records
+        <name>.failure.txt for the orphan. Without this guard, the
+        next operator-initiated --resume would silently skip the
+        variant the operator was trying to retry.
+        """
+        results = tmp_path / "results"
+        results.mkdir()
+        # A perfectly-valid JSON, schema-clean.
+        (results / "v_orphan.json").write_text(
+            json.dumps({
+                "variant": "v_orphan",
+                "summary": {"variant": "v_orphan"},
+                "elapsed_sec": 1.0,
+            }),
+            encoding="utf-8",
+        )
+        # ...sitting next to a parent-recorded failure for the same
+        # variant (timestamp + traceback in real life).
+        (results / "v_orphan.failure.txt").write_text(
+            "2026-05-26T10:00:00\nMockPickleError\n", encoding="utf-8",
+        )
+        completed = battery._completed_variant_names(tmp_path)
+        assert "v_orphan" not in completed, (
+            "A variant with both <name>.json and <name>.failure.txt "
+            "must NOT be reported as completed. The .failure.txt is "
+            "authoritative -- the parent recorded a failure even "
+            "though the worker managed to write the JSON."
+        )
+
+    def test_failure_txt_alone_does_not_quarantine_anything(self, tmp_path: Path):
+        """A bare `<name>.failure.txt` (no sibling .json) must NOT
+        cause a quarantine warning -- the variant is just not in the
+        completed set, which is the desired outcome for a real
+        run-time failure."""
+        results = tmp_path / "results"
+        results.mkdir()
+        (results / "v_failed.failure.txt").write_text(
+            "2026-05-26T10:00:00\nKeyError: 'foo'\n", encoding="utf-8",
+        )
+        completed = battery._completed_variant_names(tmp_path)
+        assert "v_failed" not in completed
+        # And no .corrupt rename happened (there was no .json to quarantine)
+        assert list(results.glob("*.corrupt")) == []
+
+    def test_orphan_with_failure_does_not_quarantine_the_orphan(self, tmp_path: Path):
+        """The orphan-JSON masking guard must NOT also rename the
+        orphan to .corrupt -- that would lose forensic data and
+        confuse downstream tooling. We only EXCLUDE it from
+        completed; the JSON stays in place for the operator to
+        inspect alongside the failure.txt traceback."""
+        results = tmp_path / "results"
+        results.mkdir()
+        orphan = results / "v_orphan.json"
+        orphan.write_text(
+            json.dumps({
+                "variant": "v_orphan",
+                "summary": {"variant": "v_orphan"},
+                "elapsed_sec": 1.0,
+            }),
+            encoding="utf-8",
+        )
+        (results / "v_orphan.failure.txt").write_text(
+            "boom\n", encoding="utf-8",
+        )
+        battery._completed_variant_names(tmp_path)
+        # Orphan JSON still in place, NOT quarantined.
+        assert orphan.exists()
+        assert not (results / "v_orphan.json.corrupt").exists()
+
     def test_tmp_files_are_skipped(self, tmp_path: Path):
         """Atomic-write residue (`<name>.json.tmp`) must not be picked
         up as a candidate result file — it would always fail schema
@@ -386,6 +462,66 @@ class TestTrendContextTimeout:
             "_trend_context must read TREND_FETCH_TIMEOUT_SEC from "
             "the environment so the timeout is tunable without a "
             "code change. Tests rely on this."
+        )
+
+    def test_timeout_actually_returns_within_window_when_fetch_hangs(
+        self, monkeypatch
+    ):
+        """Runtime test (audit fix, 2026-05-26): when the inner fetch
+        is genuinely hung, `_yf_download_with_timeout` MUST return
+        within ~timeout seconds.
+
+        Why this test exists: the original Bug G-3 fix wrapped
+        ``ex.submit(...).result(timeout=N)`` in a
+        ``with ThreadPoolExecutor(...) as ex:`` block. ``Executor.__exit__``
+        calls ``shutdown(wait=True)``, which BLOCKS until every running
+        task completes -- so when the fetch hung, the whole helper
+        hung waiting for shutdown, defeating the timeout. Source-only
+        tests (the rest of this class) cannot catch that class of bug
+        because the broken code passes them all. This test forces a
+        deliberate hang and asserts wall-clock behaviour.
+
+        We use a 1.0s timeout and a 30s sleeper so the test takes
+        ~1s and any regression (e.g. someone reintroducing the
+        with-block) would balloon to 30s -- way over our assertion.
+        """
+        import time
+        from packages.strategies import _trend_context as tc
+
+        def hanging_yf(*_args, **_kwargs):
+            # Simulate a stalled HTTP socket: sleep far longer than the
+            # caller's timeout. The helper must NOT block on us.
+            time.sleep(30)
+            return None  # never reached
+
+        # Monkeypatch the inner closure by replacing yf.download. The
+        # helper imports yfinance lazily inside _do_fetch, so we need
+        # to inject into sys.modules.
+        import sys
+        import types
+        fake_yf = types.ModuleType("yfinance")
+        fake_yf.download = hanging_yf  # type: ignore[attr-defined]
+        monkeypatch.setitem(sys.modules, "yfinance", fake_yf)
+
+        t0 = time.time()
+        result = tc._yf_download_with_timeout("RELIANCE", timeout=1.0)
+        elapsed = time.time() - t0
+
+        assert result is None, (
+            "Hung fetch must return None (fail-open), not the dataframe."
+        )
+        # Generous upper bound: 1.0s timeout + ~2s slop for thread
+        # creation, GIL contention, finally-block shutdown, etc.
+        # If this ever exceeds 5s, someone has reintroduced a
+        # blocking shutdown(wait=True) somewhere on the path.
+        assert elapsed < 5.0, (
+            f"_yf_download_with_timeout(timeout=1.0) took {elapsed:.1f}s "
+            f"to return when the inner fetch was hung -- the timeout "
+            f"is structurally broken. The classic regression here is "
+            f"using `with ThreadPoolExecutor(...) as ex:`, whose "
+            f"__exit__ calls shutdown(wait=True) and blocks on the "
+            f"hung thread. Use try/finally with "
+            f"`shutdown(wait=False, cancel_futures=True)` instead."
         )
 
 

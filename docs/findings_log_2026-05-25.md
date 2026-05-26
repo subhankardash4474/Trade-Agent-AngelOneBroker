@@ -1445,3 +1445,200 @@ the original happy path would have produced; Bug G-3 only changes
 behavior on a network hang where the prior code would have
 hung-then-watchdog-killed). No bypass slot consumed. Bypass ledger
 remains 1/3 (risk.allow_shorts).
+
+
+## 15. Bug G self-audit — two real defects in the original Bug G fix (2026-05-26 morning)
+
+**Trigger.** The user asked to "check the bug g and fix" without
+deploying. Bug G shipped overnight while the validation run
+continued on the in-memory pre-G code; the next scheduler-spawned
+launch (`nifty50_60d` resume in ~28h) was going to be the first
+container to actually exercise the new code paths. If a defect lurked
+in any of G-1/G-2/G-3/G-5, that resume would be the worst possible
+moment to discover it — mid-validation, on a critical-path job, with
+no human in the loop. So we did a line-by-line self-audit of the
+cb76f0e diff, mentally simulating every failure path each fix
+claimed to handle.
+
+**Two real defects surfaced.** Both reproduced in pytest by
+temporarily reverting the audit fix and re-running the new
+regression test. Both were silently broken in cb76f0e — no test
+covered the failure path because the original tests were
+source-level structural checks rather than behavioural tests.
+
+### 15.1 G-1.A — Orphan `<name>.json` masks `<name>.failure.txt` on resume
+
+**Failure mode.** The worker (`_run_variant_in_subprocess`) writes
+`results/<name>.json` *atomically at the end of the function*, then
+returns the payload tuple. Pickling and IPC happen between the
+return statement and the parent's `fut.result()`. If anything raises
+in that window — non-pickleable object reaches the IPC channel, an
+OOM during pickle-buffer allocation, the subprocess receives a
+SIGKILL after the JSON write but before the return — the parent's
+per-future `except Exception` branch records a `<name>.failure.txt`,
+but the on-disk JSON survives. The variant now has BOTH files: a
+clean-looking JSON that says "I succeeded" and a failure.txt that
+says "I crashed".
+
+**Original `_completed_variant_names` was structurally blind to this.**
+It read `results/*.json`, schema-checked each, and added the stem to
+`completed`. The failure.txt was never consulted. Consequence: on
+the next operator-initiated `--resume <run_id>`, the variant would
+appear in `completed`, the resume's `pending` filter would exclude
+it, and the variant the operator was specifically trying to retry
+would silently be skipped. This is the exact failure-mode pattern
+Bug G-1 was supposed to prevent (silent skip on resume) — the fix
+just plugged a different leak.
+
+**Probability assessment.** Low per-variant. The window between
+JSON write and successful return is small — single-digit
+milliseconds — and most exception sources we'd hit there
+(non-pickleable types) would have been caught earlier by the JSON
+serialization which uses `default=str`. But "low per variant" times
+"19 variants × N validation runs × indefinite future" is not
+obviously low at the program scope, especially as we add stricter
+content into payloads.
+
+**Fix.** `_completed_variant_names` now also enumerates
+`results/*.failure.txt`, computes the variant name (string-slice
+because `Path.stem` only strips one suffix), and treats the
+failure-txt set as an *override*: any JSON whose sibling failure
+exists is omitted from `completed` regardless of how cleanly it
+parses. The orphan JSON is left in place (NOT renamed to .corrupt)
+so an operator triaging the failure can still inspect what the
+worker computed before crashing. The within-run case (same retry
+loop, after writing failure.txt) is also covered correctly: the
+variant is in `real_failed` so the loop's `not_done` filter excludes
+it; the next attempt would see the failure.txt and skip the orphan
+even if `real_failed` were lost.
+
+**Cost.** ~15 lines net in `_completed_variant_names`, 3 new tests
+in `TestCorruptJsonQuarantine`. Behaviour change is strictly
+*excluding* a variant from completed; never *including* one that
+shouldn't be. Cannot regress any happy-path run.
+
+### 15.2 G-3.A — `with ThreadPoolExecutor(...) as ex:` defeats the timeout
+
+**Failure mode.** The original `_yf_download_with_timeout` looked
+like a textbook portable-timeout: submit to a single-worker
+ThreadPoolExecutor, `result(timeout=N)`, catch TimeoutError, fail
+open. Source review passed. Tests passed.
+
+**It does not work when the inner fetch is genuinely hung.** The
+`with _cf.ThreadPoolExecutor(...) as ex:` construct relies on
+`Executor.__exit__`, which is documented to call
+`shutdown(wait=True)`. With `wait=True`, `__exit__` blocks until
+every running task completes. So when `result(timeout=N)` raises
+`TimeoutError` and control hands back to the with-block, the
+with-block's `__exit__` then BLOCKS WAITING FOR THE HUNG THREAD —
+exactly the thing the timeout was supposed to escape. The function
+never returns within `timeout` seconds; it returns whenever the
+underlying yfinance call decides to wake up (or never).
+
+The G-3 fix was, in effect, equivalent to the no-timeout original
+on the failure path it was supposed to handle.
+
+**Empirically reproduced.** A new behavioural test
+(`test_timeout_actually_returns_within_window_when_fetch_hangs`)
+mocks `yfinance.download` to sleep 30s, asks for a 1.0s timeout,
+and asserts `elapsed < 5.0`. With the cb76f0e code: elapsed = 30.0s
+(test fails). With the audit fix: elapsed ≈ 1.0s (test passes).
+
+**Why this matters in production.** A hung yfinance worker thread
+inside a battery variant is the exact upstream of a Bug F-style
+cascade: watchdog eventually fires `os._exit(124)` → ProcessPool
+sees worker death → BrokenProcessPool for all sibling variants. The
+G-3 fix was meant to close that path by failing the fetch fast and
+returning None (fail-open: trend filter treats it as "trend
+unknown" and lets the trade through). With the broken fix, the
+fetch doesn't fail fast — it hangs → watchdog → cascade. We didn't
+notice in the validation run because no yfinance call has actually
+hung yet.
+
+**Fix.** Replace the `with`-block with an explicit
+`try/finally`: create the executor manually, return the result on
+success (or None on TimeoutError), and call
+`ex.shutdown(wait=False, cancel_futures=True)` in the finally. The
+hung yfinance thread leaks until the worker subprocess exits, but
+`max_tasks_per_child=1` guarantees the worker exits after the
+single variant — bounding the leak to one variant's lifetime. The
+trade-off (briefly leak a daemon-equivalent thread vs. block the
+whole worker indefinitely) is unambiguously correct for our
+use-case.
+
+**Cost.** ~10 lines in `_yf_download_with_timeout`, 1 new
+behavioural test. The behavioural test (sleep+timeout pattern)
+takes ~1.5s to run, so it doesn't materially slow the suite. The
+test is the load-bearing piece — source-level checks fundamentally
+cannot catch this class of bug.
+
+### 15.3 What we did NOT change (audit findings, deferred)
+
+Several minor issues surfaced during the audit and were
+intentionally left alone (documented here so they aren't
+re-discovered as "new" later):
+
+* **`_atomic_write_text` race on shared target.** Two callers
+  writing to the same path concurrently can lose a write — both
+  use the same deterministic `<path>.tmp` filename. Fine in
+  practice (every current call site has exclusive ownership);
+  flagged for the day someone adds a parallel writer to
+  comparison.md or a results JSON.
+* **Watchdog cascades a single-variant hang.** Even with G-2's
+  retry loop, if variant X *deterministically* hangs and triggers
+  the watchdog, X cascades the pool and takes its in-flight
+  siblings down with it. After MAX_POOL_RETRIES=3 attempts X is
+  marked stuck. Acceptable: a deterministically-hanging variant is
+  itself the bug to fix; the retry loop's job is to absorb
+  *transient* cascades. A future enhancement could run the suspect
+  alone (max_workers=1) on retry.
+* **Worker log appends across retries.** When G-2 retries variant
+  X, loguru opens `workers/X.log` in append mode (default), so
+  attempt-2 content concatenates onto attempt-1's truncated tail.
+  Forensic-quality only — operator triage still works, just with
+  a "where does attempt 2 start?" scan. Not worth the change.
+* **G-5 stale stderr on rm-failure path.** When `docker rm -f`
+  itself fails, the stored failure record carries the *first*
+  launch's "in use by container" stderr rather than the rm-failed
+  context. Operator can read the scheduler stdout for the
+  "docker rm -f failed" line that precedes the saved record.
+
+### 15.4 Freeze accounting — no slot, no policy change
+
+Both audit fixes are post-cb76f0e amendments to the same
+harness/library files:
+
+* `packages/research/battery.py` (`_completed_variant_names`)
+* `packages/strategies/_trend_context.py` (`_yf_download_with_timeout`)
+
+Neither file is on FREEZE_v2.1's slot-consuming list. Both fixes
+make the *failure-handling* paths actually work as advertised —
+they don't change anything about *what* the backtester computes on
+a happy path. Backtest results remain byte-identical for any run
+that doesn't trigger the failure paths these fixes guard. Bypass
+ledger remains 1/3 (risk.allow_shorts).
+
+### 15.5 Deployment posture — explicitly NOT pushed to the VM
+
+Per the user's directive ("check the bug g and fix just don't
+deploy it"), this audit-fix commit is pushed to origin/main but
+**not** pulled to the backtester VM. Rationale:
+
+* The currently-running validation container (started before
+  cb76f0e) holds in-memory pre-Bug-G code; it is not affected by
+  any commit on disk.
+* The next scheduler-spawned launch — `nifty50_60d` resume — picks
+  up the latest pulled code via the read-only `packages/`
+  bind-mount. The VM-side checkout currently sits at cb76f0e (the
+  ORIGINAL Bug G fixes). That includes the broken G-3 timeout, so
+  if a yfinance call hangs in the resume window we'd cascade.
+* Per user instruction, we do NOT pull the audit fix mid-window.
+  The validation tail is the priority; a VM-side `git pull` would
+  also affect any other code path that's been touched on origin.
+* If a yfinance hang materializes during the resume, we revisit.
+  Probability is low (no hang has occurred in the last ~12h of
+  active validation traffic) and the watchdog still acts as a
+  backstop (60-min silence window → fail the variant rather than
+  wedge indefinitely).
+* Post-validation, both audit fixes get pulled with the rest of
+  the post-Friday tail of changes.

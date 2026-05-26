@@ -1296,3 +1296,100 @@ gets all four fixes when it launches in ~37 h.
 - `tests/unit/test_battery_robustness.py` — NEW, 26 tests
 - `docs/findings_log_2026-05-25.md` — §14 added
 - `docs/changes_done_2026-05-25.md` — this §13
+
+
+## §14. Bug G self-audit fixes (2026-05-26 morning, audit-only, NOT deployed)
+
+User asked to "check the bug g and fix just don't deploy it". A
+line-by-line review of the cb76f0e diff surfaced **two real defects
+in the original Bug G fix** that no source-level test would have
+caught. Full RCA in `findings_log_2026-05-25.md` §15. This section
+records the operational change-log and freeze accounting.
+
+### §14.1 Defects fixed
+
+**G-1.A — orphan results JSON masks failure.txt on resume.** When
+the worker writes `results/<name>.json` successfully but then
+crashes during return / pickle / IPC (rare but possible), the
+parent records `<name>.failure.txt`. The original Bug G-1's
+`_completed_variant_names` only inspected `*.json` files, so on the
+next operator-initiated `--resume`, the orphan JSON looked clean
+and the variant was silently skipped. Fix: make the reader treat
+the presence of a sibling `<name>.failure.txt` as authoritative
+("not completed; resume must re-run") regardless of how clean the
+JSON parses.
+
+**G-3.A — `with ThreadPoolExecutor(...)` defeats the timeout.**
+`Executor.__exit__` calls `shutdown(wait=True)`, which BLOCKS
+waiting for running tasks to complete. So when `result(timeout=N)`
+raised TimeoutError, the with-block's `__exit__` then hung
+indefinitely waiting for the still-running yfinance call —
+defeating the entire timeout. Reproduced empirically: a 1.0s
+timeout against a 30s sleep returned in 30.0s, not 1.0s. Fix:
+replace the with-block with explicit try/finally and call
+`shutdown(wait=False, cancel_futures=True)` so the function
+returns within the timeout window even when the inner thread is
+genuinely hung.
+
+### §14.2 Code changes (audit-only, NO bypass slot consumed)
+
+* `packages/research/battery.py` — `_completed_variant_names`
+  enumerates `*.failure.txt` and treats matching variants as
+  not-completed; ~15 lines net.
+* `packages/strategies/_trend_context.py` —
+  `_yf_download_with_timeout` rewritten with explicit try/finally;
+  ~10 lines net.
+* `tests/unit/test_battery_robustness.py` — +4 tests:
+  * `test_orphan_json_with_failure_txt_excluded` (G-1.A behavioural)
+  * `test_failure_txt_alone_does_not_quarantine_anything`
+  * `test_orphan_with_failure_does_not_quarantine_the_orphan`
+  * `test_timeout_actually_returns_within_window_when_fetch_hangs`
+    (G-3.A behavioural — the load-bearing one; takes ~1.5s real
+    wall-clock to verify the timeout works against a deliberate
+    sleep).
+
+Both behavioural tests were verified to FAIL on the original
+cb76f0e code (`git stash` of the audit fix → run test → fail) and
+to PASS on the audit fix. This rules out false-pass tests.
+
+### §14.3 VM operations — explicitly NONE
+
+Per the user's "don't deploy it" directive, the audit fix is
+pushed to `origin/main` only. The backtester VM checkout remains
+at cb76f0e (the original Bug G fixes, including the broken G-3
+timeout). The currently-running validation container is unaffected
+in any case (it runs the in-memory pre-G code). The next
+scheduler-spawned launch (`nifty50_60d` resume in ~28 h) will pick
+up cb76f0e via the read-only bind-mount, NOT the audit fix. If a
+yfinance hang materializes during that resume window we revisit;
+probability is low (no hang has occurred in 12+ hours of active
+fetching). Post-validation (after Friday 2026-05-29 review), the
+audit fix gets pulled with the rest of the post-window backlog.
+
+### §14.4 Test count
+
+* Pre-audit: 1267 unit tests (1241 + 26 Bug G robustness)
+* Post-audit: 1271 unit tests (+4 new behavioural)
+* Result: **1271/1271 passing**, 47.4 s wall-clock for the full
+  unit suite.
+
+### §14.5 Freeze accounting
+
+Both fixes touch the same files Bug G already touched (battery.py,
+_trend_context.py). Neither file is on FREEZE_v2.1's slot-
+consuming list. Both fixes are *failure-handling* corrections —
+they make the originally-claimed behaviour actually work — without
+changing anything about happy-path computations. No bypass slot
+consumed. Bypass ledger remains 1/3 (still only
+`risk.allow_shorts`).
+
+### §14.6 Files touched in §14
+
+- `packages/research/battery.py` — `_completed_variant_names`
+  failure.txt-aware
+- `packages/strategies/_trend_context.py` —
+  `_yf_download_with_timeout` non-blocking shutdown
+- `tests/unit/test_battery_robustness.py` — +4 behavioural tests
+- `docs/findings_log_2026-05-25.md` — §15 added
+- `docs/changes_done_2026-05-25.md` — this §14
+- `docs/FREEZE_v2.1.md` — audit-only entry extended
