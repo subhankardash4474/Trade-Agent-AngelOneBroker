@@ -1782,3 +1782,149 @@ artifact state" as a first-class column.
   diagnose.
 * Fix cost: 4 lines of code, 1 test line, 1 file copy. ~15 min
   dev time + ~10 min VM ops.
+
+---
+
+## 17. Bug I — Trader VM operating with 5 uncommitted local hot-fixes for ~2 weeks (2026-05-26 afternoon)
+
+### 17.1 Discovery context
+
+Triggered by attempting to deploy `risk.allow_shorts: false` to the
+trader VM (the slot-1 pre-staged flag, authorised today by the user
+under "deploy all the fix"). The deploy hop was `git pull origin
+main` on the trader, which **aborted** with:
+
+```
+error: Your local changes to the following files would be overwritten by merge:
+        docker-compose.yml
+        packages/core/stock_scanner.py
+        packages/monitoring/alerts.py
+        tools/cloud/install_heartbeat_cron.sh
+        tools/send_heartbeat.py
+Please commit your changes or stash them before you merge.
+error: The following untracked working tree files would be overwritten by merge:
+        tools/cloud/install_watchdog_cron.sh
+        tools/watchdog_check.py
+Please move or remove them before you merge.
+Aborting
+```
+
+Trader HEAD: `868d5ad` (2026-05-19). Origin/main HEAD: `73c26bf`
+(2026-05-26). Divergence on disk = 7 days. The container had been
+restarted as part of the deploy attempt, but the pull failed and the
+`sed` edit of `config.yaml` was a no-op (the key wasn't present on
+the trader's `config.yaml` because the slot-1 commit was never pulled
+in). **Net effect: trader is operating identically to pre-attempt,
+behaviour unchanged, but in a state that quietly resists upgrades.**
+
+### 17.2 What the 5 modified files contain
+
+Every diff is a *real production hot-fix* that solves an operational
+problem. None are bugs or junk:
+
+| File | Local delta | Justification (from in-file comments) |
+|---|---|---|
+| `docker-compose.yml` | +16 lines: bind-mounts `./tools:/app/tools:ro` and `./packages:/app/packages:ro` | 2026-05-23: enabling host-side hotpatch without an image rebuild during freeze. Required for everything below to actually take effect. |
+| `packages/core/stock_scanner.py` | rewritten (523 lines vs HEAD's 418) | NSE archives CSV path hot-fix. Without it, the live scanner fails to refresh its NSE universe. |
+| `packages/monitoring/alerts.py` | rewritten (665 lines vs HEAD's 644) | TLS verify default flip + markdown→HTML render for emails. Without it, alert emails fail under corporate-network TLS interception and arrive as walls of pseudo-text. |
+| `tools/send_heartbeat.py` | rewritten (463 lines vs HEAD's 362) | Refactor + container-exec mode so cron can fire `docker exec trader python ...` from the host. |
+| `tools/cloud/install_heartbeat_cron.sh` | +92 lines | `--container` mode + log-file pre-create dance (diagnosed 2026-05-25 09:10 IST when first heartbeat fire was a permission-denied no-op). |
+
+And four untracked files that the trader genuinely relies on:
+
+| File | Mtime | Why |
+|---|---|---|
+| `tools/cloud/install_watchdog_cron.sh` | 2026-05-25 | Watchdog installer (added in response to 2026-05-22 11-hour silent-hang). |
+| `tools/watchdog_check.py` | 2026-05-25 | The watchdog daemon itself — 5-min cron-fired probe of `logs/health.json` mtime, alerts on transitions. |
+| `docker-compose.override.yml` | 2026-05-11 | OCI VM memory limits: 750M cap, 400M reservation. |
+| `EMERGENCY_STOP` | 2026-05-13 | Empty sentinel file; daemon checks for its presence and refuses to open new positions if present. |
+| `_deploy.sh` | 2026-05-13 | Operator script for `git reset --hard origin/main` + UID alignment + image rebuild. |
+| `logs/.eod_sent_2026-05-15.flag` | 2026-05-15 | EOD-summary dedup marker; harmless residue. |
+
+### 17.3 Why it matters
+
+* **Upgrades are blocked.** Any attempt to pull origin/main aborts
+  on the modified-files check. This is a freeze-policy concern in
+  two directions:
+  1. Future audit-only fixes (e.g. the G-3 / G-3.A yfinance timeout,
+     which is genuinely relevant to live trading because the daemon
+     calls yfinance in the trend-context cache) cannot land on the
+     trader without manual reconciliation.
+  2. The slot-1 `risk.allow_shorts: false` change cannot be deployed
+     via the documented `git pull` hop. Today's deploy attempt
+     proved this. The same will be true of slot-2 and slot-3 when
+     they're consumed.
+* **The trader is on a fork-style branch with no upstream.** The 5
+  modified files have never been committed (anywhere). If the trader
+  VM disk is lost, the hot-fixes are lost with it.
+* **The freeze ledger does not reflect the actual production state.**
+  `FREEZE_v2.1.md` tracks slot consumption via files-modified-on-main.
+  None of the trader's hot-fixes appear in the ledger because they
+  never went through main. The ledger reads "1/3 slots used" but the
+  trader is materially N changes ahead of the documented baseline.
+
+### 17.4 What today's attempt did NOT cause (defensive accounting)
+
+* `config.yaml` was unchanged because the `sed` regex couldn't match
+  `allow_shorts:` (the line doesn't exist on the trader's config).
+* `config.yaml.bak_pre_allow_shorts_20260526T091042` was created on
+  the trader and remains as a forensic snapshot of the pre-attempt
+  state.
+* The trader container was restarted with the SAME config + SAME
+  on-disk packages it had at 14:37 IST. It came back healthy at
+  14:41 IST, rehydrated 3 trades + 3 cooldowns from DB, loaded
+  xgboost successfully, and ran preflight clean. **Behaviour
+  identical to pre-attempt.**
+* Operationally: the user explicitly took over the trader VM
+  rebuild as a manual task ("i will maually rebuilt the tarder vm")
+  upon seeing the divergence. This finding documents what was on
+  disk at handover time.
+
+### 17.5 Recommended reconciliation (post-Friday review)
+
+Not done today on purpose — too risky during the validation tail.
+Plan for post-Friday:
+
+1. On the trader VM, create a feature branch:
+   ```
+   sudo git -c safe.directory=/opt/trading-agent checkout -b trader-hotfixes-2026-05-26
+   sudo git -c safe.directory=/opt/trading-agent add docker-compose.yml \
+       packages/core/stock_scanner.py packages/monitoring/alerts.py \
+       tools/cloud/install_heartbeat_cron.sh tools/send_heartbeat.py \
+       tools/cloud/install_watchdog_cron.sh tools/watchdog_check.py \
+       docker-compose.override.yml
+   # leave EMERGENCY_STOP + _deploy.sh + .eod_sent flag uncommitted on
+   # purpose -- those are operator-local artifacts
+   sudo git -c safe.directory=/opt/trading-agent commit -m 'trader: production hot-fixes ... 2026-05-11 → 2026-05-25'
+   sudo git -c safe.directory=/opt/trading-agent push origin trader-hotfixes-2026-05-26
+   ```
+2. Pull-request that branch into main, review each hot-fix for
+   intent, merge.
+3. `git pull origin main` on the trader VM now fast-forwards cleanly.
+4. Then the slot-1 `risk.allow_shorts: false` deploy is the
+   documented 2-line edit-of-config.yaml + restart.
+
+Total estimated reconciliation time: ~90 minutes including review.
+Best done on a Saturday morning when the market is closed.
+
+### 17.6 Lesson for the freeze policy
+
+The freeze ledger tracks main-branch changes. It does NOT track the
+gap between main-branch state and on-VM state. For the next freeze
+iteration, the ledger should either:
+* Run a daily reconciliation check (`git status --porcelain` on
+  each VM, alert if non-empty), OR
+* Pin VMs to a tag with no read-write working tree (mounts only,
+  no `git pull` capacity).
+
+The current freeze policy assumes the VM's checkout is always the
+canonical artifact. Today's discovery shows that's wishful thinking
+once an operator starts hot-fixing in place. The 5 hot-fixes here
+are all *good* changes — the system worked correctly to keep the
+daemon alive — but they accumulated outside the audit trail.
+
+### 17.7 Files touched in this finding
+
+* `docs/findings_log_2026-05-25.md` — this §17 added
+* `docs/changes_done_2026-05-25.md` — §16 mirror entry (next commit)
+* No code changes. No deploy. No restart. Pure documentation.

@@ -1555,3 +1555,59 @@ Bypass ledger remains **1/3** (still only `risk.allow_shorts`).
 * `docs/findings_log_2026-05-25.md` — §16 added
 * `docs/changes_done_2026-05-25.md` — this §15
 * `docs/FREEZE_v2.1.md` — audit-only entry extended
+
+---
+
+## 16. Bug I — Trader VM ~2 weeks of uncommitted hot-fixes block routine pulls
+
+### §16.0 What was discovered
+
+Attempting to `git pull origin main` on the trader VM as part of
+today's `risk.allow_shorts: false` deploy aborted because the trader
+has 5 tracked-but-uncommitted modified files and 4 untracked files
+that origin/main wants to overwrite. Trader HEAD = `868d5ad`
+(2026-05-19); on-disk state is materially further along (hot-fixes
+added on 2026-05-23 and 2026-05-25 for NSE-archives CSV path, TLS
+verify default, host-side tools/ + packages/ bind-mounts, watchdog
+cron, OCI memory limits, etc.).
+
+Full details, file-by-file diff justification, and reconciliation
+plan are in `docs/findings_log_2026-05-25.md` §17.
+
+### §16.1 What today's attempt did
+
+* Backed up trader's `config.yaml` to
+  `config.yaml.bak_pre_allow_shorts_20260526T091042`.
+* `git fetch origin` succeeded; `git pull --ff-only origin main`
+  aborted on the local-changes check.
+* `sed -i ... allow_shorts: false ...` ran but matched nothing
+  (the line doesn't exist on the trader; the slot-1 commit was
+  never pulled). `config.yaml` is byte-identical to before.
+* `docker compose restart trader` ran successfully. Container came
+  back at 2026-05-26T09:10:58Z (14:40:58 IST), rehydrated cleanly:
+  3 trades + 3 cooldowns from DB, xgboost loaded, preflight green.
+* Effective change in trader behaviour: **zero**. Same as a
+  no-op restart.
+
+### §16.2 What this commit does
+
+* Zero code changes.
+* Adds Bug I to findings (§17) and Bug I mirror entry to changes
+  (this §16) so the audit trail captures the discovery moment.
+* No deploy. The user is taking over trader VM reconciliation
+  manually ("i will maually rebuilt the tarder vm") rather than
+  letting the dev tooling stash/pop/merge on a live trading VM
+  while a 36+h validation run depends on disk integrity.
+
+### §16.3 Freeze accounting
+
+Documentation-only. **No bypass slot consumed.** The slot-1
+allow_shorts pre-stage was committed days ago (slot 1/3 used); it's
+just that the deploy hop failed today, so the flag is still inert
+on the trader. Slot count is unchanged.
+
+### §16.4 Files touched
+
+* `docs/findings_log_2026-05-25.md` — §17 added (Bug I full detail).
+* `docs/changes_done_2026-05-25.md` — this §16 (Bug I mirror).
+* No source code, no tests, no config. No VM-side deploy.
