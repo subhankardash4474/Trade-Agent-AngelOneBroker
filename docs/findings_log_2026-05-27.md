@@ -852,7 +852,155 @@ and the full-vs-windowed equivalence suite. No bypass slot consumed.
 
 ---
 
-## 8. Cross-references
+## 8. Battery queue trim — drop ~144h of pre-retrain compute
+
+**Status:** DEPLOYED 2026-05-27 ~15:42 IST (10:12 UTC).
+**Commit:** `84f5acd` (queue config), `ae847e3` (§7.5 honest perf
+attribution amendment — preceding doc-only commit).
+**Freeze-v2.1 class:** audit-only (queue config only; no behaviour
+change in the harness, the strategies, or the live trader). **No
+bypass slot consumed.**
+
+### 8.1 Context — why trim now
+
+Operator question 15:35 IST asked what the queue's ~7h ETA actually
+buys us, and whether V1→V19 gets re-run on different data after
+`nifty50_60d` finishes. The honest answer was: yes — under the
+old queue, V1→V19 would re-run on 232 stocks × 60d (job 3,
+v2_baseline_90d, ~48h), then again on 232 × 60d train (~32h),
+then 232 × 30d holdout (~16h), then 232 × 120d (~64h). Total
+~160h of compute downstream of slot #2.
+
+Those four jobs were designed pre-2026-05-26 to characterise the
+SHIPPED 5-strategy ensemble across multiple windows and regimes.
+But yesterday's slot-2 (commit `f32009c`) disabled
+`xgboost_classifier` live because the production .pkl was
+forensically confirmed broken (§5). So those long-history v2_*
+jobs would now be re-validating a 4-strategy ensemble that the
+**post-retrain** ensemble will strictly dominate — ~144h of
+backtester time spent on a question the retrain (slot-3 candidate,
+sprint Day 4-5) will moot.
+
+### 8.2 What we trimmed
+
+Old queue (6 jobs):
+
+1. `nifty50_60d`                              ~7h     all 19 variants
+2. `nifty500_v4_long_only_validation_60d`     ~10-12h 6 variants
+3. `v2_baseline_90d`                          ~48h    all 19 variants
+4. `v2_train_60d`                             ~32h    all 19 variants
+5. `v2_holdout_30d`                           ~16h    all 19 variants
+6. `v2_baseline_120d`                         ~64h    all 19 variants
+
+New queue (3 jobs):
+
+1. `nifty50_60d`                              ~7h     all 19 variants
+   — *currently running, untouched*
+2. `nifty500_v4_long_only_validation_60d`     ~10-12h 6 variants
+   — *Friday 2026-05-29 review evidence (V4/V17/V18/V19 on full
+     232-stock universe)*
+3. `v2_holdout_30d`  *(promoted from slot #5)*  ~16h  all 19 variants
+   — *p-hack guard: if a slot-#1 winner crumbles on the last 30d,
+     the slot-#1 ranking was overfit. We keep the holdout (the
+     guard) and drop the matching train-60d slot, since slot #1
+     already covers a 60d-window ranking on a comparable universe.*
+
+**Dropped (preserved in git at HEAD~):**
+
+* `v2_baseline_90d`   (~48h) — broken-ensemble re-validation, moot
+* `v2_train_60d`      (~32h) — redundant given slot #1 + slot #3
+* `v2_baseline_120d`  (~64h) — regime-dependence check, useful only
+                                post-retrain
+
+**Net compute saved:** ~144h ≈ 6 days.
+
+### 8.3 Why this is audit-only (not a freeze slot)
+
+* Edits a queue config file (`data/battery_queue.yaml`), not the
+  trader, harness, strategies, or risk code.
+* Does not change variant definitions in
+  `packages/research/battery.py`.
+* Does not start, stop, or alter the in-flight job (`nifty50_60d`,
+  the slot #1 entry that was already running).
+* Removed jobs were future-scheduled work, not commitments — they
+  hadn't appeared in `data/battery_queue_state.json` yet (state
+  file is written on job *start*).
+* Post-retrain, the dropped windows will be re-queued as a
+  separate block validating the NEW ensemble. We are not making
+  the no-xgb config the long-term shipping target; we are skipping
+  validation of a known-dead ensemble.
+
+### 8.4 Verification before commit
+
+| Check | Result |
+|:------|:-------|
+| `python -c "import yaml; yaml.safe_load(...)"` parses | OK — 3 jobs, expected keys |
+| `pytest tests/unit/test_battery_queue_scheduler.py -q` | 29/29 pass |
+| Diff is queue-config only (no .py touched) | confirmed |
+
+### 8.5 Deploy verification on backtester VM
+
+Captured by `/tmp/bt_queue_deploy.sh`:
+
+| Checkpoint | Before deploy | After deploy |
+|:-----------|:--------------|:-------------|
+| HEAD | `9ac6435` | `84f5acd` |
+| Queue entries | 6 | **3** |
+| scheduler PID | 1035215 | 1050628 (restarted) |
+| In-flight container | `Up 3 hours` | **`Up 3 hours`** *(same container, undisturbed)* |
+| state file | nifty50_60d="running" | nifty50_60d="running" *(unchanged — scheduler re-attaches via `wait_for_running_battery`)* |
+
+Scheduler journal line confirming the new shape:
+
+```
+May 27 10:12:27 backtester battery-scheduler[1050628]: \
+    [scheduler] queue: /opt/trading-agent/data/battery_queue.yaml (3 jobs)
+May 27 10:12:27 backtester battery-scheduler[1050628]: \
+    [scheduler] waiting for pre-existing battery \
+    'battery_nifty50_60d_20260527T065700' to finish (poll every 90s)...
+```
+
+The scheduler correctly:
+1. Loaded the new 3-job queue on restart.
+2. Detected the in-flight `battery_nifty50_60d_20260527T065700`
+   container still running (uptime 3 hours, untouched by the
+   restart because it's a detached docker container, not a child
+   of the systemd unit).
+3. Entered `wait_for_running_battery()` to wait it out.
+4. Will resume queue processing from the new slot #2 (validation)
+   once `nifty50_60d` completes (~3h from deploy time).
+
+### 8.6 Expected end-to-end timeline
+
+Sequential, single-VM (workers=2 inside each job's container):
+
+| Slot | Job | Wall-clock | Expected completion (IST) |
+|:----:|:----|:----------:|:--------------------------|
+| 1 | `nifty50_60d`                              | ~3h remaining | Wed 19:30 |
+| 2 | `nifty500_v4_long_only_validation_60d`     | ~10-12h       | Thu 07:00 |
+| 3 | `v2_holdout_30d`                            | ~16h          | Thu 23:00 |
+
+**Friday 2026-05-29 review** has evidence from all 3 jobs in
+hand. Backtester VM is then free for post-review work (e.g., the
+model-retrain job — slot-3 candidate).
+
+### 8.7 Rollback
+
+If we change our minds, the dropped jobs are at `git show HEAD~1:data/battery_queue.yaml`. Restore with:
+
+```bash
+sudo -u opc git show HEAD~1:data/battery_queue.yaml > \
+    /opt/trading-agent/data/battery_queue.yaml
+sudo systemctl restart battery-scheduler.service
+```
+
+The in-flight job is unaffected by either roll-forward or
+roll-back of the queue file, because the queue is only consulted
+*between* jobs.
+
+---
+
+## 9. Cross-references
 
 * `findings_log_2026-05-25.md` §15 (Bug G self-audit), §16 (Bug H —
   xgboost missing from battery), §17 (Bug I — trader VM divergence).
@@ -868,9 +1016,9 @@ and the full-vs-windowed equivalence suite. No bypass slot consumed.
 
 ---
 
-## 9. Files touched in this finding (writes only)
+## 10. Files touched in this finding (writes only)
 
-* `docs/findings_log_2026-05-27.md` — this file (§5 + §6 + §7 added)
+* `docs/findings_log_2026-05-27.md` — this file (§5 + §6 + §7 + §8 added)
 * `docs/diagnosis_sprint_2026-05-27.md` — created earlier today
 * `docs/FREEZE_v2.1.md` — slot reclassification (`8bcc360`)
 * `config.yaml`:
@@ -893,6 +1041,8 @@ and the full-vs-windowed equivalence suite. No bypass slot consumed.
   identical + all-strategies mutation/determinism contracts)
 * `tests/unit/test_audit_2026_05_27_fixes.py` — F-46 string assert
   updated for P-04 variable rename
+* `data/battery_queue.yaml` — queue trim (`84f5acd`); slots #3-6
+  dropped, holdout promoted to slot #3; ~144h compute saved.
 * No risk-manager / position-sizer / ensemble code changes.
 * No model files modified or replaced (the broken .pkl is left in
   place as forensic evidence; it cannot be loaded because the active
