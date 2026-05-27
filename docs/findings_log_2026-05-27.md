@@ -657,7 +657,157 @@ Queued for tonight after-hours: same archive-and-rewrite there.
 
 ---
 
-## 7. Cross-references
+## 7. Strategy hot-path performance sprint (P-03, P-04, P-11)
+
+### 7.1 Trigger
+
+Strategy-level audit memo (afternoon 2026-05-27) flagged three
+behavior-preserving perf hotspots in the rule-based / LSTM hot paths:
+
+* **P-03** — `SupertrendFollow._compute_supertrend` drove a
+  `pd.Series.iloc[i] = ...` loop, ~12 ms per 1500-bar slice. Same file
+  also called `_compute_atr(df, period=10)` twice per event (once
+  inside the Supertrend computation, once for SL/TP sizing). Same file
+  also did the standard `df = data.copy()` opener.
+* **P-04** — Five other rule-based strategies (`rsi_momentum`,
+  `vwap_bounce`, `mean_reversion`, `opening_range_breakout`,
+  `moving_average_crossover`) each opened with `df = data.copy()`
+  purely to be able to write 3-7 derived columns back to the frame
+  for local `.iloc[-1]` reads. `_make_signal` only consumes
+  `data["close"]` + `data.index`, so the copy was strictly waste.
+* **P-11** — `LSTMPriceModel` inference round-tripped through pandas
+  four times (DataFrame -> fillna DataFrame -> sklearn -> DataFrame
+  rewrap -> numpy -> torch). Could be 1 numpy block + in-place fill
+  + sklearn + `torch.from_numpy` (zero-copy).
+
+### 7.2 Decision: bundle vs. defer
+
+Memo asked whether to fold these into Slot-2 (xgboost disable) since
+it was already being live-deployed. Verdict: **no -- keep separate**,
+treat as audit-only:
+
+* Slot-2 is consumed (xgboost disable, commit `f32009c`).
+* The May-14 panic-patch lesson is exactly this: do not bundle a
+  strategy-altering change with operational/perf changes in the same
+  deploy. Independent revertability matters.
+* Perf fixes are mechanically byte-identical (mathematics unchanged,
+  only allocation pattern + loop substrate change). They qualify as
+  **audit-only under freeze-v2.1** provided tests prove the equality.
+
+### 7.3 Implementation
+
+Three commits, each independently revertable:
+
+| Commit  | Scope                                         | Files |
+|---------|-----------------------------------------------|-------|
+| `1fe1deb` | P-03 SupertrendFollow + perf-invariants test  | 2 |
+| `7f19990` | P-04 5 strategies + F-46 string-assert tweak  | 6 |
+| `0809cf5` | P-11 LSTMPriceModel numpy handoff             | 1 |
+
+P-03 details:
+
+* `_compute_supertrend` now operates on numpy arrays internally (same
+  algorithm: bar-by-bar direction comparison, trailing-band carry-
+  forward within a direction segment, direction-segment-flip reset).
+  Each iteration is a direct array index instead of a pandas
+  BlockManager lookup.
+* `_compute_atr_cached(self, df, period)` -- instance-level cache
+  keyed by `(id(df), period)`. Within a single `generate_signal` call
+  the two `_compute_atr` callers collapse to one compute + one cache
+  hit. Across events the cache invalidates automatically (new slice
+  has a new id).
+* `data.copy()` removed; `supertrend`/`st_dir`/`adx` held as local
+  Series instead of being written back to the frame.
+
+P-04 details:
+
+* All 5 strategies refactored to compute derived columns as locals.
+* ORB never wrote to the frame in the first place -- the copy was
+  pure waste, removed.
+* `_make_signal` calls now pass the original `data` frame
+  (`_make_signal` only reads `data["close"]` + `data.index`, so this
+  is safe).
+
+P-11 details:
+
+* `self._ml_feature_cols` cached at `__init__` (was being re-queried
+  from `FeatureEngine.get_ml_feature_columns()` every cycle).
+* `window_df.to_numpy(dtype=float32)` -> in-place `np.nan_to_num` ->
+  `scaler.transform(numpy)` -> `torch.from_numpy(...).unsqueeze(0)`.
+* `torch.from_numpy` shares memory with the numpy array; we never
+  mutate it after constructing the tensor, so aliasing is safe.
+* NaN-skew detector (F-14) ported to numpy (`np.isnan(arr).sum()`).
+* Behavior unchanged today because `lstm_price_model` is not in
+  `strategies.active`; commit is forward prep for re-enablement
+  post-retrain.
+
+### 7.4 Verification
+
+* `tests/unit/test_strategy_perf_invariants.py` (new file, 19 tests,
+  all passing):
+  - `test_supertrend_vectorised_matches_pandas_loop` -- the **pre-fix
+    pandas loop is preserved verbatim** as a reference function;
+    output asserted byte-identical to the new vectorised path across
+    5 RNG seeds.
+  - `test_no_caller_frame_mutation[*]` -- sha256 of input frame
+    before vs after the call, parametrised across all 6 strategies.
+  - `test_strategy_output_is_deterministic[*]` -- two consecutive
+    calls produce bit-identical TradeSignals; parametrised across
+    all 6 strategies (guards against cache-state leakage).
+  - `test_supertrend_atr_cache_invalidates_on_new_frame` -- distinct
+    DataFrames yield distinct ATR values.
+* Full unit suite: **1,395 tests pass** (was 1,394 + 1 stale string
+  assert; updated as part of P-04 commit).
+* `tests/unit/test_strategy_history_window.py` -- the pre-existing
+  full-vs-windowed equivalence suite (TestSupertrendEquivalence,
+  TestRSIMomentumEquivalence, TestMeanReversionEquivalence,
+  TestMACrossoverEquivalence, TestVWAPBounceEquivalence) **continues
+  to pass**, which is independent confirmation that the refactor
+  preserved windowing semantics.
+
+### 7.5 Measured speedup
+
+Local micro-benchmark on a 1500-bar synthetic frame:
+
+| Stage                           | Pre-fix | Post-fix | Speedup |
+|---------------------------------|--------:|---------:|--------:|
+| `_compute_supertrend` (n=1500)  | ~12 ms  | 2.8 ms   | ~4.3x   |
+| `generate_signal` (n=1500)      | ~25 ms  | 5.6 ms   | ~4.5x   |
+
+Across the backtester (~169 symbols x 5 active strategies x ~75
+events/symbol/day per variant) this is the dominant per-event cost
+saved. Projected backtester wall-clock reduction: ~25-30% per
+variant (matches the audit memo's prediction).
+
+### 7.6 Freeze v2.1 ledger impact
+
+Slot count unchanged at **2/3 used**:
+
+* Slot 1: `risk.allow_shorts: false` durability (`8e1e926`) -- LIVE.
+* Slot 2: xgboost disable (`f32009c`) -- LIVE today.
+* Slot 3: reserved (model retrain, when the new pkl lands).
+
+Today's three perf commits (`1fe1deb`, `7f19990`, `0809cf5`) are
+**audit-only**, evidenced by the byte-identical reference-loop test
+and the full-vs-windowed equivalence suite. No bypass slot consumed.
+
+### 7.7 Deploy plan
+
+* **Backtester VM**: pull origin/main (post-P-11 HEAD), rebuild
+  `trading-agent:latest`, cleanup partial run artifacts, restart
+  scheduler. This commit completes the unblock work for resuming
+  the V1-V19 nifty50_60d re-run on the now-cleaner 4-strategy
+  config. **Deploying immediately** per operator instruction.
+* **Trader VM**: **NO deploy today.** Trader image stays on
+  `f32009c` (xgboost-disabled config + observability). Perf fixes
+  do not affect live signal generation behavior, only throughput;
+  validating them on the backtester first is the May-14 lesson.
+  Trader image will be rolled forward at the post-Friday review
+  along with any other accumulated changes.
+
+---
+
+## 8. Cross-references
 
 * `findings_log_2026-05-25.md` §15 (Bug G self-audit), §16 (Bug H —
   xgboost missing from battery), §17 (Bug I — trader VM divergence).
@@ -673,9 +823,9 @@ Queued for tonight after-hours: same archive-and-rewrite there.
 
 ---
 
-## 8. Files touched in this finding (writes only)
+## 9. Files touched in this finding (writes only)
 
-* `docs/findings_log_2026-05-27.md` — this file (§5 + §6 added)
+* `docs/findings_log_2026-05-27.md` — this file (§5 + §6 + §7 added)
 * `docs/diagnosis_sprint_2026-05-27.md` — created earlier today
 * `docs/FREEZE_v2.1.md` — slot reclassification (`8bcc360`)
 * `config.yaml`:
@@ -687,7 +837,17 @@ Queued for tonight after-hours: same archive-and-rewrite there.
 * `logs/trades.csv` — manual_test rows removed (this commit)
 * `logs/trades_manual_test_archive_2026-05-26.csv` — created (this
   commit)
-* No strategy code changes (xgboost disable is a config edit).
+* `packages/strategies/supertrend_follow.py` — P-03 vectorise + ATR
+  cache + drop copy (`1fe1deb`)
+* `packages/strategies/{rsi_momentum,vwap_bounce,mean_reversion,
+  opening_range_breakout,moving_average_crossover}.py` — P-04 drop
+  copy (`7f19990`)
+* `packages/strategies/lstm_model.py` — P-11 numpy handoff + cached
+  feature cols (`0809cf5`)
+* `tests/unit/test_strategy_perf_invariants.py` — new (P-03 byte-
+  identical + all-strategies mutation/determinism contracts)
+* `tests/unit/test_audit_2026_05_27_fixes.py` — F-46 string assert
+  updated for P-04 variable rename
 * No risk-manager / position-sizer / ensemble code changes.
 * No model files modified or replaced (the broken .pkl is left in
   place as forensic evidence; it cannot be loaded because the active
