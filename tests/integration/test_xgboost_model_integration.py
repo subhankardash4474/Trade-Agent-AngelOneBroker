@@ -250,19 +250,54 @@ def test_low_confidence_returns_hold(strategy: XGBoostClassifier):
 # ── 5. Config integration ─────────────────────────────────────────
 
 
-def test_config_enables_xgboost_classifier():
-    """Locked in 2026-05-06 when we first turned the strategy on.
-    If the active list drops xgboost_classifier without an explicit
-    revert decision, this test fires."""
+def test_config_disables_xgboost_classifier_pending_retrain():
+    """Inverted on 2026-05-27 (commit f32009c, FREEZE_v2.1 slot-2):
+    the production xgboost model on disk
+    (``models/xgboost_model.pkl``, mtime 2026-05-14 12:51 IST) is
+    provably broken -- forensic-audit signal-audit data shows a clean
+    ~95 % SELL -> 100 % BUY directional flip on 2026-05-11 in the
+    same bear regime with the same features, plus four known
+    training-pipeline bugs none of which were applied to the .pkl
+    on disk (P1 #8 May 17, C-23 May 26, F-22 + F-24 May 27).
+
+    Re-enabling REQUIRES, per the commit message of f32009c:
+      (a) a clean retrain on the corrected pipeline,
+      (b) held-out backtest validation showing edge,
+      (c) explicit ``freeze-bypass: critical-bug-fix`` slot consumption.
+
+    If you re-enable xgboost without doing those three things, this
+    test will fail and force you to either revert OR update the test
+    in the same commit that re-enables -- forcing the operator to
+    confront the criteria, not bypass them.
+
+    See:
+      * docs/findings_log_2026-05-27.md §6 (forensic audit synthesis)
+      * commit f32009c (DISABLE rationale + re-enable criteria)
+      * FREEZE_v2.1.md §Bypass ledger (slot 2 of 3 used)
+    """
     import yaml
     cfg_path = Path(__file__).resolve().parents[2] / "config.yaml"
     with open(cfg_path) as f:
         cfg = yaml.safe_load(f)
 
     active = cfg.get("strategies", {}).get("active", [])
-    assert "xgboost_classifier" in active, (
-        "xgboost_classifier missing from strategies.active. "
-        "If intentional, also remove the test or document the revert."
+    assert "xgboost_classifier" not in active, (
+        "xgboost_classifier is present in strategies.active again. "
+        "Per FREEZE_v2.1.md slot-2 and commit f32009c, re-enable "
+        "requires (a) clean retrain, (b) held-out validation, "
+        "(c) explicit slot consumption. If those three gates are "
+        "genuinely satisfied, invert this assertion in the same "
+        "commit that re-enables. Do NOT silently flip both."
+    )
+
+    # Defence in depth: the disabled stanza must still carry the
+    # `DISABLED 2026-05-27` marker so a future operator reading the
+    # raw config file sees the rationale, not just a missing line.
+    raw = cfg_path.read_text(encoding="utf-8")
+    assert "DISABLED 2026-05-27" in raw, (
+        "config.yaml lost the `DISABLED 2026-05-27` marker comment "
+        "near xgboost_classifier. The audit trail is part of the "
+        "freeze-bypass discipline -- preserve it."
     )
 
 
