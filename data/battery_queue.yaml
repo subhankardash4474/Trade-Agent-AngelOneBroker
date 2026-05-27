@@ -38,15 +38,54 @@
 # Runtime estimate: 6 variants × ~14h ÷ 2 workers = ~42h. Completes
 # Wed/Thu, ahead of Friday review.
 #
-# Full v2_baseline_90d is preserved as slot #3 -- still queued, just
-# runs after the validation evidence is in hand.
+# 2026-05-27 TRIM (audit-only, freeze-v2.1 docs-class). Rationale:
+# the xgboost_classifier was disabled live in slot-2 yesterday (commit
+# f32009c) because the 2026-05-14 .pkl was confirmed broken (forensic
+# audit, see docs/findings_log_2026-05-27.md §5). The four long-history
+# v2_* jobs that previously sat in slots #3-6 of this queue were
+# designed to characterise the SHIPPED ensemble across multiple
+# windows / regimes. With xgboost out of strategies.active, those
+# jobs would be re-validating a 4-strategy ensemble that's already
+# strictly dominated by the upcoming retrained-xgboost path -- ~144h
+# of backtester time spent on a question the retrain will moot.
+#
+# We keep:
+#   * Slot #1 (nifty50_60d, all 19 variants)    — fast sanity ranking
+#     of variant configs on the 4-strategy ensemble. Currently RUNNING.
+#   * Slot #2 (validation_60d, 6 variants)      — Friday 2026-05-29
+#     review evidence. Answers V4 vs V17 vs V18 vs V19 on the full
+#     232-stock universe.
+#   * Slot #3 (v2_holdout_30d, all 19 variants) — p-hack guard. If a
+#     variant wins on slot #1's 60d window but crumbles on the last
+#     30d, the slot-#1 result was overfit. Cheapest viable
+#     train/holdout split.
+#
+# We drop (preserved in git history at commit prior-to-this):
+#   * v2_baseline_90d            (~48h) — would re-validate broken
+#                                  4-strategy ensemble; superseded
+#                                  by post-retrain runs.
+#   * v2_train_60d               (~32h) — train half of the
+#                                  train/holdout split; redundant
+#                                  given we keep just the holdout
+#                                  (the holdout IS the p-hack guard
+#                                  — train is already covered by
+#                                  slot #1).
+#   * v2_baseline_120d           (~64h) — longer-window
+#                                  regime-dependence check; useful
+#                                  only after retrain is live.
+#
+# Net compute saved: ~144h ≈ 6 days. Once the retrained xgboost model
+# is qualified (sprint Day 4-5, see docs/diagnosis_sprint_2026-05-27.md),
+# we will queue a SEPARATE block of long-history jobs that validate
+# the new ensemble — those replace what we removed here, but on the
+# post-retrain config rather than the broken-xgb config.
 
 schema_version: 1
 
 jobs:
   # ── 1. Smaller universe, faster turnaround (FIRST EVIDENCE) ─────────
-  # Nifty 50 in 60d on workers=2 ~= 12-18h after the quiet-logger
-  # patch landed 2026-05-19. Use this as the "is the harness even
+  # Nifty 50 in 60d on workers=2 ~= 7h after the 2026-05-27 perf fixes
+  # (P-03/P-04/P-11). Use this as the "is the harness even
   # producing variant rankings?" sanity check before committing the
   # backtester VM to multi-day v2 runs.
   - name: nifty50_60d
@@ -71,37 +110,15 @@ jobs:
       - V18_long_only_threshold_3pct
       - V19_long_only_filters_off
 
-  # ── 3. Baseline (matches today's deploy, full v2 universe) ──────────
-  - name: v2_baseline_90d
-    days: 90
-    interval: 5m
-    workers: 2
-    universe-file: tests/fixtures/battery_v2_universe.json
-
-  # ── 4. Walk-forward TRAIN slice ──────────────────────────────────────
-  # First 60 of 90 days. Use to pick the best variant.
-  - name: v2_train_60d
-    days: 90
-    interval: 5m
-    workers: 2
-    universe-file: tests/fixtures/battery_v2_universe.json
-    train-window-days: 60
-
-  # ── 5. Walk-forward HOLDOUT slice ────────────────────────────────────
-  # Last 30 of 90 days. Variants that win on TRAIN must survive HOLDOUT.
-  # If a variant crumbles here, the train win was p-hacked.
+  # ── 3. Walk-forward HOLDOUT slice (2026-05-27 moved up) ──────────────
+  # Last 30 of 90 days. P-hack guard: if any variant wins on slot #1's
+  # 60d window (the de-facto TRAIN) but crumbles on this HOLDOUT,
+  # the slot-#1 ranking was overfit and we discard the candidate.
+  # Promoted from old slot #5 to slot #3 on 2026-05-27 because the
+  # other three v2_* jobs were dropped (see header for rationale).
   - name: v2_holdout_30d
     days: 90
     interval: 5m
     workers: 2
     universe-file: tests/fixtures/battery_v2_universe.json
     holdout-window-days: 30
-
-  # ── 6. Longer history sanity ─────────────────────────────────────────
-  # 120d uses the same v2 universe but a longer lookback. Useful for
-  # catching regime-dependence of variant rankings.
-  - name: v2_baseline_120d
-    days: 120
-    interval: 5m
-    workers: 2
-    universe-file: tests/fixtures/battery_v2_universe.json
