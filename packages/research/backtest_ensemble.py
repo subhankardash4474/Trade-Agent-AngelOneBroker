@@ -333,6 +333,20 @@ class EnsembleBacktester:
         run_t0 = time.time()
         next_progress_at = PROGRESS_LOG_INTERVAL_EVENTS
         last_progress_wall_t = run_t0
+        # B-05 (audit 2026-05-27 third pass): track the prior progress tick's
+        # event counter so we can emit an INSTANTANEOUS rate alongside the
+        # cumulative one. The cumulative rate ``event_idx / elapsed`` is a
+        # running average from variant start -- after a fast warmup phase
+        # (every strategy returns insufficient_data for the first ~200
+        # bars per symbol) it stays artificially high for tens of minutes
+        # and the operator (correctly) suspects the run is degrading when
+        # the cumulative number drifts down toward steady state. The
+        # instantaneous rate, measured over the last PROGRESS_LOG_INTERVAL
+        # window, reflects current per-event cost honestly so the ETA can
+        # be reasoned about. Both are emitted; the cumulative one is still
+        # what feeds ``eta_sec`` because it's the smoother basis for
+        # long-horizon extrapolation.
+        last_progress_event_idx = 0
 
         for event_idx, (ts, symbol, bar, df_slice) in enumerate(events, start=1):
             # Periodic progress log. Without this, the worker emits only
@@ -353,6 +367,21 @@ class EnsembleBacktester:
                 elapsed = max(now_wall - run_t0, 1e-6)
                 pct = event_idx / total_events * 100 if total_events else 0.0
                 rate = event_idx / elapsed
+                # B-05 (audit 2026-05-27 third pass): compute the
+                # instantaneous rate over the window since the previous
+                # progress tick. This is what an operator wants to see
+                # when they ask "is the run getting slower?" -- the
+                # cumulative rate above is a stable but lagging average,
+                # while ``inst_rate`` reflects the last ~PROGRESS_LOG_INTERVAL_SECONDS
+                # of work. On the very first tick (last_progress_event_idx == 0)
+                # they coincide; thereafter they diverge as soon as the
+                # per-event cost changes. The ETA still uses the cumulative
+                # rate (smoother basis for hour-scale extrapolation) but
+                # the operator can mentally substitute inst_rate when
+                # the divergence is large.
+                tick_elapsed = max(now_wall - last_progress_wall_t, 1e-6)
+                tick_events = event_idx - last_progress_event_idx
+                inst_rate = tick_events / tick_elapsed if tick_events > 0 else 0.0
                 remaining = max(total_events - event_idx, 0)
                 eta_sec = remaining / rate if rate > 0 else 0.0
                 eta_str = self._format_duration(eta_sec)
@@ -362,7 +391,8 @@ class EnsembleBacktester:
                 sim_date = str(ts)[:10]
                 logger.info(
                     f"[BATTERY-PROGRESS] {event_idx:,}/{total_events:,} "
-                    f"({pct:5.1f}%) | sim_date={sim_date} | rate={rate:,.0f} ev/s "
+                    f"({pct:5.1f}%) | sim_date={sim_date} | "
+                    f"rate={rate:,.0f} ev/s (now={inst_rate:,.0f}) "
                     f"| elapsed={self._format_duration(elapsed)} | ETA={eta_str}"
                 )
                 # Advance the event watermark to the next 10k boundary
@@ -371,6 +401,7 @@ class EnsembleBacktester:
                 while next_progress_at <= event_idx:
                     next_progress_at += PROGRESS_LOG_INTERVAL_EVENTS
                 last_progress_wall_t = now_wall
+                last_progress_event_idx = event_idx
 
             # B-01 (audit 2026-05-27 second pass): clear per-stock loss
             # counter at the start of every new IST trading day so

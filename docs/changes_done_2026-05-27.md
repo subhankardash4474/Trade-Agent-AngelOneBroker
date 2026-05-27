@@ -193,11 +193,25 @@ into the same Tier D file and same regression test file.
 | B-03  | **Perf micro.** ``_apply_slippage`` short-circuits and returns the input price unchanged when ``slippage_pct == 0.0`` (idealised-stress and fee-only studies). Skips both the multiply and the RNG draw — bit-identical to the mathematical limit, lighter on the hot path. | `packages/research/backtest_ensemble.py` |
 | B-04  | **Perf micro.** ``_bump_equity`` now reads ``current_day`` from the enclosing scope (already computed once per event by the B-01 rollover block) instead of calling ``_ts.date()`` again. Defensive ``_ts.date()`` fallback retained for the ``current_day is None`` corner case. Removes ~220k Python attribute-conversion calls on a Nifty-50 / 60-day run. | `packages/research/backtest_ensemble.py` |
 
+### Third-pass: operator observability after VM deployment
+
+A real run on the backtester VM showed the cumulative ev/s drifting
+from 33 → 29 in the first 5 min, which (correctly) made the operator
+suspect a degradation. The cumulative rate ``event_idx / elapsed`` is
+a lagging average from variant start, so a real per-tick slowdown
+(warmup ending, contention) only appears as a slow drift in the
+displayed number. Diagnosing it required arithmetic on two
+consecutive progress lines.
+
+| ID    | Fix                                                                                                                                                                                                                                                                                  | Files |
+| ----- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ----- |
+| B-05  | **Observability.** ``[BATTERY-PROGRESS]`` now emits ``rate=X ev/s (now=Y)`` where ``Y`` is the instantaneous rate over the last progress-tick window (``tick_events / tick_elapsed``). Operator can now read true current throughput directly instead of inferring it from two consecutive cumulative numbers. ETA still uses the cumulative rate (smoother basis for hour-scale extrapolation). | `packages/research/backtest_ensemble.py` |
+
 ### Tests
 
 New regression file: `tests/unit/test_backtester_perf_2026_05_27.py` —
-**19 tests** covering each of P-01, P-05, P-06, P-07, P-08, P-10, P-12,
-B-01, B-02, B-03, B-04.
+**21 tests** covering each of P-01, P-05, P-06, P-07, P-08, P-10, P-12,
+B-01, B-02, B-03, B-04, B-05.
 Mix of (a) source-search asserts (so the structural perf change can't
 silently regress), (b) numerical-equivalence asserts (vectorised MDD vs
 loop; `compute_all` short-circuit vs full recompute on the last row;
@@ -205,12 +219,13 @@ loop; `compute_all` short-circuit vs full recompute on the last row;
 (`_in_dead_hour` cache hit, `_prefetch_trend_context` calls
 `get_trend` once per symbol).
 
-Full-suite run after the perf sweep + second-pass fixes: **1617 / 1617
-passing** (1598 pre-existing + 12 Tier-D perf + 7 second-pass B-* tests).
+Full-suite run after the perf sweep + second-pass + third-pass fixes:
+**1619 / 1619 passing** (1598 pre-existing + 12 Tier-D perf + 7 second-pass
+B-01..B-04 + 2 third-pass B-05).
 
 ```
 $ python -m pytest tests -q
-.................................................................. 1617 passed in 68.92s
+.................................................................. 1619 passed in 63.34s
 ```
 
 ### Freeze accounting

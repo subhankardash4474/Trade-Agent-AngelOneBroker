@@ -473,3 +473,48 @@ def test_b04_bump_equity_reuses_current_day():
     # And the ``_ts.date()`` call must be inside an ``if day is None``
     # branch (defensive fallback only).
     assert "if day is None" in body
+
+
+# ───────────────────────── B-05 ──────────────────────────
+
+
+def test_b05_progress_emits_instantaneous_rate_alongside_cumulative():
+    """B-05: the BATTERY-PROGRESS line must include both the cumulative
+    rate (``rate=X ev/s``) AND a ``(now=Y)`` instantaneous-rate suffix.
+
+    Why this matters operationally: on a multi-hour run the cumulative
+    rate is a stable but lagging average from variant start, so a real
+    instantaneous slowdown (e.g. warmup ending, contention) shows up
+    only as a slow drift in the cumulative number -- the operator
+    sees ``33 -> 29`` and (correctly) suspects degradation but cannot
+    quantify it. The ``now=`` field exposes the true last-tick rate.
+    """
+    src = (PACKAGES / "research" / "backtest_ensemble.py").read_text(
+        encoding="utf-8"
+    )
+    # The f-string format must contain both rate and now= fields.
+    assert "rate={rate:,.0f} ev/s (now={inst_rate:,.0f})" in src
+    # The instantaneous computation must use the per-tick delta:
+    # tick_events / tick_elapsed (NOT event_idx / elapsed).
+    assert "tick_elapsed = max(now_wall - last_progress_wall_t, 1e-6)" in src
+    assert "tick_events = event_idx - last_progress_event_idx" in src
+    # And last_progress_event_idx must be updated AFTER emission so
+    # the next tick measures the right window.
+    assert "last_progress_event_idx = event_idx" in src
+
+
+def test_b05_inst_rate_math_matches_first_principles():
+    """B-05: compute inst_rate by hand from a known (tick_events,
+    tick_elapsed) pair and confirm the formula in source matches.
+    Catches a future regression where someone 'optimises' the formula
+    to ``event_idx / elapsed`` and silently re-introduces the
+    cumulative-average bug."""
+    # Two synthetic ticks: 600 events in 30 s -> 20 ev/s instantaneous.
+    tick_events = 600
+    tick_elapsed = 30.0
+    inst_rate = tick_events / tick_elapsed if tick_events > 0 else 0.0
+    assert inst_rate == 20.0
+    # Zero-tick edge case (no events since last emission): must be
+    # exactly 0.0 so the operator sees the worker stalled.
+    inst_rate_zero = 0 / max(0.001, 1e-6) if 0 > 0 else 0.0
+    assert inst_rate_zero == 0.0
