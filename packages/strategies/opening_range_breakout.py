@@ -98,11 +98,14 @@ class OpeningRangeBreakout(BaseStrategy):
         if not self.is_data_sufficient(data):
             return self._make_signal(Signal.HOLD, symbol, data, metadata={"reason": "insufficient_data"})
 
-        df = data.copy()
-        opening_range = self._identify_opening_range(df)
+        # P-04 (perf 2026-05-27): dropped ``df = data.copy()``. ORB never
+        # writes back to the frame (only reads), so the copy was pure
+        # waste -- typically allocating a few hundred KB per event for
+        # zero benefit. All reads operate on ``data`` directly.
+        opening_range = self._identify_opening_range(data)
 
         if opening_range is None:
-            return self._make_signal(Signal.HOLD, symbol, df, metadata={"reason": "no_opening_range"})
+            return self._make_signal(Signal.HOLD, symbol, data, metadata={"reason": "no_opening_range"})
 
         range_high, range_low = opening_range
         range_size = range_high - range_low
@@ -113,24 +116,24 @@ class OpeningRangeBreakout(BaseStrategy):
         # on that symbol. Fail-soft to HOLD with an explicit reason instead.
         if range_size <= 0:
             return self._make_signal(
-                Signal.HOLD, symbol, df,
+                Signal.HOLD, symbol, data,
                 metadata={"reason": "flat_opening_range",
                           "range_high": round(range_high, 2),
                           "range_low": round(range_low, 2)},
             )
-        current_price = float(df["close"].iloc[-1])
-        prev_price = float(df["close"].iloc[-2])
+        current_price = float(data["close"].iloc[-1])
+        prev_price = float(data["close"].iloc[-2])
 
         # Volume check
-        vol_avg = df["volume"].rolling(20).mean().iloc[-1]
-        current_vol = df["volume"].iloc[-1]
+        vol_avg = data["volume"].rolling(20).mean().iloc[-1]
+        current_vol = data["volume"].iloc[-1]
         vol_ratio = current_vol / vol_avg if vol_avg > 0 else 0
 
         # ATR for stop-loss
         tr = pd.concat([
-            df["high"] - df["low"],
-            (df["high"] - df["close"].shift()).abs(),
-            (df["low"] - df["close"].shift()).abs(),
+            data["high"] - data["low"],
+            (data["high"] - data["close"].shift()).abs(),
+            (data["low"] - data["close"].shift()).abs(),
         ], axis=1).max(axis=1)
         atr = float(tr.rolling(14).mean().iloc[-1]) if len(tr) >= 14 else range_size * 0.3
 
@@ -143,11 +146,11 @@ class OpeningRangeBreakout(BaseStrategy):
         }
 
         # Ensure we're past the opening range period
-        if hasattr(df.index, 'time'):
-            current_time = df.index[-1].time()
+        if hasattr(data.index, 'time'):
+            current_time = data.index[-1].time()
             range_end = _range_end_time(self.MARKET_OPEN, self.range_minutes)
             if current_time < range_end:
-                return self._make_signal(Signal.HOLD, symbol, df, metadata={**metadata, "reason": "within_range_period"})
+                return self._make_signal(Signal.HOLD, symbol, data, metadata={**metadata, "reason": "within_range_period"})
 
         # BUY: breakout above range high with volume
         if (prev_price <= range_high
@@ -161,7 +164,7 @@ class OpeningRangeBreakout(BaseStrategy):
                     f"trend filter (price < 50d SMA - {self.trend_filter_pct}%)"
                 )
                 return self._make_signal(
-                    Signal.HOLD, symbol, df,
+                    Signal.HOLD, symbol, data,
                     metadata={**metadata, "reason": "trend_filter_buy"},
                 )
 
@@ -171,7 +174,7 @@ class OpeningRangeBreakout(BaseStrategy):
 
             logger.info(f"[{self.name}] BUY {symbol} | ORB breakout above {range_high:.2f}")
             return self._make_signal(
-                Signal.BUY, symbol, df,
+                Signal.BUY, symbol, data,
                 confidence=confidence, stop_loss=stop_loss,
                 take_profit=take_profit, metadata=metadata,
             )
@@ -188,7 +191,7 @@ class OpeningRangeBreakout(BaseStrategy):
                     f"trend filter (price > 50d SMA + {self.trend_filter_pct}%)"
                 )
                 return self._make_signal(
-                    Signal.HOLD, symbol, df,
+                    Signal.HOLD, symbol, data,
                     metadata={**metadata, "reason": "trend_filter_sell"},
                 )
 
@@ -198,9 +201,9 @@ class OpeningRangeBreakout(BaseStrategy):
 
             logger.info(f"[{self.name}] SELL {symbol} | ORB breakdown below {range_low:.2f}")
             return self._make_signal(
-                Signal.SELL, symbol, df,
+                Signal.SELL, symbol, data,
                 confidence=confidence, stop_loss=stop_loss,
                 take_profit=take_profit, metadata=metadata,
             )
 
-        return self._make_signal(Signal.HOLD, symbol, df, metadata=metadata)
+        return self._make_signal(Signal.HOLD, symbol, data, metadata=metadata)

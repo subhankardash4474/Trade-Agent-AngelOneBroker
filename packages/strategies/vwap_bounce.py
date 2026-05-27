@@ -73,18 +73,23 @@ class VWAPBounce(BaseStrategy):
         if not self.is_data_sufficient(data):
             return self._make_signal(Signal.HOLD, symbol, data, metadata={"reason": "insufficient_data"})
 
-        df = data.copy()
-        df["vwap"] = self._compute_vwap(df)
-        df["vol_avg"] = df["volume"].rolling(20).mean()
-        df["vol_ratio"] = df["volume"] / df["vol_avg"].replace(0, np.nan)
+        # P-04 (perf 2026-05-27): dropped ``df = data.copy()``. The old
+        # code wrote three derived columns (vwap, vol_avg, vol_ratio)
+        # purely to read their ``.iloc[-1]`` / ``.iloc[-2]`` values at
+        # the end. We hold those as local Series instead -- zero copies,
+        # zero caller-frame mutation. ``_atr`` / ``_make_signal`` are
+        # read-only on the input frame.
+        vwap_series = self._compute_vwap(data)
+        vol_avg_series = data["volume"].rolling(20).mean()
+        vol_ratio_series = data["volume"] / vol_avg_series.replace(0, np.nan)
 
-        current = df.iloc[-1]
-        prev = df.iloc[-2]
-        price = current["close"]
-        vwap = current["vwap"]
+        price = float(data["close"].iloc[-1])
+        prev_close = float(data["close"].iloc[-2])
+        vwap = vwap_series.iloc[-1]
+        prev_vwap = vwap_series.iloc[-2]
 
         if pd.isna(vwap) or vwap == 0:
-            return self._make_signal(Signal.HOLD, symbol, df, metadata={"reason": "vwap_nan"})
+            return self._make_signal(Signal.HOLD, symbol, data, metadata={"reason": "vwap_nan"})
 
         # F-47 (audit 2026-05-27): VWAP is session-reset (see
         # ``_compute_vwap``). Comparing ``prev["close"] vs prev["vwap"]``
@@ -97,12 +102,12 @@ class VWAPBounce(BaseStrategy):
         # two bars are on different calendar dates (the convention
         # FeatureEngine and _compute_vwap already use for sessioning).
         try:
-            prev_idx = df.index[-2]
-            cur_idx = df.index[-1]
+            prev_idx = data.index[-2]
+            cur_idx = data.index[-1]
             if hasattr(prev_idx, "date") and hasattr(cur_idx, "date"):
                 if prev_idx.date() != cur_idx.date():
                     return self._make_signal(
-                        Signal.HOLD, symbol, df,
+                        Signal.HOLD, symbol, data,
                         metadata={"reason": "session_boundary"},
                     )
         except Exception:
@@ -112,22 +117,23 @@ class VWAPBounce(BaseStrategy):
             pass
 
         distance_pct = abs(price - vwap) / vwap * 100
-        vol_ratio = current["vol_ratio"] if not pd.isna(current["vol_ratio"]) else 0
+        vol_ratio_last = vol_ratio_series.iloc[-1]
+        vol_ratio = float(vol_ratio_last) if not pd.isna(vol_ratio_last) else 0.0
 
         metadata = {
-            "vwap": round(vwap, 2),
+            "vwap": round(float(vwap), 2),
             "distance_pct": round(distance_pct, 3),
             "vol_ratio": round(vol_ratio, 2),
         }
 
         # BUY: price near VWAP, coming from below, with volume spike
         if (distance_pct <= self.vwap_proximity_pct
-                and prev["close"] < prev["vwap"]
+                and prev_close < prev_vwap
                 and price >= vwap
                 and vol_ratio >= self.volume_spike_ratio):
 
             # Confirm upward momentum over confirmation_bars
-            recent_closes = df["close"].iloc[-(self.confirmation_bars + 1):]
+            recent_closes = data["close"].iloc[-(self.confirmation_bars + 1):]
             if all(recent_closes.diff().dropna() > 0):
                 if self.trend_filter_pct is not None and is_against_trend(
                     symbol, "BUY", threshold_pct=self.trend_filter_pct
@@ -137,7 +143,7 @@ class VWAPBounce(BaseStrategy):
                         f"trend filter (price < 50d SMA - {self.trend_filter_pct}%)"
                     )
                     return self._make_signal(
-                        Signal.HOLD, symbol, df,
+                        Signal.HOLD, symbol, data,
                         metadata={**metadata, "reason": "trend_filter_buy"},
                     )
 
@@ -151,13 +157,13 @@ class VWAPBounce(BaseStrategy):
                 # next 5-min wick, while SELL had a properly sized SL.
                 # Use the same ``_atr(df)`` helper as the SELL branch
                 # so both directions get a comparable risk-per-share.
-                atr = self._atr(df)
+                atr = self._atr(data)
                 stop_loss = vwap - 0.5 * atr if atr > 0 else price * 0.99
                 take_profit = price + 1.5 * (price - stop_loss)
 
                 logger.info(f"[{self.name}] BUY {symbol} @ {price:.2f} (VWAP={vwap:.2f}, vol_ratio={vol_ratio:.1f}x)")
                 return self._make_signal(
-                    Signal.BUY, symbol, df,
+                    Signal.BUY, symbol, data,
                     confidence=confidence, stop_loss=stop_loss,
                     take_profit=take_profit, metadata=metadata,
                 )
@@ -169,7 +175,7 @@ class VWAPBounce(BaseStrategy):
         # LONGs needed institutional confirmation -- a one-sided edge that
         # backtests on choppy days revealed as a SHORT-bias bleed. Apply
         # the same ``volume_spike_ratio`` to both sides.
-        if (prev["close"] > prev["vwap"] and price < vwap
+        if (prev_close > prev_vwap and price < vwap
                 and vol_ratio >= self.volume_spike_ratio):
             if self.trend_filter_pct is not None and is_against_trend(
                 symbol, "SELL", threshold_pct=self.trend_filter_pct
@@ -179,19 +185,19 @@ class VWAPBounce(BaseStrategy):
                     f"trend filter (price > 50d SMA + {self.trend_filter_pct}%)"
                 )
                 return self._make_signal(
-                    Signal.HOLD, symbol, df,
+                    Signal.HOLD, symbol, data,
                     metadata={**metadata, "reason": "trend_filter_sell"},
                 )
 
             confidence = min(0.4 + vol_ratio / 5.0, 0.9)
-            atr_sell = self._atr(df)
+            atr_sell = self._atr(data)
             stop_loss = vwap + 0.5 * atr_sell if atr_sell > 0 else price * 1.01
             take_profit = price - 1.5 * (stop_loss - price) if stop_loss > price else price * 0.985
             logger.info(f"[{self.name}] SELL {symbol} @ {price:.2f} (broke below VWAP)")
             return self._make_signal(
-                Signal.SELL, symbol, df,
+                Signal.SELL, symbol, data,
                 confidence=confidence, stop_loss=stop_loss,
                 take_profit=take_profit, metadata=metadata,
             )
 
-        return self._make_signal(Signal.HOLD, symbol, df, metadata=metadata)
+        return self._make_signal(Signal.HOLD, symbol, data, metadata=metadata)

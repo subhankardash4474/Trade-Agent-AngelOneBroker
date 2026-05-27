@@ -66,24 +66,29 @@ class MeanReversion(BaseStrategy):
         if not self.is_data_sufficient(data):
             return self._make_signal(Signal.HOLD, symbol, data, metadata={"reason": "insufficient_data"})
 
-        df = data.copy()
-        df["rolling_mean"] = df["close"].rolling(window=self.lookback_period).mean()
-        df["rolling_std"] = df["close"].rolling(window=self.lookback_period).std()
-        df["z_score"] = (df["close"] - df["rolling_mean"]) / df["rolling_std"].replace(0, np.nan)
+        # P-04 (perf 2026-05-27): dropped ``df = data.copy()``. The old
+        # code wrote seven derived columns (rolling_mean, rolling_std,
+        # z_score, bb_upper, bb_lower, bb_width, ...) just to read their
+        # ``.iloc[-1]`` / ``.iloc[-2]`` values. We compute them as local
+        # Series instead -- zero copies, zero caller-frame mutation.
+        close = data["close"]
+        rolling_mean_series = close.rolling(window=self.lookback_period).mean()
+        rolling_std_series = close.rolling(window=self.lookback_period).std()
+        z_score_series = (close - rolling_mean_series) / rolling_std_series.replace(0, np.nan)
 
         # Bollinger Band width as volatility gauge
-        df["bb_upper"] = df["rolling_mean"] + 2 * df["rolling_std"]
-        df["bb_lower"] = df["rolling_mean"] - 2 * df["rolling_std"]
-        df["bb_width"] = (df["bb_upper"] - df["bb_lower"]) / df["rolling_mean"]
+        bb_upper_series = rolling_mean_series + 2 * rolling_std_series
+        bb_lower_series = rolling_mean_series - 2 * rolling_std_series
+        bb_width_series = (bb_upper_series - bb_lower_series) / rolling_mean_series
 
-        z = df["z_score"].iloc[-1]
-        z_prev = df["z_score"].iloc[-2] if len(df) > 1 else 0
-        current_price = df["close"].iloc[-1]
-        rolling_mean = df["rolling_mean"].iloc[-1]
-        bb_width = df["bb_width"].iloc[-1]
+        z = z_score_series.iloc[-1]
+        z_prev = z_score_series.iloc[-2] if len(z_score_series) > 1 else 0
+        current_price = close.iloc[-1]
+        rolling_mean = rolling_mean_series.iloc[-1]
+        bb_width = bb_width_series.iloc[-1]
 
         if pd.isna(z) or pd.isna(rolling_mean):
-            return self._make_signal(Signal.HOLD, symbol, df, metadata={"reason": "nan_values"})
+            return self._make_signal(Signal.HOLD, symbol, data, metadata={"reason": "nan_values"})
 
         metadata = {
             "z_score": round(z, 3),
@@ -93,7 +98,7 @@ class MeanReversion(BaseStrategy):
 
         # Avoid trading in extremely low volatility (Bollinger squeeze)
         if not pd.isna(bb_width) and bb_width < 0.01:
-            return self._make_signal(Signal.HOLD, symbol, df, metadata={**metadata, "reason": "low_volatility"})
+            return self._make_signal(Signal.HOLD, symbol, data, metadata={**metadata, "reason": "low_volatility"})
 
         # BUY: price significantly below mean and starting to revert
         if z <= -self.entry_z_score and z > z_prev:
@@ -105,7 +110,7 @@ class MeanReversion(BaseStrategy):
                     f"trend filter (price < 50d SMA - {self.trend_filter_pct}%)"
                 )
                 return self._make_signal(
-                    Signal.HOLD, symbol, df,
+                    Signal.HOLD, symbol, data,
                     metadata={**metadata, "reason": "trend_filter_long"},
                 )
             confidence = min(abs(z) / (self.entry_z_score * 2), 1.0)
@@ -114,7 +119,7 @@ class MeanReversion(BaseStrategy):
             take_profit = current_price + (rolling_mean - current_price) * self.tp_reversion_pct
             logger.info(f"[{self.name}] BUY signal for {symbol} | Z={z:.2f}")
             return self._make_signal(
-                Signal.BUY, symbol, df,
+                Signal.BUY, symbol, data,
                 confidence=confidence,
                 stop_loss=stop_loss,
                 take_profit=take_profit,
@@ -131,7 +136,7 @@ class MeanReversion(BaseStrategy):
                     f"trend filter (price > 50d SMA + {self.trend_filter_pct}%)"
                 )
                 return self._make_signal(
-                    Signal.HOLD, symbol, df,
+                    Signal.HOLD, symbol, data,
                     metadata={**metadata, "reason": "trend_filter_short"},
                 )
             confidence = min(abs(z) / (self.entry_z_score * 2), 1.0)
@@ -140,7 +145,7 @@ class MeanReversion(BaseStrategy):
             take_profit = current_price - (current_price - rolling_mean) * self.tp_reversion_pct
             logger.info(f"[{self.name}] SELL signal for {symbol} | Z={z:.2f}")
             return self._make_signal(
-                Signal.SELL, symbol, df,
+                Signal.SELL, symbol, data,
                 confidence=confidence,
                 stop_loss=stop_loss,
                 take_profit=take_profit,
@@ -169,7 +174,7 @@ class MeanReversion(BaseStrategy):
                 f"(exit path is owned by position management, not the strategy)."
             )
             return self._make_signal(
-                Signal.HOLD, symbol, df,
+                Signal.HOLD, symbol, data,
                 metadata={
                     **metadata,
                     "reason": "mean_reversion_complete",
@@ -178,4 +183,4 @@ class MeanReversion(BaseStrategy):
                 },
             )
 
-        return self._make_signal(Signal.HOLD, symbol, df, metadata=metadata)
+        return self._make_signal(Signal.HOLD, symbol, data, metadata=metadata)

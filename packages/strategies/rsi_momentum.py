@@ -93,19 +93,23 @@ class RSIMomentum(BaseStrategy):
         if not self.is_data_sufficient(data):
             return self._make_signal(Signal.HOLD, symbol, data, metadata={"reason": "insufficient_data"})
 
-        df = data.copy()
-        df["rsi"] = self._compute_rsi(df["close"], self.period)
-        df["rsi_prev"] = df["rsi"].shift(1)
-        df["rsi_prev2"] = df["rsi"].shift(2)
+        # P-04 (perf 2026-05-27): dropped ``df = data.copy()``. The old
+        # code copied the whole OHLCV frame just to write three derived
+        # RSI columns that were only consumed via ``.iloc[-1]``. We now
+        # hold them as local Series. ``_compute_rsi`` reads only
+        # ``data["close"]`` (no mutation), and ``_atr`` / ``_make_signal``
+        # are read-only on the input frame, so we never mutate the
+        # caller's data.
+        rsi_series = self._compute_rsi(data["close"], self.period)
 
-        rsi = df["rsi"].iloc[-1]
-        rsi_prev = df["rsi_prev"].iloc[-1]
-        rsi_prev2 = df["rsi_prev2"].iloc[-1]
-        current_price = df["close"].iloc[-1]
+        rsi = rsi_series.iloc[-1]
+        rsi_prev = rsi_series.iloc[-2] if len(rsi_series) >= 2 else np.nan
+        rsi_prev2 = rsi_series.iloc[-3] if len(rsi_series) >= 3 else np.nan
+        current_price = data["close"].iloc[-1]
 
         # Volume surge check: current volume > 1.5x average of last 20 bars
-        vol_avg = df["volume"].iloc[-20:].mean() if len(df) >= 20 else df["volume"].mean()
-        current_vol = df["volume"].iloc[-1]
+        vol_avg = data["volume"].iloc[-20:].mean() if len(data) >= 20 else data["volume"].mean()
+        current_vol = data["volume"].iloc[-1]
         volume_surge = current_vol > 1.5 * vol_avg if vol_avg > 0 else False
 
         metadata = {
@@ -114,7 +118,7 @@ class RSIMomentum(BaseStrategy):
             "volume_surge": volume_surge,
         }
 
-        atr = self._atr(df)
+        atr = self._atr(data)
 
         # BUY: RSI was in oversold zone and is now rising
         if rsi_prev2 < self.oversold and rsi_prev < self.oversold and rsi >= self.oversold:
@@ -126,7 +130,7 @@ class RSIMomentum(BaseStrategy):
                     f"trend filter (price < 50d SMA - {self.trend_filter_pct}%)"
                 )
                 return self._make_signal(
-                    Signal.HOLD, symbol, df,
+                    Signal.HOLD, symbol, data,
                     metadata={**metadata, "reason": "trend_filter_buy"},
                 )
 
@@ -136,7 +140,7 @@ class RSIMomentum(BaseStrategy):
             take_profit = current_price + 2.5 * atr if atr > 0 else current_price * 1.03
             logger.info(f"[{self.name}] BUY signal for {symbol} | RSI={rsi:.1f} reversal from oversold")
             return self._make_signal(
-                Signal.BUY, symbol, df,
+                Signal.BUY, symbol, data,
                 confidence=confidence,
                 stop_loss=stop_loss,
                 take_profit=take_profit,
@@ -153,7 +157,7 @@ class RSIMomentum(BaseStrategy):
                     f"trend filter (price > 50d SMA + {self.trend_filter_pct}%)"
                 )
                 return self._make_signal(
-                    Signal.HOLD, symbol, df,
+                    Signal.HOLD, symbol, data,
                     metadata={**metadata, "reason": "trend_filter_sell"},
                 )
 
@@ -163,11 +167,11 @@ class RSIMomentum(BaseStrategy):
             take_profit = current_price - 2.5 * atr if atr > 0 else current_price * 0.97
             logger.info(f"[{self.name}] SELL signal for {symbol} | RSI={rsi:.1f} reversal from overbought")
             return self._make_signal(
-                Signal.SELL, symbol, df,
+                Signal.SELL, symbol, data,
                 confidence=confidence,
                 stop_loss=stop_loss,
                 take_profit=take_profit,
                 metadata=metadata,
             )
 
-        return self._make_signal(Signal.HOLD, symbol, df, metadata=metadata)
+        return self._make_signal(Signal.HOLD, symbol, data, metadata=metadata)

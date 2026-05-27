@@ -41,27 +41,34 @@ class MovingAverageCrossover(BaseStrategy):
         if not self.is_data_sufficient(data):
             return self._make_signal(Signal.HOLD, symbol, data, metadata={"reason": "insufficient_data"})
 
-        df = data.copy()
-        df["ema_short"] = df["close"].ewm(span=self.short_window, adjust=False).mean()
-        df["ema_long"] = df["close"].ewm(span=self.long_window, adjust=False).mean()
-        df["ma_diff"] = df["ema_short"] - df["ema_long"]
-        df["ma_diff_prev"] = df["ma_diff"].shift(1)
+        # P-04 (perf 2026-05-27): dropped ``df = data.copy()``. The four
+        # derived columns (ema_short, ema_long, ma_diff, ma_diff_prev)
+        # were written purely to read ``.iloc[-1]`` values. We compute
+        # them as local Series instead -- zero copies, zero caller-frame
+        # mutation. ``_atr`` and ``_make_signal`` are read-only on the
+        # input frame.
+        close = data["close"]
+        ema_short_series = close.ewm(span=self.short_window, adjust=False).mean()
+        ema_long_series = close.ewm(span=self.long_window, adjust=False).mean()
+        ma_diff_series = ema_short_series - ema_long_series
 
-        current_diff = df["ma_diff"].iloc[-1]
-        prev_diff = df["ma_diff_prev"].iloc[-1]
-        current_price = df["close"].iloc[-1]
-        ema_long_val = df["ema_long"].iloc[-1]
+        current_diff = ma_diff_series.iloc[-1]
+        # is_data_sufficient gate above guarantees len >= long_window + 5
+        # (>= 14 bars), so .iloc[-2] is always safe here.
+        prev_diff = ma_diff_series.iloc[-2]
+        current_price = close.iloc[-1]
+        ema_long_val = ema_long_series.iloc[-1]
 
         pct_gap = abs(current_diff / ema_long_val) * 100 if ema_long_val != 0 else 0
 
         metadata = {
-            "ema_short": round(df["ema_short"].iloc[-1], 2),
+            "ema_short": round(ema_short_series.iloc[-1], 2),
             "ema_long": round(ema_long_val, 2),
             "ma_diff": round(current_diff, 2),
             "pct_gap": round(pct_gap, 2),
         }
 
-        atr = self._atr(df)
+        atr = self._atr(data)
 
         # Bullish crossover: short EMA crosses above long EMA
         if prev_diff <= 0 < current_diff and pct_gap >= self.signal_threshold:
@@ -70,7 +77,7 @@ class MovingAverageCrossover(BaseStrategy):
             take_profit = current_price + 2.5 * atr if atr > 0 else current_price * 1.03
             logger.info(f"[{self.name}] BUY signal for {symbol} | gap={pct_gap:.2f}%")
             return self._make_signal(
-                Signal.BUY, symbol, df,
+                Signal.BUY, symbol, data,
                 confidence=confidence,
                 stop_loss=stop_loss,
                 take_profit=take_profit,
@@ -84,11 +91,11 @@ class MovingAverageCrossover(BaseStrategy):
             take_profit = current_price - 2.5 * atr if atr > 0 else current_price * 0.97
             logger.info(f"[{self.name}] SELL signal for {symbol} | gap={pct_gap:.2f}%")
             return self._make_signal(
-                Signal.SELL, symbol, df,
+                Signal.SELL, symbol, data,
                 confidence=confidence,
                 stop_loss=stop_loss,
                 take_profit=take_profit,
                 metadata=metadata,
             )
 
-        return self._make_signal(Signal.HOLD, symbol, df, metadata=metadata)
+        return self._make_signal(Signal.HOLD, symbol, data, metadata=metadata)

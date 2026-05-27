@@ -232,9 +232,14 @@ def test_f45_base_strategy_atr_uses_ewm():
 
 def test_f46_vwap_uses_symmetric_atr_and_volume():
     src = (PACKAGES / "strategies" / "vwap_bounce.py").read_text(encoding="utf-8")
-    # BUY now uses _atr(df), not the broken (max-min)/14 expression.
-    assert "atr = self._atr(df)" in src
+    # BUY now uses the BaseStrategy ATR helper, not the broken
+    # (max-min)/14 expression. P-04 (perf 2026-05-27) renamed the local
+    # frame variable from ``df`` to ``data`` (dropped ``data.copy()``),
+    # so we match either argument name to keep the F-46 contract test
+    # decoupled from the perf-fix variable rename.
+    assert ("atr = self._atr(df)" in src) or ("atr = self._atr(data)" in src)
     assert "df[\"high\"].iloc[-14:].max() - df[\"low\"].iloc[-14:].min()" not in src
+    assert "data[\"high\"].iloc[-14:].max() - data[\"low\"].iloc[-14:].min()" not in src
     # SELL threshold now uses the strategy-configured volume_spike_ratio.
     assert "vol_ratio >= self.volume_spike_ratio" in src
     # And the old asymmetric `vol_ratio >= 1.0` literal is gone from the SELL branch.
