@@ -147,7 +147,30 @@ emit run
 echo "run_id: `$LATEST"
 if [ -n "`$LATEST" ]; then
     RDIR="logs/backtests/`$LATEST"
-    started=`$(stat -c '%y' "`$RDIR" 2>/dev/null | head -1)
+    # 2026-05-27 (perf-sprint UX fix): the run-dir's mtime is unreliable
+    # as a "started_at" signal. Every time the battery writes
+    # comparison.md via tempfile-then-rename (the atomic pattern at
+    # research.battery.write_comparison_md), a new inode lands in
+    # logs/backtests/<run_id>/, which bumps the parent dir's mtime to
+    # the current second. On a long-running queue this caused
+    # ``started`` to display the latest activity time instead of the
+    # actual launch time, which in turn poisoned the downstream
+    # ``per-variant (avg)`` and ``ETA`` math (both showed 0.0h because
+    # elapsed_since_started was effectively the time since the last
+    # comparison.md rewrite).
+    #
+    # The run_id always carries the immutable launch timestamp as its
+    # trailing YYYYMMDDTHHMMSS suffix (UTC), e.g.
+    #   battery_nifty50_60d_20260527T065700
+    # Parse that when available; only fall back to dir mtime when the
+    # run_id has no parseable timestamp (custom-named runs, legacy
+    # folders).
+    TS_SUFFIX=`$(echo "`$LATEST" | grep -oE '[0-9]{8}T[0-9]{6}' | tail -1)
+    if [ -n "`$TS_SUFFIX" ]; then
+        started="`${TS_SUFFIX:0:4}-`${TS_SUFFIX:4:2}-`${TS_SUFFIX:6:2} `${TS_SUFFIX:9:2}:`${TS_SUFFIX:11:2}:`${TS_SUFFIX:13:2} +0000"
+    else
+        started=`$(stat -c '%y' "`$RDIR" 2>/dev/null | head -1)
+    fi
     echo "started: `$started"
     last=`$(stat -c '%y' "`$RDIR/comparison.md" 2>/dev/null | head -1)
     echo "comparison_last_modified: `$last"
