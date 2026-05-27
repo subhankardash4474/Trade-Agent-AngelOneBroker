@@ -174,7 +174,23 @@ if [ -n "`$LATEST" ]; then
         for f in `$(sudo ls "`$RDIR/workers" 2>/dev/null); do
             sz=`$(sudo stat -c '%s' "`$RDIR/workers/`$f" 2>/dev/null)
             mt=`$(sudo stat -c '%Y' "`$RDIR/workers/`$f" 2>/dev/null)
-            last=`$(sudo tail -1 "`$RDIR/workers/`$f" 2>/dev/null | cut -c1-220)
+            # 2026-05-27 (perf-sprint UX fix): the ``last:`` field is meant
+            # to give the operator a single line of context about what the
+            # worker most recently did. Pre-fix it was ``tail -1``, which
+            # during a POSITION-SIZE skip burst (very common on the
+            # 4-strategy post-xgb-disable nifty50 universe -- many signals
+            # fire for high-priced stocks whose risk_per_share exceeds the
+            # per-trade budget) showed a routine skip message even though
+            # the worker had just emitted a more-informative line moments
+            # earlier (typically a [BATTERY-PROGRESS] tick). We filter the
+            # known high-volume noise patterns first; if the worker has
+            # emitted nothing else yet (very early in startup, before the
+            # first progress marker), fall back to the raw tail so the
+            # operator at least sees activity.
+            last=`$(sudo grep -vE '\[POSITION-SIZE\]' "`$RDIR/workers/`$f" 2>/dev/null | tail -1 | cut -c1-220)
+            if [ -z "`$last" ]; then
+                last=`$(sudo tail -1 "`$RDIR/workers/`$f" 2>/dev/null | cut -c1-220)
+            fi
             # Most-recent BATTERY-PROGRESS marker -- gives true %, sim_date,
             # rate, ETA. Falls back gracefully (empty) when the worker hasn't
             # emitted one yet (first ~10k bars or freshly-started worker).
@@ -421,7 +437,17 @@ foreach ($pr in $pRows) {
 # fixed width with printf, so once those drop into single-digit hours
 # the value gets a leading space (e.g. `ETA= 9.9h`). Allow `\s*` after
 # every `=` so single-digit padding doesn't break the match.
-$progressRe = '\[BATTERY-PROGRESS\]\s+([\d,]+)\s*/\s*([\d,]+)\s*\(\s*([\d.]+)%\s*\)\s*\|\s*sim_date=\s*(\S+)\s*\|\s*rate=\s*([\d,]+)\s*ev/s\s*\|\s*elapsed=\s*(\S+)\s*\|\s*ETA=\s*(\S+)'
+#
+# 2026-05-27: backtest_ensemble now emits an instantaneous-rate addendum
+# in parentheses after the average rate, e.g.:
+#   rate=75 ev/s (now=72) | elapsed=12.9m | ETA=33.0m
+# The previous regex hard-required ``ev/s`` to be followed immediately
+# by ``\s*\|``, which made it fail to match every progress line the
+# new code emits -- ALL workers fell through to the noisy raw
+# ``last:`` fallback. The optional non-capturing group below tolerates
+# either format (legacy ``rate=N ev/s |`` or new ``rate=N ev/s (now=M)
+# |``) so the structured ``progress:`` line renders for every worker.
+$progressRe = '\[BATTERY-PROGRESS\]\s+([\d,]+)\s*/\s*([\d,]+)\s*\(\s*([\d.]+)%\s*\)\s*\|\s*sim_date=\s*(\S+)\s*\|\s*rate=\s*([\d,]+)\s*ev/s(?:\s*\([^)]*\))?\s*\|\s*elapsed=\s*(\S+)\s*\|\s*ETA=\s*(\S+)'
 
 if (-not $wRows) {
     Write-Host "  [NO WORKER LOGS]" -ForegroundColor Yellow
