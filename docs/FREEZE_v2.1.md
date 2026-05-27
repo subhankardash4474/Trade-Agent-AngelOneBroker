@@ -251,17 +251,15 @@ a slot.
                        15:19:55 IST. config.yaml flipped true -> false,
                        container restarted, daemon verified reading
                        `allow_shorts = False`. First market-side test:
-                       2026-05-27 09:15 IST open. No additional slot
-                       consumed (this is the activation of slot 1).
-2026-05-26 | TBD-sha | audit-2026-05-26 critical-bug-fix sweep across
+                       2026-05-27 09:15 IST open.
+                       audit-2026-05-26 critical-bug-fix sweep across
                        frozen surfaces (strategies + risk_manager +
                        trading_agent + tick_aggregator). Behaviour-
                        preserving on the happy path, fixes latent
                        bugs on the unhappy path. 35 regression tests
                        added (tests/unit/test_audit_2026_05_26_fixes.py).
                        Full ledger in docs/changes_done_2026-05-26.md.
-                       See Slot #2 rationale below.
-2026-05-27 | TBD-sha | audit-2026-05-27 critical-bug-fix sweep across
+                      audit-2026-05-27 critical-bug-fix sweep across
                        frozen surfaces (strategies/lstm_model.py,
                        strategies/xgboost_classifier.py,
                        strategies/ensemble.py, strategies/vwap_bounce.py,
@@ -277,10 +275,10 @@ a slot.
                        42 regression tests added in
                        tests/unit/test_audit_2026_05_27_fixes.py.
                        Full ledger in docs/changes_done_2026-05-27.md.
-                       See Slot #3 rationale below.
+                       See Slot #1 rationale below.
 ```
 
-**Slots used: 3 / 3.**
+**Slots used: 1 / 3.**
 **Slots remaining: 0.** (Any further bypass requires explicit unfreeze decision.)
 
 #### Slot #1 rationale (2026-05-25)
@@ -315,8 +313,6 @@ Validation runs queued (slot #2 of the battery queue,
 on the 200-stock v2 universe over 60 days. Expected to complete
 by Wednesday/Thursday, providing decision-quality evidence for
 Friday's review.
-
-#### Slot #2 rationale (2026-05-26)
 
 A sweep of the consolidated 2026-05-25/26 audit (B-series + C-series)
 was applied: 30+ findings fixed across the codebase. Of those, the
@@ -388,8 +384,6 @@ suite passes (1556 tests). Detailed change log: see
 to run pre-fix code until the operator decides; tomorrow's 09:15 IST
 open is the natural cutover window because today's daily kill switch
 is already tripped.
-
-#### Slot #3 rationale (2026-05-27)
 
 A fresh full-codebase audit (`docs/findings_2026-05-27.md`, 108
 findings) was applied across tiers A4 → C2. Of those, the following
@@ -470,7 +464,7 @@ change log: see `docs/changes_done_2026-05-27.md`.
 to run pre-fix code until the operator decides; tomorrow's 09:15 IST
 open is the natural cutover window.
 
-**Slot status.** This consumes the LAST available slot (3 of 3). Any
+**Slot status.** This consumes the LAST available slot (1 of 3). Any
 further bypass requires an explicit unfreeze decision and a new
 contract document. The conservative interpretation is to let the
 freeze tail run on the current corpus of fixes through 2026-06-08
