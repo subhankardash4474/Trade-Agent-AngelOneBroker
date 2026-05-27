@@ -115,7 +115,27 @@ strategies:
     - vwap_bounce
     - opening_range_breakout
     - supertrend_follow
-    - xgboost_classifier  # ENABLED 2026-05-06 (AUC 0.6436)
+    # - xgboost_classifier       # DISABLED 2026-05-27 (forensic audit verdict: BROKEN MODEL)
+    #   Slot-2 consumption (FREEZE_v2.1 bypass ledger).
+    #   The pkl on disk (models/xgboost_model.pkl, mtime 2026-05-14 12:51) is
+    #   the panic-patch retrain bundled in commit 35adcd2c. Signal-audit data
+    #   shows a clean ~95% SELL -> 100% BUY directional flip on 2026-05-11
+    #   (2026-05-06: 521 SELL / 15 BUY; 2026-05-11: 270 BUY / 0 SELL; same
+    #   bear regime, same features, opposite output). Four known training
+    #   bugs are fixed in code (P1 #8 May 17, C-23 May 26, F-22 + F-24 May 27)
+    #   but NONE applied to the .pkl on disk: model still has bull-default
+    #   prior + same-day daily-close lookahead + in-sample calibration +
+    #   leak-prone early-stop baked in.
+    #   Empirical impact: 2026-05-19 alone -- 11,775 xgb BUYs emitted,
+    #   11,605 rejected by long_regime:bear_high_vol gate, 0 xgb trades
+    #   actually accepted. The regime gate has been the only circuit
+    #   breaker; the 3 BUYs that slipped through on 2026-05-26 (during a
+    #   bear_low_vol intermission) cost Rs 453 in 6h.
+    #   Re-enable ONLY after: (a) clean retrain on the corrected pipeline,
+    #   (b) held-out backtest validation showing edge, (c) explicit
+    #   freeze-bypass:critical-bug-fix slot consumption.
+    #   Evidence: docs/findings_log_2026-05-27.md (audit synthesis to be
+    #   appended), signal_audit_2026-05-{06..26}.csv.
     # Uncomment after training the LSTM model:
     # - lstm_price_model
 
