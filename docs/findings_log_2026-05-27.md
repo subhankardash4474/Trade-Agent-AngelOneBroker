@@ -767,17 +767,62 @@ P-11 details:
 
 ### 7.5 Measured speedup
 
-Local micro-benchmark on a 1500-bar synthetic frame:
+**Clean, isolated measurement (local micro-benchmark):**
 
 | Stage                           | Pre-fix | Post-fix | Speedup |
 |---------------------------------|--------:|---------:|--------:|
 | `_compute_supertrend` (n=1500)  | ~12 ms  | 2.8 ms   | ~4.3x   |
 | `generate_signal` (n=1500)      | ~25 ms  | 5.6 ms   | ~4.5x   |
 
-Across the backtester (~169 symbols x 5 active strategies x ~75
-events/symbol/day per variant) this is the dominant per-event cost
-saved. Projected backtester wall-clock reduction: ~25-30% per
-variant (matches the audit memo's prediction).
+This is the cleanest signal we have for P-03 specifically. It was
+run via `time.perf_counter` in a local Python REPL on a single
+strategy instance, no xgboost involved, no daemon, no other
+strategies competing for CPU. The 4.5x is real and byte-identity is
+proven by `test_supertrend_vectorised_matches_pandas_loop`.
+
+**End-to-end backtester throughput (confounded):**
+
+| Window                                  | Throughput    | What changed     |
+|:----------------------------------------|--------------:|:-----------------|
+| Pre-pause (May 25-27 morning)           | 19-40 ev/s    | xgb active, no perf fixes |
+| Post-restart (this run, May 27 12:27+)  | 75-104 ev/s   | xgb disabled AND perf fixes |
+
+This is a 2-3x throughput improvement at the queue level -- BUT
+it cannot cleanly attribute between "xgboost removed from active"
+(commit f32009c, slot-2) and "P-03/P-04 perf fixes" (today). Both
+shipped in the same image rebuild during the backtester restart.
+
+The decomposition I currently believe is most likely:
+
+* **xgboost-disable: ~2x** -- xgboost was very probably 40-60% of
+  per-event compute (FeatureEngine.compute_all + XGB model.predict
+  on every signal cycle, dwarfing any single rule strategy). Dropping
+  it from `strategies.active` skips that entire branch.
+* **P-03/P-04 perf fixes: ~1.3-1.5x** on top -- consistent with the
+  isolated supertrend measurement scaled by supertrend's share of the
+  remaining 4-strategy mix (~25-30%).
+* **Multiplicative: ~2.5-3x combined** -- matches the observed peak.
+
+**Earlier framing was sloppy:** I previously called this a
+"~25-30% wall-clock reduction from the perf fixes" / "perf fixes
+landed harder than projected -- 2-4x". That was conflating the
+xgb-disable effect with the perf-fix effect. The perf fixes
+contribute meaningfully but are NOT the dominant factor. The
+honest summary is:
+
+> The perf fixes deliver the ~25-30% improvement they were designed
+> for. The 2-3x throughput we are observing in this run is mostly
+> the xgboost-disable being a much bigger win than initially
+> credited.
+
+**Clean A/B not run** because it would have cost ~50 min of
+backtester time mid-queue, and the variants themselves (what
+configs beat V1) are the actually-decision-relevant signal --
+not the perf attribution. If we want the isolated perf-fix number
+later, the cleanest path is a single-variant A/B between
+HEAD~3 (xgb-disabled, no perf fixes) and HEAD (xgb-disabled, perf
+fixes) on identical market_data, run after the current queue
+completes.
 
 ### 7.6 Freeze v2.1 ledger impact
 
