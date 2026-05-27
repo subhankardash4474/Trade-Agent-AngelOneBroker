@@ -46,6 +46,99 @@ class TestRegimeClassification:
         assert classify_regime({"nifty_trend": 0, "india_vix": 14.0}) == "sideways"
         assert classify_regime({"nifty_trend": 0, "india_vix": 22.0}) == "sideways"
 
+    # ------------------------------------------------------------------
+    # Diagnostic sprint 2026-05-27, hypothesis #1: per-cycle observability
+    # of the inputs the classifier sees. The log is the only artefact that
+    # lets us answer "did the classifier see VIX 28 when actual VIX was
+    # 18?" without rebuilding history -- so the log line is a contract,
+    # pinned by these tests. Observability-only, behaviour-preserving
+    # (the same input still produces the same regime label).
+    # ------------------------------------------------------------------
+    def _capture_logs(self):
+        from loguru import logger as loguru_logger
+
+        captured = []
+        handler_id = loguru_logger.add(
+            lambda msg: captured.append(str(msg)),
+            level="INFO",
+        )
+        return loguru_logger, handler_id, captured
+
+    def test_classify_regime_emits_input_log(self):
+        loguru_logger, handler_id, captured = self._capture_logs()
+        try:
+            result = classify_regime({"nifty_trend": -1, "india_vix": 26.0})
+        finally:
+            loguru_logger.remove(handler_id)
+        assert result == "bear_high_vol"
+        combined = "".join(captured)
+        assert "[REGIME-INPUT]" in combined
+        assert "nifty_trend=-1" in combined
+        assert "india_vix=26.0" in combined
+        assert "high_vol=True" in combined
+        assert "regime=bear_high_vol" in combined
+
+    def test_classify_regime_logs_unknown_with_missing_inputs(self):
+        loguru_logger, handler_id, captured = self._capture_logs()
+        try:
+            result = classify_regime({"nifty_trend": 1})
+        finally:
+            loguru_logger.remove(handler_id)
+        assert result == "unknown"
+        combined = "".join(captured)
+        assert "[REGIME-INPUT]" in combined
+        # The advisor's "garbage-in" hypothesis (#1): the log must surface
+        # missing inputs as ``None`` rather than pretending they were sane.
+        assert "india_vix=None" in combined
+        assert "regime=unknown" in combined
+
+    def test_classify_regime_logs_none_context(self):
+        loguru_logger, handler_id, captured = self._capture_logs()
+        try:
+            result = classify_regime(None)
+        finally:
+            loguru_logger.remove(handler_id)
+        assert result == "unknown"
+        combined = "".join(captured)
+        assert "[REGIME-INPUT]" in combined
+        assert "nifty_trend=None" in combined
+        assert "india_vix=None" in combined
+        assert "high_vol=None" in combined
+        assert "regime=unknown" in combined
+
+    def test_classify_intraday_regime_emits_input_log(self):
+        from core.regime import classify_intraday_regime
+
+        loguru_logger, handler_id, captured = self._capture_logs()
+        try:
+            result = classify_intraday_regime(
+                {"nifty_intraday_pct": -0.8, "vix_intraday_delta": 0.2}
+            )
+        finally:
+            loguru_logger.remove(handler_id)
+        assert result == "risk_off"
+        combined = "".join(captured)
+        assert "[REGIME-INTRADAY-INPUT]" in combined
+        assert "nifty_intraday_pct=-0.8" in combined
+        assert "vix_intraday_delta=0.2" in combined
+        assert "regime=risk_off" in combined
+
+    def test_classify_intraday_regime_logs_unknown_on_missing(self):
+        from core.regime import classify_intraday_regime
+
+        loguru_logger, handler_id, captured = self._capture_logs()
+        try:
+            result = classify_intraday_regime(
+                {"nifty_intraday_pct": 1.0}  # vix_intraday_delta missing
+            )
+        finally:
+            loguru_logger.remove(handler_id)
+        assert result == "unknown"
+        combined = "".join(captured)
+        assert "[REGIME-INTRADAY-INPUT]" in combined
+        assert "vix_intraday_delta=None" in combined
+        assert "regime=unknown" in combined
+
     def test_mr_multiplier_favors_sideways(self):
         assert regime_multiplier("mean_reversion", "sideways") > 1.0
         assert regime_multiplier("mean_reversion", "bull_low_vol") < 1.0
