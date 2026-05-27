@@ -72,6 +72,23 @@ class LSTMPriceModel(BaseStrategy):
         # asking the model to extrapolate, and the prediction is junk.
         self._nan_warn_threshold = 0.25
         self._nan_warned_for: set[str] = set()
+        # P-11 (perf 2026-05-27): cache the ML feature-column list once.
+        # ``get_ml_feature_columns()`` returns a constant for the lifetime
+        # of a FeatureEngine instance (it's derived from a class-level
+        # spec, not from any runtime state); previously this was called
+        # on every ``generate_signal`` cycle, allocating a fresh list of
+        # ~30 strings per inference. Cache it here and read the attribute
+        # in the hot path. ``_validate_model_contract`` still calls the
+        # method once at load time as a self-check.
+        try:
+            self._ml_feature_cols = list(
+                self._feature_engine.get_ml_feature_columns()
+            )
+        except Exception:
+            # FeatureEngine should always expose this method; if it
+            # doesn't, fall back to lazy lookup in the hot path so the
+            # strategy still functions.
+            self._ml_feature_cols = []
         self._load_model()
 
     @property
@@ -234,23 +251,42 @@ class LSTMPriceModel(BaseStrategy):
         df = self._feature_engine.compute_all(
             data, market_context=self._market_context or None
         )
-        feature_cols = self._feature_engine.get_ml_feature_columns()
+        # P-11 (perf 2026-05-27): cached ml_feature_cols (constant for
+        # this strategy's lifetime) -- avoids re-querying FeatureEngine
+        # every cycle. Fall back to live lookup if the cache is empty.
+        feature_cols = self._ml_feature_cols or list(
+            self._feature_engine.get_ml_feature_columns()
+        )
         available_cols = [c for c in feature_cols if c in df.columns]
 
         if len(available_cols) < 5:
             return self._make_signal(Signal.HOLD, symbol, df, metadata={"reason": "insufficient_features"})
 
-        # Prepare sequence input
-        feature_data = df[available_cols].iloc[-self.sequence_length:].copy()
+        # P-11 (perf 2026-05-27): the previous flow round-tripped
+        # through pandas:
+        #   df[...].iloc[-30:].copy() -> .fillna() -> scaler.transform
+        #   -> pd.DataFrame(scaled_array, ...) -> .values -> torch.FloatTensor
+        # That's 4 allocations of ~30x30 float arrays per inference
+        # AND ~3 unnecessary DataFrame wrap-unwrap cycles, just to feed
+        # numbers into a tensor. We now go straight numpy -> in-place
+        # NaN-fill -> scaler -> torch.from_numpy (zero-copy view).
+        window_df = df[available_cols].iloc[-self.sequence_length:]
+        # ``ascontiguousarray`` guarantees a fresh writeable float32
+        # block (``to_numpy`` may return a view when the dtype already
+        # matches, which would make ``nan_to_num(copy=False)`` raise).
+        window_arr = np.ascontiguousarray(
+            window_df.to_numpy(dtype=np.float32)
+        )
+
         # F-14: detect train/serve skew from NaN dominance BEFORE we
         # fillna(0). The training pipeline does its own fillna(0) but
         # upstream preprocessing dropped the worst rows; if live
         # inference is filling >25% of cells with zeros we're feeding
         # the model out-of-distribution input. Log once per symbol and
-        # HOLD — better to skip a cycle than emit a junk signal.
+        # HOLD -- better to skip a cycle than emit a junk signal.
         try:
-            total_cells = feature_data.size
-            nan_cells = int(feature_data.isna().sum().sum())
+            total_cells = window_arr.size
+            nan_cells = int(np.isnan(window_arr).sum())
             if total_cells > 0 and (nan_cells / total_cells) >= self._nan_warn_threshold:
                 if symbol not in self._nan_warned_for:
                     logger.warning(
@@ -268,16 +304,19 @@ class LSTMPriceModel(BaseStrategy):
                     },
                 )
         except Exception:
-            # NaN counting is diagnostics — never let it block inference.
+            # NaN counting is diagnostics -- never let it block inference.
             pass
-        feature_data = feature_data.fillna(0)
+        # In-place NaN -> 0, no allocation.
+        np.nan_to_num(window_arr, copy=False, nan=0.0)
 
         if self._scaler is not None:
-            feature_data = pd.DataFrame(
-                self._scaler.transform(feature_data),
-                columns=available_cols,
-                index=feature_data.index,
-            )
+            # sklearn StandardScaler.transform returns a fresh ndarray;
+            # accept its native dtype rather than re-wrap as DataFrame.
+            scaled_arr = self._scaler.transform(window_arr)
+            # Ensure float32 for torch without an extra copy when the
+            # scaler already produced float32 (rare; usually float64).
+            if scaled_arr.dtype != np.float32:
+                scaled_arr = scaled_arr.astype(np.float32, copy=False)
         else:
             # F-15: belt-and-braces. _load_model already disables the
             # strategy when the scaler is absent, but if anything ever
@@ -289,7 +328,11 @@ class LSTMPriceModel(BaseStrategy):
             )
 
         try:
-            x = torch.FloatTensor(feature_data.values).unsqueeze(0)  # (1, seq_len, features)
+            # ``torch.from_numpy`` shares memory with the source array
+            # (no copy), unlike ``torch.FloatTensor`` which always
+            # allocates. We never mutate ``scaled_arr`` after this point,
+            # so aliasing is safe.
+            x = torch.from_numpy(scaled_arr).unsqueeze(0)  # (1, seq_len, features)
             with torch.no_grad():
                 output = self._model(x)
 
