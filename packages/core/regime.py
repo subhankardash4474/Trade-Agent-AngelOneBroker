@@ -17,6 +17,8 @@ trend vs its 200 EMA (provided by trading_agent._market_context).
 
 from typing import Dict, Optional
 
+from loguru import logger
+
 
 # Coarse regime → which strategy categories do well in it.
 # Values are multipliers (1.0 = normal, 0.0 = skip, >1.0 = prefer).
@@ -186,23 +188,39 @@ def classify_regime(market_context: Optional[Dict]) -> str:
     Args:
         market_context: Dict with keys `nifty_trend` (1 above 200EMA, -1 below)
                         and `india_vix` (latest VIX).
+
+    Observability (diagnostic sprint 2026-05-27, hypothesis #1): every call
+    emits a single ``[REGIME-INPUT]`` line at INFO so the advisor's "is the
+    classifier seeing the right inputs?" question can be answered without
+    reconstructing state. Behaviour is unchanged -- this is observability-
+    only and does not consume a freeze slot (see ``docs/FREEZE_v2.1.md``
+    "What is NOT frozen" section).
     """
+    trend: Optional[int] = None
+    vix: Optional[float] = None
+    high_vol: Optional[bool] = None
+
     if not market_context:
-        return "unknown"
+        regime = "unknown"
+    else:
+        trend = market_context.get("nifty_trend")
+        vix = market_context.get("india_vix")
+        if trend is None or vix is None:
+            regime = "unknown"
+        else:
+            high_vol = vix >= 16.0
+            if trend == 1:
+                regime = "bull_high_vol" if high_vol else "bull_low_vol"
+            elif trend == -1:
+                regime = "bear_high_vol" if high_vol else "bear_low_vol"
+            else:
+                regime = "sideways"
 
-    trend = market_context.get("nifty_trend")
-    vix = market_context.get("india_vix")
-
-    if trend is None or vix is None:
-        return "unknown"
-
-    high_vol = vix >= 16.0
-
-    if trend == 1:
-        return "bull_high_vol" if high_vol else "bull_low_vol"
-    if trend == -1:
-        return "bear_high_vol" if high_vol else "bear_low_vol"
-    return "sideways"
+    logger.info(
+        f"[REGIME-INPUT] nifty_trend={trend} india_vix={vix} "
+        f"high_vol={high_vol} -> regime={regime}"
+    )
+    return regime
 
 
 def classify_intraday_regime(market_context: Optional[Dict]) -> str:
@@ -236,28 +254,41 @@ def classify_intraday_regime(market_context: Optional[Dict]) -> str:
     without inverting it -- a daily `bull_low_vol` + intraday `risk_off`
     means "cooled bull session, be careful with new longs", not "bear".
     """
+    nifty_intraday = None
+    vix_delta = None
     if not market_context:
-        return "unknown"
-    nifty_intraday = market_context.get("nifty_intraday_pct")
-    vix_delta = market_context.get("vix_intraday_delta")
-    # P2 logic-edges (2026-05-17): the OLD code imputed missing inputs to
-    # 0.0 (``float(x or 0.0)``), so a missing VIX delta combined with a
-    # +2% Nifty intraday would label the regime "risk_on" purely from the
-    # Nifty signal -- as if VIX were calm. That's exactly the regime we
-    # under-defended against during the 2026-05-08 spike. If EITHER
-    # input is missing, fall back to "unknown" so callers route to the
-    # permissive (no overlay) path instead of pretending a data gap is
-    # a calm reading.
-    if nifty_intraday is None or vix_delta is None:
-        return "unknown"
-    nifty_intraday = float(nifty_intraday)
-    vix_delta = float(vix_delta)
+        regime = "unknown"
+    else:
+        nifty_intraday = market_context.get("nifty_intraday_pct")
+        vix_delta = market_context.get("vix_intraday_delta")
+        # P2 logic-edges (2026-05-17): the OLD code imputed missing inputs to
+        # 0.0 (``float(x or 0.0)``), so a missing VIX delta combined with a
+        # +2% Nifty intraday would label the regime "risk_on" purely from the
+        # Nifty signal -- as if VIX were calm. That's exactly the regime we
+        # under-defended against during the 2026-05-08 spike. If EITHER
+        # input is missing, fall back to "unknown" so callers route to the
+        # permissive (no overlay) path instead of pretending a data gap is
+        # a calm reading.
+        if nifty_intraday is None or vix_delta is None:
+            regime = "unknown"
+        else:
+            nifty_intraday = float(nifty_intraday)
+            vix_delta = float(vix_delta)
+            if nifty_intraday <= -0.5 or vix_delta >= 1.5:
+                regime = "risk_off"
+            elif nifty_intraday >= 0.5 and vix_delta <= 0.5:
+                regime = "risk_on"
+            else:
+                regime = "neutral"
 
-    if nifty_intraday <= -0.5 or vix_delta >= 1.5:
-        return "risk_off"
-    if nifty_intraday >= 0.5 and vix_delta <= 0.5:
-        return "risk_on"
-    return "neutral"
+    # Diagnostic-sprint 2026-05-27, hypothesis #1: per-cycle observability of
+    # the intraday overlay inputs (paired with the daily classify_regime log).
+    # Observability-only; no behaviour change vs. pre-patch.
+    logger.info(
+        f"[REGIME-INTRADAY-INPUT] nifty_intraday_pct={nifty_intraday} "
+        f"vix_intraday_delta={vix_delta} -> regime={regime}"
+    )
+    return regime
 
 
 def regime_multiplier(
