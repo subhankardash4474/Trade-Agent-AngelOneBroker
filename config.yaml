@@ -296,7 +296,7 @@ risk:
   # bear_high_vol regime (28 trades, -Rs 1,505); the 2026-05-18 90d
   # battery showed the short side losing on 339+ trades regardless of
   # filter setting.
-  allow_shorts: true
+  allow_shorts: false
 
   # Position sizing
   # 2026-05-08: dropped 25 -> 15 alongside Rs 100k paper capital. 25% × Rs 100k
