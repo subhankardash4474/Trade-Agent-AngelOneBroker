@@ -128,6 +128,109 @@ $ python -m pytest -x -q
 .................................................................. 1598 passed in 76.97s
 ```
 
+> Updated after the same-day Tier D perf sweep below: **1610 / 1610
+> passing** (1598 above + 12 new perf regression tests).
+
+---
+
+## Tier D — Backtester performance sweep (post-audit, same day)
+
+Operator-requested perf review of the backtester ("see if performance
+can be handled"). The sweep is **freeze-safe**: every change touches
+files explicitly allowed mid-freeze under `FREEZE_v2.1.md` line 49–51
+("Backtester / battery infra — scripts, runners, parsers, dashboards on
+the new backtester VM"). No frozen strategy / risk / ensemble file
+modified, no bypass slot consumed. Three other identified wins
+(`SupertrendFollow` cached supertrend, rule-strategy `data.copy()`
+elimination, LSTM numpy passthrough) sit inside `packages/strategies/`
+and were deferred — they need an explicit unfreeze decision.
+
+| ID    | Fix                                                                                                                                                                            | Files |
+| ----- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ----- |
+| P-01  | `FeatureEngine.compute_all` short-circuits when the input frame already carries the sentinel column set (`ema_50`, `rsi`, `atr`, `vwap`, `supertrend`, `adx`, `dist_from_supertrend_atr`, `tod_sin`). XGBoost + LSTM strategies in the backtester were re-running the full ~30-indicator pipeline on every event despite `EnsembleBacktester.run()` having pre-enriched the frame once over the full history. Pre-computed values at any row past the warmup window are equivalent within the existing `strategy_history_window` precision contract (test: `tests/unit/test_strategy_history_window.py`). Live path is unaffected — `DataHandler.get_historical_data` returns OHLCV-only, so the sentinel check fails and the full pipeline runs as before. | `packages/core/features.py` |
+| P-05  | Legacy `BacktestEngine._run_strategy` now caps the per-event history slice at the same 300 bars as `EnsembleBacktester` (`_STRATEGY_HISTORY_WINDOW = 300`). Pre-fix `data.iloc[:i + 1]` grew unboundedly, making per-event work O(i) and the run O(N²) — a 90-day 5-min single-symbol run was ~22M row-touches. | `packages/research/backtest.py` |
+| P-06  | `_build_result` max-drawdown now uses `numpy.maximum.accumulate` instead of a Python loop over the ~220k-element event-level equity curve. Output is byte-identical (same definition: `max(running_peak − value)` and `mdd_pct = mdd / final_peak`). | `packages/research/backtest_ensemble.py` |
+| P-07  | Consolidated 11 inline copies of the gate-skip bookkeeping (`get_total_value` + `equity_curve.append` + `last_equity_per_day[ts.date()] = …` under try/except) into a single `_bump_equity(ts, symbol, close)` closure. Removes ~70 lines of repeated code and removes one source of "did we forget to update `last_equity_per_day`" bugs (F-72 was exactly that class). | `packages/research/backtest_ensemble.py` |
+| P-08  | `_merge_bars` now uses `heapq.merge` over per-symbol pre-sorted iterators (O(N log K), K = symbols) instead of materialising a single ~220k-tuple list and sorting it (O(N log N)). Peak memory drops from O(N) to O(K). Order is identical (proven by `test_p08_merge_bars_order_matches_old_implementation`). | `packages/research/backtest_ensemble.py` |
+| P-10  | `EnsembleBacktester.run` pre-warms the `_trend_context._cache` for every symbol BEFORE entering the event loop. Pre-fix, the first `is_against_trend(...)` call from inside the hot loop fired a synchronous `yfinance.download` with a 30 s hard timeout — on a 50-symbol Nifty 50 run that's up to 25 minutes of serialised network I/O sprinkled across the first ~50 events. Failures are absorbed (fail-open default preserved). | `packages/research/backtest_ensemble.py` |
+| P-12  | `_in_dead_hour` now memoises by `(hour, minute)`; `_atr_pct` / `_latest_atr` use `df.iat[-1, col_idx]` (column-position lookup) instead of `df["col"].iloc[-1]` (column-Series materialisation). Defensive fallback to `.iloc[-1]` retained if the iat path raises. | `packages/research/backtest_ensemble.py` |
+
+### Expected speedup
+
+Based on static call-graph analysis (not measured wall-clock):
+
+- **Per-event CPU**: ~55–70 % reduction (P-01 alone is most of it — it
+  removes the duplicate `compute_all` over a 300-bar window from every
+  XGBoost + LSTM event).
+- **Battery wall-clock** (Nifty 50, 60 days, 8 strategies, 36 variants):
+  estimated **2.5–3.5×** faster end-to-end. A typical 8 h variant
+  becomes ~2.5–3 h; a long 45 h smoke run becomes ~13–18 h.
+- **Peak memory per worker**: ~20–30 % lower (fewer ephemeral
+  300 × 50-cell frame copies in the hot loop; O(K) instead of O(N)
+  event tuples in `_merge_bars`).
+- **Numerical drift vs current**: < 1e-4 per indicator at the last row
+  of any slice (within the precision contract already enforced by
+  `strategy_history_window`).
+
+### Identified but deferred (frozen-file blocker)
+
+| Finding | Why deferred |
+| ------- | ------------ |
+| P-03 (full) | `SupertrendFollow._compute_supertrend` is a Python `for` loop with `iloc` get/set on every iteration; the same series is already in `df["supertrend"] / df["supertrend_direction"]` from the pre-enrichment. Switching to cached columns requires touching frozen `packages/strategies/supertrend_follow.py`. Partial mitigation already in place via `strategies.weights.supertrend_follow = 0.0` (kill verdict, freeze line 58). |
+| P-04 | All six rule strategies (`rsi_momentum`, `mean_reversion`, `vwap_bounce`, `supertrend_follow`, `opening_range_breakout`, `moving_average_crossover`) do `df = data.copy()` on every event. Eliminating it requires per-strategy review of which columns are then assigned vs read from the cache. Frozen tree. |
+| P-11 | `LSTMPriceModel.generate_signal` allocates a fresh `pd.DataFrame` around the scaled features just to feed torch; could be `numpy` end-to-end. Frozen tree. |
+
+### Second-pass findings (same day, operator-requested deployment review)
+
+A second pass focused on "anything else worth fixing before pushing to
+the backtester VM" surfaced four more items. All freeze-safe; folded
+into the same Tier D file and same regression test file.
+
+| ID    | Fix                                                                                                                                                                            | Files |
+| ----- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ----- |
+| B-01  | **Business-logic bug.** ``EnsembleBacktester.run()`` accumulated ``losses_per_stock`` for the FULL backtest duration, while the live agent calls ``self._stock_loss_today.clear()`` at the start of every new IST trading day (``trading_agent.py`` ``_reset_daily_trackers`` ``L1748-1752``) — the config key is literally ``max_losses_per_stock_per_day``. Pre-fix: a 60-day backtest blacklisted volatile names by day 5 and never re-traded them, systematically under-counting trades and under-stating losses vs live. The fix tracks ``current_day`` and ``.clear()`` s the dict on every IST date rollover. | `packages/research/backtest_ensemble.py` |
+| B-02  | **Observability gap.** ``GateStats.total_signals`` was bumped before the ensemble aggregator ran, so an ensemble-HOLD outcome (no consensus among non-HOLD strategy votes) left no trace in the gate table — operators reading the gate breakdown thought the missing events had been blocked by an explicit rule. New field ``GateStats.ensemble_hold`` is bumped in that branch so the table arithmetic now balances: ``total_signals == executed + sum(other gates)``. Surfaces regime-fragile ensembles (low consensus) directly. | `packages/research/backtest_ensemble.py` |
+| B-03  | **Perf micro.** ``_apply_slippage`` short-circuits and returns the input price unchanged when ``slippage_pct == 0.0`` (idealised-stress and fee-only studies). Skips both the multiply and the RNG draw — bit-identical to the mathematical limit, lighter on the hot path. | `packages/research/backtest_ensemble.py` |
+| B-04  | **Perf micro.** ``_bump_equity`` now reads ``current_day`` from the enclosing scope (already computed once per event by the B-01 rollover block) instead of calling ``_ts.date()`` again. Defensive ``_ts.date()`` fallback retained for the ``current_day is None`` corner case. Removes ~220k Python attribute-conversion calls on a Nifty-50 / 60-day run. | `packages/research/backtest_ensemble.py` |
+
+### Tests
+
+New regression file: `tests/unit/test_backtester_perf_2026_05_27.py` —
+**19 tests** covering each of P-01, P-05, P-06, P-07, P-08, P-10, P-12,
+B-01, B-02, B-03, B-04.
+Mix of (a) source-search asserts (so the structural perf change can't
+silently regress), (b) numerical-equivalence asserts (vectorised MDD vs
+loop; `compute_all` short-circuit vs full recompute on the last row;
+`heapq.merge` vs naive sort ordering), and (c) behavioural smoke tests
+(`_in_dead_hour` cache hit, `_prefetch_trend_context` calls
+`get_trend` once per symbol).
+
+Full-suite run after the perf sweep + second-pass fixes: **1617 / 1617
+passing** (1598 pre-existing + 12 Tier-D perf + 7 second-pass B-* tests).
+
+```
+$ python -m pytest tests -q
+.................................................................. 1617 passed in 68.92s
+```
+
+### Freeze accounting
+
+Zero bypass slots consumed by this sweep:
+
+- `packages/core/features.py` — not in the FREEZE_v2.1 frozen-file list
+  (the list explicitly enumerates `risk_manager.py`, `position_sizer.py`,
+  strategy code, ensemble code, and the XGBoost model artifact).
+  The short-circuit is a pure performance change with a behaviour
+  proof: when the sentinel set is absent (live path) the original
+  pipeline runs unchanged; when present (backtester path) the
+  pre-computed columns are returned, which is mathematically
+  equivalent at any row past warmup to per-slice recompute. No
+  user-visible behaviour change.
+- `packages/research/*.py` — explicitly allowed mid-freeze under
+  `FREEZE_v2.1.md` line 49–51 ("Backtester / battery infra").
+
+The bypass ledger in `docs/FREEZE_v2.1.md` is unchanged at 3 / 3.
+
 ---
 
 ## Deferred items (require user policy / large architectural change)

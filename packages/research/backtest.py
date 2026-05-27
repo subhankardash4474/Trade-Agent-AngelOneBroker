@@ -106,6 +106,19 @@ class BacktestEngine:
 
         return self._results
 
+    # Perf P-05 (audit 2026-05-27): cap the per-event history slice the
+    # same way ``EnsembleBacktester.run`` already does (300 bars =
+    # 5x the longest fixed feature window used by any active strategy).
+    # Without this cap, ``data.iloc[:i + 1]`` grows unboundedly so the
+    # per-event cost is O(i) and the total run is O(N**2). On a 90-day
+    # 5-minute single-symbol run that's ~6,750 events with an average
+    # slice of ~3,375 rows — pandas indicators (RSI/MACD/ATR/etc.) then
+    # recompute over the full growing window on every call. The cap is
+    # numerically equivalent at the last-bar signal (proof: see
+    # ``tests/unit/test_strategy_history_window.py``; all rule strategies
+    # converge inside ~5x their period and the longest is 50).
+    _STRATEGY_HISTORY_WINDOW = 300
+
     def _run_strategy(
         self, strategy: BaseStrategy, market_data: Dict[str, pd.DataFrame]
     ) -> dict:
@@ -127,8 +140,10 @@ class BacktestEngine:
             min_bars = strategy.required_history_bars
             logger.info(f"  Processing {symbol}: {len(data)} bars (need {min_bars} min)")
 
+            window_size = self._STRATEGY_HISTORY_WINDOW
             for i in range(min_bars, len(data)):
-                window = data.iloc[:i + 1]
+                start = max(0, i + 1 - window_size)
+                window = data.iloc[start:i + 1]
                 current_bar = data.iloc[i]
                 current_price = float(current_bar["close"])
                 current_time = window.index[-1]

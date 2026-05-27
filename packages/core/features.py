@@ -25,12 +25,46 @@ class FeatureEngine:
       - Derived: Distance from day high/low, gap %, pre-market volume
     """
 
+    # Sentinel column set used to detect an already-enriched frame. These
+    # cover one column from each `_add_*_features` block (trend, momentum,
+    # volatility, volume, derived) so a partially-computed frame from an
+    # older/different pipeline still falls through to the full recompute
+    # path and gets a complete column set.
+    _ENRICHED_SENTINELS = (
+        "ema_50", "rsi", "atr", "vwap", "supertrend", "adx",
+        "dist_from_supertrend_atr", "tod_sin",
+    )
+
     def compute_all(self, df: pd.DataFrame, market_context: Optional[dict] = None) -> pd.DataFrame:
         """
         Compute all features on an OHLCV DataFrame.
         Modifies df in-place and returns it.
+
+        Perf P-01 (audit 2026-05-27): when ``df`` already carries the
+        full sentinel column set this method is the dominant cost in the
+        backtester hot loop (XGBoost + LSTM call ``compute_all`` on every
+        event despite ``EnsembleBacktester.run`` having pre-computed the
+        features once over the full history). Fast-path that case by
+        returning the input unchanged (or with only the market-context
+        columns refreshed when a non-empty ``market_context`` is supplied).
+        The pre-computed values at any row past the warmup zone are
+        numerically equivalent to per-slice recomputation within the
+        ``strategy_history_window`` precision contract already enforced
+        by ``tests/unit/test_strategy_history_window.py``. Live callers
+        pass raw OHLCV (no sentinel columns), so the sentinel check fails
+        and the full pipeline runs — live behaviour is unchanged.
         """
         if df.empty or len(df) < 2:
+            return df
+
+        # Fast path: frame is already feature-enriched. Only refresh the
+        # 3 market-context columns when an explicit, non-empty context
+        # was passed (the caller may want today's nifty_trend/vix even on
+        # a frame originally enriched with stale defaults).
+        if all(c in df.columns for c in self._ENRICHED_SENTINELS):
+            if market_context:
+                df = df.copy()
+                return self._add_market_context(df, market_context)
             return df
 
         df = df.copy()
