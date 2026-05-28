@@ -62,6 +62,36 @@ Net state at end-of-day-11:
 
 ---
 
+**Update 2026-05-28 (market holiday).** Three additional sections
+landed during the holiday window while the trader VM idled:
+
+7. **§7 Strategy hot-path performance sprint (P-03/P-04/P-11)** -- byte-
+   identical refactors of SupertrendFollow + 5 rule-based strategies +
+   LSTM. Backtester throughput jumped from 19-40 ev/s to 75-104 ev/s.
+   Honest attribution: ~2x from the xgboost-disable (§5) cutting the
+   per-event ML cost, ~1.3-1.5x from the refactors themselves. 1395
+   unit tests green.
+8. **§8 Battery queue trim** -- old 6-job queue would have spent ~160h
+   re-validating the broken-pkl ensemble post-§5. Trimmed to 3 jobs
+   (~36h total). The remaining jobs were intended as: slot #1 (50
+   stocks 60d, 19 variants), slot #2 (232 stocks 60d, 6 variants),
+   slot #3 (232 stocks holdout-30d, 19 variants).
+9. **§9 Bug K -- `--holdout-window-days` / `--train-window-days`
+   silently ignored in parallel-worker path.** Caught 2026-05-28
+   11:55 IST: slot #3 of the trimmed queue produced byte-identical
+   V1+V2 results to slot #2, exposing that the slice logic in
+   `battery.py:1305-1334` runs in main *after* the market_data
+   cache is saved -- workers reload pre-slice data and never see
+   the slice. Audit-only research-tool defect, no live-trader
+   impact. Fix queued for post-Friday. Slot #3 reframed as
+   "wider variant sweep on 232 stocks" rather than a p-hack
+   guard. Bug J's permanent fix (§1.5) also landed today --
+   bootstrap script three-way ownership split + writer probes
+   + 7 unit tests. Trader VM trades.csv verified clean (no
+   manual_test pollution, no archive needed).
+
+---
+
 ## 1. Bug J — `tools/cloud/bootstrap_backtester.sh` chowns to container UID, breaking host-side scheduler
 
 ### 1.1 Discovery context
@@ -1052,7 +1082,189 @@ roll-back of the queue file, because the queue is only consulted
 
 ---
 
-## 9. Cross-references
+## 9. Bug K — `--holdout-window-days` / `--train-window-days` silently ignored in parallel-worker path
+
+**Discovered 2026-05-28 11:55 IST while spot-checking the supposed
+"holdout-30d" job (slot #3 of the trimmed queue) on the backtester
+VM.** The job is structurally a duplicate of slot #2's 60d run; it
+gives no walk-forward evidence, contrary to what `data/battery_queue.yaml`
+advertised when the queue was trimmed yesterday.
+
+### 9.1 The smoking-gun observation
+
+`battery_v2_holdout_30d_20260528T011921` and
+`battery_nifty500_v4_long_only_validation_60d_20260527T142630` both
+ran on 232 stocks. They were *supposed* to test different time
+windows -- the holdout job with `--days 90 --holdout-window-days 30`
+should have backtested only the LAST 30 days; the validation job
+with `--days 60 --holdout-window-days <unset>` backtested the full
+60d. Their V1+V2 results came out byte-identical:
+
+| Variant | Trades | WR% | PnL | PF | Sharpe | MaxDD% | Ret% |
+|---------|--------|-----|------|----|--------|--------|------|
+| V1 (holdout job) | 235 | 36.2 | -₹693 | 0.78 | -2.57 | 8.77 | -6.68% |
+| V1 (validation job) | 235 | 36.2 | -₹693 | 0.78 | -2.57 | 8.77 | -6.68% |
+| V2 (holdout job) | 266 | 34.6 | -₹981 | 0.69 | -4.10 | 11.21 | -9.58% |
+| V2 (validation job) | 266 | 34.6 | -₹981 | 0.69 | -4.10 | 11.21 | -9.58% |
+
+Identical to every decimal place. That can only happen if both jobs
+saw the same market_data over the same window.
+
+### 9.2 Triangulating evidence
+
+Three independent log signals confirm the slice didn't propagate to
+the workers:
+
+1. **Main process DID slice.** `log.txt` for the holdout run shows:
+   ```
+   [BATTERY] walk-forward slice (last 30d, applied to 224/224 symbols):
+            351829 bars (was 974726, ratio 36.1%)
+   ```
+   So `args.holdout_window_days = 30` was parsed and the slice loop
+   in `packages/research/battery.py:1305-1334` executed correctly --
+   in the **main** process's in-memory `market_data` dict.
+
+2. **Workers did NOT see the slice.** `workers/V1_baseline_current_shipped.log`
+   shows progress against `974,726` (the *pre-slice* total bars):
+   ```
+   [BATTERY-PROGRESS] 8,736/974,726 (0.9%) | sim_date=2026-02-26 | ...
+   ```
+   And `sim_date=2026-02-26`. The data window starts in late
+   February, NOT in late April (which is what last-30d would mean
+   for a Thu-2026-05-28 job kickoff).
+
+3. **Cache write order is wrong.** Reading `battery.py` line 525 +
+   line 1305-1334 confirms it: `_save_market_data_cache()` is called
+   on line 525 with the FULL pre-slice 974k-bar dataset; the slice
+   logic at line 1305 mutates only the in-process dict, never the
+   on-disk cache. Workers (line 539) then *reload from the cache*
+   (`_load_market_data_cache(...)`) and never see the slice.
+
+### 9.3 Root cause
+
+Order of operations in `battery.main()`:
+
+```python
+# Line ~525  -- cache saved with FULL window
+_save_market_data_cache(market_data, out_root)
+[BATTERY] market_data cached (417.2 MB) -> .../market_data.pkl
+
+# Line 1305 -- slice applied AFTER cache, in main only
+if args.train_window_days or args.holdout_window_days:
+    n = args.train_window_days or args.holdout_window_days
+    keep = "first" if args.train_window_days else "last"
+    for sym in list(market_data.keys()):
+        df = market_data[sym]
+        if keep == "last":
+            cutoff = df.index.max() - pd.Timedelta(days=n)
+            market_data[sym] = df[df.index >= cutoff]
+        else:
+            cutoff = df.index.min() + pd.Timedelta(days=n)
+            market_data[sym] = df[df.index < cutoff]
+    [BATTERY] walk-forward slice (...): 351829 bars (was 974726, ratio 36.1%)
+
+# Workers in subprocesses then call _load_market_data_cache(...)
+# from disk -> they see the FULL pre-slice 974k bars again.
+```
+
+The fix is to reorder: apply the slice BEFORE the cache write, so
+workers reload the already-sliced data. There is no other dynamic
+state to preserve -- the slice is deterministic from `args`.
+
+### 9.4 Severity & freeze-policy classification
+
+* **Audit-only research-tool defect.** This is in
+  `packages/research/battery.py`, the offline backtester harness.
+  It does not affect the live trading code path on the trader VM
+  -- the live daemon never calls `--holdout-window-days`.
+* **Consumes no freeze-bypass slot.** Same reasoning as Bug J §1.6.
+* **Affects every battery run we've ever shipped that used these
+  flags.** Best evidence we have, looking back: zero. The flags
+  were documented in §11.5 of the README and listed in the script
+  help text, but no production battery run before 2026-05-28
+  actually invoked them. Slot #3 of yesterday's trimmed queue was
+  the first real use, and Bug K immediately killed its decision
+  value. So the cross-history blast radius is small.
+
+### 9.5 What slot #3 of the current queue *does* give us
+
+Even though the holdout slice is dead, the running job is **not**
+worthless:
+
+* It runs **all 19 variants** on the **232-stock universe** (slot #2
+  only ran 6 variants -- V1, V2, V4, V17, V18, V19). So slot #3
+  fills in V3, V5..V16 on the bigger universe, including:
+  * **V15_mr_xgb_only** -- the only *positive* variant on slot #1's
+    50-stock run (PF 1.02). If V15 stays positive on 232 stocks, the
+    XGBoost-retrain priority jumps.
+  * **V16_completely_naked** -- catastrophic on 50 stocks (-40.48%).
+    Confirms-or-not whether the gates' value transfers to the bigger
+    universe.
+  * **V18 anomaly check** -- V18's 3% threshold went missing on slot
+    #2 (V18 = V2, 266 trades, instead of V18 = V4, 229 trades). If
+    slot #3 reproduces this, we have a separate config-merge bug to
+    investigate post-Friday.
+* It runs on the SAME 60d window as slot #2 -- so cross-job
+  consistency checks on the 6 shared variants (V1, V2, V4, V17,
+  V18, V19) become a free determinism contract: byte-identity
+  expected.
+
+So slot #3 is a *de-facto wider variant sweep on 232 stocks*, NOT
+the p-hack guard the queue header promised. The Friday review will
+explicitly disclose this so the reader doesn't take the holdout
+framing at face value.
+
+### 9.6 Permanent fix plan (post-Friday, ~30 min work)
+
+1. Move the slice block from `packages/research/battery.py:1305-1334`
+   to *before* the `_save_market_data_cache()` call on line 525. The
+   refactor is mechanical -- the slice loop only depends on
+   `market_data` and `args`, both available pre-cache.
+2. Add a unit test:
+   `tests/unit/test_battery_walk_forward_slice.py::test_workers_see_sliced_market_data`.
+   The test:
+   * Builds a fake market_data dict with a known 90-day index.
+   * Runs `_save_market_data_cache` then `_load_market_data_cache`
+     after a `--holdout-window-days 30` slice has been applied
+     (post-fix order).
+   * Asserts the reloaded dict has the LAST 30d only.
+   The test should *fail* on the current code (proving Bug K),
+   then *pass* after the reorder.
+3. Add a log assertion in `_run_variant_in_subprocess`: if
+   `args.train_window_days or args.holdout_window_days` is set,
+   log `[WORKER] post-slice market_data: <bars> bars` and assert
+   the count is < pre-slice. Belt-and-braces guard against future
+   refactors that re-introduce the gap.
+4. Once the fix lands, re-queue a real holdout job for the next
+   weekend run.
+
+### 9.7 Disclosure to the Friday review
+
+The Friday morning review (`docs/friday_review_2026-05-29.md`) will:
+
+* Reframe slot #3 as "wider variant sweep on 232 stocks" rather
+  than "holdout-30d p-hack guard".
+* Use slot #2 + slot #3 *only* for variant ranking on the bigger
+  universe; treat the cross-window comparison as "60d slot-#1 (50
+  stocks) vs 60d slot-#2/#3 (232 stocks) on the SAME window" --
+  which is still useful for cross-universe transfer but is NOT a
+  walk-forward / p-hack guard.
+* Defer the V4-as-live-config decision until a real holdout run
+  has been completed post-fix. The slot-3 retrain go/no-go will
+  be conditioned on the V15 result on 232 stocks alone.
+
+### 9.8 Files touched (this finding)
+
+* `packages/research/battery.py` -- *no changes today*. Fix queued
+  for post-Friday week.
+* `docs/findings_log_2026-05-27.md` §9 -- this section (added
+  2026-05-28).
+* `docs/friday_review_2026-05-29.md` -- to be drafted today,
+  incorporates §9.7 disclosure.
+
+---
+
+## 10. Cross-references
 
 * `findings_log_2026-05-25.md` §15 (Bug G self-audit), §16 (Bug H —
   xgboost missing from battery), §17 (Bug I — trader VM divergence).
@@ -1068,7 +1280,7 @@ roll-back of the queue file, because the queue is only consulted
 
 ---
 
-## 10. Files touched in this finding (writes only)
+## 11. Files touched in this finding (writes only)
 
 * `docs/findings_log_2026-05-27.md` — this file (§5 + §6 + §7 + §8 added)
 * `docs/diagnosis_sprint_2026-05-27.md` — created earlier today
@@ -1095,7 +1307,18 @@ roll-back of the queue file, because the queue is only consulted
   updated for P-04 variable rename
 * `data/battery_queue.yaml` — queue trim (`84f5acd`); slots #3-6
   dropped, holdout promoted to slot #3; ~144h compute saved.
+* `tools/cloud/bootstrap_backtester.sh` — Bug J permanent fix
+  (`31703bc`); three-way ownership split + writer probes (steps
+  [7/8] and [8/8]) + 30-line comment linking back to §1.
+* `tests/unit/test_bootstrap_backtester_perms.py` — new
+  (`31703bc`); 7 file-text regression tests pinning the chown
+  contract and probe presence so Bug J can't sneak back in.
 * No risk-manager / position-sizer / ensemble code changes.
 * No model files modified or replaced (the broken .pkl is left in
   place as forensic evidence; it cannot be loaded because the active
   strategies list excludes its consumer).
+* `packages/research/battery.py` — *no changes today* despite §9
+  (Bug K) documenting a defect in this file; the fix is queued
+  for post-Friday so we don't disturb the running slot #3
+  worker. The bug is also audit-only (research tool, not live
+  trading), so deferring is safe.
