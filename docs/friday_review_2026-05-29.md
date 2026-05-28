@@ -373,11 +373,46 @@ a one-off, possibly a config snapshot issue.
 |------|----------|---------|------------------|
 | Bug K fix (move slice before cache save) + unit test | HIGH | None | ~30 min code + 1h test/CI |
 | Re-queue a real holdout-30d batch after Bug K fix | HIGH | Bug K fix lands first | One overnight run |
-| XGBoost retrain (slot-3 candidate) | TBD by §7 matrix | Friday morning V15 transfer result | ~2 days per `findings_log_2026-05-27.md §5.9` |
+| **XGBoost retrain -- PRE-FLIGHT (steps A-E)** | HIGH (if §7 says GO) | Friday morning V15 transfer result | ~2h, local only, no VM impact. Full checklist in `findings_log_2026-05-27.md §5.10`. |
+| **XGBoost retrain -- TRAINING (steps 2-5 of §5.9)** | HIGH (if §7 says GO) | Pre-flight A-E complete + slot #3 finished | ~30h wall-clock (train ~18h + validate 30min + bench ~6h + deploy 15min). Slot-3 of bypass ledger consumed at deploy. |
 | V18 anomaly RCA | LOW | None | ~1h code-read + ~1h test |
 | Trader VM trades.csv cleanup | DONE | -- | Verified clean 2026-05-28 11:55 IST, no work needed |
 | Bug J permanent fix | DONE | -- | Landed `31703bc` 2026-05-28 |
 | Entry-lag forensic (Hypothesis H3 from sprint) | OPEN | Entry-lag never measured | sprint Day 3-4 |
+
+### 8.1 Retrain pre-flight sequence (Friday morning runbook)
+
+If §7 matrix says GO, execute in this order (do NOT skip pre-flight --
+the broken pkl came from a panic patch that skipped it):
+
+```
+[ ] A. Code-read prepare_dataset.py. Verify P1 #7 cross-symbol
+       calendar-leak fix is present.                     (20 min)
+[ ] B. Code-read train_xgboost.py. Verify C-23 out-of-sample
+       calibration is present.                           (20 min)
+[ ] C. Pick training + holdout windows. Document choice
+       in findings_log_2026-05-27.md §5.10.              (30 min)
+[ ] D. Write tests/unit/test_training_pipeline_preflight.py
+       (5 bug-fix assertions). Run -> all green.         (30 min)
+[ ] E. Run prepare_dataset.py on a 10-stock slice. Assert
+       label distribution not extreme (no >85% one-sided). (15 min)
+[ ] 2. Stop battery scheduler. docker run prepare_dataset
+       on full universe. docker run train_xgboost.       (~18h)
+[ ] 3. Held-out backtest validation. AUC > 0.60, Brier
+       improvement, calibration plot near-diagonal.      (~30 min)
+[ ] 4. Bench-test new pkl through V1+V4 on Nifty 50 60d
+       and 232-stock 60d. Compare vs job#1/job#2 numbers. (~6h)
+[ ] 5. Write FREEZE_v2.1.md slot-3 entry. Replace
+       models/xgboost_model.pkl on BOTH VMs. Re-enable
+       xgboost_classifier in strategies.active. Restart
+       trader container. Verify [BUY/SELL] log balance.  (~15 min)
+[ ] 6. Resume backtester queue (battery-scheduler.service).
+```
+
+Hard stop at step 3 if any of {AUC <= 0.60, calibration plot
+miscalibrated, BUY/SELL distribution > 85% one-sided}. Means the
+training-bug fixes weren't sufficient -- log as a 6th finding
+and defer further retrains until the root cause is understood.
 
 ---
 

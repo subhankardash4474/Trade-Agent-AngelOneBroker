@@ -690,6 +690,56 @@ To be executed once slot 3 is approved:
    battery-scheduler.service`. The V3-V19 re-run now produces
    trustworthy data.
 
+### 5.10 Retrain pre-flight decision — 2026-05-28 13:25 IST
+
+**Decision:** Pre-flight + training **deferred until Friday morning**
+after slot #3 V15 transfer evidence lands. No code or backtester
+action taken today.
+
+**Why not retrain on the holiday:**
+
+1. **Circular dependency on the backtester scheduler.** §5.9 step 2
+   requires `sudo systemctl stop battery-scheduler.service` to free
+   the VM for training. Slot #3 of the trimmed queue is still
+   running V3..V19; killing it now would destroy the V15-transfer
+   evidence that the §7 decision matrix in
+   `docs/friday_review_2026-05-29.md` uses to decide whether to
+   retrain in the first place. Starting the retrain would blind us
+   to whether we should be starting the retrain.
+2. **Two unverified bug fixes.** §5.9 step 1 lists C-23 (out-of-sample
+   calibration) and P1 #7 (cross-symbol calendar-leak fix) as "to be
+   re-verified during the retrain pre-flight". The earlier broken pkl
+   was produced by a 2026-05-14 panic patch that skipped pre-flight.
+   Repeating that mistake is the dominant retrain-failure mode.
+3. **Phase A (train+validate+benchmark) is reversible until Phase B
+   (deploy).** Phase B consumes bypass slot-3 of FREEZE_v2.1 -- the
+   last slot -- and requires Friday's V15-transfer data anyway. No
+   real time is saved by starting Phase A on Thursday.
+
+**Pre-flight checklist (queued for Friday morning, ~2h total):**
+
+| Step | What | Where | Effort | Gating |
+|------|------|-------|--------|--------|
+| A | Code-read `packages/training/prepare_dataset.py`. Verify F-24 lookahead-shift + P1 #8 neutral default (CONFIRMED) AND re-verify **P1 #7 cross-symbol calendar-leak fix**. | Local | 20 min | None |
+| B | Code-read `packages/training/train_xgboost.py`. Verify F-22 chronological-tail validation (CONFIRMED) AND re-verify **C-23 out-of-sample calibration**. | Local | 20 min | None |
+| C | Pick training window + holdout window. Avoid the 2024-Q1 -> 2026-Q1 window that trained the broken pkl. Candidates documented + chosen. | Local | 30 min | Pre-flight A+B done |
+| D | Write `tests/unit/test_training_pipeline_preflight.py` -- file-text + signature assertions for the 5 known bug fixes. Belt-and-braces regression guard. | Local | 30 min | A+B done |
+| E | Run `prepare_dataset.py` locally on a small (~10-stock) slice. Assert label balance not extreme (no 95% one-sided). | Local | 15 min compute, no VM impact | A+B+C done |
+
+After pre-flight: §5.9 steps 2-5 land on the backtester VM (step 2
+training run ~16-20h; step 3 validation ~30 min; step 4 bench-test
+~6h; step 5 deploy ~15 min). Total wall-clock from Friday GO to
+live: ~30 hours (Sat midday ish).
+
+**Alternative considered + dismissed:** spin up a separate training
+VM right now (now possible since Bug J fix landed). Dismissed
+because (a) doubles OCI cost, (b) doesn't bypass the V15-transfer
+gate which is about *deployment* not training, and (c) adds a
+fresh VM into the operational surface during freeze-v2.1.
+
+**Owner of the GO/NO-GO call on Friday morning:** operator + advisor
+review using the §7 decision matrix in friday_review_2026-05-29.md.
+
 ---
 
 ## 6. Trades.csv hygiene — manual_test rows archived
