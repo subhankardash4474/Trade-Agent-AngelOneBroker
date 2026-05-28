@@ -675,3 +675,25 @@ class Database:
         with self._conn() as conn:
             result = conn.execute("DELETE FROM ticks WHERE timestamp < ?", (cutoff,))
             logger.info(f"Purged {result.rowcount} old ticks (older than {days} days)")
+
+    def purge_old_equity_points(self, days: int = 90):
+        """Remove equity_curve snapshots older than N days.
+
+        CONC-12 (audit 2026-05-28): pre-fix there was no retention on
+        ``equity_curve`` even though the daemon writes a snapshot
+        every cycle (and ``_snapshot_equity`` every 5 cycles writes
+        another). 90 days of cycles at the prod cadence is ~750k
+        rows -- enough to start blowing the SQLite cache. 90 days
+        is also long enough to cover any reasonable equity-curve
+        analysis horizon; older points are retrievable from the
+        daily JSON snapshots written by tools/eod_diagnostic.
+        """
+        cutoff = (datetime.now() - pd.Timedelta(days=days)).isoformat()
+        with self._conn() as conn:
+            result = conn.execute(
+                "DELETE FROM equity_curve WHERE timestamp < ?", (cutoff,)
+            )
+            logger.info(
+                f"Purged {result.rowcount} old equity_curve points "
+                f"(older than {days} days)"
+            )

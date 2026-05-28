@@ -26,6 +26,7 @@ from typing import Dict, Optional, Tuple
 import numpy as np
 import pandas as pd
 import pytz
+from loguru import logger
 
 IST = pytz.timezone("Asia/Kolkata")
 
@@ -128,6 +129,15 @@ def check_data_quality(
     # index is treated as UTC — NOT as IST. Before the fix, localizing as IST
     # inflated every bar's age by 5h30m (the UTC-IST offset) and silently
     # killed signal generation via the "stale_data" gate.
+    #
+    # OBS-06 (audit 2026-05-28): both staleness AND the 20% spike check
+    # previously swallowed exceptions silently with ``pass``. A parse
+    # failure (e.g. timezone-confused index, non-numeric close) would
+    # therefore skip the guard entirely AND fail open -- the strategy
+    # would then evaluate on whatever data made it through. The fix
+    # flips both branches fail-closed: parse failure -> reject the
+    # frame with a named reason, plus a WARNING log so the operator
+    # can see when the guard is being bypassed.
     try:
         last_ts = df.index[-1]
         if hasattr(last_ts, "to_pydatetime"):
@@ -139,8 +149,12 @@ def check_data_quality(
             # During market hours we expect freshness; allow >24h for after-hours.
             if age > timedelta(minutes=max_staleness_minutes) and age < timedelta(hours=12):
                 return False, f"stale_data (age={age})"
-    except Exception:
-        pass  # index isn't a datetime — skip staleness check
+    except Exception as exc:  # OBS-06: was bare ``pass``
+        logger.warning(
+            f"[market-safety] staleness check failed (last_ts parse) -> "
+            f"failing closed. {type(exc).__name__}: {exc!r}"
+        )
+        return False, "staleness_check_failed"
 
     # Price spike detection: last close vs prev close > 20% is almost certainly
     # a corporate action (split/bonus) or a bad tick. Either way, indicators
@@ -153,8 +167,12 @@ def check_data_quality(
                 move = abs(last_close - prev_close) / prev_close * 100
                 if move > 20.0:
                     return False, f"price_spike ({move:.1f}% bar-over-bar — possible split)"
-        except Exception:
-            pass
+        except Exception as exc:  # OBS-06: was bare ``pass``
+            logger.warning(
+                f"[market-safety] spike check failed (close parse) -> "
+                f"failing closed. {type(exc).__name__}: {exc!r}"
+            )
+            return False, "spike_check_failed"
 
     return True, "ok"
 

@@ -53,6 +53,12 @@ class TestRegimeClassification:
     # 18?" without rebuilding history -- so the log line is a contract,
     # pinned by these tests. Observability-only, behaviour-preserving
     # (the same input still produces the same regime label).
+    #
+    # PERF-03 (audit 2026-05-28): demoted from INFO to DEBUG to remove
+    # the synchronous-file-sink hot path on rejection-heavy days. The
+    # contract still holds -- the log is emitted with the same format
+    # and content -- just at DEBUG level. The capture handler below
+    # uses level="DEBUG" so these tests continue to pin the contract.
     # ------------------------------------------------------------------
     def _capture_logs(self):
         from loguru import logger as loguru_logger
@@ -60,7 +66,7 @@ class TestRegimeClassification:
         captured = []
         handler_id = loguru_logger.add(
             lambda msg: captured.append(str(msg)),
-            level="INFO",
+            level="DEBUG",
         )
         return loguru_logger, handler_id, captured
 

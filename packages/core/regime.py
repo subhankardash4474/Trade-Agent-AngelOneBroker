@@ -216,7 +216,15 @@ def classify_regime(market_context: Optional[Dict]) -> str:
             else:
                 regime = "sideways"
 
-    logger.info(
+    # PERF-03 (audit 2026-05-28): pre-fix this was logger.info on EVERY
+    # classify_regime call -- which is called once per cycle plus once
+    # per _audit_reject, _process_signal gate, and _open_new_position.
+    # On rejection-heavy days (8,900+/day audited) that's thousands of
+    # formatted INFO lines/hour going through a synchronous file sink.
+    # Demoted to DEBUG (operator can still grep). Operator-visible
+    # observability is preserved at the cycle-digest layer which prints
+    # the cycle's final regime once.
+    logger.debug(
         f"[REGIME-INPUT] nifty_trend={trend} india_vix={vix} "
         f"high_vol={high_vol} -> regime={regime}"
     )
@@ -284,7 +292,11 @@ def classify_intraday_regime(market_context: Optional[Dict]) -> str:
     # Diagnostic-sprint 2026-05-27, hypothesis #1: per-cycle observability of
     # the intraday overlay inputs (paired with the daily classify_regime log).
     # Observability-only; no behaviour change vs. pre-patch.
-    logger.info(
+    # PERF-03 (audit 2026-05-28): same rationale as classify_regime --
+    # demoted from INFO to DEBUG to remove the synchronous-file-sink
+    # hot path. Cycle-digest still surfaces the final intraday regime
+    # once per cycle.
+    logger.debug(
         f"[REGIME-INTRADAY-INPUT] nifty_intraday_pct={nifty_intraday} "
         f"vix_intraday_delta={vix_delta} -> regime={regime}"
     )

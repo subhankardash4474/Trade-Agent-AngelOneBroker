@@ -655,6 +655,21 @@ class TradingAgent:
         self._dq_warned_symbols: set = set()
         self._prev_close_cache: Dict[str, float] = {}      # symbol → yesterday's close (for circuit check)
 
+        # PERF-02 (audit 2026-05-28): per-cycle historical-data memo.
+        # With ``use_websocket: false`` in prod the tick aggregator is
+        # empty, so EVERY (symbol, strategy) pair in _evaluate_strategy
+        # falls through to ``data_handler.get_historical_data``. With
+        # 300 symbols x 4 active strategies that's ~1,200 REST fetches
+        # per cycle. The strategies all ask for the same intraday
+        # window (5min, ~7 calendar days), so dedup by (symbol,
+        # timeframe) per cycle collapses the count by ~4x without
+        # changing any output. Cleared at the start of every
+        # ``_trading_cycle`` -- see _clear_historical_cache().
+        self._historical_cache: Dict[Tuple[str, str], "pd.DataFrame"] = {}
+        # Per-cycle hit/miss tallies surface in the cycle digest.
+        self._historical_cache_hits: int = 0
+        self._historical_cache_misses: int = 0
+
         # Concentration / safety limits from risk config
         risk_cfg_raw = self.config.get("risk", {})
         self._max_sector_exposure_pct: float = risk_cfg_raw.get("max_sector_exposure_pct", 40.0)
@@ -1004,17 +1019,27 @@ class TradingAgent:
 
         # ── Emergency stop (file-based kill switch, 2026-05-06) ──────
         # Operator can halt the agent without hunting PIDs by creating
-        # a STOP file in the configured location (default `logs/STOP`).
-        # The agent picks it up at the top of every cycle, sends an
-        # alert, and exits cleanly via the existing `finally` block
+        # a STOP file in the configured location (default
+        # ``logs/STOP.<mode>`` -- live or paper daemons get distinct
+        # kill switches per STATE-10 audit fix 2026-05-28). The agent
+        # picks it up at the top of every cycle, sends an alert, and
+        # exits cleanly via the existing `finally` block
         # (which runs `_shutdown()` and the EOD summary). Existing
         # positions are NOT auto-flattened — closing them is a manual
         # decision since intraday MIS positions auto-square at 15:15
         # anyway.
         ops_cfg = self.config.get("operations", {})
         log_dir = self.config.get("logging", {}).get("log_dir", "logs")
+        # STATE-10 (audit 2026-05-28): pre-fix the path was unconditionally
+        # ``logs/STOP``. A live + paper daemon sharing the same log dir
+        # would both halt on a single ``touch logs/STOP`` -- bad if the
+        # operator only intended to kill paper. The default now includes
+        # the run mode so the kill switch is scoped per-instance. An
+        # explicit ``emergency_stop_path`` in config is still honoured
+        # verbatim (legacy override).
+        mode_suffix = (self.execution.mode if hasattr(self, "execution") else "live").lower()
         self._emergency_stop_path: str = ops_cfg.get(
-            "emergency_stop_path", os.path.join(log_dir, "STOP")
+            "emergency_stop_path", os.path.join(log_dir, f"STOP.{mode_suffix}")
         )
         # Whether the kill switch should also try to flatten open
         # positions before exiting. Default off — most operators want
@@ -1164,12 +1189,30 @@ class TradingAgent:
             logger.add(sys.stderr, level=log_level,
                        format="<green>{time:HH:mm:ss}</green> | <level>{level: <8}</level> | {message}")
         if log_cfg.get("file", True):
+            # PERF-12 (audit 2026-05-28): pre-fix the file sink was
+            # synchronous -- a cycle with 300+ INFO lines (per-symbol
+            # signal + cycle digest + previously the chatty
+            # REGIME-INPUT, see PERF-03) blocked the main thread on
+            # fsync-eligible I/O for 30-300 ms. ``enqueue=True`` runs
+            # the file sink on a dedicated thread with a SimpleQueue
+            # buffer; the main thread's logger.* calls become
+            # near-instant.
+            #
+            # Safety notes:
+            #   * loguru flushes the queue on logger.complete() and on
+            #     interpreter shutdown, so logs survive a clean exit.
+            #   * On SIGKILL the in-queue lines may be lost -- that's
+            #     acceptable because graceful shutdown (SIGTERM) is
+            #     handled by run_daemon and the trader systemd unit.
+            #   * Tests that capture via ``logger.add(lambda)`` are
+            #     unaffected because those sinks are separate.
             logger.add(
                 os.path.join(log_dir, "trading_agent_{time:YYYY-MM-DD}.log"),
                 level=log_level,
                 rotation=f"{log_cfg.get('max_file_size_mb', 10)} MB",
                 retention=log_cfg.get("backup_count", 5),
                 format="{time:YYYY-MM-DD HH:mm:ss} | {level: <8} | {message}",
+                enqueue=True,
             )
 
     def _load_strategies(self) -> List[BaseStrategy]:
@@ -1507,8 +1550,26 @@ class TradingAgent:
         try:
             self.database.store_tick(symbol, price, volume,
                                      bid=tick.get("bid", 0), ask=tick.get("ask", 0))
-        except Exception:
-            pass
+        except Exception as exc:
+            # OBS-09 (audit 2026-05-28): pre-fix this swallowed the
+            # store_tick failure silently. The aggregator still has the
+            # tick in memory, so trading is not affected -- but the
+            # tick row never lands in SQLite, which means EOD analytics
+            # / replay tooling sees holes. Rate-limit the log to avoid
+            # drowning the file sink under a runaway DB problem.
+            now_ts = time.time()
+            last = getattr(self, "_obs09_last_warn_ts", 0.0)
+            if now_ts - last > 60.0:  # 1 warning/minute is enough
+                self._obs09_last_warn_ts = now_ts
+                count = getattr(self, "_obs09_skipped_count", 0) + 1
+                self._obs09_skipped_count = 0
+                logger.warning(
+                    f"[ws-tick] store_tick({symbol}) failed (and "
+                    f"{count} similar failures in the last 60s, "
+                    f"now suppressed): {type(exc).__name__}: {exc!r}"
+                )
+            else:
+                self._obs09_skipped_count = getattr(self, "_obs09_skipped_count", 0) + 1
 
         # Only act on ticks for symbols we actually hold -- saves CPU when
         # the watchlist is wider than the position book.
@@ -1932,8 +1993,33 @@ class TradingAgent:
                     "Boot health checks failed:\n\n" + "\n".join(fails),
                     level="critical",
                 )
-            except Exception:
-                pass
+            except Exception as exc:
+                # OBS-17 (audit 2026-05-28): pre-fix this swallowed the
+                # alert dispatch failure silently. The daemon was about
+                # to refuse to start because preflight failed; we want
+                # SOME record on disk so an SRE looking at the VM later
+                # can correlate. Write a sticky flag file alongside the
+                # critical log -- absence of the alert + presence of
+                # the flag = "alert system is down, preflight failed".
+                logger.critical(
+                    f"[preflight] alert dispatch FAILED while reporting "
+                    f"{len(fails)} preflight failures: "
+                    f"{type(exc).__name__}: {exc!r}. Original failures: {fails!r}"
+                )
+                try:
+                    from pathlib import Path as _P
+                    flag = _P("logs") / "preflight_failed.flag"
+                    flag.parent.mkdir(parents=True, exist_ok=True)
+                    flag.write_text(
+                        f"preflight failed at {datetime.now().isoformat()}\n"
+                        f"alert dispatch error: {type(exc).__name__}: {exc!r}\n"
+                        f"failures:\n  " + "\n  ".join(fails) + "\n"
+                    )
+                except Exception:
+                    # If we can't even write the flag, there's nothing
+                    # more to do -- the CRITICAL log above is the last
+                    # line of defense.
+                    pass
         return critical_ok
 
     def _emergency_stop_file_present(self) -> bool:
@@ -2919,6 +3005,12 @@ class TradingAgent:
             # 2026-05-14 Intraday overlay -- pull a 1-min Nifty bar to compute
             # ~60-min momentum, and snapshot VIX vs morning open. Best-effort:
             # any failure leaves the overlay at "unknown" (permissive).
+            #
+            # OBS-13 (audit 2026-05-28): pre-fix both blocks bare-passed
+            # exceptions. The intraday overlay drives `risk_off` gating
+            # for ensemble; silent failure means we fall back to
+            # "unknown" which is treated as permissive (full size). Log
+            # so the operator sees when intraday gating is offline.
             try:
                 intraday = _fetch_close("^NSEI", range_str="1d", interval="1m")
                 if intraday and len(intraday) >= 60:
@@ -2927,8 +3019,13 @@ class TradingAgent:
                     if sixty_back > 0:
                         pct = (last - sixty_back) / sixty_back * 100.0
                         self._market_context["nifty_intraday_pct"] = round(pct, 3)
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.warning(
+                    f"[market-context] Nifty intraday fetch failed -- "
+                    f"intraday momentum overlay unavailable this refresh; "
+                    f"regime gating will be permissive. "
+                    f"{type(exc).__name__}: {exc!r}"
+                )
             try:
                 vix_intraday = _fetch_close("^INDIAVIX", range_str="1d", interval="5m")
                 if vix_intraday and len(vix_intraday) >= 1:
@@ -2939,8 +3036,13 @@ class TradingAgent:
                     open_vix = self._market_context.get("vix_open") or vix_intraday[0]
                     delta = vix_intraday[-1] - open_vix
                     self._market_context["vix_intraday_delta"] = round(delta, 3)
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.warning(
+                    f"[market-context] VIX intraday fetch failed -- "
+                    f"vix_intraday_delta unavailable this refresh; "
+                    f"regime gating will be permissive. "
+                    f"{type(exc).__name__}: {exc!r}"
+                )
 
             from core.regime import classify_intraday_regime
             intraday_regime = classify_intraday_regime(self._market_context)
@@ -2973,6 +3075,12 @@ class TradingAgent:
         """Single iteration of the trading loop."""
         now = datetime.now(IST)
         logger.debug(f"--- Cycle #{self._cycle_count} @ {now.strftime('%H:%M:%S')} ---")
+
+        # PERF-02 (audit 2026-05-28): drop the per-cycle historical
+        # memo at the very top of the cycle so each cycle's strategy
+        # evaluations start with a clean slate -- no risk of stale
+        # bars from the prior cycle leaking into this one's signals.
+        self._clear_historical_cache()
 
         # Refresh VIX / Nifty trend periodically
         self._refresh_market_context()
@@ -3089,6 +3197,9 @@ class TradingAgent:
             self._last_trade_block_reason = reason
             # Still check SL/TP on open positions even if can't open new
             current_prices = self.data_handler.get_multiple_ltp(self.instruments)
+            # PERF-11 (audit 2026-05-28): stash on self so _snapshot_equity
+            # can reuse instead of doing another N+1 LTP fetch.
+            self._last_prices = current_prices
             self._check_position_exits(current_prices)
             self.risk_manager.update_open_positions(self.portfolio.open_position_count)
             return
@@ -3097,6 +3208,8 @@ class TradingAgent:
         self._last_trade_block_reason = None
 
         current_prices = self.data_handler.get_multiple_ltp(self.instruments)
+        # PERF-11 (audit 2026-05-28): stash for _snapshot_equity reuse.
+        self._last_prices = current_prices
         ltp_count = sum(1 for p in current_prices.values() if p is not None)
         logger.info(f"LTP fetched: {ltp_count}/{len(self.instruments)} instruments")
 
@@ -3260,6 +3373,16 @@ class TradingAgent:
         # Single INFO line per cycle, collapses all silent branches into a
         # readable tally so you can SEE whether we're data-starved, vote-less,
         # or just below the confidence threshold.
+        #
+        # PERF-02 (audit 2026-05-28): tail of the line carries
+        # ``hist_cache=H/M`` -- per-cycle historical-data cache
+        # hits/misses. On a healthy production cycle with 300 symbols
+        # x 4 strategies, expect M~=300 and H~=900 (4 strategies hit
+        # the same (symbol, timeframe) but only the first one pays
+        # the REST round-trip). Drift toward M>>H means the cache key
+        # is too narrow (e.g. timeframe varies more than expected).
+        hcm = self._historical_cache_misses
+        hch = self._historical_cache_hits
         logger.info(
             f"[CYCLE-DIGEST] symbols={symbols_evaluated} "
             f"with_data={symbols_with_data} "
@@ -3267,7 +3390,8 @@ class TradingAgent:
             f"ensemble_acts={ensemble_acts} "
             f"ensemble_holds={ensemble_holds} "
             f"threshold={self.ensemble.confidence_threshold:.2f} "
-            f"regime={current_regime}"
+            f"regime={current_regime} "
+            f"hist_cache={hch}/{hcm}"
         )
 
         self.risk_manager.update_open_positions(self.portfolio.open_position_count)
@@ -3318,6 +3442,46 @@ class TradingAgent:
         target = base + (0.5 - wr) * span
         self.ensemble.set_runtime_threshold(target)
 
+    def _clear_historical_cache(self) -> None:
+        """PERF-02: drop the per-cycle historical memo at cycle start.
+
+        Resets hit/miss tallies as well so the next digest reflects a
+        single cycle, not a running total.
+        """
+        self._historical_cache.clear()
+        self._historical_cache_hits = 0
+        self._historical_cache_misses = 0
+
+    def _get_historical_cached(
+        self,
+        symbol: str,
+        timeframe: str,
+        start: datetime,
+        end: datetime,
+    ) -> "pd.DataFrame":
+        """PERF-02: memoised wrapper around ``data_handler.get_historical_data``.
+
+        Keyed by ``(symbol, timeframe)`` only -- first writer wins.
+        Callers asking for a different ``(start, end)`` window in the
+        same cycle will get the cached frame even if their requested
+        window was narrower or wider. This is safe because every
+        in-cycle caller through ``_evaluate_strategy`` computes the
+        same generous window (>=7 calendar days for intraday); the
+        cache layer's job is to dedup, not to enforce window
+        semantics. Callers that need a strictly different window can
+        bypass by calling ``self.data_handler.get_historical_data``
+        directly.
+        """
+        key = (symbol, timeframe)
+        cached = self._historical_cache.get(key)
+        if cached is not None:
+            self._historical_cache_hits += 1
+            return cached
+        self._historical_cache_misses += 1
+        data = self.data_handler.get_historical_data(symbol, timeframe, start, end)
+        self._historical_cache[key] = data
+        return data
+
     def _evaluate_strategy(self, strategy: BaseStrategy, symbol: str, token: str) -> Optional[TradeSignal]:
         try:
             timeframe = strategy.params.get("timeframe", "5min")
@@ -3341,7 +3505,10 @@ class TradingAgent:
                     start = end - timedelta(minutes=max(needed_minutes, 7 * 24 * 60))
                 else:
                     start = end - timedelta(days=bars_needed * 2)
-                data = self.data_handler.get_historical_data(symbol, timeframe, start, end)
+                # PERF-02: route through the per-cycle cache so 4
+                # strategies asking for the same (symbol, timeframe)
+                # only pay one REST round-trip per cycle.
+                data = self._get_historical_cached(symbol, timeframe, start, end)
 
             if data.empty or not strategy.is_data_sufficient(data):
                 return None
@@ -3502,8 +3669,18 @@ class TradingAgent:
                     today = df.iloc[-1]
                     day_high = float(today["high"])
                     day_low = float(today["low"])
-            except Exception:
-                pass
+            except Exception as exc:
+                # OBS-14 (audit 2026-05-28): pre-fix this bare-passed.
+                # day_high/day_low feed the "at day high after 7% range"
+                # exhaustion guard inside check_circuit_risk. Without
+                # them the guard silently degrades to "no day-range
+                # data, accept" -- the exhaustion check is disabled.
+                # Log so the operator sees the partial-guard mode.
+                logger.warning(
+                    f"[circuit-guard] day_high/day_low fetch failed for "
+                    f"{symbol} -- exhaustion guard runs in partial-data "
+                    f"mode this evaluation. {type(exc).__name__}: {exc!r}"
+                )
             safe, reason = check_circuit_risk(
                 current_price=current_price,
                 previous_close=prev_close,
@@ -3635,8 +3812,24 @@ class TradingAgent:
                 take_profit=take_profit,
                 quantity=quantity,
             )
-        except Exception:
-            pass
+        except Exception as exc:
+            # OBS-08 (audit 2026-05-28): pre-fix this swallowed the
+            # signal-audit write failure silently. The EOD "X signals
+            # today" summary derives from this CSV; a persistent
+            # signal_audit.log() failure would manifest as the daemon
+            # reporting "0 signals today" while strategies were
+            # actually firing. Rate-limit the log because in pathological
+            # cases (e.g. disk full) every signal would hit the same
+            # error.
+            now_ts = time.time()
+            last = getattr(self, "_obs08_audit_last_warn_ts", 0.0)
+            if now_ts - last > 60.0:
+                self._obs08_audit_last_warn_ts = now_ts
+                logger.warning(
+                    f"[signal-audit] write failed for {signal.symbol} "
+                    f"reason={reason}: {type(exc).__name__}: {exc!r} "
+                    f"(suppressing duplicates for 60s)"
+                )
 
         # Seed the rejection cooldown unless this is a state-dependent reason.
         # Use getattr defensively — some test fixtures construct stub agents
@@ -3909,9 +4102,17 @@ class TradingAgent:
                     f"proceeding with flatten anyway (stuck SL is the lesser evil)."
                 )
 
+            # ORD-04 (audit 2026-05-28): exits MUST go through as MARKET
+            # orders. Pre-fix the order_type defaulted to the
+            # configured ``execution.order_type`` (LIMIT in prod), which
+            # means a stop-loss flatten on a gapping symbol would sit
+            # at the LIMIT price and never fill, leaving us holding
+            # through the gap. The exit path is exactly the case where
+            # accepting slippage is better than missing the exit.
             order = self.execution.place_order(
                 symbol=symbol, token=token, transaction_type=exit_side,
                 quantity=quantity, price=price, tag=tag,
+                order_type="MARKET",
             )
             # F-09 (audit 2026-05-27): the entry path accepts
             # PARTIALLY_FILLED and sizes the in-memory position to the
@@ -4058,6 +4259,35 @@ class TradingAgent:
                 exit_tx, symbol, pos.quantity, filled_price,
                 signal.strategy_name, pnl=record.pnl,
             )
+        else:
+            # OBS-02 (audit 2026-05-28): pre-fix, signal-driven exit
+            # failures were swallowed. Mirror OBS-01's CRITICAL alert
+            # pattern -- a failed counter-signal exit on a live position
+            # leaves us holding a position the model wants to be out
+            # of, with broker SL potentially cancelled.
+            logger.critical(
+                f"[SIGNAL-EXIT-FAILED] {pos.side} {pos.quantity}x{symbol}: "
+                f"signal-driven exit (strategy={signal.strategy_name}, "
+                f"confidence={signal.confidence:.2f}) returned "
+                f"order={order!r} record={record!r}. Position likely "
+                f"still live; broker SL may have been cancelled. "
+                f"MANUAL ACTION REQUIRED."
+            )
+            try:
+                self.alert_manager.send_alert(
+                    f"SIGNAL EXIT FAILED: {symbol}",
+                    f"{pos.side} {pos.quantity}x{symbol} signal exit on "
+                    f"{signal.strategy_name} did NOT complete. order={order!r} "
+                    f"record={record!r}. Position may still be live; broker "
+                    f"SL may have been cancelled. Check positionBook and "
+                    f"manually square off if needed.",
+                    level="critical",
+                )
+            except Exception as alert_exc:
+                logger.critical(
+                    f"[SIGNAL-EXIT-FAILED] alert dispatch ALSO failed: "
+                    f"{type(alert_exc).__name__}: {alert_exc!r}"
+                )
 
     def _open_new_position(
         self,
@@ -4100,6 +4330,14 @@ class TradingAgent:
                 f"[REJECT-COOLDOWN] Skipping {direction_label} {symbol}: "
                 f"recently rejected (cooldown active)"
             )
+            # NUM-13 (audit 2026-05-28): pre-fix this returned without
+            # writing an audit row, leaving a gap in signal_audit.csv
+            # that downstream EOD analytics interpreted as "signal
+            # never came through" rather than "signal came through but
+            # was cooldown-suppressed". A short-lived (symbol, side)
+            # rejection cooldown is itself an interesting analytical
+            # signal -- record it.
+            self._audit_reject(signal, current_price, "reject_cooldown:active")
             return
 
         # P2 logic-edges (2026-05-17): cooldown now keyed by (symbol, side).
@@ -4136,6 +4374,15 @@ class TradingAgent:
 
         can_trade, reason = self.risk_manager.can_trade(self._market_context)
         if not can_trade:
+            # OBS-07 (audit 2026-05-28): pre-fix this only wrote an
+            # audit row -- the daemon log had nothing. Circuit-breaker
+            # rejections (max drawdown, daily loss limit, etc.) are
+            # high-signal events that the operator needs to see in
+            # real-time without going to read signal_audit.csv. Log
+            # WARNING with the same reason text used in the audit row.
+            logger.warning(
+                f"[RISK-GATE] Skipping {direction_label} {symbol}: {reason}"
+            )
             self._audit_reject(signal, current_price, f"risk_gate:{reason}")
             return
 
@@ -4293,13 +4540,29 @@ class TradingAgent:
 
         # Cash-aware guard — applies to both sides because we lock notional
         # as collateral for shorts (see Portfolio.open_position for rationale).
+        #
+        # NUM-14 (audit 2026-05-28): pre-fix this used the full
+        # ``portfolio.cash`` as the affordability ceiling. A signal
+        # that fully deployed cash would then leave 0 buffer for the
+        # round-trip charges (STT/GST/exchange) that ``open_position``
+        # computes against ``cash``. The very next ``open_position``
+        # call would fail with a not-enough-cash error after passing
+        # this gate. We reserve a small buffer here so the sizing
+        # estimate matches what open_position will actually accept.
+        # 2x typical round-trip charges (~Rs 100) is enough for any
+        # realistic single-trade notional on Nifty 500.
         effective_price = current_price * 1.01
-        max_affordable = int(self.portfolio.cash // effective_price) if effective_price > 0 else 0
+        min_cash_buffer = float(
+            self.config.get("risk", {}).get("min_cash_buffer_rs", 200.0)
+        )
+        cash_available = max(0.0, self.portfolio.cash - min_cash_buffer)
+        max_affordable = int(cash_available // effective_price) if effective_price > 0 else 0
         cash_reduced_qty = False
         if quantity > max_affordable:
             logger.info(
                 f"[CASH-SIZE] Reducing {symbol} qty {quantity} -> {max_affordable} "
-                f"(cash=₹{self.portfolio.cash:.0f}, px=₹{current_price:.2f})"
+                f"(cash=₹{self.portfolio.cash:.0f}, buffer=₹{min_cash_buffer:.0f}, "
+                f"px=₹{current_price:.2f})"
             )
             quantity = max_affordable
             cash_reduced_qty = True
@@ -4714,7 +4977,23 @@ class TradingAgent:
                 try:
                     self.execution.update_sl_trigger_for_symbol(symbol, float(trailing_sl))
                 except Exception as e:
-                    logger.debug(f"[SL-PROPAGATE] {symbol} update failed (non-fatal): {e}")
+                    # OBS-03 (audit 2026-05-28): pre-fix this was DEBUG
+                    # which is filtered out at the default file sink.
+                    # A failed SL-propagate is the difference between
+                    # "broker enforces tight trailing-stop on daemon
+                    # crash" and "broker enforces wide original stop
+                    # on daemon crash" -- a meaningful operator signal.
+                    # Promote to WARNING, track per-symbol failure
+                    # counter so the heartbeat surfaces drift.
+                    counter = getattr(self, "_obs03_sl_propagate_failures", {})
+                    counter[symbol] = counter.get(symbol, 0) + 1
+                    self._obs03_sl_propagate_failures = counter
+                    logger.warning(
+                        f"[SL-PROPAGATE] {symbol} update failed "
+                        f"(count={counter[symbol]}); broker SL may be "
+                        f"stale at {pos.stop_loss} (intended {trailing_sl:.2f}). "
+                        f"{type(e).__name__}: {e!r}"
+                    )
 
             trigger = self.risk_manager.check_stop_loss_take_profit(
                 pos.entry_price, price, pos.side, effective_sl, pos.take_profit,
@@ -4776,6 +5055,37 @@ class TradingAgent:
                     f"PnL: \u20B9{record.pnl:+.2f}",
                     level=level,
                 )
+            else:
+                # OBS-01 (audit 2026-05-28): pre-fix, this branch did
+                # nothing. A failed flatten on SL/TP/trailing-stop hit
+                # is the worst kind of silent failure: the position is
+                # still live, broker SL may already be cancelled (P0 #1),
+                # the daemon thinks the exit was attempted and moves on
+                # to the next symbol. By the next cycle the price may
+                # have moved against us. Promote to CRITICAL log +
+                # CRITICAL alert so the operator can intervene manually.
+                logger.critical(
+                    f"[EXIT-FAILED] {pos.side} {pos.quantity}x{symbol}: "
+                    f"flatten on {actual_reason} returned "
+                    f"order={order!r} record={record!r}. Position likely "
+                    f"still live; broker SL may have been cancelled. "
+                    f"MANUAL ACTION REQUIRED."
+                )
+                try:
+                    self.alert_manager.send_alert(
+                        f"EXIT FAILED: {symbol}",
+                        f"{pos.side} {pos.quantity}x{symbol} flatten on "
+                        f"{actual_reason} did NOT complete. order={order!r} "
+                        f"record={record!r}. Position may still be live; "
+                        f"broker SL may have been cancelled. Check positionBook "
+                        f"and manually square off if needed.",
+                        level="critical",
+                    )
+                except Exception as alert_exc:
+                    logger.critical(
+                        f"[EXIT-FAILED] alert dispatch ALSO failed: "
+                        f"{type(alert_exc).__name__}: {alert_exc!r}"
+                    )
 
         # P1 #15 (2026-05-17): snapshot trailing-stop state if anything
         # mutated this cycle. Cheap (a few-symbol JSON write); the next
@@ -4785,7 +5095,16 @@ class TradingAgent:
             self._persist_trailing_states()
 
     def _square_off_all(self, reason: str = "eod_square_off"):
+        # ORD-12 (audit 2026-05-28): pre-fix this ignored the per-symbol
+        # close-result and unconditionally sent a "Square Off Complete"
+        # alert -- even if one or more closes silently failed (e.g.
+        # broker timeout) and the daemon was about to shut down with
+        # naked positions still on the broker. Now we collect per-symbol
+        # results and the completion alert distinguishes between fully-
+        # flat and partially-failed. Failed flattens get a CRITICAL log.
         logger.info(f"Squaring off all positions: {reason}")
+        succeeded: list[str] = []
+        failed: list[str] = []
         for symbol in list(self.portfolio.positions.keys()):
             pos = self.portfolio.positions.get(symbol)
             if not pos:
@@ -4794,16 +5113,38 @@ class TradingAgent:
             price = self.data_handler.get_ltp(symbol, token) or pos.entry_price
             exit_side = "SELL" if pos.side == "BUY" else "BUY"
             # P0 #1 (2026-05-15): cancel broker SL BEFORE flatten via the safe helper.
-            self._close_position_safely(
+            order, record = self._close_position_safely(
                 symbol=symbol, token=token, exit_side=exit_side,
                 quantity=pos.quantity, price=price,
                 tag=reason, exit_reason=reason,
             )
+            if order and record:
+                succeeded.append(symbol)
+            else:
+                failed.append(symbol)
+                logger.critical(
+                    f"[SQUARE-OFF-FAILED] {pos.side} {pos.quantity}x{symbol}: "
+                    f"flatten on {reason} returned order={order!r} "
+                    f"record={record!r}. Position likely still live; broker SL "
+                    f"may have been cancelled. MANUAL ACTION REQUIRED."
+                )
 
-        self.alert_manager.send_alert(
-            "Square Off Complete",
-            f"All positions closed ({reason}). Day P&L: \u20B9{self.risk_manager.state.daily_pnl:+.2f}",
-        )
+        if failed:
+            self.alert_manager.send_alert(
+                f"SQUARE-OFF INCOMPLETE: {len(failed)} symbol(s) still open",
+                f"Square off ({reason}) finished with {len(succeeded)} "
+                f"successful closes and {len(failed)} FAILURES: "
+                f"{', '.join(failed)}. Day P&L (partial): "
+                f"\u20B9{self.risk_manager.state.daily_pnl:+.2f}. "
+                f"Check positionBook and manually square off failed symbols.",
+                level="critical",
+            )
+        else:
+            self.alert_manager.send_alert(
+                "Square Off Complete",
+                f"All positions closed ({reason}). Day P&L: "
+                f"\u20B9{self.risk_manager.state.daily_pnl:+.2f}",
+            )
 
     def _get_token(self, symbol: str) -> str:
         for inst in self.instruments:
@@ -4982,6 +5323,14 @@ class TradingAgent:
         except Exception as e:
             logger.error(f"Tick purge failed: {e}")
 
+        # CONC-12 (audit 2026-05-28): also purge equity_curve points
+        # older than 90 days. See database.purge_old_equity_points
+        # docstring for the retention rationale.
+        try:
+            self.database.purge_old_equity_points(days=90)
+        except Exception as e:
+            logger.error(f"Equity purge failed: {e}")
+
         # Cap in-memory candle history at 500 candles per symbol/interval.
         # B-13 / C-15 (audit 2026-05-26): delegate to TickAggregator.cap_history
         # which takes its internal lock — prevents the race against the
@@ -4994,10 +5343,31 @@ class TradingAgent:
             logger.warning(f"tick_aggregator.cap_history failed (non-fatal): {e}")
 
     def _snapshot_equity(self):
-        """Record current equity to database for curve tracking."""
+        """Record current equity to database for curve tracking.
+
+        PERF-11 (audit 2026-05-28): pre-fix this re-fetched LTP for
+        every instrument via ``get_ltp`` -- duplicating the N+1
+        broker-call pattern that ``_trading_cycle`` already paid via
+        ``get_multiple_ltp``. With ``scanner.top_n=300`` and the 3/sec
+        AngelOne rate limit, that's ~100 s of broker time every 5
+        cycles, on top of the main cycle's own LTP fetch.
+        Now we reuse ``self._last_prices`` which is stashed by
+        ``_trading_cycle`` just before this function is called.
+        Equity-snapshot accuracy is unaffected because the snapshot
+        runs immediately after the cycle that produced the prices.
+        """
         try:
-            prices = {inst["symbol"]: self.data_handler.get_ltp(inst["symbol"], inst.get("token", ""))
-                       for inst in self.instruments}
+            prices = getattr(self, "_last_prices", None)
+            if not prices:
+                # Falls back to a fresh fetch on the rare path where
+                # snapshot fires before any trading cycle has stashed
+                # (e.g. pre-market boot snapshot, or paper-mode skip).
+                prices = {
+                    inst["symbol"]: self.data_handler.get_ltp(
+                        inst["symbol"], inst.get("token", "")
+                    )
+                    for inst in self.instruments
+                }
             equity = self.portfolio.get_total_value(prices)
             self.database.store_equity_point(equity, self.portfolio.cash, self.portfolio.open_position_count)
         except Exception as e:

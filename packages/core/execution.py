@@ -358,7 +358,19 @@ class ExecutionEngine:
             return
         try:
             order_book = self._api.orderBook()
-        except Exception:
+        except Exception as exc:
+            # OBS-11 (audit 2026-05-28): pre-fix this was a bare ``return``
+            # with no log. AngelOne RMS soft-rejects (documented inline
+            # in the modify path) can leave the trigger price stale on
+            # the broker side while our local state thinks it's been
+            # updated. A failed orderBook() fetch here means we cannot
+            # verify the modify -- log loudly so the operator can spot
+            # cases where SL-M is drifting away from intended trigger.
+            logger.warning(
+                f"[SL-verify] orderBook() raised while verifying "
+                f"order_id={order_id} expected_trigger={expected_trigger}: "
+                f"{type(exc).__name__}: {exc!r}. Trigger may be stale broker-side."
+            )
             return
         if not isinstance(order_book, dict):
             return
@@ -503,7 +515,16 @@ class ExecutionEngine:
         try:
             self._db.save_order(result)
         except Exception as e:
-            logger.debug(f"Order ledger persist failed: {e}")
+            # OBS-16 (audit 2026-05-28): pre-fix this was DEBUG which is
+            # filtered out at the default file sink. A failed audit-trail
+            # write deserves to be visible; the order itself still
+            # executed, but downstream EOD reconciliation against the DB
+            # ledger would silently miss this row.
+            logger.warning(
+                f"[order-ledger] persist failed for "
+                f"order_id={result.get('order_id')} symbol={result.get('symbol')} "
+                f"status={result.get('status')}: {type(e).__name__}: {e!r}"
+            )
 
     def _live_order_with_retry(
         self, symbol: str, token: str, tx_type: str,

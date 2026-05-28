@@ -133,6 +133,17 @@ class SignalAudit:
                     if out == "REJECTED":
                         gate = row.get("reason", "?").split(":", 1)[0]
                         stats["rejections"][gate] = stats["rejections"].get(gate, 0) + 1
-        except Exception:
-            pass
+        except Exception as exc:
+            # OBS-08 (audit 2026-05-28): pre-fix this returned partial
+            # stats with no log on read failure. The EOD summary banner
+            # would then quietly under-count signals/rejections. Surface
+            # the failure to the caller via a sentinel field so the
+            # banner can highlight "stats incomplete".
+            from loguru import logger
+            logger.warning(
+                f"[signal-audit] summarize_today read failed for "
+                f"{date_str}: {type(exc).__name__}: {exc!r}. "
+                f"Returned stats are partial -- treat as lower bound."
+            )
+            stats["read_error"] = f"{type(exc).__name__}: {exc!r}"
         return stats

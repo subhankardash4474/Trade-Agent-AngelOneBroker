@@ -526,17 +526,25 @@ class DataHandler:
         if now.weekday() >= 5:  # Saturday/Sunday
             return False
         if not is_known_holiday_year(now.year):
-            # B-6 (audit 2026-05-25): warn loudly when the holiday calendar
-            # has not been updated for the current year. We keep returning
-            # True (don't break automation) but the operator will see this
-            # in trading_agent_*.log every cycle until they extend
-            # NSE_HOLIDAYS — and the warning text spells out the fix.
-            logger.warning(
+            # OBS-12 (audit 2026-05-28): when the holiday calendar has
+            # not been curated for the current year, the pre-fix
+            # behaviour was to warn but return True (fail-open). That
+            # combination is exactly the Bug L pattern: after 2026-12-25
+            # the daemon would scan every 2027 holiday as a normal
+            # trading day until the operator noticed. Now we fail
+            # CLOSED -- if a year hasn't been curated we refuse to
+            # claim the market is open, and the operator must extend
+            # NSE_HOLIDAYS before the daemon will trade in that year.
+            # B-6 (2026-05-25) introduced the warning; OBS-12 hardens
+            # the return value.
+            logger.critical(
                 f"[holiday-calendar] NSE_HOLIDAYS has no entries for {now.year}; "
-                f"is_market_open() cannot rule out a holiday today. Update "
+                f"is_market_open() failing CLOSED to prevent the Bug L pattern "
+                f"(scanning a closed market on uncurated holidays). Update "
                 f"packages/core/data_handler.py:NSE_HOLIDAYS with this year's "
-                f"NSE schedule."
+                f"NSE schedule before {now.year} trading begins."
             )
+            return False
         if now.strftime("%Y-%m-%d") in NSE_HOLIDAYS:
             return False
         trading_hours = self._market_config.get("trading_hours", {})

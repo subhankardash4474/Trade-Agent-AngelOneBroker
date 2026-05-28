@@ -734,7 +734,19 @@ class TradeAnalyzer:
 
         try:
             patterns = self._db.load_trade_patterns(limit=self.pattern_lookback)
-        except Exception:
+        except Exception as exc:
+            # OBS-15 (audit 2026-05-28): pre-fix this swallowed the DB
+            # error with no log. Pattern-learning silently disables
+            # itself ("db_error" weight=0.0) and the gate caller treats
+            # that as "no learning signal, use defaults". A persistent
+            # DB problem (locked, corrupt, schema mismatch) would have
+            # zero observability until someone wondered why learning
+            # weights are flat in EOD.
+            logger.warning(
+                f"[LEARNING] load_trade_patterns failed -- pattern weight=0.0; "
+                f"caller will treat as 'no learning signal'. "
+                f"{type(exc).__name__}: {exc!r}"
+            )
             return 0.0, "db_error"
 
         if len(patterns) < self.min_trades:

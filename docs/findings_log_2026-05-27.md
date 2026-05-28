@@ -1567,3 +1567,158 @@ which could itself fail. Revisit post-Friday review.
   for post-Friday so we don't disturb the running slot #3
   worker. The bug is also audit-only (research tool, not live
   trading), so deferring is safe.
+
+---
+
+## 13. Audit-2026-05-28 follow-up — Phase 1 of 5 landed (22 findings FIXED)
+
+Today (2026-05-28, the Bakri Eid market holiday), in addition to the
+Bug L holiday-calendar work in §12, a 6-angle production audit produced
+**86 concrete findings with `file:line` citations** captured in
+`docs/audit_2026-05-28_followup.md`. Operator directive: "fix all, but
+don't deploy so the freeze slot won't be consumed". Interpretation:
+make the fixes in code on `main`, ship across multiple sessions; slot
+consumption is the deploy action, not the commit.
+
+### 13.1 Phase split (5 phases for tractability)
+
+* **Phase 1 (this session)** — 22 cheap, low-blast-radius, all-non-frozen
+  findings. Mostly log promotions, fail-closed flips on silent-failure
+  paths, in-cycle dedup caching, and the 4 perf quick-wins. Effort:
+  ~3h of code + 20 regression tests.
+* **Phase 2 (next session)** — 6 substantial findings: OBS-05 (boot
+  reconcile fail-closed), STATE-02 (broker positionBook reconcile at
+  boot), ORD-01/STATE-01 (wait for terminal status before mutating
+  portfolio), ORD-02 (idempotency on retry), ORD-03 (broker-leg
+  rollback on portfolio failure).
+* **Phase 3 (next session)** — architectural: CONC-02..09 (WS hot path
+  becomes enqueue-and-return + worker thread), ORD-06 (WS reconnect on
+  JWT refresh), STATE-04..09 + STATE-11/12 (atomicity, persistence
+  on lock-timeout, fail-closed on corrupt JSON, day-boundary
+  validate). Larger blast radius; requires paper-mode regression.
+* **Phase 4 (separate session)** — PERF-01 (LTP batch endpoint via
+  AngelOne marketQuote), PERF-04..PERF-15. Touches broker code,
+  needs paper regression.
+* **Phase 5 (freeze-lift OR explicit slot)** — 11 findings on frozen
+  files: 8 in `risk_manager.py` (NUM-03/04/08/09/12, OBS-04/19,
+  CONC-01), 2 in `_trend_context.py` (NUM-05/15), 1 in
+  `base_strategy.py` (OBS-10). Each touches `§What-is-frozen` per
+  `FREEZE_v2.1.md` so must wait.
+
+### 13.2 Phase 1 changeset (committed but NOT deployed)
+
+#### Observability promotions / fail-closed flips (16)
+
+| Finding | File | What changed |
+|---|---|---|
+| OBS-01 | `trading_agent.py:_check_position_exits_locked` | Failed SL/TP/peak-giveback exit → CRITICAL log + CRITICAL alert ("MANUAL ACTION REQUIRED") |
+| OBS-02 | `trading_agent.py:_exit_on_signal` | Failed counter-signal exit → CRITICAL log + alert |
+| OBS-03 | `trading_agent.py:_check_position_exits_locked` SL-PROPAGATE | DEBUG → WARNING + per-symbol failure counter (`_obs03_sl_propagate_failures`) |
+| OBS-06 | `market_safety.py:check_data_quality` | Staleness/spike `except: pass` → WARNING + `staleness_check_failed` / `spike_check_failed` returns |
+| OBS-07 | `trading_agent.py:risk_gate` | Added `logger.warning("[RISK-GATE] ...")` before audit row |
+| OBS-08 | `trading_agent.py:_audit_reject` + `signal_audit.py:summarize_today` | Both swallows → rate-limited WARNING; read errors return `read_error` sentinel field |
+| OBS-09 | `trading_agent.py:_on_tick store_tick` | Rate-limited (1/min) WARNING + suppression counter |
+| OBS-11 | `execution.py:_verify_modify_trigger` | `orderBook()` failure → WARNING with order_id + expected trigger |
+| OBS-12 | `data_handler.py:is_market_open` | Uncurated year fails CLOSED (was fail-open warning) — the Bug L pattern hardening |
+| OBS-13 | `trading_agent.py:_refresh_market_context` | Nifty/VIX overlay `except: pass` → WARNING with "regime gating permissive" consequence |
+| OBS-14 | `trading_agent.py:circuit_guard day high/low` | `except: pass` → WARNING with "partial-data mode" tag |
+| OBS-15 | `trade_analyzer.py:evaluate_setup` | `except: pass` → WARNING with `repr(exc)` |
+| OBS-16 | `execution.py:_persist_order` | DEBUG → WARNING with order_id/symbol/status |
+| OBS-17 | `trading_agent.py:preflight alert` | `except: pass` → CRITICAL log + `logs/preflight_failed.flag` sticky file |
+| OBS-18 | `websocket_client.py:Kite set_mode` | `except: pass` → WARNING with "feed degraded to LTP-only" |
+| OBS-20 | `battery.py:_load_market_data_cache` | Added SHA256[:16] + mtime + absolute path to load log |
+
+#### Numeric / correctness (2)
+
+| Finding | File | What changed |
+|---|---|---|
+| NUM-13 | `trading_agent.py:_process_signal` | Rejection-cooldown short-circuit now calls `_audit_reject(..., "reject_cooldown:active")` |
+| NUM-14 | `trading_agent.py:CASH-SIZE block` | `risk.min_cash_buffer_rs` (default Rs 200) reserved before affordability divide |
+
+#### Operational (3)
+
+| Finding | File | What changed |
+|---|---|---|
+| STATE-10 | `trading_agent.py:_setup_logging area` | Default kill-switch path is now `logs/STOP.<mode>` (live or paper) — distinct files per instance |
+| ORD-04 | `trading_agent.py:_close_position_safely` | `place_order(..., order_type="MARKET")` forced on every exit path — no more LIMIT-pending exits on gapping symbols |
+| ORD-12 | `trading_agent.py:_square_off_all` | Per-symbol close result accumulator; distinct "SQUARE-OFF INCOMPLETE" alert when any close fails; CRITICAL log per failure |
+
+#### Concurrency / resource (2)
+
+| Finding | File | What changed |
+|---|---|---|
+| CONC-11 | `portfolio.py:Portfolio.__init__` | `trade_history: List[TradeRecord]` → `deque(maxlen=10000)`; iteration/`len()` semantics unchanged |
+| CONC-12 | `database.py` + `trading_agent.py:_periodic_cleanup` | New `purge_old_equity_points(days=90)` mirroring `purge_old_ticks`; called from the 100-cycle cleanup hook |
+
+#### Runtime performance (4)
+
+| Finding | File | What changed |
+|---|---|---|
+| PERF-02 | `trading_agent.py:_get_historical_cached` + `_evaluate_strategy` + `_trading_cycle` | Per-cycle `(symbol, timeframe) -> DataFrame` memo; cleared at cycle entry; hit/miss tallies tail-appended to `[CYCLE-DIGEST]` as `hist_cache=H/M`. With 300 symbols × 4 strategies expected dedup ratio ~4:1. |
+| PERF-03 | `regime.py:classify_regime` + `classify_intraday_regime` | `[REGIME-INPUT]` / `[REGIME-INTRADAY-INPUT]` lines INFO → DEBUG. Test `tests/unit/test_regime_and_gates.py` updated to capture at DEBUG so the contract still pins content. |
+| PERF-11 | `trading_agent.py:_snapshot_equity` + `_trading_cycle` | `_trading_cycle` stashes the just-fetched `current_prices` on `self._last_prices`; `_snapshot_equity` reuses (fallback to N+1 fetch only on the rare pre-market boot snapshot path) |
+| PERF-12 | `trading_agent.py:_setup_logging` | File sink now `logger.add(..., enqueue=True)` — main thread no longer blocks on fsync I/O during chatty cycles |
+
+### 13.3 Test coverage
+
+`tests/unit/test_audit_2026_05_28_phase1.py` — **20 tests, all green**.
+Mix of source-level assertions (cheaper, catch reverts via grep)
+and runtime assertions (PERF-02 cache identity, OBS-06 pytz patch,
+OBS-12 uncurated-year fake-datetime). One existing test pinned the
+PERF-03 log level (`tests/unit/test_regime_and_gates.py::_capture_logs`)
+and was updated to capture at DEBUG.
+
+Full unit suite: **1,456 / 1,456 PASS** (was 1,436 before Phase 1
+landed; +20 from the new file).
+
+### 13.4 Deploy posture
+
+**No deploy.** Per operator directive ("fix all, just don't deploy so
+the slot won't be consumed"), Phase 1 is committed to `main` and
+pushed but **not** rolled to the trader VM. The freeze policy treats
+slot consumption as triggered by deploy / live behaviour change, not
+by commit-on-main. Phase 5 (frozen files) is the only phase that
+would otherwise need slot accounting; we will revisit when the bundle
+is ready to deploy or when freeze-v2.1 lifts on 2026-06-08.
+
+The trader VM continues to run commit `430069c` (Bug L). The next
+deploy will batch some subset of Phase 1 + Phase 2 + Phase 3 once we
+have paper-mode regression evidence — likely during the freeze-lift
+review window.
+
+### 13.5 Severity reassessment after Phase 1
+
+The Phase 1 set is dominated by Medium-severity findings (silent-failure
+fail-open paths). Critical findings still OPEN:
+
+* **ORD-01 / STATE-01** — Live treats `status=="PLACED"` as fill. Phase 2.
+* **ORD-02** — No idempotency on retry. Phase 2.
+* **ORD-03** — No broker-leg rollback on portfolio failure. Phase 2.
+* **STATE-02** — Boot reconcile skips broker-only positions. Phase 2.
+* **NUM-01** — Short MIS margin 100% instead of 20% in backtester. Frozen-adjacent (portfolio.py is non-frozen but the change re-runs every battery → has to be paired with v2_holdout re-run). Phase 4.
+* **OBS-01** — **FIXED** in Phase 1 (CRITICAL alert on failed flatten).
+* **PERF-01** — LTP batch endpoint (needs broker work). Phase 4.
+* **PERF-02** — **FIXED** in Phase 1 (in-cycle dedup; the in-cycle part
+  of the audit's "4× immediately" claim).
+
+So of the 8 audit-tagged Critical findings, 2 are now closed (OBS-01,
+PERF-02). The remaining 6 (ORD-01/02/03, STATE-01/02, NUM-01, PERF-01)
+are the order-state-truth / boot-reconcile / backtester-bias / broker-
+batch-endpoint cluster — all targeted in Phases 2-4.
+
+### 13.6 Files touched this commit batch
+
+* `packages/core/market_safety.py` — OBS-06
+* `packages/core/data_handler.py` — OBS-12
+* `packages/core/execution.py` — OBS-11, OBS-16
+* `packages/core/trade_analyzer.py` — OBS-15
+* `packages/core/websocket_client.py` — OBS-18
+* `packages/core/portfolio.py` — CONC-11
+* `packages/core/database.py` — CONC-12 (new method)
+* `packages/core/regime.py` — PERF-03
+* `packages/core/signal_audit.py` — OBS-08
+* `packages/research/battery.py` — OBS-20
+* `trading_agent.py` — OBS-01/02/03/07/08/09/13/14/17, NUM-13/14, ORD-04/12, STATE-10, CONC-12 wiring, PERF-02/11/12
+* `tests/unit/test_audit_2026_05_28_phase1.py` — new (20 regression tests)
+* `tests/unit/test_regime_and_gates.py` — capture handler updated to DEBUG to track PERF-03 demotion
+* `docs/audit_2026-05-28_followup.md` — Status column updated for 22 FIXED findings + phase 1 changelog entry

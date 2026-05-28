@@ -533,12 +533,25 @@ def _load_market_data_cache(out_root: Path) -> dict | None:
     if not cache_path.exists():
         return None
     try:
+        # OBS-20 (audit 2026-05-28): pre-fix this logged only the size
+        # + symbol count. For research reproducibility we want absolute
+        # path + size + mtime + SHA256 so any worker's cache load can
+        # be cross-referenced against the main process's cache write
+        # in the same out_root. Research-only path; no live impact.
+        import hashlib
+        sha = hashlib.sha256()
+        with cache_path.open("rb") as f:
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                sha.update(chunk)
+        digest = sha.hexdigest()[:16]
+        mtime = cache_path.stat().st_mtime
         with cache_path.open("rb") as f:
             md = pickle.load(f)
         size_mb = cache_path.stat().st_size / (1024 * 1024)
         logger.info(
             f"[BATTERY] reusing cached market_data ({size_mb:.1f} MB, "
-            f"{len(md)} symbols) — skipping yfinance fetch"
+            f"{len(md)} symbols, sha256[:16]={digest}, mtime={mtime:.0f}, "
+            f"path={cache_path.resolve()}) — skipping yfinance fetch"
         )
         return md
     except Exception as e:

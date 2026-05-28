@@ -160,8 +160,18 @@ class WebSocketClient:
                     ws.subscribe(int_tokens)
                     try:
                         ws.set_mode(ws.MODE_FULL, int_tokens)
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        # OBS-18 (audit 2026-05-28): pre-fix this was a
+                        # bare ``pass``. set_mode(MODE_FULL) failure
+                        # silently degrades the Kite feed to LTP-only,
+                        # which means depth/OHLC tick fields downstream
+                        # consumers expect will be missing. Log so the
+                        # degradation is visible; retry on next subscribe.
+                        logger.warning(
+                            f"[ws-kite] set_mode(MODE_FULL) failed for "
+                            f"{len(int_tokens)} tokens -- feed degraded to "
+                            f"LTP-only. {type(exc).__name__}: {exc!r}"
+                        )
                 if remove_tokens:
                     int_tokens = [int(t) for t in remove_tokens]
                     try:

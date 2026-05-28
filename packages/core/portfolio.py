@@ -122,7 +122,23 @@ class Portfolio:
         # INTRADAY (MIS) or DELIVERY (CNC) — drives realistic charges model
         self.product_type = product_type.upper()
         self.positions: Dict[str, Position] = {}
-        self.trade_history: List[TradeRecord] = []
+        # CONC-11 (audit 2026-05-28): pre-fix this was an unbounded
+        # ``List[TradeRecord]``. A daemon running for months
+        # accumulates monotonic RSS growth proportional to the trade
+        # count -- not a leak, but eventually a problem on the 1.5 GB
+        # OCI VM. SQLite ``trades`` table is the source of truth for
+        # historical trades; this in-memory cache only needs the
+        # recent tail for dashboards / EOD calc. 10,000 trades is
+        # ~2-3 years at our current trade cadence -- more than
+        # enough headroom while still bounding RSS.
+        #
+        # The container type swap is intentional: ``deque(maxlen=N)``
+        # implements every method this file actually uses on
+        # ``trade_history`` (``append``, ``len``, ``iter``,
+        # comprehension). Tests + tools that index via ``[-1]`` etc.
+        # also work on a deque.
+        from collections import deque
+        self.trade_history: "deque[TradeRecord]" = deque(maxlen=10000)
         self._db = database
         self._log_dir = log_dir
         self._trade_log_path = os.path.join(log_dir, "trades.csv")

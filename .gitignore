@@ -143,6 +143,9 @@ desktop.ini
 # ── Misc generated reports kept outside logs/ ──────────────────
 audit_*.md
 checkpoint_*.md
+# Persistent audit follow-up docs live under docs/ and are tracked
+# (the wildcard above is for transient per-day audit logs in logs/).
+!docs/audit_*.md
 
 # ── Cloud sync (research-pod outputs mirrored to laptop) ───────
 # logs/cloud_sync/  files already caught by logs/**/* rules above,
