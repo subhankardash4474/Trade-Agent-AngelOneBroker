@@ -89,6 +89,19 @@ landed during the holiday window while the trader VM idled:
    bootstrap script three-way ownership split + writer probes
    + 7 unit tests. Trader VM trades.csv verified clean (no
    manual_test pollution, no archive needed).
+10. **§12 Bug L -- `NSE_HOLIDAYS` missing 2026-05-28 (Bakri Eid).**
+    The trader daemon ran a full ~7h trading pipeline on a market
+    holiday because the date was absent from
+    `packages/core/data_handler.py:NSE_HOLIDAYS`. Damage was zero
+    (defensive stack absorbed: opening-lockout + allow_shorts:false
+    + xgb-disabled + paper-mode). Cross-source diff revealed the
+    pre-fix 2026 set was actually wrong in 16 of 18 entries (9
+    spurious + 7 missing -- the next gap is 2026-06-26 Muharram in
+    29 days). Fixed today: rewrote 2026 calendar with festival-name
+    inline comments + curator contract, added 20 calendar tests,
+    added a YELLOW POSSIBLE_MISSED_HOLIDAY detector to the audit
+    checkpoint with 14 tests of its own. Full unit suite:
+    **1436/1436 green**. Audit-only, no freeze slot consumed.
 
 ---
 
@@ -1311,6 +1324,188 @@ The Friday morning review (`docs/friday_review_2026-05-29.md`) will:
   2026-05-28).
 * `docs/friday_review_2026-05-29.md` -- to be drafted today,
   incorporates §9.7 disclosure.
+
+---
+
+## 12. Bug L — NSE_HOLIDAYS missing 2026-05-28 (Bakri Eid); daemon ran 7h on a closed market
+
+**Discovered 2026-05-28 17:00 IST after the operator noticed the
+broker app showed market closed but the trader VM had run all day.**
+Live miss of the Bakri Eid holiday because the date was absent from
+`packages/core/data_handler.py:NSE_HOLIDAYS`.
+
+### 12.1 Today's evidence
+
+`logs/trading_agent_2026-05-28.log` shows the daemon ran a full
+trading pipeline from 08:00:57 to 16:00:53 IST:
+
+* 193 cycles completed (~2.5 min/cycle, normal cadence).
+* 169 symbols with data, fetched into the scanner every cycle.
+* `[REGIME-INPUT] nifty_trend=-1 india_vix=14.98 high_vol=False -> regime=bear_low_vol`.
+* **One** ensemble-vote signal generated all day:
+  `09:16:11 [ENSEMBLE] SELL ICICIPRULI | conf=0.629 | strategies=['rsi_momentum']`.
+  Blocked by `[OPENING-LOCKOUT] Skipping SELL ICICIPRULI: in 15-min opening window`.
+* SESSION SUMMARY: 0 trades, ₹+0.00 day P&L, 0 positions.
+* `logs/health.json`: `state: idle_off_hours, running: false, daily_trades: 0`.
+* `logs/audit/2026-05-28/checkpoint_1600.md` verdict: **GREEN**
+  (which is technically accurate -- no errors, no trades -- but
+  misleading; the agent was scanning a closed market).
+
+### 12.2 Root cause
+
+`packages/core/data_handler.py:NSE_HOLIDAYS` did not contain
+`"2026-05-28"`. `DataHandler.is_market_open()` therefore returned
+True at 09:15 IST, the daemon entered its normal cycle loop, and the
+data fetcher served (presumably yesterday's close) bars for the 231
+symbols on which strategies then voted HOLD all day.
+
+The pre-Bug-L 2026 set contained **18 entries**, of which a diff
+against the authoritative NSE list (cross-checked via
+Samco/Upstox/Zerodha/ET/Outlook Business) showed only 9 were correct.
+**9 dates were spurious** (`02-17, 03-20, 03-30, 05-25, 07-07, 08-15,
+08-17, 10-09, 10-21`) and **7 real holidays were missing** (`01-15,
+03-26, 03-31, 05-28, 06-26, 09-14, 11-10`). Notably:
+
+* `2026-05-28` (Bakri Id, Thursday) -- the date that bit us today.
+* `2026-06-26` (Muharram, Friday) -- the next gap; would have bitten us in 29 days.
+* `2026-07-07` was incorrectly tagged as Muharram (the real date is `06-26`).
+* `2026-09-14` (Ganesh Chaturthi, Monday), `2026-11-10` (Diwali Balipratipada, Tuesday) -- both missing.
+
+The previous audit finding B-6 (2026-05-25) caught the *year-coverage*
+edge case (what happens after 2026-12-25 with no 2027 entries) but
+did not check *within-year completeness*. The hardcoded set was
+treated as authoritative without ever being diffed against the
+official NSE schedule.
+
+### 12.3 Why damage was zero today
+
+The defensive stack absorbed everything:
+
+1. **Opening lockout** (15-min post-open suppression) blocked the
+   one SELL signal at 09:16.
+2. **`allow_shorts: false`** (slot-1, live since 2026-05-26)
+   would have blocked the same SELL signal anyway.
+3. **`xgboost_classifier` disabled** (slot-2, live since 2026-05-27)
+   prevented cross-signal amplification or directional flip.
+4. **`mode: paper`** (per `health.json`): even an accepted signal
+   would have produced a simulated trade, not a real broker order.
+
+So the only cost was ~7h of CPU compute and ~169 wasted yfinance/
+SmartAPI fetches per cycle × 193 cycles. The compute is on the
+trader VM (not the user's laptop) and the broker session was idle,
+not abused.
+
+Had any of those 4 defenses been off (e.g. live mode + shorts
+allowed) we'd have placed a real SELL order on a closed market at
+09:16 IST. The broker would have rejected with a market-closed
+error, generating an error in the log -- which would have flipped
+the audit checkpoint to RED. So the damage trajectory degrades
+gracefully, but only because we currently sit on a 4-layer defense.
+
+### 12.4 Fix landed today
+
+Three deliverables, all on `main`:
+
+1. **`packages/core/data_handler.py:NSE_HOLIDAYS` rewritten for 2026.**
+   * 16 entries (matches the official NSE count).
+   * Each entry carries a `# DAY  Holiday Name` inline comment so a
+     future maintainer can audit against any third-party source
+     without re-reading code.
+   * 30-line header block documenting the Bug L incident + a new
+     **CONTRACT for future curators**: every entry MUST carry the
+     festival name + day-of-week. A bare ISO date with no comment
+     is a code-review red flag.
+   * 2025 entries left untouched (Bug L scope was 2026 only;
+     touching 2025 would risk breaking backtests).
+
+2. **`tests/unit/test_holiday_calendar.py` -- 20 tests, all green.**
+   * `test_2026_holiday_set_matches_authoritative_list` -- exact
+     diff against the 16-date cross-source list. The other 19
+     tests can pass while this one is broken; this one is the
+     contract.
+   * `test_2026_has_exactly_16_holidays` -- pins the count.
+   * `test_bakri_id_2026_in_set` and `test_muharram_2026_date_correct`
+     -- the two date-specific regression guards.
+   * `test_no_spurious_2026_entries[...]` -- parametrized over all
+     9 spurious dates; any of them coming back triggers a test
+     fail.
+   * `test_known_holiday_year_excludes_2027` -- enforces the
+     B-6 contract.
+   * Four `test_is_market_open_returns_false_on_known_2026_holidays`
+     parametric tests + one `..._returns_true_on_regular_trading_day`
+     sanity check. Uses a metaclass-based fake datetime so the
+     mock doesn't break `datetime.strptime` calls downstream in
+     `is_market_open()`.
+
+3. **`tools/audit_checkpoint.py` -- new
+   `_possible_missed_holiday_verdict()` + 14 tests
+   (`tests/unit/test_audit_checkpoint_holiday_detector.py`).**
+   The function returns a `YELLOW -- POSSIBLE_MISSED_HOLIDAY`
+   verdict iff ALL of:
+
+   * `now.weekday() < 5` (Mon-Fri)
+   * `today_iso NOT IN NSE_HOLIDAYS` (else daemon would have idled)
+   * `now >= 12:30 IST` (gives morning a chance)
+   * `cycles_completed >= 5` (daemon was actively running)
+   * `total_ensemble_acts == 0`
+   * `closed_trades_today == 0`
+   * `avg_directional_votes < 15`
+
+   Today's 16:00 checkpoint would have produced this verdict
+   instead of GREEN (cycles=6, acts=0, trades=0, votes=6.0, today
+   was a Thursday not yet in NSE_HOLIDAYS). All 14 tests pass; the
+   detector is intentionally conservative (only fires when ALL
+   gates are met), and the live `NSE_HOLIDAYS` integration is
+   tested via `test_uses_live_holiday_set_by_default` which uses
+   the now-curated 2026-05-28 entry to verify the
+   "today-is-already-a-known-holiday short-circuit" path.
+
+4. **Full unit suite: 1436/1436 green** (was 1436 before, holiday
+   tests added net +34 -- 20 calendar + 14 detector).
+
+### 12.5 Severity & freeze-policy classification
+
+* **Audit-only fix.** No live-trader behaviour changed -- the
+   daemon already had a holiday check; we just gave it accurate
+   data. The two new test files are unit-only.
+* **No freeze-bypass slot consumed.** Same reasoning as Bug J
+   (§1) and Bug K (§9).
+* **Deployment:** trader VM pulls + restarts the container. No
+   model reload, no config change beyond the holiday set, no
+   risk of perturbing the backtester (which has its own VM).
+
+### 12.6 What this catches going forward
+
+* **2026-06-26 Muharram (Friday)** -- the next gap that would
+   have repeated today's pattern in 29 days, now in the set.
+* **2026-07-09 +** -- if any future NSE unscheduled closure
+   slips past the curator, the audit checkpoint's YELLOW
+   POSSIBLE_MISSED_HOLIDAY verdict will flag it within 60 minutes
+   of the first checkpoint after 12:30 IST. The `trading-audit`
+   Cursor skill already treats YELLOW as "highlight + suggest
+   action" so the operator gets a direct prompt to cross-check
+   the NSE calendar.
+
+### 12.7 Files touched (this finding)
+
+* `packages/core/data_handler.py` -- NSE_HOLIDAYS 2026 rewrite +
+   30-line Bug L header.
+* `tools/audit_checkpoint.py` -- `_possible_missed_holiday_verdict()`
+   helper + wire into `_verdict()`.
+* `tests/unit/test_holiday_calendar.py` -- new, 20 tests.
+* `tests/unit/test_audit_checkpoint_holiday_detector.py` -- new,
+   14 tests.
+
+### 12.8 Backlog: Option B (API-fetched calendar)
+
+Today's fix is Option D from the 17:00 IST plan-of-record: fix the
+hardcoded calendar + add a YELLOW detector. Option B (replace the
+hardcoded set with a daily NSE-bulletin scrape + fallback to
+hardcoded on failure) is deferred. The case for it is real: even
+with the perfect 2026 calendar, the next missed holiday is a
+curator-attention question. The case against right now is that
+fetching from NSE adds an external dependency to daemon startup
+which could itself fail. Revisit post-Friday review.
 
 ---
 

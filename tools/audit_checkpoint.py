@@ -544,6 +544,108 @@ def _section_self_sufficiency() -> Dict[str, Any]:
         return {"enabled": False, "error": f"{type(e).__name__}: {e}"}
 
 
+# ── Verdict helpers ──────────────────────────────────────────────────────
+
+# Bug L (2026-05-28): the trader daemon ran ~7h of scanning cycles on
+# 2026-05-28 (Bakri Eid) because the date was missing from
+# packages/core/data_handler.py:NSE_HOLIDAYS. The damage was zero
+# (defensive stack absorbed the one SELL signal generated), but the
+# audit checkpoint reported GREEN throughout the wasted day. The
+# detector below catches the same pattern next time the calendar
+# misses a holiday: weekday in IST, past midday, multiple cycles ran
+# in the window but signal pipeline produced essentially nothing AND
+# zero trades closed today. See docs/findings_log_2026-05-27.md
+# section 12 (Bug L) for the reference incident.
+#
+# Conservative on purpose: it only fires when ALL of {weekday, past
+# 12:30 IST, today not already a known holiday, cycles >= 5, zero
+# ensemble acts, zero closed trades, avg directional votes < 15}
+# hold. A normal slow trading day with even 1-2 trades won't trigger.
+
+_POSSIBLE_HOLIDAY_CUTOFF_HOUR = 12
+_POSSIBLE_HOLIDAY_CUTOFF_MIN = 30
+_POSSIBLE_HOLIDAY_MIN_CYCLES = 5
+_POSSIBLE_HOLIDAY_MAX_AVG_VOTES = 15
+
+
+def _possible_missed_holiday_verdict(
+    now: datetime,
+    signal_pipeline: Dict[str, Any],
+    day_pnl: Dict[str, Any],
+    holiday_set: Optional[set] = None,
+) -> Optional[str]:
+    """Return a YELLOW verdict string if today looks like a missed
+    NSE holiday, else None.
+
+    See module-level Bug L comment above for the heuristic + rationale.
+
+    Parameters
+    ----------
+    now : datetime
+        Current time. Must be IST-aware (or naive interpreted as IST);
+        we look at .weekday() / .hour / .minute / .strftime() only.
+    signal_pipeline : dict
+        The ``signal_pipeline`` section of the snapshot. We read
+        ``cycles_completed``, ``total_ensemble_acts``, and
+        ``avg_directional_votes``.
+    day_pnl : dict
+        The ``day_pnl`` section. We read ``closed_trades_today``.
+    holiday_set : set, optional
+        Override for ``packages.core.data_handler.NSE_HOLIDAYS``. Useful
+        for tests that want to isolate the heuristic from the live
+        calendar. Defaults to the live set.
+    """
+    if holiday_set is None:
+        try:
+            from packages.core.data_handler import NSE_HOLIDAYS as _live_set
+            holiday_set = _live_set
+        except Exception:
+            # If the data_handler isn't importable for any reason, fall
+            # back to an empty set so the detector still runs (but loses
+            # one of its conservative gates).
+            holiday_set = set()
+
+    if now.weekday() >= 5:  # Saturday/Sunday -- not a trading day anyway
+        return None
+
+    today_iso = now.strftime("%Y-%m-%d")
+    if today_iso in holiday_set:
+        # Daemon would have idled on this day already. No need to alert.
+        return None
+
+    # Give the morning enough time to settle. A genuinely quiet morning
+    # can still produce signals by lunch; if not, that's the smell.
+    if now.hour < _POSSIBLE_HOLIDAY_CUTOFF_HOUR or (
+        now.hour == _POSSIBLE_HOLIDAY_CUTOFF_HOUR
+        and now.minute < _POSSIBLE_HOLIDAY_CUTOFF_MIN
+    ):
+        return None
+
+    cycles = signal_pipeline.get("cycles_completed", 0) or 0
+    acts = signal_pipeline.get("total_ensemble_acts", 0) or 0
+    avg_votes = signal_pipeline.get("avg_directional_votes", 0) or 0
+    trades_today = day_pnl.get("closed_trades_today", 0) or 0
+
+    if (
+        cycles >= _POSSIBLE_HOLIDAY_MIN_CYCLES
+        and acts == 0
+        and trades_today == 0
+        and avg_votes < _POSSIBLE_HOLIDAY_MAX_AVG_VOTES
+    ):
+        return (
+            f"YELLOW — POSSIBLE_MISSED_HOLIDAY: {today_iso} is a weekday "
+            f"and not in NSE_HOLIDAYS, but {cycles} cycles produced 0 "
+            f"ensemble acts, 0 closed trades, and only {avg_votes} avg "
+            f"directional votes/cycle. The live exchange may have "
+            f"declared an unscheduled closure. Cross-check the NSE "
+            f"calendar; if today IS a trading holiday, add it to "
+            f"packages/core/data_handler.py:NSE_HOLIDAYS. See "
+            f"docs/findings_log_2026-05-27.md section 12 (Bug L)."
+        )
+
+    return None
+
+
 # ── Markdown rendering ───────────────────────────────────────────────────
 
 def _render_markdown(now: datetime, data: Dict[str, Any], delta: Optional[Dict[str, Any]]) -> str:
@@ -566,6 +668,12 @@ def _render_markdown(now: datetime, data: Dict[str, Any], delta: Optional[Dict[s
             return "RED — traceback detected"
         if not pos.get("round_trip_ok", True):
             return "RED — DB round-trip failure"
+        # Bug L (2026-05-28): catch the 'ran on a closed market' pattern
+        # the moment it shows up in a checkpoint, not when the operator
+        # notices nothing happened all day. Returns None for normal days.
+        missed_holiday = _possible_missed_holiday_verdict(now, sig, pnl)
+        if missed_holiday:
+            return missed_holiday
         if log.get("warning_count", 0) > 50:
             return f"YELLOW — high warning count ({log['warning_count']})"
         return "GREEN"

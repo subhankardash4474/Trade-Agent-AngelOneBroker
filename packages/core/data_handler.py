@@ -44,17 +44,54 @@ IST = pytz.timezone("Asia/Kolkata")
 # the supported range explicit; `is_known_holiday_year()` lets callers
 # (run_daemon, market_safety) fail-closed when asked about a year we
 # haven't curated yet. Update annually.
+#
+# Bug L (2026-05-28 live miss): the 2026 list was previously curated by
+# date-only without festival names and turned out to contain 9 spurious
+# entries (02-17, 03-20, 03-30, 05-25, 07-07, 08-15, 08-17, 10-09, 10-21)
+# and 7 missing real holidays (01-15, 03-26, 03-31, 05-28, 06-26, 09-14,
+# 11-10). The 2026-05-28 (Bakri Id) miss caused the trader daemon to
+# scan a closed market for ~7 hours on a holiday. Damage was zero
+# (defensive stack -- opening lockout + allow_shorts:false + paper mode
+# + xgb-disabled -- absorbed everything), but the next gap is
+# 2026-06-26 (Muharram, Friday). The list below was cross-checked
+# against Samco / Upstox / Zerodha / ET / Outlook Business -- all 5
+# sources agree on the 16 holidays for 2026. See
+# docs/findings_log_2026-05-27.md section 12 (Bug L).
+#
+# CONTRACT for future curators: every entry MUST carry the festival
+# name + day-of-week as a comment. A bare ISO date with no comment is
+# a code-review red flag; the comment is what makes the calendar
+# auditable against any third-party source without re-reading code.
 NSE_HOLIDAYS = {
     # 2025
     "2025-02-26", "2025-03-14", "2025-03-31", "2025-04-10", "2025-04-14",
     "2025-04-18", "2025-05-01", "2025-08-15", "2025-08-27", "2025-10-02",
     "2025-10-20", "2025-10-21", "2025-10-22", "2025-11-05", "2025-11-26",
     "2025-12-25",
-    # 2026
-    "2026-01-26", "2026-02-17", "2026-03-03", "2026-03-20", "2026-03-30",
-    "2026-04-03", "2026-04-14", "2026-05-01", "2026-05-25", "2026-07-07",
-    "2026-08-15", "2026-08-17", "2026-10-02", "2026-10-09", "2026-10-20",
-    "2026-10-21", "2026-11-24", "2026-12-25",
+    # 2026 -- 16 holidays, Bug L corrected list (2026-05-28). Verified
+    # against Samco/Upstox/Zerodha/ET/Outlook Business.
+    "2026-01-15",  # THU  Municipal Corporation Elections in Maharashtra
+    "2026-01-26",  # MON  Republic Day
+    "2026-03-03",  # TUE  Holi
+    "2026-03-26",  # THU  Shri Ram Navami
+    "2026-03-31",  # TUE  Shri Mahavir Jayanti
+    "2026-04-03",  # FRI  Good Friday
+    "2026-04-14",  # TUE  Dr. Baba Saheb Ambedkar Jayanti
+    "2026-05-01",  # FRI  Maharashtra Day / Buddha Pournima
+    "2026-05-28",  # THU  Bakri Id  (Bug L: added 2026-05-28 after live miss)
+    "2026-06-26",  # FRI  Muharram  (Bug L: corrected from wrong 2026-07-07)
+    "2026-09-14",  # MON  Ganesh Chaturthi
+    "2026-10-02",  # FRI  Mahatma Gandhi Jayanti
+    "2026-10-20",  # TUE  Dussehra
+    "2026-11-10",  # TUE  Diwali-Balipratipada
+    "2026-11-24",  # TUE  Prakash Gurpurb Sri Guru Nanak Dev
+    "2026-12-25",  # FRI  Christmas
+    # Holidays falling on Sat/Sun (already non-trading; intentionally NOT
+    # listed above): 2026-02-15 Mahashivratri (Sun), 2026-03-21 Eid-Ul-Fitr
+    # (Sat), 2026-08-15 Independence Day (Sat), 2026-11-08 Diwali Laxmi
+    # Pujan (Sun -- special Muhurat trading session this date, timings
+    # announced closer to date; not a normal full-day session, currently
+    # not encoded here).
 }
 
 # Years for which `NSE_HOLIDAYS` is authoritative. Derived from the set
