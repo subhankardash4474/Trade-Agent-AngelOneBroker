@@ -148,17 +148,56 @@ remote "
         git -C ${TRADER_HOME} checkout ${GIT_BRANCH}
         git -C ${TRADER_HOME} reset --hard origin/${GIT_BRANCH} || git -C ${TRADER_HOME} reset --hard ${GIT_BRANCH}
     fi
-    mkdir -p ${TRADER_HOME}/logs/backtests ${TRADER_HOME}/data ${TRADER_HOME}/models
+    mkdir -p ${TRADER_HOME}/logs/backtests \
+             ${TRADER_HOME}/logs/battery_scheduler \
+             ${TRADER_HOME}/data \
+             ${TRADER_HOME}/data/research \
+             ${TRADER_HOME}/models
 
-    # CRITICAL: the trading-agent image runs as in-container UID 1001 (the
-    # 'trader' service user baked into the Dockerfile). The bind-mounted
-    # host directories must be writable by that UID, otherwise the battery
-    # crashes with PermissionError as soon as it tries to mkdir
-    # logs/backtests/<run_id>/. Discovered the hard way during the first
-    # backtester deploy on 2026-05-18.
-    sudo chown -R 1001:1001 ${TRADER_HOME}/logs ${TRADER_HOME}/data ${TRADER_HOME}/models
-    sudo chmod -R u+rwX,g+rwX ${TRADER_HOME}/logs ${TRADER_HOME}/data ${TRADER_HOME}/models
-    ls -ld ${TRADER_HOME}/logs ${TRADER_HOME}/data ${TRADER_HOME}/models
+    # ------------------------------------------------------------------
+    # Bug J fix (2026-05-28). See docs/findings_log_2026-05-27.md §1.
+    #
+    # The backtester VM has TWO writers with DIFFERENT UIDs:
+    #
+    #   1. Host-side battery-scheduler.service runs as the SSH bootstrap
+    #      user (\$USER -- opc on Oracle Linux, ubuntu on Ubuntu, both
+    #      typically UID 1000). It writes:
+    #        - data/battery_queue_state.json (queue checkpoint)
+    #        - logs/battery_scheduler/*.log (operator log)
+    #
+    #   2. Docker'd battery workers run as in-container UID 1001 (the
+    #      'trader' service user baked into the Dockerfile). They write:
+    #        - logs/backtests/<run_id>/ (per-run trade logs)
+    #        - data/research/<run>/    (per-run research artefacts)
+    #
+    # Pre-fix this script did 'chown -R 1001:1001 logs data models',
+    # which silently broke writer #1: the scheduler crashed with
+    # 'PermissionError: data/.../tmp' on its first checkpoint write
+    # because UID 1000 has no write permission on a 1001-owned tree.
+    # Discovered 2026-05-27 during the post-purge fresh deploy.
+    #
+    # The fix is a three-way ownership split: host-owned for the
+    # scheduler's writable paths, container-owned for the worker's
+    # writable paths, and either-fine for read-only paths (models/).
+    # Both \$USER and 1001 typically belong to the same primary group
+    # so cross-reads work without further chmod gymnastics.
+    # ------------------------------------------------------------------
+    # Host-owned (host-side scheduler writes here):
+    sudo chown -R \$USER:\$USER ${TRADER_HOME}/data \
+                                ${TRADER_HOME}/logs/battery_scheduler
+    # Container-owned (in-container UID 1001 writes here):
+    sudo chown -R 1001:1001 ${TRADER_HOME}/data/research \
+                            ${TRADER_HOME}/logs/backtests \
+                            ${TRADER_HOME}/models
+    sudo chmod -R u+rwX,g+rwX ${TRADER_HOME}/data \
+                              ${TRADER_HOME}/logs \
+                              ${TRADER_HOME}/models
+    echo 'ownership split:'
+    echo \"  data/                     -> \$(stat -c '%U:%G' ${TRADER_HOME}/data)\"
+    echo \"  data/research/            -> \$(stat -c '%U:%G' ${TRADER_HOME}/data/research)\"
+    echo \"  logs/backtests/           -> \$(stat -c '%U:%G' ${TRADER_HOME}/logs/backtests)\"
+    echo \"  logs/battery_scheduler/   -> \$(stat -c '%U:%G' ${TRADER_HOME}/logs/battery_scheduler)\"
+    echo \"  models/                   -> \$(stat -c '%U:%G' ${TRADER_HOME}/models)\"
 "
 
 echo "[5/6] Build the trading-agent image (this is the long step)..."
@@ -175,13 +214,45 @@ remote "
     sudo docker images trading-agent:latest --format '{{.Repository}}:{{.Tag}}  {{.Size}}'
 "
 
-echo "[6/6] Smoke-test: battery --help inside the freshly built image..."
+echo "[6/8] Smoke-test: battery --help inside the freshly built image..."
 remote "
     set -euo pipefail
     sudo docker run --rm \
         -e BACKTESTER_MODE=1 \
         trading-agent:latest \
         python tools/run_battery.py --help | head -20
+"
+
+# Bug J regression guard (2026-05-28). The two probes below exercise the
+# two writers we explicitly split ownership for in step [4/8]. If either
+# fails, the bootstrap exits non-zero and the operator gets a clear
+# 'cannot write here' message instead of a PermissionError lurking in
+# the scheduler journal six hours later.
+echo "[7/8] Verify host-side writer (scheduler can write data/ + logs/battery_scheduler/)..."
+remote "
+    set -euo pipefail
+    cd ${TRADER_HOME}
+    # Should succeed as the bootstrap user (\$USER -- opc/ubuntu).
+    touch data/.bug_j_probe_host && rm data/.bug_j_probe_host
+    touch logs/battery_scheduler/.bug_j_probe_host && rm logs/battery_scheduler/.bug_j_probe_host
+    echo '  host-side writes: OK'
+"
+
+echo "[8/8] Verify container-side writer (worker can write logs/backtests/ + data/research/)..."
+remote "
+    set -euo pipefail
+    cd ${TRADER_HOME}
+    # Should succeed because UID 1001 owns these paths after step [4/8].
+    sudo docker run --rm \
+        -v ${TRADER_HOME}/logs:/app/logs \
+        -v ${TRADER_HOME}/data:/app/data \
+        trading-agent:latest \
+        bash -c '
+            set -euo pipefail
+            mkdir -p /app/logs/backtests/.bug_j_probe && rmdir /app/logs/backtests/.bug_j_probe
+            mkdir -p /app/data/research/.bug_j_probe && rmdir /app/data/research/.bug_j_probe
+            echo \"  container-side writes: OK\"
+        '
 "
 
 echo "============================================================"

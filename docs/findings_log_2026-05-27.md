@@ -126,15 +126,67 @@ This is what the backtester VM is running on right now. The fix is
 **volatile** — if `bootstrap_backtester.sh` is re-run (e.g. a future
 fresh deploy), the bug re-appears.
 
-### 1.5 Permanent fix (queued, not done today)
+### 1.5 Permanent fix — **DONE 2026-05-28**
 
-Edit `tools/cloud/bootstrap_backtester.sh` to replace the single
-`chown -R 1001:1001 logs data models` with the three-way split above.
-Add an explicit comment block linking back to this finding and to the
-permission table in §1.3.
+Landed on `main` during the holiday holiday-window backtester sweep.
+Three deliverables:
 
-Cost: ~5 lines of bash, ~10 min testing on a fresh OCI compute provision.
-Scope: backtester-VM bootstrap only; the trader-VM bootstrap is unaffected.
+1. **`tools/cloud/bootstrap_backtester.sh` rewritten step [4/8]** to
+   apply the three-way ownership split documented in §1.3:
+   * `data/` and `logs/battery_scheduler/` -> `$USER:$USER` (host-owned)
+   * `data/research/` and `logs/backtests/` -> `1001:1001` (container)
+   * `models/` -> `1001:1001` (read-only by both, container default)
+   The new block carries a 30-line comment that links back to this
+   finding and explains the two-writer rationale, so a future
+   maintainer sees the trap before re-introducing it.
+
+2. **Two new self-verification steps [7/8] and [8/8]** added to the
+   bootstrap. After build + smoke-test the script exercises BOTH
+   writers end-to-end:
+   * **Host-side probe:** `touch data/.bug_j_probe_host && rm ...` and
+     same for `logs/battery_scheduler/`. Runs as the bootstrap SSH
+     user.
+   * **Container-side probe:** `docker run --rm ... bash -c 'mkdir
+     /app/logs/backtests/.bug_j_probe && rmdir ...'` and same for
+     `data/research/`. Runs as in-container UID 1001.
+   If either probe fails, the script exits non-zero with a clear "cannot
+   write here" message. Bug J would have been caught on day 1 by these
+   probes -- they're the cheapest possible regression guard.
+
+3. **`tests/unit/test_bootstrap_backtester_perms.py`** -- 7 file-text
+   assertions on the bootstrap script:
+   * `test_no_blanket_1001_chown_of_full_tree` -- explicitly asserts
+     the broken pre-fix line is gone (would catch the exact regression).
+   * `test_data_root_is_host_owned`,
+     `test_battery_scheduler_log_dir_is_host_owned` -- assert the host-
+     owned paths are chown'd to `$USER`.
+   * `test_logs_backtests_is_container_owned`,
+     `test_models_dir_chowned_for_container_read` -- assert the
+     container-owned paths are chown'd to `1001:1001` and that the
+     1001 chown command actually includes the right paths.
+   * `test_writer_probes_present` -- pins the two probes from step
+     [7/8] / [8/8].
+   * `test_bug_j_documented_in_script` -- asserts the script
+     references "Bug J" and `findings_log_2026-05-27.md` so a future
+     maintainer can grep their way to root cause.
+
+   All 7 tests pass on `main`. The `_extract_chown_block` helper
+   matches `sudo chown -R <owner>` (with sudo prefix) so it doesn't
+   pick up the comment-block discussion of the pre-fix behaviour.
+
+**Verification on the backtester VM:**
+* The currently-live VM is operating on the workaround from §1.4 (out-
+  of-band chown applied 2026-05-27). The fix only affects FRESH
+  bootstraps -- it doesn't touch the running VM.
+* On any future fresh OCI provision, the bootstrap will land the
+  three-way split natively and self-verify.
+* `bash -n tools/cloud/bootstrap_backtester.sh` on the backtester VM
+  passes (syntax OK after the patch).
+
+Cost actual: ~50 lines of bash (chown + comments + 2 probe steps),
++ 1 unit test file (7 tests). Total ~25 min of work. No freeze slot
+consumed -- the bootstrap is an operator tool, not on the live-trading
+code path.
 
 ### 1.6 Why this is NOT a freeze-policy concern
 
