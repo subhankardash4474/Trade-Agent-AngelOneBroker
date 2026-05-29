@@ -1423,48 +1423,71 @@ def main() -> int:
         for s in list(market_data.keys()):
             market_data[s] = fe.compute_all(market_data[s])
 
+        # ── Walk-forward slice (optional) ──
+        # MUST run BEFORE _save_market_data_cache so worker subprocesses
+        # reload pre-sliced data. Bug K (2026-05-29, findings_log_2026-05-27.md
+        # §9): the previous ordering applied the slice AFTER cache save, which
+        # silently dropped the slice in the parallel-worker path — workers
+        # ran _load_market_data_cache and replayed the FULL pre-slice 974k-bar
+        # dataset while the main process's `--holdout-window-days` log line
+        # claimed a 36% slice. The byte-identical V1+V2 results between the
+        # validation_60d job (no slice) and the v2_holdout_30d job (slice
+        # supposedly 30d) was the smoking gun. Slicing by calendar days
+        # (not bar count) so weekends/holidays are handled correctly:
+        # 30 calendar days = ~22 trading days = ~1500 bars at 5m intervals
+        # in a normal NSE month.
+        if args.train_window_days or args.holdout_window_days:
+            pre_slice_total = sum(len(df) for df in market_data.values())
+            n = args.train_window_days or args.holdout_window_days
+            keep = "first" if args.train_window_days else "last"
+            sliced_count = 0
+            for sym in list(market_data.keys()):
+                df = market_data[sym]
+                if df.empty:
+                    continue
+                try:
+                    if keep == "first":
+                        cutoff = df.index.min() + pd.Timedelta(days=n)
+                        market_data[sym] = df[df.index < cutoff]
+                    else:
+                        cutoff = df.index.max() - pd.Timedelta(days=n)
+                        market_data[sym] = df[df.index >= cutoff]
+                    sliced_count += 1
+                except (TypeError, AttributeError) as e:
+                    # df.index isn't datetime-like -- can't time-slice. Skip but
+                    # warn so the user knows this symbol's data is suspect.
+                    logger.warning(f"[BATTERY] {sym}: cannot apply walk-forward "
+                                   f"slice (non-datetime index): {e}")
+            sliced_total = sum(len(df) for df in market_data.values())
+            ratio = sliced_total / pre_slice_total if pre_slice_total else 0
+            logger.info(
+                f"[BATTERY] walk-forward slice ({keep} {n}d, applied to "
+                f"{sliced_count}/{len(market_data)} symbols): "
+                f"{sliced_total} bars (was {pre_slice_total}, ratio {ratio:.1%})"
+            )
+
         _save_market_data_cache(out_root, market_data)
+    else:
+        # Resume path: the cached market_data already reflects the
+        # original run's slice (or no slice, if the original didn't
+        # pass the flags). Re-applying the slice here would either be
+        # idempotent (same args) or silently wrong (different args, on
+        # already-cropped data). Loud-fail: if the operator passes a
+        # slice flag on resume we warn that it is ignored and direct
+        # them to a fresh run.
+        if args.train_window_days or args.holdout_window_days:
+            n = args.train_window_days or args.holdout_window_days
+            keep = "first" if args.train_window_days else "last"
+            logger.warning(
+                f"[BATTERY] resume: walk-forward slice flag "
+                f"({keep} {n}d) ignored — the cached market_data already "
+                f"reflects the original run's slice (Bug K fix, 2026-05-29). "
+                f"Drop --resume and start a fresh run if you need a "
+                f"different slice."
+            )
 
     total_bars = sum(len(df) for df in market_data.values())
     logger.info(f"[BATTERY] data ready: {len(market_data)} symbols, {total_bars} bars total")
-
-    # ── Walk-forward slice (optional) ──
-    # Keep this AFTER market_data is fully loaded/cached so that the cache
-    # always contains the FULL window. Subsequent --resume invocations can
-    # then re-slice differently without re-downloading from yfinance.
-    # Slicing by calendar days (not bar count) so weekends/holidays are
-    # handled correctly: 30 calendar days = ~22 trading days = ~1500 bars
-    # at 5m intervals in a normal NSE month.
-    if args.train_window_days or args.holdout_window_days:
-        n = args.train_window_days or args.holdout_window_days
-        keep = "first" if args.train_window_days else "last"
-        sliced_count = 0
-        for sym in list(market_data.keys()):
-            df = market_data[sym]
-            if df.empty:
-                continue
-            try:
-                if keep == "first":
-                    cutoff = df.index.min() + pd.Timedelta(days=n)
-                    market_data[sym] = df[df.index < cutoff]
-                else:
-                    cutoff = df.index.max() - pd.Timedelta(days=n)
-                    market_data[sym] = df[df.index >= cutoff]
-                sliced_count += 1
-            except (TypeError, AttributeError) as e:
-                # df.index isn't datetime-like -- can't time-slice. Skip but
-                # warn so the user knows this symbol's data is suspect.
-                logger.warning(f"[BATTERY] {sym}: cannot apply walk-forward "
-                               f"slice (non-datetime index): {e}")
-        sliced_total = sum(len(df) for df in market_data.values())
-        ratio = sliced_total / total_bars if total_bars else 0
-        logger.info(
-            f"[BATTERY] walk-forward slice ({keep} {n}d, applied to "
-            f"{sliced_count}/{len(market_data)} symbols): "
-            f"{sliced_total} bars (was {total_bars}, ratio {ratio:.1%})"
-        )
-        # Reload total_bars for downstream metadata so the slice is reflected.
-        total_bars = sliced_total
 
     # ── Step 2: run each variant ──
     # Hydrate `rows` from already-completed variants so comparison.md is

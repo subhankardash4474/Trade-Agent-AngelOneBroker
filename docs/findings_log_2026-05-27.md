@@ -138,6 +138,22 @@ landed during the holiday window while the trader VM idled:
     ETA tonight); informational only and cannot change the
     verdict.
 
+**Update 2026-05-29 15:00 IST (Friday afternoon, Bug K fix).**
+
+14. **§9.6.1 Bug K permanent fix LANDED.** `--holdout-window-days`
+    / `--train-window-days` no longer silently dropped on the
+    parallel-worker path. Walk-forward slice block now runs BEFORE
+    `_save_market_data_cache(...)` inside the fresh-run branch in
+    `packages/research/battery.py`; workers reload pre-sliced
+    data. Resume-time guard added (warns + tells operator to drop
+    `--resume` if they pass a different slice flag). 12 new
+    regression tests in `tests/unit/test_battery_walk_forward_slice.py`
+    (AST ordering proofs + round-trip + resume-guard + log-line
+    pins). Full unit **1,680/1,680** + integration **248/248**
+    green. Audit-only research-tool fix; zero trader-VM impact;
+    no freeze slot consumed. Re-queue of a real holdout job
+    waits until slot-#3 (V18+V19) finishes tonight.
+
 ---
 
 ## 1. Bug J — `tools/cloud/bootstrap_backtester.sh` chowns to container UID, breaking host-side scheduler
@@ -1335,6 +1351,105 @@ framing at face value.
    refactors that re-introduce the gap.
 4. Once the fix lands, re-queue a real holdout job for the next
    weekend run.
+
+### 9.6.1 Permanent fix LANDED -- 2026-05-29 15:00 IST
+
+Fix shipped on the same Friday afternoon as the V15 verdict
+(§22), since both depend on understanding the slot-3 result
+correctly. Step 1 (reorder) and step 2 (unit test) landed; step
+3 (worker-side log assertion) deferred as belt-and-braces only
+(the AST guard at the source level catches the same regression
+class without runtime cost). Step 4 (re-queue real holdout) waits
+for the next-sprint Bug K verification weekend.
+
+**Source-level changes (`packages/research/battery.py`):**
+
+* Walk-forward slice block moved from the post-cache main-body
+  position into the fresh-run branch (`if market_data is None:`)
+  and now runs *before* `_save_market_data_cache(...)`. Workers
+  reload pre-sliced data; the original Bug K silently-ignored
+  path no longer exists.
+* The slice block's local `pre_slice_total` is computed inside
+  the fresh-run branch right before the slice loop, so the
+  `[BATTERY] walk-forward slice (...): N bars (was M, ratio P%)`
+  log line reports the genuine pre-slice number rather than a
+  potentially-stale `total_bars` from earlier in main().
+* Added a resume-time guard in the `else:` branch (i.e. when
+  `_load_market_data_cache` returned a dict): if the operator
+  passes `--train-window-days` / `--holdout-window-days` on
+  resume, the harness now emits a `WARNING: walk-forward slice
+  (...) ignored` line that explicitly tells the operator to
+  drop `--resume` for a different slice. Re-slicing on
+  already-cropped data was the silent failure mode that masked
+  Bug K from the post-mortem reading; this guard makes the
+  next mistake loud.
+* Comment block above the slice loop now says explicitly
+  `MUST run BEFORE _save_market_data_cache so worker
+  subprocesses reload pre-sliced data`, names "Bug K", and
+  cross-references `findings_log_2026-05-27.md §9`. The AST
+  guard test (below) pins the comment so a future refactor
+  cannot quietly drop the rationale.
+
+**Regression test suite (`tests/unit/test_battery_walk_forward_slice.py`,
+12 tests, all green):**
+
+* `TestBugKSliceOrderingSource` (3 tests) — AST proof that the
+  slice block runs before `_save_market_data_cache` in the
+  fresh-run branch; pins the `Bug K` and findings-log
+  references in the fix comment; pins the `BEFORE
+  _save_market_data_cache` phrase so the ordering invariant
+  is unambiguous at the source.
+* `TestBugKSliceRoundTrip` (2 tests) — end-to-end save→load
+  contract using the real `_save_market_data_cache` /
+  `_load_market_data_cache` round-trip on a synthetic 90-day
+  market_data dict. The post-slice round-trip preserves the
+  last-30d window; the unsliced round-trip preserves the
+  full window (negative control).
+* `TestBugKResumeGuard` (2 tests) — AST proof that the resume
+  branch emits `logger.warning` (not `logger.info`, not
+  silent), uses the word "ignored", and tells the operator to
+  drop `--resume` for a different slice.
+* `TestBugKSliceLogContract` (2 tests) — pins `was
+  {pre_slice_total}` (the freshly-computed pre-slice bar count)
+  and `({keep} {n}d,` (calendar-day unit) so the audit log
+  remains correct and parseable.
+* `TestBugKSliceFailSoft` (2 tests) — pins the existing
+  fail-soft branch on non-datetime index (TypeError /
+  AttributeError) and the `pd.Timedelta(days=n)` calendar-day
+  arithmetic so the reorder doesn't drop these contracts.
+* `TestBugKSliceLivesInFreshBranch` (1 test) — AST proof that
+  the slice loop is nested inside `if market_data is None:`,
+  not at module-statement level inside main(). Catches the
+  refactor where someone "moves the block earlier" without
+  also nesting it.
+
+**Suite results post-fix:**
+
+* Unit: **1,680 / 1,680** (was 1,668 pre-fix; +12 from the
+  new Bug K suite).
+* Integration: **248 / 248**.
+* Battery test cluster narrowed run: 214 / 214 across nine
+  files in `tests/unit/test_battery_*.py`.
+
+**What the fix does NOT cover (deferred):**
+
+* Worker-side log assertion (step 3 of the original plan). The
+  AST guard catches the same regression class without spinning
+  up a real ProcessPoolExecutor, and a runtime worker-side
+  assertion would add ~20 lines of code to a hot path for
+  belt-and-braces only.
+* Re-queueing a real holdout job (step 4). Slot #3 of the
+  current trimmed queue still has V18 + V19 in flight; we'll
+  re-queue a real `--days 90 --holdout-window-days 30` run on
+  the next weekend window once the in-flight job completes.
+
+**Trader VM impact:** zero. The live daemon never calls the
+battery harness; the fix is research-tool only and does not
+consume any freeze-bypass slot.
+
+**Commit (this finding):** to be appended after a follow-up
+push that lands `packages/research/battery.py` +
+`tests/unit/test_battery_walk_forward_slice.py` together.
 
 ### 9.7 Disclosure to the Friday review
 
