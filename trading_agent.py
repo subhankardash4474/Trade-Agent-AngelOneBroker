@@ -10,7 +10,8 @@ import sys
 import threading
 import time
 from datetime import datetime, time as dtime, timedelta, date
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple
 
 import pandas as pd
 import pytz
@@ -296,6 +297,25 @@ class TradingAgent:
                 f"Continuing boot — manual SL audit recommended."
             )
 
+        # OBS-05 / STATE-02 (audit 2026-05-28): default-initialise the
+        # boot-reconcile gate. Set True by the reconcile block below if
+        # positionBook() fetch fails after all retries OR an unexpected
+        # exception escapes the try/except. The gate is checked at the
+        # top of every entry attempt (``_boot_reconcile_gate_open``).
+        # An operator clears the gate by touching
+        # ``logs/boot_reconcile.ack`` (one-shot; the file is consumed).
+        self._boot_reconcile_failed_live: bool = False
+        self._boot_reconcile_failure_reason: Optional[str] = None
+        self._boot_reconcile_ack_path: Path = (
+            Path(self.config.get("logging", {}).get("log_dir", "logs"))
+            / "boot_reconcile.ack"
+        )
+        # ORD-03 (audit 2026-05-28): symbols whose atomic-entry rollback
+        # could not be fully completed (e.g. broker counter-flatten
+        # failed mid-way). Caller-side gate refuses new entries on
+        # these symbols until manual ack.
+        self._symbols_blocked_by_rollback: Set[str] = set()
+
         # P2 restart-cluster (2026-05-17) -- LIVE-MODE SAFETY: position
         # reconciliation with the broker. If the broker auto-flattened a
         # position out-of-band (RMS rule violation, margin call, manual
@@ -305,16 +325,20 @@ class TradingAgent:
         # while having nothing to actually exit. P0 #4 closed the same hole
         # for the SL-order side; this closes it for the underlying position.
         try:
-            if self.portfolio.positions:
-                # Serialize positions for the reconcile call (just side and
-                # quantity needed for the comparison).
-                restored_for_reconcile = {
-                    sym: {"side": pos.side, "quantity": pos.quantity}
-                    for sym, pos in self.portfolio.positions.items()
-                }
-                report = self.execution.reconcile_positions_with_broker(
-                    restored_for_reconcile
-                )
+            # STATE-02 (audit 2026-05-28): call reconcile EVEN IF the DB
+            # has no positions, so broker-only symbols (broker holds
+            # exposure the DB doesn't know about) get detected. Pre-
+            # fix this branch only ran when self.portfolio.positions
+            # was non-empty -- which meant the crash-after-fill-
+            # before-DB-write scenario was silently invisible.
+            restored_for_reconcile = {
+                sym: {"side": pos.side, "quantity": pos.quantity}
+                for sym, pos in self.portfolio.positions.items()
+            }
+            report = self.execution.reconcile_positions_with_broker(
+                restored_for_reconcile
+            )
+            if True:  # keep indent for diff readability
                 for sym, entry in report.items():
                     status = entry.get("status")
                     if status == "orphan":
@@ -396,12 +420,93 @@ class TradingAgent:
                                 f"[POSITION-RECONCILE] {sym} mismatch-block "
                                 f"failed: {e!r}. Manual intervention required."
                             )
+                    elif status == "broker_only":
+                        # STATE-02 (audit 2026-05-28): broker holds
+                        # non-zero exposure on a symbol the DB has no
+                        # record of (crash-after-fill-before-DB-write
+                        # or out-of-band manual entry from the broker
+                        # UI). Block new entries on this symbol via
+                        # the same per-stock-loss gate used by
+                        # mismatch, and queue a CRITICAL alert so the
+                        # operator reconciles manually before the
+                        # next session.
+                        try:
+                            blacklist_threshold = max(
+                                self._max_losses_per_stock, 1
+                            )
+                            self._stock_loss_today[sym] = blacklist_threshold
+                            logger.critical(
+                                f"[POSITION-RECONCILE] {sym} flagged BROKER_ONLY "
+                                f"-- new entries blocked via "
+                                f"stock_loss_today={blacklist_threshold}. "
+                                f"broker_netqty={entry.get('broker_netqty')} "
+                                f"({entry.get('broker_side')} "
+                                f"qty={entry.get('broker_quantity')}). "
+                                f"DB has no position. Manual broker-vs-DB "
+                                f"audit required."
+                            )
+                            self._pending_boot_alerts.append({
+                                "title": f"[CRITICAL] {sym} broker-only position",
+                                "message": (
+                                    f"Broker holds "
+                                    f"{entry.get('broker_side')} "
+                                    f"qty={entry.get('broker_quantity')} "
+                                    f"but DB has no record. Daemon will "
+                                    f"refuse new entries on this symbol "
+                                    f"this session. Investigate and "
+                                    f"reconcile manually."
+                                ),
+                                "level": "critical",
+                            })
+                        except Exception as e:
+                            logger.critical(
+                                f"[POSITION-RECONCILE] {sym} broker_only-block "
+                                f"failed: {e!r}. Manual intervention required."
+                            )
+
+            # OBS-05 (audit 2026-05-28): if positionBook() failed after
+            # all retries in live mode, set a global gate so the agent
+            # refuses new entries until the operator inspects the
+            # broker state and acks via logs/boot_reconcile.ack. Pre-
+            # fix the daemon would silently continue on stale state.
+            if getattr(self.execution, "boot_reconcile_failed_live", False):
+                self._boot_reconcile_failed_live = True
+                self._boot_reconcile_failure_reason = getattr(
+                    self.execution, "boot_reconcile_failure_reason",
+                    "unknown_failure_reason",
+                )
+                logger.critical(
+                    f"[POSITION-RECONCILE] boot reconcile FAILED "
+                    f"({self._boot_reconcile_failure_reason}). New entries "
+                    f"BLOCKED until operator touches "
+                    f"logs/boot_reconcile.ack."
+                )
+                self._pending_boot_alerts.append({
+                    "title": "[CRITICAL] Boot reconcile FAILED",
+                    "message": (
+                        f"positionBook() unavailable at boot "
+                        f"({self._boot_reconcile_failure_reason}). "
+                        f"Daemon will refuse all new entries until "
+                        f"operator inspects broker state and touches "
+                        f"logs/boot_reconcile.ack to clear the gate."
+                    ),
+                    "level": "critical",
+                })
+            else:
+                self._boot_reconcile_failed_live = False
+                self._boot_reconcile_failure_reason = None
         except Exception as e:
             logger.error(
                 f"[POSITION-RECONCILE] boot reconcile failed unexpectedly "
                 f"({e}); positions left as DB. Manual broker-vs-DB audit "
                 f"recommended before resuming trading."
             )
+            # Defensive default if the reconcile call itself blew up
+            # before we could read the flag.
+            self._boot_reconcile_failed_live = (
+                self.execution.mode == "live"
+            )
+            self._boot_reconcile_failure_reason = f"reconcile_unexpected_exception:{type(e).__name__}"
         self.alert_manager = AlertManager(self.config)
 
         # 2026-05-18 (Audit Issue #2): flush any CRITICAL alerts that the
@@ -1700,6 +1805,50 @@ class TradingAgent:
                     f"{entry.get('title', '?')!r}: {exc!r}"
                 )
         self._pending_boot_alerts = []
+
+    def _boot_reconcile_gate_open(self) -> bool:
+        """OBS-05 / STATE-02 (audit 2026-05-28): return True iff new
+        entries must be refused due to an unresolved boot reconcile
+        failure (positionBook unavailable, broker-only position
+        detected, or an unexpected reconcile exception).
+
+        The gate clears one-shot when the operator touches the
+        ack file (``logs/boot_reconcile.ack``). Consuming the file
+        on first read means a transient reconnection later in the
+        session that re-arms the gate must be acked again.
+
+        Returns False in paper mode (no broker truth to fail open
+        on) and when the flag was never set.
+        """
+        if not getattr(self, "_boot_reconcile_failed_live", False):
+            return False
+        try:
+            ack_path = self._boot_reconcile_ack_path
+            if ack_path.exists():
+                # One-shot consumption -- delete the ack file so a
+                # later re-arm of the gate requires a fresh ack.
+                try:
+                    ack_path.unlink()
+                except OSError as exc:
+                    logger.warning(
+                        f"[BOOT-RECONCILE-GATE] ack file existed but "
+                        f"unlink failed ({exc!r}); honouring the ack "
+                        f"and clearing the in-memory flag anyway."
+                    )
+                self._boot_reconcile_failed_live = False
+                self._boot_reconcile_failure_reason = None
+                logger.info(
+                    f"[BOOT-RECONCILE-GATE] operator ack consumed "
+                    f"({ack_path}); gate CLEARED -- new entries allowed."
+                )
+                return False
+        except Exception as exc:  # noqa: BLE001 - defensive: never block trading on the gate itself
+            logger.warning(
+                f"[BOOT-RECONCILE-GATE] ack-file check raised "
+                f"{type(exc).__name__}: {exc!r}; keeping gate ENGAGED "
+                f"(safer to refuse entries than silently bypass)."
+            )
+        return True
 
     def _persist_cooldown_state(self) -> None:
         """Atomically snapshot the three cooldown maps to data/cooldowns.json.
@@ -4307,6 +4456,33 @@ class TradingAgent:
         symbol = signal.symbol
         direction_label = "BUY" if side == "BUY" else "SELL"
 
+        # OBS-05 / STATE-02 (audit 2026-05-28): top-level boot-reconcile
+        # gate. If positionBook() failed at boot OR a broker-only / mismatch
+        # finding is unresolved, refuse new entries until the operator
+        # acks. This is the global counterpart to the per-symbol
+        # ``_stock_loss_today`` block already applied below.
+        if self._boot_reconcile_gate_open():
+            logger.warning(
+                f"[BOOT-RECONCILE-GATE] Refusing new {direction_label} on "
+                f"{symbol}: reconcile flag set "
+                f"({self._boot_reconcile_failure_reason!r}). Operator must "
+                f"touch {self._boot_reconcile_ack_path} to clear."
+            )
+            self._audit_reject(signal, current_price, "boot_reconcile_gate")
+            return
+
+        # ORD-03 (audit 2026-05-28): symbol-level rollback gate. If a
+        # prior atomic-entry rollback could not fully reconcile, refuse
+        # new entries on this symbol until manual intervention.
+        if symbol in self._symbols_blocked_by_rollback:
+            logger.warning(
+                f"[ROLLBACK-BLOCK] Refusing new {direction_label} on "
+                f"{symbol}: prior atomic-entry rollback incomplete; "
+                f"manual broker-vs-DB audit required."
+            )
+            self._audit_reject(signal, current_price, "rollback_block:incomplete")
+            return
+
         # Single-shot enforcement (Stage 3 e2e safety, --single-shot flag).
         # Once a symbol has had a full round-trip today, refuse re-entry. This
         # caps the maximum number of fills per symbol per day at 2 (one entry,
@@ -4701,19 +4877,37 @@ class TradingAgent:
                     f"[PARTIAL-FILL] {symbol}: requested {quantity}, "
                     f"filled {actual_qty} — sizing position accordingly"
                 )
-            opened = self.portfolio.open_position(
-                symbol=symbol, side=side, price=filled_price,
-                quantity=actual_qty,
-                strategy=leading_strategy or signal.strategy_name,
-                stop_loss=stop_loss, take_profit=take_profit,
-                order_id=order["order_id"],
-                rsi=snap.get("rsi"),
-                atr_pct=snap.get("atr_pct"),
-                volume_ratio=snap.get("volume_ratio"),
-                market_trend=self._market_context.get("nifty_trend"),
-                regime=current_regime,
-                contributing_strategies=signal.contributing_strategies or {},
-            )
+            # ORD-03 (audit 2026-05-28): wrap open_position so a portfolio
+            # failure (DB write error, UNIQUE constraint, future schema
+            # mismatch, or an exception in the side-effect chain) triggers
+            # an atomic broker rollback. Pre-fix the broker leg + SL-M
+            # stayed live while the portfolio had no record -- NAKED
+            # exposure with no daemon-side awareness.
+            opened = False
+            open_position_exception: Optional[BaseException] = None
+            try:
+                opened = self.portfolio.open_position(
+                    symbol=symbol, side=side, price=filled_price,
+                    quantity=actual_qty,
+                    strategy=leading_strategy or signal.strategy_name,
+                    stop_loss=stop_loss, take_profit=take_profit,
+                    order_id=order["order_id"],
+                    rsi=snap.get("rsi"),
+                    atr_pct=snap.get("atr_pct"),
+                    volume_ratio=snap.get("volume_ratio"),
+                    market_trend=self._market_context.get("nifty_trend"),
+                    regime=current_regime,
+                    contributing_strategies=signal.contributing_strategies or {},
+                )
+            except Exception as exc:  # noqa: BLE001
+                open_position_exception = exc
+                logger.critical(
+                    f"[TRADE-OPEN-EXCEPTION] {direction_label} {symbol} "
+                    f"qty={actual_qty} @ {filled_price:.2f}: "
+                    f"portfolio.open_position RAISED "
+                    f"{type(exc).__name__}: {exc!r}. Broker has the "
+                    f"position + SL-M. Initiating atomic rollback."
+                )
 
             # 2026-05-06: previously we ignored open_position's return value.
             # When the DB save failed (e.g. JSON-serialization bug, UNIQUE
@@ -4721,14 +4915,51 @@ class TradingAgent:
             # create a trailing stop, send a "trade executed" alert, and log
             # [TRADE-OPEN] — leaving phantom risk-manager state and lying to
             # the user. Guard the post-trade actions behind the actual result.
+            # ORD-03 (audit 2026-05-28): not enough to skip the post-trade
+            # actions -- we MUST also undo the BROKER leg, otherwise the
+            # daemon "moves on" while the broker still holds a naked
+            # position. Trigger atomic rollback before the early-return.
             if not opened:
-                logger.error(
+                logger.critical(
                     f"[TRADE-OPEN-FAILED] {direction_label} {symbol} qty={actual_qty} "
-                    f"@ {filled_price:.2f} — open_position returned False; "
-                    f"skipping trailing-stop creation and alert. "
-                    f"Order {order.get('order_id')} simulated as filled but "
-                    f"position was NOT persisted. Cash unchanged."
+                    f"@ {filled_price:.2f} — open_position returned "
+                    f"{opened!r} (exception: {open_position_exception!r}). "
+                    f"Order {order.get('order_id')} broker-side LIVE but "
+                    f"portfolio NOT updated. Initiating ATOMIC ROLLBACK."
                 )
+                rollback_ok = False
+                try:
+                    rollback_ok = self.execution.rollback_entry_on_portfolio_failure(
+                        symbol=symbol, token=token,
+                        entry_order_id=order["order_id"],
+                        entry_tx=side, quantity=actual_qty,
+                    )
+                except Exception as roll_exc:  # noqa: BLE001
+                    logger.critical(
+                        f"[ATOMIC-ROLLBACK] {symbol}: rollback helper itself "
+                        f"RAISED {type(roll_exc).__name__}: {roll_exc!r}. "
+                        f"Treating as INCOMPLETE -- blocking symbol."
+                    )
+                if not rollback_ok:
+                    # Defence in depth: block this symbol for the rest
+                    # of the session so the next cycle does not retry
+                    # an entry on top of a possibly-naked broker leg.
+                    self._symbols_blocked_by_rollback.add(symbol)
+                    try:
+                        self.alert_manager.send_alert(
+                            title=f"[CRITICAL] {symbol} atomic rollback incomplete",
+                            message=(
+                                f"open_position failed AND broker rollback "
+                                f"was incomplete for {direction_label} "
+                                f"{symbol} qty={actual_qty}. Broker may "
+                                f"hold a naked position. Symbol blocked "
+                                f"for the session -- manual reconciliation "
+                                f"REQUIRED."
+                            ),
+                            level="critical",
+                        )
+                    except Exception:
+                        pass
                 try:
                     self.signal_audit.log(
                         symbol=symbol,
@@ -4739,7 +4970,13 @@ class TradingAgent:
                         strategy=leading_strategy or signal.strategy_name,
                         contributing=signal.contributing_strategies,
                         outcome="REJECTED",
-                        reason="open_position_returned_false",
+                        reason=(
+                            "open_position_raised:atomic_rollback="
+                            f"{'ok' if rollback_ok else 'incomplete'}"
+                            if open_position_exception is not None
+                            else "open_position_returned_false:atomic_rollback="
+                            f"{'ok' if rollback_ok else 'incomplete'}"
+                        ),
                         stop_loss=stop_loss,
                         take_profit=take_profit,
                         quantity=actual_qty,

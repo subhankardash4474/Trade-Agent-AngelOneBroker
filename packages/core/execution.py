@@ -8,8 +8,8 @@ import os
 import random as _random_module
 import time
 import uuid
-from datetime import datetime
-from typing import Dict, Optional
+from datetime import datetime, timedelta
+from typing import Any, Dict, Optional
 
 import pytz
 from loguru import logger
@@ -160,6 +160,41 @@ class ExecutionEngine:
         # Schema:
         #     {symbol: {"order_id": str, "trigger": float, "side": "BUY"|"SELL"}}
         self._sl_orders_by_symbol: dict[str, dict] = {}
+
+        # ── Phase 2 (audit 2026-05-28) ────────────────────────────────
+        # ORD-01 / STATE-01: wait-for-terminal timing knobs. Pre-fix
+        # ``_live_order_with_retry`` returned immediately on
+        # ``placeOrder`` response with ``status=="PLACED"`` -- the
+        # caller then opened a portfolio position using the signal-time
+        # price as the "fill price" without waiting to know whether
+        # the order actually filled or what price it filled at. The
+        # poll loop below blocks for at most ``live_order_fill_timeout_sec``
+        # and polls every ``live_order_fill_poll_interval_sec``. The
+        # defaults are conservative (10s / 1s) so the live path
+        # blocks no more than 10s per entry; intra-cycle latency
+        # budget is comfortably above that.
+        self.live_order_fill_timeout_sec: float = float(
+            exec_cfg.get("live_order_fill_timeout_sec", 10.0)
+        )
+        self.live_order_fill_poll_interval_sec: float = float(
+            exec_cfg.get("live_order_fill_poll_interval_sec", 1.0)
+        )
+        # ORD-02 idempotency window: when a retry kicks in, scan the
+        # broker orderBook for an order matching (symbol, side, qty,
+        # ordertype) that was placed in the last N seconds and reuse
+        # its id instead of placing a duplicate.
+        self.idempotency_lookback_sec: float = float(
+            exec_cfg.get("idempotency_lookback_sec", 30.0)
+        )
+        # OBS-05 / STATE-02 boot-reconcile state. Set True (in live
+        # mode) when the boot ``positionBook()`` fetch fails all of
+        # its retries OR when a broker-only symbol is detected at
+        # boot. Caller (TradingAgent) checks this before allowing
+        # any new entry. Cleared only by an operator-touched ack
+        # file (``logs/boot_reconcile.ack``) so a flaky transient
+        # API blip cannot silently re-enable trading mid-session.
+        self.boot_reconcile_failed_live: bool = False
+        self.boot_reconcile_failure_reason: Optional[str] = None
 
     def place_order(
         self,
@@ -526,12 +561,272 @@ class ExecutionEngine:
                 f"status={result.get('status')}: {type(e).__name__}: {e!r}"
             )
 
+    # ─────────── ORD-01 / ORD-02 helpers (audit 2026-05-28) ───────────
+
+    # AngelOne (and most brokers) return status strings that vary in
+    # case, spelling, and tense. Normalise to lowercase and pin the
+    # known set so a typo in the broker payload doesn't silently
+    # downgrade us back to "treat as pending" behaviour. The lists
+    # mirror the e2e tool tools/test_live_single_trade.py so the
+    # poll-loop semantics are identical between e2e harness and prod.
+    _TERMINAL_FILLED = frozenset(
+        {"complete", "completed", "filled", "executed"}
+    )
+    _TERMINAL_PARTIAL = frozenset(
+        {"partially_filled", "partial", "partially filled"}
+    )
+    _TERMINAL_CANCELLED = frozenset(
+        {"cancelled", "canceled", "rejected"}
+    )
+
+    def _wait_for_terminal(
+        self,
+        order_id: str,
+        timeout_sec: Optional[float] = None,
+    ) -> Optional[dict]:
+        """ORD-01/STATE-01 (audit 2026-05-28): poll the broker orderBook
+        until ``order_id`` reaches a terminal state or ``timeout_sec``
+        elapses.
+
+        Returns the broker order row dict on terminal (any of FILLED,
+        PARTIAL, CANCELLED, REJECTED) or ``None`` if the order was
+        still pending at timeout / never seen in the book / broker
+        call kept failing.
+
+        Live-mode only. Paper / shadow shouldn't call this -- they
+        synth-fill instantly inside ``_paper_order``.
+
+        Why this exists: pre-fix, the live caller treated
+        ``placeOrder`` returning an order_id as success and used the
+        signal-time price as the "fill price" -- which is wrong
+        for any LIMIT, wrong for any MARKET on a fast-moving symbol,
+        and catastrophic for a slow-fill scenario where the
+        portfolio reflects an open position but the broker order
+        is still PENDING. Paper mode hides this entire failure mode
+        (paper synth-fills instantly), which is exactly why the
+        bug went uncaught.
+        """
+        if self.mode == "paper" or self._api is None:
+            return None
+
+        timeout = timeout_sec if timeout_sec is not None else self.live_order_fill_timeout_sec
+        poll = max(0.1, self.live_order_fill_poll_interval_sec)
+        deadline = time.time() + timeout
+        last_seen_status: Optional[str] = None
+
+        while time.time() < deadline:
+            try:
+                book = self._api.orderBook()
+            except Exception as exc:
+                logger.warning(
+                    f"[WAIT-TERMINAL] orderBook() raised while polling "
+                    f"{order_id}: {type(exc).__name__}: {exc!r}; retrying."
+                )
+                book = None
+            order_row = self._find_order_in_book(book, order_id)
+            if order_row is not None:
+                status = self._normalise_status(order_row)
+                last_seen_status = status
+                if (
+                    status in self._TERMINAL_FILLED
+                    or status in self._TERMINAL_PARTIAL
+                    or status in self._TERMINAL_CANCELLED
+                ):
+                    return order_row
+            time.sleep(poll)
+
+        logger.warning(
+            f"[WAIT-TERMINAL] order_id={order_id} did not reach terminal "
+            f"within {timeout:.1f}s; last_seen_status={last_seen_status!r}. "
+            f"Caller will treat as PENDING_AT_TTL."
+        )
+        return None
+
+    @staticmethod
+    def _find_order_in_book(book: Any, order_id: str) -> Optional[dict]:
+        """Locate ``order_id`` in a variably-shaped AngelOne orderBook
+        response. Returns the matching row dict or None."""
+        if not isinstance(book, dict):
+            return None
+        rows = book.get("data") or []
+        if not isinstance(rows, list):
+            return None
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            if (
+                row.get("orderid") == order_id
+                or row.get("orderID") == order_id
+                or row.get("order_id") == order_id
+            ):
+                return row
+        return None
+
+    @staticmethod
+    def _normalise_status(row: dict) -> str:
+        """Return ``row``'s broker status, lowercased + stripped."""
+        raw = row.get("status") or row.get("orderstatus") or "unknown"
+        return str(raw).strip().lower()
+
+    @staticmethod
+    def _extract_avg_fill_price(row: dict) -> Optional[float]:
+        """Parse the broker's average fill price from an orderBook row.
+        AngelOne uses ``averageprice``; other brokers vary. Returns
+        None if the field is absent / unparseable / zero."""
+        for key in ("averageprice", "averagePrice", "avg_price", "avgprice"):
+            v = row.get(key)
+            if v in (None, "", 0, 0.0, "0", "0.0"):
+                continue
+            try:
+                f = float(v)
+                if f > 0:
+                    return f
+            except (TypeError, ValueError):
+                continue
+        return None
+
+    @staticmethod
+    def _extract_filled_qty(row: dict) -> int:
+        """Parse the broker's filled-quantity field. AngelOne uses
+        ``filledshares``. Returns 0 if unparseable."""
+        for key in ("filledshares", "filledquantity", "filledqty", "filled_shares"):
+            v = row.get(key)
+            if v in (None, ""):
+                continue
+            try:
+                return int(float(v))
+            except (TypeError, ValueError):
+                continue
+        return 0
+
+    def _find_idempotent_match(
+        self,
+        *,
+        symbol: str,
+        tx_type: str,
+        quantity: int,
+        order_type: str,
+        max_age_sec: Optional[float] = None,
+    ) -> Optional[str]:
+        """ORD-02 (audit 2026-05-28): scan the broker orderBook for a
+        recently-placed order that matches the (symbol, side, qty,
+        ordertype) intent. If found, return its order_id; the caller
+        skips the duplicate placeOrder.
+
+        This is the cheapest workable idempotency: AngelOne's
+        placeOrder API has no client-supplied order-tag we can use as
+        a true idempotency key (verified 2026-05-28 by reading the
+        wrapper), so we fall back to a "did the broker already see
+        this intent recently?" probe. The lookback window is the
+        time between the previous attempt's ``placeOrder`` start
+        and now; pre-retry sleep is the retry_delay so a 30s
+        default lookback covers the typical retry budget.
+        """
+        if self.mode == "paper" or self._api is None:
+            return None
+        max_age = max_age_sec if max_age_sec is not None else self.idempotency_lookback_sec
+        cutoff_ts = datetime.now(IST) - timedelta(seconds=max_age)
+        try:
+            book = self._api.orderBook()
+        except Exception as exc:
+            logger.warning(
+                f"[IDEMPOTENT-CHECK] orderBook() raised: "
+                f"{type(exc).__name__}: {exc!r}. Falling through to retry "
+                f"(better duplicate than zero exposure)."
+            )
+            return None
+        if not isinstance(book, dict):
+            return None
+        rows = book.get("data") or []
+        if not isinstance(rows, list):
+            return None
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            if (row.get("tradingsymbol") or "").upper() != symbol.upper():
+                continue
+            if (row.get("transactiontype") or "").upper() != tx_type.upper():
+                continue
+            if (row.get("ordertype") or "").upper() != order_type.upper():
+                continue
+            # Quantity match: requested == orderqty (or filled+pending).
+            try:
+                row_qty = int(float(row.get("quantity") or row.get("orderqty") or 0))
+            except (TypeError, ValueError):
+                continue
+            if row_qty != quantity:
+                continue
+            # Skip already-terminal cancellations -- those don't count
+            # as "the intent is alive on the broker side".
+            status = self._normalise_status(row)
+            if status in self._TERMINAL_CANCELLED:
+                continue
+            # Time gate: AngelOne timestamps look like
+            # "DD-MMM-YYYY HH:MM:SS" or ISO. Be defensive.
+            ts_raw = row.get("orderentrytime") or row.get("updatetime") or row.get("exchorderupdatetime")
+            placed_at: Optional[datetime] = None
+            if ts_raw:
+                placed_at = self._parse_broker_timestamp(str(ts_raw))
+            if placed_at is None:
+                # No usable timestamp -- safer to assume it's recent
+                # and reuse than to risk a duplicate.
+                pass
+            else:
+                if placed_at.tzinfo is None:
+                    placed_at = IST.localize(placed_at)
+                if placed_at < cutoff_ts:
+                    continue
+            order_id = row.get("orderid") or row.get("orderID") or row.get("order_id")
+            if order_id:
+                logger.warning(
+                    f"[IDEMPOTENT-CHECK] {symbol} {tx_type} {quantity} "
+                    f"{order_type}: broker already has an in-flight order "
+                    f"id={order_id} (status={status}, placed_at={placed_at}). "
+                    f"Reusing instead of placing a duplicate."
+                )
+                return str(order_id)
+        return None
+
+    @staticmethod
+    def _parse_broker_timestamp(raw: str) -> Optional[datetime]:
+        """Parse a broker timestamp string. Tries the AngelOne
+        ``DD-MMM-YYYY HH:MM:SS`` format first, then ISO. Returns
+        None on any failure."""
+        if not raw:
+            return None
+        # AngelOne's documented format
+        for fmt in ("%d-%b-%Y %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S"):
+            try:
+                return datetime.strptime(raw, fmt)
+            except (ValueError, TypeError):
+                continue
+        try:
+            # Handles ISO with sub-second / tz offset
+            return datetime.fromisoformat(raw)
+        except (ValueError, TypeError):
+            return None
+
     def _live_order_with_retry(
         self, symbol: str, token: str, tx_type: str,
         quantity: int, price: float, order_type: str,
         stop_loss: Optional[float], take_profit: Optional[float], tag: str,
     ) -> Optional[dict]:
-        """Place a live order through AngelOne with retry logic."""
+        """Place a live order through AngelOne with retry logic.
+
+        ORD-01 (audit 2026-05-28): after placeOrder succeeds, the
+        loop now calls ``_wait_for_terminal`` and only mutates the
+        returned dict to ``FILLED`` / ``PARTIALLY_FILLED`` / etc.
+        based on the broker's terminal state. ``filled_price`` is
+        the broker's ``averageprice`` (never the signal-time price)
+        and ``slippage`` is computed against the requested price.
+
+        ORD-02 (audit 2026-05-28): on retry attempts >= 2, scan
+        the broker orderBook for a recently-placed order matching
+        (symbol, side, qty, ordertype). If found, use its id
+        instead of placing a duplicate. AngelOne's ``placeOrder``
+        timeout warning is honoured: a timed-out call may have
+        placed the order, and a naive retry would duplicate it.
+        """
         if self._api is None:
             logger.error("SmartAPI not initialized for live trading")
             return None
@@ -553,9 +848,23 @@ class ExecutionEngine:
             order_params["triggerprice"] = str(stop_loss)
 
         for attempt in range(1, self.retry_attempts + 1):
+            # ORD-02 idempotency probe (only on retry attempts).
+            response: Optional[str] = None
+            if attempt >= 2:
+                idempotent_id = self._find_idempotent_match(
+                    symbol=symbol, tx_type=tx_type,
+                    quantity=quantity, order_type=order_type,
+                )
+                if idempotent_id is not None:
+                    response = idempotent_id
+
             try:
-                logger.info(f"Placing order (attempt {attempt}/{self.retry_attempts}): {tx_type} {quantity} x {symbol}")
-                response = self._api.placeOrder(order_params)
+                if response is None:
+                    logger.info(
+                        f"Placing order (attempt {attempt}/{self.retry_attempts}): "
+                        f"{tx_type} {quantity} x {symbol}"
+                    )
+                    response = self._api.placeOrder(order_params)
 
                 if response:
                     result = {
@@ -568,6 +877,7 @@ class ExecutionEngine:
                         "order_type": order_type,
                         "requested_price": price,
                         "filled_price": None,
+                        "filled_quantity": 0,
                         "exchange": self.exchange,
                         "timestamp": datetime.now(IST).isoformat(),
                         "mode": "live",
@@ -578,6 +888,57 @@ class ExecutionEngine:
                     self._pending_orders[response] = result
                     self._persist_order(result)
                     logger.info(f"[LIVE] Order placed: {response}")
+
+                    # ORD-01/STATE-01: wait for terminal status before
+                    # treating this as a fill. The caller (entry path)
+                    # uses ``filled_price`` to open the portfolio
+                    # position, so we MUST know the real fill price
+                    # before returning -- otherwise the portfolio's
+                    # P&L would be biased by the signal-time price
+                    # vs broker reality (esp. on LIMIT orders).
+                    terminal_row = self._wait_for_terminal(response)
+                    if terminal_row is not None:
+                        status = self._normalise_status(terminal_row)
+                        filled_price = self._extract_avg_fill_price(terminal_row)
+                        filled_qty = self._extract_filled_qty(terminal_row)
+                        if status in self._TERMINAL_FILLED:
+                            result["status"] = "FILLED"
+                            result["filled_price"] = filled_price or price
+                            result["filled_quantity"] = filled_qty or quantity
+                        elif status in self._TERMINAL_PARTIAL:
+                            result["status"] = "PARTIALLY_FILLED"
+                            result["filled_price"] = filled_price or price
+                            result["filled_quantity"] = filled_qty
+                        elif status in self._TERMINAL_CANCELLED:
+                            result["status"] = "REJECTED"
+                            result["filled_price"] = None
+                            result["filled_quantity"] = 0
+                            logger.error(
+                                f"[LIVE] Order {response} terminal status "
+                                f"{status!r} -- treating as failure."
+                            )
+                            # Caller treats None as failed; surface as such.
+                            return None
+                        # Recompute slippage now that we know the real fill.
+                        if (
+                            result["filled_price"]
+                            and price
+                            and price > 0
+                        ):
+                            result["slippage"] = round(
+                                abs(result["filled_price"] - price), 4
+                            )
+                        # Reflect updated state on the pending-orders cache
+                        # so downstream order-status queries see the truth.
+                        self._pending_orders[response] = result
+                    else:
+                        # TTL expired with no terminal observation. Keep
+                        # ``status="PLACED"`` and ``filled_price=None``
+                        # so the caller can decide whether to proceed
+                        # (current behaviour: caller treats PLACED as
+                        # FILLED for the in-memory position). Logging
+                        # the TTL warning is already done by _wait_for_terminal.
+                        result["filled_quantity"] = 0
 
                     # Place SL order after entry (opposite side). Track its
                     # id by symbol so we can cancel/modify it on close/trail.
@@ -693,6 +1054,122 @@ class ExecutionEngine:
         except Exception:
             pass
         self._pending_orders.pop(entry_order_id, None)
+
+    def rollback_entry_on_portfolio_failure(
+        self,
+        *,
+        symbol: str,
+        token: str,
+        entry_order_id: str,
+        entry_tx: str,
+        quantity: int,
+    ) -> bool:
+        """ORD-03 (audit 2026-05-28): atomic-entry rollback when the
+        broker leg succeeded but ``portfolio.open_position`` failed.
+
+        Pre-fix path: broker holds an open position + a live SL-M leg,
+        portfolio has nothing recorded, and the daemon "moves on" --
+        leaving NAKED exposure with NO daemon-side awareness. Next
+        cycle could even re-fire the same entry on top of it.
+
+        Recovery sequence (best-effort, every step is logged CRITICAL):
+          1. Cancel the SL-M leg so it cannot fire as a reverse trade
+             after the counter-flatten.
+          2. Place a MARKET counter-flatten on the OPPOSITE side to
+             zero broker exposure.
+          3. Clean up the order-log + pending-orders tracking artifacts
+             so the in-memory state matches "entry never happened".
+
+        Returns True iff every step succeeded. False signals a
+        partial rollback -- caller MUST block new entries on this
+        symbol and surface the alert.
+
+        Paper mode: no-op (the portfolio is the only state to roll
+        back, and the caller already noticed the failure).
+        """
+        if self.mode == "paper" or self._api is None:
+            # Nothing to roll back at the broker; clean caller-side
+            # tracking and return success.
+            self._pending_orders.pop(entry_order_id, None)
+            return True
+
+        logger.critical(
+            f"[ATOMIC-ROLLBACK] {symbol}: entry order {entry_order_id} "
+            f"FILLED at broker but portfolio.open_position FAILED. "
+            f"Initiating atomic rollback (cancel SL + counter-flatten)."
+        )
+
+        all_ok = True
+
+        # Step 1: cancel SL-M leg so it can't fire mid-rollback.
+        try:
+            sl_ok = self.cancel_sl_order_for_symbol(symbol)
+            if not sl_ok:
+                logger.critical(
+                    f"[ATOMIC-ROLLBACK] {symbol}: SL cancel returned False. "
+                    f"SL-M may still be live on broker -- LTP hit on "
+                    f"the trigger could fire a reverse trade."
+                )
+                all_ok = False
+        except Exception as exc:
+            logger.critical(
+                f"[ATOMIC-ROLLBACK] {symbol}: SL cancel raised "
+                f"{type(exc).__name__}: {exc!r}. Continuing with "
+                f"counter-flatten anyway -- naked exposure is the "
+                f"bigger risk."
+            )
+            all_ok = False
+
+        # Step 2: counter-flatten the broker leg.
+        counter_side = "SELL" if entry_tx.upper() == "BUY" else "BUY"
+        flatten_params = {
+            "variety": "NORMAL",
+            "tradingsymbol": symbol,
+            "symboltoken": token,
+            "transactiontype": counter_side,
+            "exchange": self.exchange,
+            "ordertype": "MARKET",
+            "producttype": self.product_type,
+            "duration": "DAY",
+            "quantity": str(quantity),
+        }
+        try:
+            counter_id = self._api.placeOrder(flatten_params)
+            if counter_id:
+                logger.critical(
+                    f"[ATOMIC-ROLLBACK] {symbol}: counter-flatten "
+                    f"{counter_side} x{quantity} placed "
+                    f"(order_id={counter_id}). Broker exposure expected "
+                    f"to zero out. Manual broker statement audit recommended."
+                )
+            else:
+                logger.critical(
+                    f"[ATOMIC-ROLLBACK] {symbol}: counter-flatten returned "
+                    f"empty broker id. BROKER POSITION LIKELY NAKED. "
+                    f"INTERVENE IMMEDIATELY."
+                )
+                all_ok = False
+        except Exception as exc:
+            logger.critical(
+                f"[ATOMIC-ROLLBACK] {symbol}: counter-flatten RAISED "
+                f"{type(exc).__name__}: {exc!r}. BROKER POSITION IS NAKED. "
+                f"IMMEDIATE INTERVENTION REQUIRED."
+            )
+            all_ok = False
+
+        # Step 3: clean caller-side tracking so the entry doesn't show
+        # as "in-flight" forever. We deliberately do NOT remove the
+        # entry-order DB ledger row -- it should remain for forensic
+        # audit. The pending-orders / order-log entries are in-memory
+        # only and are safe to drop.
+        try:
+            if self._order_log and self._order_log[-1].get("order_id") == entry_order_id:
+                self._order_log.pop()
+        except Exception:
+            pass
+        self._pending_orders.pop(entry_order_id, None)
+
+        return all_ok
 
     def _place_sl_order(self, symbol: str, token: str, quantity: int,
                         trigger_price: float, tx_type: str) -> Optional[str]:
@@ -1095,51 +1572,97 @@ class ExecutionEngine:
         """P2 restart-cluster (2026-05-17): close DB-side positions that
         the broker has already flattened (RMS auto-flatten, manual close
         by the operator, broker margin call). Returns a report keyed by
-        symbol with one of four statuses:
+        symbol with one of five statuses:
 
-          * ``ok``       DB and broker agree on side AND quantity.
-          * ``orphan``   DB shows open, broker shows flat. Caller MUST
-                         close the DB-side position with reason
-                         ``broker_reconcile_at_boot``.
-          * ``mismatch`` DB and broker disagree on side or quantity (e.g.
-                         DB long-100 vs broker short-100, or DB 100 vs
-                         broker 50 from a half-fill that DB missed).
-                         Caller should alert and freeze new entries on
-                         this symbol until manual reconciliation.
-                         Added 2026-05-18 (Regression #3) -- previously
-                         any non-zero broker netqty was rubber-stamped
-                         ``ok`` without validating side/qty agreement.
-          * ``skipped``  broker call failed or paper mode -- caller leaves
-                         the position as-is.
+          * ``ok``           DB and broker agree on side AND quantity.
+          * ``orphan``       DB shows open, broker shows flat. Caller MUST
+                             close the DB-side position with reason
+                             ``broker_reconcile_at_boot``.
+          * ``mismatch``     DB and broker disagree on side or quantity.
+                             Caller should alert and freeze new entries on
+                             this symbol until manual reconciliation.
+                             Added 2026-05-18 (Regression #3) -- previously
+                             any non-zero broker netqty was rubber-stamped
+                             ``ok`` without validating side/qty agreement.
+          * ``broker_only``  Broker has a non-zero netqty for a symbol the
+                             DB doesn't know about. Crash-after-fill-
+                             before-DB-write window. STATE-02 (audit
+                             2026-05-28): pre-fix this was silently
+                             missed -- daemon booted "flat" while broker
+                             held real exposure. Caller MUST block new
+                             entries on this symbol and emit a CRITICAL
+                             alert until manual reconciliation.
+          * ``skipped``      broker call failed or paper mode -- caller
+                             leaves the position as-is.
+
+        OBS-05 (audit 2026-05-28): when ``get_positions()`` fails in live
+        mode, we retry up to 3 times with exponential backoff (2s, 4s,
+        8s). On final failure we set ``self.boot_reconcile_failed_live``
+        so the caller can fail-CLOSED (refuse new entries) instead of
+        the pre-fix fail-open behaviour. Paper mode and the no-DB-
+        position case both bypass this gate (nothing to reconcile).
 
         We do NOT touch the portfolio here; the caller (TradingAgent)
         owns that. Keeps this concern at the daemon layer.
         """
         report: Dict[str, Dict] = {}
-        if not restored_positions:
-            return report
         if self.mode == "paper":
-            for sym in restored_positions:
+            # Paper mode: no broker truth to compare against. Return
+            # "skipped" for every DB symbol; nothing else to do.
+            for sym in restored_positions or {}:
                 report[sym] = {"status": "skipped", "reason": "paper_mode"}
             return report
-        try:
-            response = self.get_positions()
-        except Exception as exc:  # noqa: BLE001 - never block boot on this
-            logger.warning(
-                f"[POSITION-RECONCILE] broker positionBook fetch raised: "
-                f"{exc!r}. Skipping reconciliation -- positions left as DB."
+
+        # ---------------------------------------------------------------
+        # OBS-05: retry positionBook() up to 3x with backoff before we
+        # decide to fail-closed. A single transient broker hiccup
+        # shouldn't refuse the operator the day, but a persistent one
+        # MUST -- the alternative is the pre-fix fail-open behaviour
+        # where every DB position was marked "skipped: api_error" and
+        # new entries were allowed against possibly-stale state.
+        # ---------------------------------------------------------------
+        response = None
+        last_exc: Optional[BaseException] = None
+        for attempt in range(1, 4):
+            try:
+                response = self.get_positions()
+                if response is not None:
+                    break
+            except Exception as exc:  # noqa: BLE001
+                last_exc = exc
+                logger.warning(
+                    f"[POSITION-RECONCILE] positionBook() attempt "
+                    f"{attempt}/3 raised: {type(exc).__name__}: {exc!r}"
+                )
+            if attempt < 3:
+                time.sleep(2 ** attempt)  # 2s, 4s
+        if response is None:
+            # All 3 attempts failed. In live mode this is the OBS-05
+            # fail-CLOSED case. Caller will refuse new entries until
+            # an operator-touched ack file lifts the gate.
+            self.boot_reconcile_failed_live = True
+            self.boot_reconcile_failure_reason = (
+                f"positionBook_fetch_failed_after_3_retries "
+                f"last_exc={type(last_exc).__name__ if last_exc else 'no_response'}"
             )
-            for sym in restored_positions:
+            logger.critical(
+                f"[POSITION-RECONCILE] positionBook() failed after 3 retries. "
+                f"Last exception: {last_exc!r}. Setting "
+                f"boot_reconcile_failed_live=True. New entries BLOCKED "
+                f"until operator inspects broker state and touches the "
+                f"ack file (logs/boot_reconcile.ack)."
+            )
+            for sym in restored_positions or {}:
                 report[sym] = {"status": "skipped", "reason": "api_error"}
             return report
         if not response:
-            for sym in restored_positions:
+            for sym in restored_positions or {}:
                 report[sym] = {"status": "skipped", "reason": "empty_response"}
             return report
 
         rows = response.get("data") if isinstance(response, dict) else response
         if not isinstance(rows, list):
-            for sym in restored_positions:
+            for sym in restored_positions or {}:
                 report[sym] = {"status": "skipped", "reason": "unexpected_shape"}
             return report
 
@@ -1226,6 +1749,38 @@ class ExecutionEngine:
                 "db_quantity": db_qty,
                 "reasons": mismatch_reasons,
             }
+
+        # STATE-02 (audit 2026-05-28): scan for broker-only symbols
+        # the DB doesn't know about. This is the crash-after-fill-
+        # before-DB-write window -- pre-fix the daemon would boot
+        # "flat" while the broker held real exposure, and the next
+        # cycle's entry on the same symbol would compound it into a
+        # double position. Surface every non-zero broker netqty
+        # that's absent from the DB and flag it CRITICAL so the
+        # caller blocks new entries until manual reconciliation.
+        db_symbols = set((restored_positions or {}).keys())
+        for sym, broker_qty in broker_qty_by_symbol.items():
+            if broker_qty == 0:
+                continue
+            if sym in db_symbols:
+                continue  # already covered above
+            broker_side = "BUY" if broker_qty > 0 else "SELL"
+            broker_abs_qty = abs(broker_qty)
+            logger.critical(
+                f"[POSITION-RECONCILE] {sym}: BROKER-ONLY -- "
+                f"broker holds {broker_side} qty={broker_abs_qty} but "
+                f"DB has no record. Crash-after-fill-before-DB-write or "
+                f"out-of-band manual entry. Marking BROKER_ONLY; caller "
+                f"will BLOCK new entries on this symbol until operator "
+                f"reconciles manually."
+            )
+            report[sym] = {
+                "status": "broker_only",
+                "broker_netqty": broker_qty,
+                "broker_side": broker_side,
+                "broker_quantity": broker_abs_qty,
+            }
+
         return report
 
     @property

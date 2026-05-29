@@ -103,6 +103,23 @@ landed during the holiday window while the trader VM idled:
     checkpoint with 14 tests of its own. Full unit suite:
     **1436/1436 green**. Audit-only, no freeze slot consumed.
 
+**Update 2026-05-29 (Friday morning).**
+
+11. **§13 Audit-2026-05-28 follow-up — Phase 1 of 5 landed.** 22
+    findings closed in code (16 OBS, 4 PERF, 2 NUM, 1 STATE,
+    2 ORD, 2 CONC). 20 new regression tests, full suite
+    1456/1456 green. NOT deployed; freeze slot preserved.
+12. **§14 Audit-2026-05-28 follow-up — Phase 2 of 5 landed.** 6
+    findings closed in code: ORD-01/STATE-01 (wait-for-terminal +
+    broker `averageprice` truth), ORD-02 (pre-retry orderBook
+    idempotency probe), ORD-03 (atomic-entry rollback on portfolio
+    failure), STATE-02 (broker-only position detection at boot),
+    OBS-05 (boot reconcile fail-CLOSED with operator ack file).
+    27 new regression tests, full suite **1483/1483 green**. NOT
+    deployed; freeze slot preserved. **6 of 8 audit-tagged
+    Critical findings now FIXED in code** (only NUM-01 and PERF-01
+    remain, both Phase 4).
+
 ---
 
 ## 1. Bug J — `tools/cloud/bootstrap_backtester.sh` chowns to container UID, breaking host-side scheduler
@@ -1722,3 +1739,161 @@ batch-endpoint cluster — all targeted in Phases 2-4.
 * `tests/unit/test_audit_2026_05_28_phase1.py` — new (20 regression tests)
 * `tests/unit/test_regime_and_gates.py` — capture handler updated to DEBUG to track PERF-03 demotion
 * `docs/audit_2026-05-28_followup.md` — Status column updated for 22 FIXED findings + phase 1 changelog entry
+
+---
+
+## 14. Audit-2026-05-28 follow-up — Phase 2 of 5 landed (6 findings, money-at-risk truth-telling)
+
+**Date:** 2026-05-29 (Friday)
+**Commit:** see `git log --grep=audit-2026-05-28-phase2`
+**Deployment:** NOT deployed; freeze slot still NOT consumed.
+
+### 14.1 What the phase closes
+
+Phase 1 was about reducing silent-failure fail-open paths. Phase 2 is
+the harder fix: **the daemon's in-memory model of broker truth was a
+fiction in five distinct ways**, and every one of them could lose money
+silently on a slow-fill or network-blip day. Each finding is now closed
+in code with a regression test that pins the contract:
+
+* **ORD-01 / STATE-01** — `_live_order_with_retry` previously returned
+  immediately after `placeOrder` succeeded with `status="PLACED"` and
+  `filled_price=None`. The caller then opened a portfolio position
+  using the **signal-time price** as the fill price. On any LIMIT
+  order this is a lie; on a fast-moving symbol with MARKET it's a
+  bias; on a slow fill the portfolio thinks the trade is open while
+  the broker still has it pending. Paper mode hid all of this
+  (paper synth-fills instantly), which is why the bug went uncaught.
+  The fix introduces a production `_wait_for_terminal()` helper
+  patterned after `tools/test_live_single_trade.py::_wait_for_terminal`
+  with shared terminal-status sets (`_TERMINAL_FILLED / _PARTIAL /
+  _CANCELLED`). The wrapper now blocks for at most
+  `live_order_fill_timeout_sec` (default 10s, configurable),
+  populates `filled_price` from broker `averageprice`, computes
+  slippage against the requested price, and returns `None` on
+  REJECTED so the caller treats it as a failure.
+
+* **ORD-02** — The broker wrapper itself documents the hazard:
+  `placeOrder` may have placed the order even when it raises a
+  timeout. The pre-fix retry would call `placeOrder` again,
+  duplicating the position. The fix is the cheapest workable
+  idempotency probe given that AngelOne has no client-supplied
+  order tag: `_find_idempotent_match()` scans the broker
+  `orderBook` for a recent order matching `(symbol, side, qty,
+  ordertype)` within `idempotency_lookback_sec` (default 30s).
+  Cancelled / rejected and stale rows are skipped. On retry
+  attempts ≥ 2 the helper short-circuits the duplicate
+  `placeOrder` and reuses the existing order_id.
+
+* **ORD-03** — The pre-fix entry path placed the broker order +
+  SL-M, then called `portfolio.open_position()`. If the portfolio
+  call failed (DB write error, UNIQUE constraint, JSON-serialisation
+  bug, future schema mismatch, exception in side-effect chain), the
+  daemon logged "[TRADE-OPEN-FAILED]" and **moved on**, leaving the
+  broker holding a real position + a real SL-M leg. New
+  `ExecutionEngine.rollback_entry_on_portfolio_failure()` runs three
+  steps best-effort: (1) cancel SL leg so it can't fire as a reverse
+  trade; (2) place MARKET counter-flatten on the OPPOSITE side; (3)
+  pop tracking artifacts from `_pending_orders` / `_order_log`. The
+  caller wraps `portfolio.open_position` in try/except so both the
+  return-False path AND the raise path land in the rollback. On
+  partial rollback (counter-flatten or SL cancel fails) the symbol
+  is added to `_symbols_blocked_by_rollback` and `_open_new_position`
+  refuses re-entry on that symbol for the rest of the session.
+
+* **STATE-02** — The pre-fix boot reconcile only iterated
+  DB-restored positions. Crash-after-fill-before-DB-write window
+  meant the daemon would boot "flat" while the broker held real
+  exposure; the next cycle's entry on the same symbol would
+  compound it into a double position. The reconcile now iterates
+  every broker `positionBook` row with non-zero netqty and
+  reports `status="broker_only"` for symbols absent from DB. The
+  boot block in `trading_agent.py` no longer gates on
+  `if self.portfolio.positions:` — broker-only detection MUST run
+  even when DB is empty. The `broker_only` handler queues a
+  CRITICAL alert and adds the symbol to `_stock_loss_today` so
+  the per-symbol blacklist gate refuses new entries on that name
+  for the session.
+
+* **OBS-05** — Pre-fix, when `positionBook()` raised, the reconcile
+  caught the exception, logged a WARNING, and returned every DB
+  symbol as `skipped: api_error`. The caller treated this as
+  "nothing to reconcile" and allowed entries to flow against
+  possibly-stale state. The fix retries `positionBook()` up to 3
+  times with 2/4s backoff. On final live-mode failure, the engine
+  sets `boot_reconcile_failed_live=True`. New
+  `TradingAgent._boot_reconcile_gate_open()` is checked at the top
+  of `_open_new_position` and refuses every entry with audit
+  reason `boot_reconcile_gate` until the operator touches
+  `logs/boot_reconcile.ack`. Ack is one-shot (file consumed on
+  first read) so a transient re-arm requires fresh ack.
+
+### 14.2 Phase 2 changeset (committed but NOT deployed)
+
+| Finding | File | What changed |
+|---|---|---|
+| ORD-01 / STATE-01 | `packages/core/execution.py` | New module-level `_TERMINAL_FILLED / _TERMINAL_PARTIAL / _TERMINAL_CANCELLED` sets. New `ExecutionEngine._wait_for_terminal()` poll loop. `_live_order_with_retry` now waits on the helper and populates `filled_price` / `filled_quantity` / `slippage` from broker truth. Returns `None` on terminal REJECTED. |
+| ORD-02 | `packages/core/execution.py` | New `_find_idempotent_match()` and `_parse_broker_timestamp()` helpers. `_live_order_with_retry` retry loop short-circuits attempts ≥ 2 when an in-flight match is found. `idempotency_lookback_sec` config knob (default 30s). |
+| ORD-03 | `packages/core/execution.py` + `trading_agent.py:_open_new_position` | New `rollback_entry_on_portfolio_failure()` (cancel SL → counter-flatten MARKET → cleanup). Caller wraps `open_position` in try/except; on rollback failure adds symbol to `_symbols_blocked_by_rollback`. New gate at top of `_open_new_position` refuses re-entry on rollback-blocked symbols. |
+| STATE-02 | `packages/core/execution.py` + `trading_agent.py:307-498` | Reconcile iterates all broker positions; non-zero netqty for unknown symbols → `status="broker_only"`. Boot block now always invokes reconcile (not gated on `self.portfolio.positions`). New `broker_only` handler queues CRITICAL + stock-loss block. |
+| OBS-05 | `packages/core/execution.py` + `trading_agent.py:_boot_reconcile_gate_open` | 3× retry with 2/4s backoff before fail-closed. New `boot_reconcile_failed_live` flag on engine. New `_boot_reconcile_gate_open()` checks flag + ack file. New global gate at top of `_open_new_position`. |
+
+### 14.3 Test coverage
+
+`tests/unit/test_audit_2026_05_28_phase2.py` — **27 tests, all green**:
+
+* `test_ord01_*` (8) — `_wait_for_terminal` semantics, `averageprice`
+  extraction, live order's `filled_price` contract, terminal-rejected
+  → None, TTL behaviour.
+* `test_ord02_*` (4) — idempotent-match positive case, cancelled-skip,
+  stale-skip, retry-skips-placeOrder when match found.
+* `test_ord03_*` (5) — rollback live happy-path, counter-flatten
+  failure, SL cancel failure, paper-mode no-op + cleanup, source-level
+  caller-side wiring assertion.
+* `test_state02_*` (3) — broker-only detection, zero-netqty rows
+  ignored, source-level caller-side handler assertion.
+* `test_obs05_*` (7) — 3× retry contract, transient recovery doesn't
+  trip the gate, paper-mode never trips, gate-open semantics, ack-file
+  consumption, gate-cleared-when-flag-never-set, source-level
+  `_open_new_position` gate-check assertion.
+
+Full unit suite: **1,483 / 1,483 PASS** (was 1,456 before Phase 2; +27
+from the new file).
+
+### 14.4 Deploy posture (unchanged)
+
+**No deploy.** Same as Phase 1: code is on `main` and pushed, but the
+trader VM continues to run commit `430069c` (Bug L). The freeze policy
+treats slot consumption as triggered by deploy / live behaviour change,
+not by commit-on-main. Phase 2 includes paths that *will* matter at
+deploy time (live `_wait_for_terminal` blocks up to 10s per entry; the
+boot-reconcile gate could refuse entries on a flaky positionBook day),
+so the deploy plan should batch Phase 1 + Phase 2 + Phase 3 once we
+have paper-mode regression evidence and the freeze lifts on
+2026-06-08.
+
+### 14.5 Severity reassessment after Phase 2
+
+The 8 audit-tagged Critical findings are now:
+
+* ORD-01 / STATE-01 — **CLOSED in Phase 2.**
+* ORD-02 — **CLOSED in Phase 2.**
+* ORD-03 — **CLOSED in Phase 2.**
+* STATE-02 — **CLOSED in Phase 2.**
+* OBS-01 — closed in Phase 1.
+* PERF-02 — closed in Phase 1.
+* NUM-01 — Phase 4 (backtester re-run gating).
+* PERF-01 — Phase 4 (LTP batch endpoint, broker work).
+
+So **6 of 8 audit-tagged Critical findings are now FIXED in code**, all
+freeze-safe, none deployed. Two remain (NUM-01 and PERF-01), both in
+Phase 4 territory because they touch broker-batch endpoints or the
+backtester re-run policy.
+
+### 14.6 Files touched this commit batch
+
+* `packages/core/execution.py` — ORD-01, ORD-02, ORD-03 helpers + `_wait_for_terminal` integration in `_live_order_with_retry` + STATE-02 broker-only loop + OBS-05 retry/backoff + new `boot_reconcile_failed_live` flag.
+* `trading_agent.py` — ORD-03 entry-path try/except + rollback wiring + `_symbols_blocked_by_rollback` gate + STATE-02 `broker_only` handler + OBS-05 boot-reconcile gate state + new `_boot_reconcile_gate_open()` helper + new `Path` import.
+* `tests/unit/test_audit_2026_05_28_phase2.py` — new (27 regression tests).
+* `docs/audit_2026-05-28_followup.md` — Status column updated for the 6 Phase-2 FIXED findings; new "Phase-2 landed" header section.
+* `docs/findings_log_2026-05-27.md` — this section (§14).

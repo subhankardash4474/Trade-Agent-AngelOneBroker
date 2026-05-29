@@ -1,6 +1,6 @@
 # Production-Grade Audit Follow-up — 2026-05-28
 
-**Status:** IN-PROGRESS (Phase 1 of 5 landed; 22 of 86 findings FIXED)
+**Status:** IN-PROGRESS (Phases 1+2 of 5 landed; 28 of 86 findings FIXED)
 **Audit date:** 2026-05-28 (post P-03/P-04/P-11 + XGBoost-disable + Bug L holiday rewrite)
 **Audit method:** 6 parallel focused exploration passes (orders, state/recovery, concurrency/resources, numeric/financial, observability/silent-failure, runtime performance)
 **Total findings:** 86 concrete bugs with `file:line` citations
@@ -25,9 +25,66 @@ PERF-02, PERF-03, PERF-11, PERF-12.
 
 Phase 1 commits: see `git log --grep=audit-2026-05-28-phase1`.
 
+---
+
+## Phase-2 landed 2026-05-29 (6 findings — money-at-risk truth-telling, NOT deployed)
+
+Code-only — slot still NOT consumed because nothing was deployed to
+live. All fixes restricted to non-frozen files (`packages/core/execution.py`,
+`trading_agent.py`).
+
+Phase-2 closes the "broker truth vs agent in-memory state" cluster
+that was the most likely silent loss-amplifier on a slow broker day:
+
+* **ORD-01 / STATE-01 (FIXED)** — `_live_order_with_retry` now polls
+  `orderBook()` until terminal status (FILLED / PARTIALLY_FILLED /
+  REJECTED) or TTL. New `ExecutionEngine._wait_for_terminal()` helper
+  + module-level `_TERMINAL_FILLED / _TERMINAL_PARTIAL /
+  _TERMINAL_CANCELLED` sets mirror the e2e harness's contract. The
+  caller now receives the broker's real `averageprice` (with
+  computed slippage) on FILLED, `None` on REJECTED, and the legacy
+  `PLACED` degrade only on TTL with no terminal observation.
+* **ORD-02 (FIXED)** — new `_find_idempotent_match()` scans the
+  broker `orderBook` for a recently-placed order matching
+  (symbol, side, qty, ordertype) within `idempotency_lookback_sec`
+  (default 30s). On retry attempts ≥ 2 the helper short-circuits
+  the duplicate `placeOrder`. Cancelled / rejected and stale orders
+  are skipped. Documented limitation: AngelOne's `placeOrder` API
+  has no client-supplied tag, so this is the cheapest workable
+  idempotency probe.
+* **ORD-03 (FIXED)** — new
+  `ExecutionEngine.rollback_entry_on_portfolio_failure()` cancels
+  the SL-M leg, places a MARKET counter-flatten on the OPPOSITE
+  side, and cleans `_pending_orders` / `_order_log`. Wired from
+  `trading_agent._open_new_position` so the rollback runs whenever
+  `portfolio.open_position` either returns `False` OR raises. On
+  partial rollback (counter-flatten or SL cancel fails), the
+  symbol is added to `_symbols_blocked_by_rollback` and the entry
+  path refuses re-entry on that symbol for the rest of the
+  session.
+* **STATE-02 (FIXED)** — `reconcile_positions_with_broker` now
+  iterates ALL broker `positionBook` rows with non-zero netqty
+  and reports `status=="broker_only"` for symbols absent from DB.
+  The boot block in `trading_agent.py` no longer gates on
+  `if self.portfolio.positions:` (broker-only detection MUST run
+  even when DB is empty); the `broker_only` handler queues a
+  CRITICAL alert + per-symbol stock-loss block.
+* **OBS-05 (FIXED)** — `reconcile_positions_with_broker` retries
+  `positionBook()` up to 3 times with 2/4s backoff before giving
+  up. On final failure (live mode) it sets
+  `boot_reconcile_failed_live=True`. New
+  `TradingAgent._boot_reconcile_gate_open()` is checked at the top
+  of `_open_new_position` and refuses every entry with
+  `audit_reject reason=boot_reconcile_gate` until the operator
+  touches `logs/boot_reconcile.ack`. Ack is one-shot (file
+  consumed on first read) so a transient re-arm requires fresh ack.
+
+Coverage: 27 new regression tests in
+`tests/unit/test_audit_2026_05_28_phase2.py`. Full unit suite
+1,483/1,483 green.
+
 Remaining queue (queued by phase in TODO list):
-- Phase 2: OBS-04 (frozen), OBS-05, STATE-02, ORD-01/STATE-01, ORD-02,
-  ORD-03 — wait-for-terminal, broker boot reconcile, idempotency, rollback.
+- Phase 2 was completed 2026-05-29.
 - Phase 3: CONC-02..09, ORD-06, STATE-04..09, STATE-11, STATE-12 —
   WS hot-path enqueue+return; architectural.
 - Phase 4: PERF-01, PERF-04..10, PERF-13..15 — broker batch endpoint,
@@ -58,10 +115,10 @@ These are independent of the freeze contract — they reflect actual broker-vs-a
 
 | ID | Severity | File:line | Status | Freeze impact | What |
 |---|---|---|---|---|---|
-| ORD-01 / STATE-01 | Critical | `trading_agent.py:4433-4453`, `packages/core/execution.py:539-601` | OPEN | Freeze-safe (not on §What is frozen) | Live treats `status=="PLACED"` as a fill. Opens/closes positions in memory using signal-time price without waiting for actual `averageprice`. **Paper mode hides this.** |
-| ORD-02 | Critical | `packages/brokers/angelone.py:302-330`, `packages/core/execution.py:534-607` | OPEN | Freeze-safe | `_live_order_with_retry` retries on timeout with **no idempotency key**. Broker wrapper itself warns timed-out call may have placed. Single network stall → duplicate order. |
-| ORD-03 | Critical | `packages/core/execution.py:561-599`, `trading_agent.py:4461-4486` | OPEN | Freeze-safe | Entry places broker order + SL-M, then calls `portfolio.open_position()`. If portfolio fails, broker leg is **not flattened**. |
-| STATE-02 | Critical | `trading_agent.py:307-317`, `packages/core/execution.py:1097-1208` | OPEN | Freeze-safe | Boot reconciliation only iterates DB-restored symbols. Crash-after-fill-before-DB → daemon boots flat while broker holds real exposure. Never queries `positionBook()` for unaccounted symbols. |
+| ORD-01 / STATE-01 | Critical | `trading_agent.py:4433-4453`, `packages/core/execution.py:539-601` | **FIXED** (phase-2) | Freeze-safe (not on §What is frozen) | Live treats `status=="PLACED"` as a fill. Opens/closes positions in memory using signal-time price without waiting for actual `averageprice`. **Paper mode hides this.** |
+| ORD-02 | Critical | `packages/brokers/angelone.py:302-330`, `packages/core/execution.py:534-607` | **FIXED** (phase-2) | Freeze-safe | `_live_order_with_retry` retries on timeout with **no idempotency key**. Broker wrapper itself warns timed-out call may have placed. Single network stall → duplicate order. |
+| ORD-03 | Critical | `packages/core/execution.py:561-599`, `trading_agent.py:4461-4486` | **FIXED** (phase-2) | Freeze-safe | Entry places broker order + SL-M, then calls `portfolio.open_position()`. If portfolio fails, broker leg is **not flattened**. |
+| STATE-02 | Critical | `trading_agent.py:307-317`, `packages/core/execution.py:1097-1208` | **FIXED** (phase-2) | Freeze-safe | Boot reconciliation only iterates DB-restored symbols. Crash-after-fill-before-DB → daemon boots flat while broker holds real exposure. Never queries `positionBook()` for unaccounted symbols. |
 | NUM-01 | Critical | `packages/core/portfolio.py:393-405`, `trading_agent.py:4294-4296` | OPEN | Freeze-safe (portfolio.py not frozen) | Short MIS margin modeled at 100% notional instead of ~20%. Backtester under-sizes shorts ~5× vs live reality. **Every short-side battery number is biased.** |
 | OBS-01 | Critical | `trading_agent.py:4740-4778` | OPEN | Freeze-safe | SL/TP/peak-giveback exit loop only logs on `if order and record:`. **Failed flattens produce no log, no alert.** |
 | PERF-01 | Critical | `packages/core/data_handler.py:505-514`, `packages/brokers/angelone.py:383-388` | OPEN | Freeze-safe | `get_multiple_ltp` is N sequential REST calls, rate-limited to 3/sec. 300 symbols = **≥100 s/cycle** before network latency. Cycle cannot fit in 60s poll. |
@@ -73,9 +130,9 @@ These are independent of the freeze contract — they reflect actual broker-vs-a
 
 | ID | Sev | Status | File:line | What | Fix sketch |
 |---|---|---|---|---|---|
-| ORD-01 | Critical | OPEN | `execution.py:539-601` | Treats `PLACED` as `FILLED` — `filled_price: None` returned but caller uses signal price | Poll `orderBook()` until terminal status or TTL; only then mutate portfolio. Treat `PLACED` as non-terminal. |
-| ORD-02 | Critical | OPEN | `angelone.py:302-330` | No idempotency on retry — wrapper warns timed-out call may have placed | Pre-retry `orderBook` reconciliation with per-intent client tag (symbol+side+qty+timestamp bucket) stored in DB before send. |
-| ORD-03 | Critical | OPEN | `execution.py:561-599` | No broker-leg rollback when `portfolio.open_position` fails after entry+SL placed | Atomic entry: pending-state DB row first; on `open_position` failure, emergency counter-flatten + SL cancel; block symbol until reconciled. |
+| ORD-01 | Critical | **FIXED** (phase-2) | `execution.py:_live_order_with_retry` | Treats `PLACED` as `FILLED` — `filled_price: None` returned but caller uses signal price | New `_wait_for_terminal()` helper polls `orderBook()` until COMPLETE/CANCELLED/REJECTED or TTL; result dict carries broker `averageprice` + computed slippage. Tests: `test_ord01_*` (8). |
+| ORD-02 | Critical | **FIXED** (phase-2) | `execution.py:_find_idempotent_match` + `_live_order_with_retry` | No idempotency on retry — wrapper warns timed-out call may have placed | Retry attempts ≥2 scan the broker `orderBook` for a recent matching (symbol, side, qty, ordertype) order within `idempotency_lookback_sec` (default 30s). Cancelled / stale rows skipped. Tests: `test_ord02_*` (4). |
+| ORD-03 | Critical | **FIXED** (phase-2) | `execution.py:rollback_entry_on_portfolio_failure` + `trading_agent.py:_open_new_position` | No broker-leg rollback when `portfolio.open_position` fails after entry+SL placed | Atomic rollback: cancel SL leg + counter-flatten MARKET + clean tracking. Caller wraps `open_position` in try/except; on partial rollback the symbol is added to `_symbols_blocked_by_rollback` for the session. Tests: `test_ord03_*` (5). |
 | ORD-04 | High | **FIXED** (phase-1) | `trading_agent.py:_close_position_safely` | Exits inherit configured default LIMIT order_type → sticky on gaps | `_close_position_safely` now passes `order_type="MARKET"` explicitly. Test: `test_ord04_close_position_safely_forces_market_order_type`. |
 | ORD-05 | High | OPEN | `trading_agent.py:3903-3915` | Cancel-SL-then-flatten not atomic — broker SL can fire in cancel window while flatten is in flight → double exit (reverse position) | Before flatten, poll `orderBook`/`positionBook`; if SL already completed, skip flatten + reconcile portfolio from broker state. |
 | ORD-06 | High | OPEN | `trading_agent.py:1717-1720`, `websocket_client.py:254-258` | JWT refresh swaps REST `_api` but **never reconnects WebSocket** → tick feed silently stops after ~7-8h | On successful JWT refresh, update `ws_client._api`, rewrite feed/auth tokens, force WS reconnect. |
@@ -92,8 +149,8 @@ These are independent of the freeze contract — they reflect actual broker-vs-a
 
 | ID | Sev | Status | File:line | What | Fix sketch |
 |---|---|---|---|---|---|
-| STATE-01 | Critical | OPEN | (same as ORD-01) | Persists open position from non-terminal status | (see ORD-01) |
-| STATE-02 | Critical | OPEN | `trading_agent.py:307-317` | Boot reconcile skips broker-only positions absent from DB | Always fetch broker `positionBook()` at boot; for every non-zero `netqty` absent from DB, CRITICAL alert + block new entries until manual ack. |
+| STATE-01 | Critical | **FIXED** (phase-2) | (same as ORD-01) | Persists open position from non-terminal status | Resolved via ORD-01 wait-for-terminal contract (live path waits for FILLED before mutating portfolio). Tests: `test_ord01_live_order_*` (3). |
+| STATE-02 | Critical | **FIXED** (phase-2) | `execution.py:reconcile_positions_with_broker` + `trading_agent.py:307-498` | Boot reconcile skips broker-only positions absent from DB | Reconcile now iterates ALL broker `positionBook` rows; non-zero netqty for unknown symbols returns `status="broker_only"`. Caller queues CRITICAL alert + per-symbol stock-loss block. Boot block no longer gates on `if self.portfolio.positions:`. Tests: `test_state02_*` (3). |
 | STATE-03 | High | OPEN | `trading_agent.py:348-398` vs `:522`, `:646` | Mismatch handler uses `_stock_loss_today` / `_max_losses_per_stock` before they're initialized → silent failure | Initialize attributes before reconcile, or move reconcile after cooldown init; on mismatch call `_persist_cooldown_state()`. |
 | STATE-04 | High | OPEN | `portfolio.py:625-660`, `database.py:84-96` | `close_position` not atomic across 5 transactions (CSV append, dict del, DB delete, trade insert, equity insert) | Single DB transaction wrapping delete-open + insert-trade + equity snapshot; append CSV only after commit. |
 | STATE-05 | High | OPEN | `execution.py:153`, `:557`, `database.py:492-523` | In-flight `_pending_orders` in-memory only — no boot recovery from `orders` table or broker orderBook | At boot, reconcile broker orderBook + SQLite `orders` for non-terminal statuses; block duplicate entries per symbol. |
@@ -158,7 +215,7 @@ These are independent of the freeze contract — they reflect actual broker-vs-a
 | OBS-02 | High | **FIXED** (phase-1) | `trading_agent.py:_exit_on_signal` | Same silent-failure pattern | Mirror OBS-01: CRITICAL log + alert. Test: `test_obs02_failed_signal_exit_emits_critical`. |
 | OBS-03 | High | **FIXED** (phase-1) | `trading_agent.py:_check_position_exits_locked` SL-PROPAGATE block | Broker trailing-SL propagation failure logged at DEBUG only | Promoted to WARNING; per-symbol `_obs03_sl_propagate_failures` counter for heartbeat surfacing. Test: `test_obs03_sl_propagate_failure_logs_warning_with_counter`. |
 | OBS-04 | High | **DEFERRED** (phase-5, frozen) | `risk_manager.py:1009-1010` | `is_trade_worth_it` catches Exception around `compute_round_trip`, substitutes fabricated 0.1% charge estimate, no log | Log `repr(exc)` + traceback; fail-closed (`return False, "charges_compute_failed"`). Touches frozen `risk_manager.py`. |
-| OBS-05 | High | OPEN (phase-2) | `execution.py:1106-1113` | Boot broker-position reconciliation catches `positionBook` failure, logs WARNING, **skips reconciliation entirely** (fails open) | Fail-closed on live boot (refuse entries / require operator ack) or retry with backoff + CRITICAL alert. |
+| OBS-05 | High | **FIXED** (phase-2) | `execution.py:reconcile_positions_with_broker` + `trading_agent.py:_boot_reconcile_gate_open` | Boot broker-position reconciliation catches `positionBook` failure, logs WARNING, **skips reconciliation entirely** (fails open) | Reconcile now retries 3× with 2/4s backoff. On final live-mode failure, sets `boot_reconcile_failed_live=True` + CRITICAL log + queued alert. New `_boot_reconcile_gate_open()` is checked at the top of `_open_new_position` and refuses entries until operator touches `logs/boot_reconcile.ack` (one-shot, file consumed on first read). Tests: `test_obs05_*` (7). |
 | OBS-06 | Medium | **FIXED** (phase-1) | `market_safety.py:check_data_quality` | Staleness + 20% spike checks wrapped parsing in `except: pass` | Both branches now log WARNING + `return False, "staleness_check_failed"` / `"spike_check_failed"`. Tests: `test_obs06_market_safety_no_bare_pass_in_staleness_or_spike`, `test_obs06_market_safety_runtime_fail_closed_on_inner_exception`. |
 | OBS-07 | Medium | **FIXED** (phase-1) | `trading_agent.py:can_trade gate` | Circuit-breaker rejections invisible in daemon log | `logger.warning(f"[RISK-GATE] Skipping {symbol}: {reason}")` added before audit. |
 | OBS-08 | Medium | **FIXED** (phase-1) | `trading_agent.py:_audit_reject` + `signal_audit.py:summarize_today` | Audit-write swallowed; read errors swallowed | Both now log WARNING (rate-limited on the write side); `summarize_today` returns a `read_error` sentinel field so the banner can highlight partial data. |
