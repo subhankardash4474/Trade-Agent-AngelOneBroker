@@ -4551,3 +4551,51 @@ applied to v3 framing as is applied to v2.1 thresholds.
 |---|---|---|---|---|
 | 19 | 2026-05-30 | v3.0 charter pre-committed: swing CNC delivery, Nifty 30, two simple rules, no ML, 4-week timeline. Doc-only pre-commit; code change gated on 2026-06-05 verdict. The dominant insight: cost-regime change (commission drag 80% -> 5-15%) is the binding lever, strategy choice is downstream. Agent's prior A+B+C pick (hourly intraday F&O ORB) acknowledged as wrong-lever. | Project | Pre-commit ACTIVE; activation pending verdict |
 
+
+### 25.6 Charter bump to v1.1 (2026-05-30 ~02:00 IST)
+
+Operator's advisor (01:36 IST) proposed a more granular Phase A1-A5
+backtester-first structure than the agent's v1.0 4-week timeline:
+
+* A1 = backtester capability gap analysis (Sat afternoon, 2-3h, new
+  deliverable docs/v3_backtester_gap_analysis.md).
+* A2 = backtester capability fixes (Sun-Mon, ~1.5d, separate from
+  strategy implementation).
+* A3 = v3 strategy implementation (Tue, ~1d).
+* A4 = battery variants V20-V24 (Tue afternoon, ~3h).
+* A5 = run + walk-forward + read (Wed-Thu, ~1.5d).
+
+Plus three structural additions the v1.0 lacked:
+
+* Explicit "trader VM untouched during Phase A" frozen-surface rule
+  (charter v1.1 section 6.1). Closes the loophole of "let me clean up
+  trader VM logs while I am here" -- exactly the May-14 panic-patch
+  failure pattern.
+* 6-condition hard gate from Phase A to Phase B (charter v1.1 section
+  7.1). Trader VM does not change until ALL six are true: backtester
+  PF >= 1.5 with >= 30 trades, walk-forward holdout PF >= 1.3, A2
+  fixes have regression tests + suite green, Bug K closed, charter +
+  kill criteria committed, slept on result one night.
+* Two non-obvious Phase-A risks (charter v1.1 section 10.5): R1 =
+  daily-timeframe backtester bugs (v2.1 found 5+ in 5-min path, daily
+  is less exercised); R2 = survivorship bias in universe selection
+  (use as-of-start-of-window composition, not as-of-today).
+
+Critical timeline shift in v1.1: Phase A starts 2026-05-30 Sat
+afternoon, NOT post-2026-06-05. Justification: backtester work is
+independent of v2.1 verdict measurements (T1+T2+T3 are mechanical
+against pre-committed thresholds, unaffected by Phase A progress).
+v2.1 verdict process is unaffected; trader VM stays in museum mode.
+If verdict is wind-down (likely), Phase B paper deploy starts Mon
+2026-06-08 with backtester evidence already in hand. If by surprise
+v2.1 survives, the v3-swing branch shelves; Phase A work preserved
+in git as audit trail.
+
+Net forward path: ~12-15 calendar days from charter v1.1 commit to
+first INR 25k live trade, conditional on Phase A gates passing AND
+v2.1 verdict going wind-down.
+
+v1.1 is still pre-slot-#4 (slot #4 finishes ~02:40 IST per the
+2026-05-30 01:42 IST status pull, not 05-08 IST as initially
+assumed). Pre-commit discipline is intact.
+

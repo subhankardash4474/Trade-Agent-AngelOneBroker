@@ -1,12 +1,17 @@
-# Freeze v3.0 — Charter, Pre-Committed 2026-05-30
+# Freeze v3.0 — Charter, Pre-Committed 2026-05-30 (v1.1)
 
 > **For the 2026-06-05 verdict meeting, read [`wind_down_criteria_2026-06-05.md`](wind_down_criteria_2026-06-05.md) first.** This charter activates IF that verdict is "wind-down-of-v2.1-hypothesis" (the most likely outcome per current data). It is the equivalent of FREEZE_v2.1.md but for the new hypothesis, written BEFORE the v2.1 verdict so the v3 framing can't be result-driven by what slot #4 produces.
 
-**Pre-commit timestamp:** 2026-05-30 ~01:30 IST (~3.5 hours before slot #4 finishes ~05:00-08:00 IST).
+**Pre-commit timestamps:**
+
+* **v1.0** — 2026-05-30 ~01:30 IST. Initial charter. Hypothesis, two rules, sizing, what-dies-vs-keeps, pre-committed gates, slot ledger, anti-temptation watch.
+* **v1.1** — 2026-05-30 ~02:00 IST (THIS REVISION). Refines §6 into the granular Phase A1-A5 backtester-first structure proposed by the operator's advisor at 01:36 IST. Adds the explicit "trader VM untouched during Phase A" frozen-surface rule (§6.1), the 6-condition hard gate to Phase B (§7.1), the discipline list (§9.1), and the two non-obvious risks for daily-timeframe backtester work (§10.5). Net change: Phase A starts 2026-05-30 Sat afternoon (not post-2026-06-05); trader VM is in museum mode until Phase B; v2.1 verdict process is unaffected.
+
+Both versions are pre-committed BEFORE slot #4 result lands (slot #4 finishes 2026-05-30 ~05:00-08:00 IST). Pre-commit discipline is the point.
 
 **Author:** trading agent + operator joint commitment.
 
-**Status:** ACTIVE pre-commit. Becomes the operating contract on the day the 2026-06-05 verdict goes wind-down-of-v2.1. If by surprise T1+T2+T3 of v2.1 all show edge, this charter is shelved and v2.1 continues.
+**Status:** ACTIVE pre-commit. Phase A activates 2026-05-30 Sat afternoon (backtester-only, trader VM untouched). Phases B and C activate IF the 2026-06-05 verdict goes wind-down-of-v2.1 AND the §7.1 hard gate to Phase B is met. If by surprise T1+T2+T3 of v2.1 all show edge on 2026-06-05, the v3-swing branch is shelved (preserved in git as audit trail) and v2.1 continues.
 
 ### Reconciliation with `wind_down_criteria_2026-06-05.md` §3
 
@@ -132,53 +137,75 @@ The trading code shrinks ~70%. The infrastructure code stays. That's the right r
 
 ---
 
-## 6. 4-week timeline (activates post-2026-06-05 verdict)
+## 6. Phase A — backtester-only validation (starts 2026-05-30 Sat afternoon)
 
-This timeline activates the day the verdict goes wind-down-of-v2.1-hypothesis. If verdict goes "v2.1 survives," timeline is shelved.
+Phase A is **backtester-only**. The trader VM is in museum mode (running v2.1 with capital paused) for the entirety of Phase A. Phase A is independent of the 2026-06-05 v2.1 verdict — the verdict measurements (T1, T2, T3) are mechanical against pre-committed thresholds and unaffected by Phase A progress. Phases B and C are gated on **both** the 2026-06-05 verdict going wind-down-of-v2.1 **and** the §7.1 hard gate to Phase B being met.
 
-### Week 1 (June 8-14) — subtractive cleanup + product-type pivot
+### Phase A timeline (5 sub-phases, ~6 working days end-to-end)
 
-* Mon: branch `v3-swing` off `main`. Archive the six retiring strategies into `packages/strategies/_archive/v2.1/`. Remove imports.
-* Tue: change broker order placement from MIS → DELIVERY. Remove the 15:15 flat-out logic (one function in `trading_agent.py`).
-* Wed: rewrite `rsi_momentum.py` → `trend_pullback.py` per Rule 1. New `breakout_20d.py` per Rule 2. Total ~300 lines.
-* Thu: switch primary candle frame from 5-min to 1-day. Universe shrink config to top-30. Daily refresh runs once at 09:20 IST; place orders at 09:25 IST.
-* Fri: write `tests/unit/test_v3_strategies.py`. ~30 cases (entry conditions, SL/TP math, trail logic, daily-bar boundary semantics).
+| Sub-phase | When | Effort | Deliverable |
+|---|---|---:|---|
+| **A1 — Backtester capability gap analysis** | Sat 2026-05-30 afternoon | 2-3 h | `docs/v3_backtester_gap_analysis.md` listing each v3 requirement vs current backtester support, with effort estimate per gap. |
+| **A2 — Backtester capability fixes** | Sun-Mon 2026-05-31 / 06-01 | ~1.5 d | Code changes to make the backtester correctly simulate v3 mechanics (daily candles, CNC product, multi-day holds, next-day-open fills, CNC charges). Each gap landed as its own small commit with a unit test + a regression test that confirms a v2.1 5-min variant remains byte-identical. |
+| **A3 — v3 strategy implementation** | Tue 2026-06-02 | ~1 d | `packages/strategies/trend_pullback.py` (Rule 1, ~150 lines) + `packages/strategies/breakout_20d.py` (Rule 2, ~120 lines). Each with entry-condition unit tests, SL/TP/trail math tests, and a 30-day fixture integration test that confirms ≥1 trade fires. |
+| **A4 — Battery variants for v3** | Tue 2026-06-02 afternoon | ~3 h | 5 variants in `packages/research/battery.py`: V20 (Rule 1 alone), V21 (Rule 2 alone), V22 (combined), V23 (combined, looser RSI 35-60), V24 (combined, tighter RSI 42-50). New universe fixture `tests/fixtures/nifty30_v3_universe.json` with `valid_from`/`valid_to` per stock. New entry in `data/battery_queue.yaml`. |
+| **A5 — Run + read + walk-forward** | Wed-Thu 2026-06-03 / 06-04 | ~1.5 d | Slot launches. 5 variants × 30 stocks × 180 days × daily bars. Estimated runtime ~30-90 min on workers=2 (vs 14h+ for 5-min equivalent). Walk-forward = first 120d train + last 60d holdout, two cutoffs. Read results against §7.1 gate. |
 
-### Week 2 (June 15-21) — backtest validation
+### Phase A expected outcomes (three buckets, decide mechanically)
 
-* Mon-Tue: run battery on backtester VM: 30 stocks × 180 days × daily bars × 2 strategies. Should complete in <2 hours given the new candle frame (vs the 14h+ at 5-min).
-* Wed: walk-forward — train on first 120 days, holdout on last 60. Walk it twice with different cutoffs.
-* Thu-Fri: read results.
+* **All 5 variants land PF ≥ 1.5 with ≥ 30 trades each.** Strong evidence; proceed to walk-forward and then Phase B.
+* **V22 (combined) lands PF 1.0-1.5 but V20 or V21 alone lands PF ≥ 1.5.** One rule is dragging the other; ship the better single rule, drop the worse. Still proceed.
+* **All variants PF < 1.0.** Surprise. Either swing CNC isn't the answer or there's a backtester bug surfacing only at daily timeframe. Do **NOT** debug into oblivion — read once, sleep on it, decide Friday whether to try a different rule set or pivot the pivot.
 
-**Backtest gate (binary, pre-committed):**
-* Rolling PF ≥ 1.5 on at least one rule with ≥ 30 trades over 180 days, AND
-* Other rule PF ≥ 0.9 (not actively destroying value).
+### Phase B — paper-trade live (starts the Mon after §7.1 gate passes)
 
-If both rules fail backtest: **kill v3, reconsider.** Do NOT iterate to "let me try a slightly different rule" — that is exactly the v2.1 failure pattern this charter exists to prevent.
+Activates only when **all six §7.1 conditions** are true. Estimated start: Mon 2026-06-08 if Phase A finishes on schedule.
 
-### Week 3 (June 22-28) — paper-trade live
+* Deploy `v3-swing` to trader VM in **paper mode**, CNC product, ₹100k notional, capital pause flag **still on**.
+* 5 paper trading days. Expect 2-4 trades.
+* Friday end-of-day: read paper-vs-backtest delta.
 
-* Mon: deploy v3-swing to trader VM in paper mode with ₹100k notional. CNC product. Live capital pause flag still on.
-* Mon-Fri: 5 paper trading days. Expect 2-4 trades. Watch them work or fail.
-* Fri: read paper-vs-backtest delta.
+**Paper-vs-backtest agreement gate (binary, pre-committed):** PF within 15%; per-trade expectancy within 25%. If outside, the H3 entry-lag forensic from v2.1 still applies; do not go live until execution layer validates.
 
-**Paper-vs-live agreement gate (binary, pre-committed):**
-* PF agreement within 15%
-* Per-trade expectancy agreement within 25%
+### Phase C — live with ₹25k seed (starts the Mon after Phase B gate passes)
 
-If outside: H3 entry-lag forensic from v2.1 still applies; don't go live until execution layer validates.
+Estimated start: Mon 2026-06-15. Live mode enabled with **₹25k seed only** (NOT ₹100k — match what the operator can afford to lose). K1-K4 from §7.2 active from the first trade. 4 supervised live days. End-of-week verdict on advancing to Phase Scale-1 (per §4 trigger conditions).
 
-### Week 4 (June 29-July 5) — live with ₹25k seed
+### Net timeline
 
-Activates only if Week 2 + Week 3 gates both pass.
+~12-15 calendar days from charter v1.1 commit (2026-05-30 ~02:00 IST) to first ₹25k live trade — IF Phase A gates pass cleanly AND v2.1 verdict on 2026-06-05 goes wind-down. If verdict goes v2.1-survives, the `v3-swing` branch shelves; v2.1 continues per its own contract.
 
-* Mon: enable live mode with **₹25k seed** (NOT ₹100k — match what the operator can afford to lose). Pre-committed kill criteria (§7) written before the first trade fires.
-* Mon-Fri: 4 trading days of supervised live. Expect 1-2 trades.
-* End of Week 4: verdict on whether to advance to Phase Scale-1 (per §4 trigger conditions).
+## 6.1 Frozen surface during Phase A — the trader VM rule
+
+The trader VM is **untouched during Phase A**. This is the single most important discipline rule of v3.0 because it is the rule v2.1's May-14 panic patch violated.
+
+* No deployment of `v3-swing` to trader VM.
+* No "while I'm here" log cleanup, config tweak, or service restart on trader VM.
+* No experimentation with broker product types on trader VM.
+* No Bug-fix commits to `main` deployed to trader VM during Phase A unless they are P0 incidents specifically about the v2.1 capital-paused trader VM continuing to operate safely.
+
+If Phase A reveals a bug in shared infrastructure (e.g., a `packages/core/portfolio.py` bug surfaced by the new daily-bar path), the **fix lands on backtester VM only**; the equivalent change to trader VM is queued in `docs/v3_trader_vm_pending_changes.md` and gated on Phase A passing the §7.1 hard gate. No exceptions, including for "obvious" fixes, until Phase B kicks off.
+
+The trader VM stays running v2.1 with `strategies.active: ["mean_reversion"]` and `allow_shorts: false` (current state) and capital paused. It is a museum exhibit during Phase A. The audit checkpoints, EOD diagnostics, and monitoring continue running so that any operational anomaly is still caught — but no behavioural changes.
 
 ---
 
-## 7. Pre-committed live kill criteria (active from first live trade onwards)
+## 7. Pre-committed gates
+
+### 7.1 Hard gate from Phase A → Phase B (six conditions, all AND)
+
+Trader VM does not change until **all six** of the following are true. No exceptions, especially if the backtester numbers look exciting (that is when discipline matters most).
+
+1. Backtester slot (V20-V24) produces **PF ≥ 1.5** on at least one variant with **≥ 30 trades** over the 180-day window.
+2. **Walk-forward holdout** (last 60d on the same variant) confirms **PF ≥ 1.3**.
+3. The Phase A2 backtester capability fixes each have a **regression test**, and the full unit suite is **green** (currently 1,718; should be ~1,750-1,760 after v3 additions).
+4. **Bug K** (holdout-flag silently ignored, slice-before-cache reorder) is closed with a unit test.
+5. The v3 charter is committed (this doc) and the Phase C kill criteria (K1-K4 in §7.2) are written and reviewed.
+6. The operator has **slept on the result for at least one night** before deploying. No same-day "the numbers look great, let's ship" deploys.
+
+If any of those is not true, Phase B does not start, regardless of how clean the rest looks.
+
+### 7.2 Phase C live kill criteria (active from first ₹25k live trade onwards)
 
 * **K1**: cumulative net PnL < -₹2,000 within 30 calendar days → re-pause, re-evaluate. (Not -₹500 like v2.1; swing PnL has higher per-trade variance, so the threshold accounts for natural drawdown.)
 * **K2**: any single trade loses > 5% of capital after slippage → SL widening bug, immediate halt.
@@ -202,7 +229,7 @@ v3.0 freeze becomes ACTIVE on the first paper-mode deploy (Week 3, Mon June 22).
 
 ---
 
-## 9. What v3 will NOT do
+## 9. What v3 will NOT do (high-level)
 
 * **Don't keep XGBoost as a future option.** File retired, .pkl archived, import removed. The strongest evidence for retirement is AUC 0.49 on a clean pipeline; the second strongest is "we keep being tempted to retrain it." Adding ML back is a v4 conversation, after v3 has 6 months of live data.
 * **Don't carry forward the 6-strategy ensemble.** Two rules above. If edge is found, add a third only after the first two have 100+ trades each on the new config.
@@ -210,6 +237,23 @@ v3.0 freeze becomes ACTIVE on the first paper-mode deploy (Week 3, Mon June 22).
 * **Don't run any "while we figure it out" continued capital deployment.** v2.1 capital pause stays paused until v3 backtest + paper gates pass.
 * **Don't simultaneously scale capital and iterate strategy.** Phase rules in §4 above.
 * **Don't re-engineer the existing 5-min code "to make it work."** The data settled that question. If the operator finds themselves drafting a "let's try once more at 5-min" plan, re-read §1 finding #4 (cost-math) and stop.
+
+## 9.1 Phase-A specific discipline list (the operationally hardest one)
+
+The strongest pull during Phase A is to do something that feels productive but isn't part of Phase A. Each of these is rejected in advance:
+
+| Tempting move | Why not |
+|---|---|
+| Touch trader VM "to clean up a stale log" or "to re-check it's still paused correctly" | Trader VM is in museum mode. Even read-only inspection should go through the existing audit-checkpoint pipeline, not direct ssh. The discipline is the rule, not the exception. |
+| Run a v2.1 variant on the new backtester capability changes "to see if it still works" | Write a regression test instead. The test is cheap and reusable; the manual run is a distraction that introduces sample-of-one anchoring on whatever the manual-run output is. |
+| Add a third strategy "just in case the two rules don't work" | Two strategies is the experiment. If two fail, three fail. Iterate on the rules, not the count. Adding a third is the v2.1 "ensemble of 4" failure pattern reasserting itself. |
+| Iterate on rule thresholds to fit the backtest result (e.g., V22 lands PF 1.2 → push RSI window to 42-48 to "rescue" PF 1.5) | Curve-fitting. The walk-forward holdout (§6 A5) will catch you. If V22 < 1.5, accept it: ship the better single rule (V20 or V21) or don't ship. |
+| Retrain the now-archived XGBoost on daily bars "while we're at it" | v4 conversation. v3 has no ML by design. The retrain temptation is exactly why the .pkl gets archived rather than left in place. |
+| Read slot #4 progress every hour Saturday morning | The data lands when it lands (~05-08 IST). Watching faster does not improve it. Read once when fresh; record T1 verdict; move to A1 gap analysis. |
+| "Just one more variant" after V20-V24 land | The five variants cover the meaningful parameter space (rule alone × 2, combined × 1, threshold sensitivity × 2). More variants = p-hacking. |
+| Deploy `v3-swing` to trader VM "in dry-run mode just to see config loads correctly" | This is what the §7.1 cooling-off requirement (slept on it one night) exists to prevent. Dry-run is just live with the safety off in disguise. |
+
+If you find yourself drafting any of these, re-read this section and pick the disciplined alternative. The pattern that consumed v2.1's three slots was ALWAYS "this one feels productive and harmless" — none of v2.1's slots felt unjustified at the moment they were consumed.
 
 ---
 
@@ -227,9 +271,31 @@ Re-read this charter. Pick the disciplined action.
 
 ---
 
+## 10.5 Two non-obvious risks specific to Phase A
+
+These are not in the v2.1 discipline list because v2.1 didn't run at the daily timeframe. Phase A surfaces them. Both are flagged in advance so they don't get mis-attributed when they appear.
+
+### Risk R1 — Backtester has bugs that only surface at the daily timeframe
+
+v2.1 found 5+ backtester bugs in the 5-min path during the audit sprints (Bug E [O(N²) loop], Bug F [harness cascade-fail], Bug G [hardening], Bug H [xgboost-mount], Bug K [holdout-flag silently ignored]). The daily candle path has been exercised much less. Budget for **1-2 surprise backtester bugs** during A2 / A5 and do not be alarmed when they appear.
+
+**The risk is psychological, not technical.** When a strategy produces a result that doesn't match expectation, the temptation is to assume the bug is in the strategy. In Phase A, the bug is at least as likely to be in the backtester's daily-bar handling. Specific suspect surfaces: SMA / RSI / ADX rolling-window calculations across the 5-min → 1-day resample boundary; CDSL per-day accrual on multi-day holds; gap-up / gap-down handling on entry-day open fills; corporate-action handling (dividend / split / bonus) over multi-day windows.
+
+**Discipline:** when a Phase A result looks wrong, write a unit test that hand-computes the expected output for a 3-day fixture before touching strategy code. If the unit test fails, fix the backtester. If the unit test passes, fix the strategy.
+
+### Risk R2 — Survivorship bias in the universe
+
+"Top 30 by 60-day average traded value as of today" conditions on stocks that are currently large/liquid. A backtest 180 days ago should use the universe **as it was 180 days ago**. For Nifty 30 / Nifty 50 this is a small effect (the index turns over slowly), but it is not zero — and it is precisely the kind of subtle bias that inflates backtest PF without inflating live PF.
+
+**Discipline:** the universe fixture file (`tests/fixtures/nifty30_v3_universe.json`) should ideally have a `valid_from` and `valid_to` field per stock. The battery harness reads the universe at the as-of-date of each backtest day, not the as-of-date of fixture creation. If implementing per-day universe lookup is too expensive for Phase A, use the index composition **as of the start of the backtest window** (2025-12-01-ish for a 180d window ending 2026-05-30) — never the as-of-today snapshot.
+
+If neither approach is feasible in Phase A scope, document the bias explicitly in the gap analysis (A1 deliverable) and apply a haircut: divide reported PF by 1.05 before comparing to the §7.1 gate. Acknowledged bias is recoverable; unacknowledged bias is what causes paper-vs-live divergence.
+
+---
+
 ## 11. The single sentence
 
-> Cut to swing CNC delivery on Nifty 30 in 4 weeks, two simple rules with no ML, reuse 70% of v2.1 infrastructure, accept that real side-hustle income requires ₹3-5L of capital eventually, prove the system at ₹25k seed first.
+> Phase A starts Sat afternoon (backtester-only, trader VM untouched). Five sub-phases over ~6 working days produce v3 backtester evidence by Thu/Fri. If §7.1 gate passes AND v2.1 verdict is wind-down, Phase B paper trades start Mon 2026-06-08. First ₹25k live trade lands ~2026-06-15.
 
 ---
 
@@ -238,7 +304,9 @@ Re-read this charter. Pick the disciplined action.
 | Role | Action | Timestamp |
 |---|---|---|
 | Operator | Reframed "kill the project" → "kill the v2.1 hypothesis"; proposed swing-CNC pivot with cost-math justification (commission drag drops 10× at swing horizon, which was the binding constraint v2.1 hit, not strategy edge). | 2026-05-30 ~01:11 IST |
-| Trading agent | Acknowledged swing-CNC pivot is materially better than the prior A+B+C pick. The cost-math finding (76-146% commission drag at retail MIS) flips the analysis: cost-regime change is the dominant lever, strategy choice is downstream. Committed charter pre-write before slot #4 finishes. | 2026-05-30 ~01:30 IST |
-| Joint pre-commitment | This charter is the operating contract for v3 IF 2026-06-05 verdict is wind-down-of-v2.1-hypothesis (the most likely outcome per current data). | 2026-05-30 |
+| Trading agent | Acknowledged swing-CNC pivot is materially better than the prior A+B+C pick. The cost-math finding (76-146% commission drag at retail MIS) flips the analysis: cost-regime change is the dominant lever, strategy choice is downstream. Committed charter v1.0 pre-write before slot #4 finishes. | 2026-05-30 ~01:30 IST |
+| Operator's advisor | Proposed the granular Phase A1-A5 backtester-first structure: gap analysis before strategy implementation; explicit "trader VM untouched" frozen-surface rule; 6-condition hard gate to Phase B; two non-obvious daily-timeframe risks (backtester bugs, survivorship bias). Argued correctly that Phase A can run in parallel with the v2.1 verdict process because the verdict measurements are independent of Phase A progress. | 2026-05-30 ~01:36 IST |
+| Trading agent | Bumped charter to v1.1 with the advisor's structure baked in. Phase A activates 2026-05-30 Sat afternoon; trader VM is in museum mode; v2.1 verdict process unaffected. v1.1 still pre-slot-#4 (slot #4 lands ~05:00-08:00 IST). | 2026-05-30 ~02:00 IST |
+| Joint pre-commitment | v1.1 is the operating contract for v3. Phase A is unconditional (starts Sat afternoon). Phases B and C are gated on §7.1 + 2026-06-05 verdict going wind-down-of-v2.1. | 2026-05-30 |
 
-**Document version:** v1.0 (2026-05-30). Any amendment requires explicit operator + agent acknowledgement and a version bump. Versioned diffs preserved in git history as audit trail.
+**Document version:** v1.1 (2026-05-30). Any further amendment requires explicit operator + agent acknowledgement and a version bump. Versioned diffs preserved in git history as audit trail.
