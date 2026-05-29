@@ -116,6 +116,21 @@ fi
 
 # ── Step 4: prepare_dataset on full 232-stock universe ───────────────────
 banner "Step 4: prepare_dataset.py (60d × 5m × 232 stocks)"
+
+# The trading-agent:latest image has a USER directive baked in
+# (uid=1001 trader, see `sudo docker run --rm trading-agent:latest id`).
+# /opt/trading-agent/data is owned by opc:opc with mode 0775 → trader has
+# read+execute but NOT write. The first iteration of this script tried to
+# do `--output data/retrain_<TS>` which failed at os.makedirs with
+# PermissionError (2026-05-29 12:05 UTC, see /home/opc/retrain_logs/
+# retrain_20260529T1205Z.log). Pre-create the output dir with chown
+# 1001:1001 so the container (uid 1001) can write into it. Keeps the
+# `data/retrain_<TS>/` path stable and is defensive against future
+# ownership drift in /opt/trading-agent/data/.
+DATASET_DIR="$REPO/data/retrain_${TS}"
+sudo mkdir -p "$DATASET_DIR"
+sudo chown 1001:1001 "$DATASET_DIR"
+
 sudo docker run --rm \
     -v "$REPO":/app \
     -v "$REPO/data":/app/data \
@@ -130,17 +145,18 @@ sudo docker run --rm \
         --threshold-pct 0.3 \
         --output data/retrain_${TS}
 
-DATASET_DIR="$REPO/data/retrain_${TS}"
 TRAIN_CSV="$DATASET_DIR/train_dataset.csv"
 TEST_CSV="$DATASET_DIR/test_dataset.csv"
 if [ ! -f "$TRAIN_CSV" ] || [ ! -f "$TEST_CSV" ]; then
     echo "[FATAL] prepare_dataset did not produce train/test CSVs" >&2
     exit 13
 fi
-# Docker writes output as root (uid 0) inside the container, which lands
-# as root-owned files on the host bind-mount. Subsequent python sub-shells
-# in this script run as opc, so they can't read root-owned CSVs without
-# sudo. chown back to opc so the rest of the pipeline reads cleanly.
+# Docker writes output as uid 1001 (trader) inside the container, which
+# lands as 1001:1001-owned files on the host bind-mount. The python
+# sub-shells below run with whatever uid invoked this script (root if
+# under sudo, opc if direct); both can read 0644 trader-owned files
+# fine, but chown back to opc anyway so the operator can `rm -rf` the
+# dataset_dir without sudo when cleaning up.
 sudo chown -R opc:opc "$DATASET_DIR"
 TRAIN_ROWS=$(($(wc -l < "$TRAIN_CSV") - 1))
 TEST_ROWS=$(($(wc -l < "$TEST_CSV") - 1))
@@ -190,7 +206,8 @@ if [ ! -f "$PKL_OUT" ]; then
     exit 14
 fi
 # Same chown rationale as for the dataset CSVs: docker wrote the pkl as
-# root, but Step 7's python sub-shell needs to pickle.load it as opc.
+# uid 1001 (trader). Step 7's python sub-shell can read it fine; we just
+# normalise ownership to opc so cleanup is friction-free.
 sudo chown opc:opc "$PKL_OUT"
 echo "Model written: $PKL_OUT"
 
