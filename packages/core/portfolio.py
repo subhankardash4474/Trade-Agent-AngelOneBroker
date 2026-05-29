@@ -639,7 +639,6 @@ class Portfolio:
                 holding_minutes=holding_minutes,
             )
             self.trade_history.append(record)
-            self._log_trade(record)
             del self.positions[symbol]
 
             logger.info(
@@ -647,33 +646,48 @@ class Portfolio:
                 f"PnL: {pnl:.2f} ({pnl_pct:.2f}%) | Reason: {exit_reason}"
             )
 
-            # Remove from database
+            # STATE-04 (audit 2026-05-28): atomic single-transaction
+            # close. Pre-fix, the DELETE + INSERT trade + INSERT equity
+            # were three separate commits -- a crash between #1 and #2
+            # left a closed-cash, no-trade DB. ``close_position_atomic``
+            # wraps all three in one commit. CSV is appended only AFTER
+            # the DB transaction succeeds so the on-disk CSV cannot
+            # show a trade the DB never recorded.
+            db_committed = False
             if self._db is not None:
                 try:
-                    self._db.remove_open_position(symbol)
+                    record_dict = (
+                        record.to_dict()
+                        if hasattr(record, "to_dict")
+                        else dict(record.__dict__)
+                    )
+                    for key in ("entry_time", "exit_time"):
+                        v = record_dict.get(key)
+                        if v is not None and hasattr(v, "isoformat"):
+                            record_dict[key] = v.isoformat()
+                    equity_at_cost = self.cash + sum(
+                        p.entry_price * p.quantity for p in self.positions.values()
+                    )
+                    self._db.close_position_atomic(
+                        symbol=symbol,
+                        trade=record_dict,
+                        equity=equity_at_cost,
+                        cash=self.cash,
+                        positions=len(self.positions),
+                    )
+                    db_committed = True
                 except Exception as e:
-                    logger.error(f"Failed to remove position from DB: {e}")
+                    logger.critical(
+                        f"[STATE-04] atomic close failed for {symbol}: {e!r}. "
+                        f"DB may be inconsistent (no rollback for in-memory "
+                        f"cash bump already applied). Manual reconcile required."
+                    )
 
-                # Idempotent trade persistence (2026-05-07 fix). The original
-                # contract was: trading_agent's _on_trade_closed() persists
-                # the trade record. But scripts that bypass trading_agent and
-                # call close_position() directly (e.g. tools/_protective_close
-                # _backfill_zyduswell, future manual-close CLI) used to silently
-                # skip persistence, leaving the DB inconsistent with cash and
-                # equity_curve. We now attempt persistence here, idempotently
-                # — if the trading_agent path also persists later, the second
-                # call no-ops via the pre-insert existence check below.
-                try:
-                    self._maybe_persist_trade(record)
-                except Exception as e:
-                    logger.error(f"Trade persistence (close_position) failed: {e}")
-
-            # Persist new cash atomically with the close (2026-05-04 fix).
-            # The previous gap was: position-row removed, but the cash bump
-            # from collateral release + realized PnL only got persisted on
-            # the next 5-cycle equity snapshot. A daemon death in that
-            # window left the DB with stale cash on next boot.
-            self._persist_state_after_event()
+            # Append to CSV only after the DB commit succeeds (or in
+            # paper mode where there's no DB to commit). This keeps the
+            # CSV from displaying trades that never landed in the DB.
+            if db_committed or self._db is None:
+                self._log_trade(record)
 
             return record
 

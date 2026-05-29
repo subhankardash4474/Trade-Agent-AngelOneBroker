@@ -472,6 +472,60 @@ class Database:
             conn.execute("DELETE FROM open_positions WHERE symbol=?", (symbol,))
         logger.debug(f"Removed open position: {symbol}")
 
+    def close_position_atomic(
+        self,
+        symbol: str,
+        trade: dict,
+        equity: float,
+        cash: float,
+        positions: int,
+    ) -> None:
+        """STATE-04 (audit 2026-05-28): single-transaction close.
+
+        Pre-fix, ``Portfolio.close_position`` issued three separate DB
+        calls -- ``remove_open_position`` (DELETE), ``store_trade``
+        (INSERT, idempotent), ``store_equity_point`` (INSERT) -- each
+        with its own commit. A crash between the DELETE and the INSERT
+        left the DB with a closed position (cash bumped) but no trade
+        record, breaking strategy attribution and post-mortem audits.
+
+        This helper does all three under one ``conn.commit()``: if any
+        statement fails, the whole close rolls back atomically.
+
+        Idempotency: the trade INSERT is gated by the same
+        (symbol, exit_time) existence check as ``store_trade`` so a
+        re-call from ``trading_agent._on_trade_closed`` is a no-op for
+        the trade row, but the equity row is appended again -- callers
+        that need single-equity-row semantics should use
+        ``store_trade``/``store_equity_point`` separately.
+        """
+        ts = datetime.now(IST).isoformat()
+        with self._conn() as conn:
+            conn.execute("DELETE FROM open_positions WHERE symbol=?", (symbol,))
+            existing = conn.execute(
+                "SELECT 1 FROM trades WHERE symbol=? AND exit_time=? LIMIT 1",
+                (trade["symbol"], trade["exit_time"]),
+            ).fetchone()
+            if not existing:
+                conn.execute(
+                    """INSERT INTO trades
+                       (symbol, side, entry_price, exit_price, quantity,
+                        entry_time, exit_time, pnl, pnl_pct, strategy,
+                        exit_reason, commission, slippage, market_context)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (trade["symbol"], trade["side"], trade["entry_price"],
+                     trade["exit_price"], trade["quantity"],
+                     trade["entry_time"], trade["exit_time"],
+                     trade["pnl"], trade["pnl_pct"], trade["strategy"],
+                     trade["exit_reason"], trade.get("commission", 0),
+                     trade.get("slippage", 0), trade.get("market_context", "")),
+                )
+            conn.execute(
+                "INSERT INTO equity_curve (timestamp, equity, cash, positions) "
+                "VALUES (?,?,?,?)",
+                (ts, equity, cash, positions),
+            )
+
     def update_position_quantity(self, symbol: str, new_quantity: int) -> None:
         """F-09 (audit 2026-05-27): persist a partial-fill exit's
         residual quantity to the open_positions row. Called by

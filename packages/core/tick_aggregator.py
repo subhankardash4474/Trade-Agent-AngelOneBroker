@@ -106,9 +106,26 @@ class TickAggregator:
 
     def process_tick(self, symbol: str, price: float, volume: float = 0,
                      timestamp: Optional[datetime] = None):
-        """Process a single tick and update all candle builders."""
+        """Process a single tick and update all candle builders.
+
+        CONC-04 (audit 2026-05-28): pre-fix, ``on_candle_close`` fired
+        SYNCHRONOUSLY while holding ``self._lock``. Because the daemon's
+        callback writes to SQLite (`store_candles`), every candle close
+        held the aggregator lock for the duration of the DB write -- and
+        ticks for OTHER symbols arriving concurrently piled up behind it.
+        Under load (50 symbols, 5+ intervals, minute boundary) this
+        produced visible tick latency spikes.
+
+        New behaviour: the lock-protected section appends the closed
+        candle to ``_history`` and resets the builder; we collect the
+        list of completed candles, release the lock, then dispatch the
+        callbacks. The dispatch can do arbitrary I/O without blocking
+        other threads' ``process_tick`` / ``get_candle_history`` calls.
+        """
         now = timestamp or datetime.now(IST)
 
+        # Stage 1: hold the lock only long enough to mutate state.
+        completed_callbacks: List[tuple] = []
         with self._lock:
             for interval in self.intervals:
                 builder = self._builders[interval][symbol]
@@ -118,24 +135,30 @@ class TickAggregator:
                 prev_start = self._candle_starts[interval].get(symbol)
 
                 if prev_start is not None and candle_start != prev_start:
-                    # Period boundary crossed — close the current candle
                     if not builder.is_empty:
                         candle = builder.to_dict()
                         candle["timestamp"] = prev_start
                         candle["symbol"] = symbol
                         candle["interval"] = interval
                         self._history[interval][symbol].append(candle)
-
                         if self.on_candle_close:
-                            try:
-                                self.on_candle_close(symbol, interval, candle)
-                            except Exception as e:
-                                logger.error(f"Candle close callback error: {e}")
+                            completed_callbacks.append((symbol, interval, candle))
 
                     builder.reset()
 
                 builder.add_tick(price, volume)
                 self._candle_starts[interval][symbol] = candle_start
+
+        # Stage 2: dispatch callbacks WITHOUT the lock held. Any DB
+        # write or strategy-side work runs concurrently with ticks for
+        # other symbols.
+        if completed_callbacks and self.on_candle_close:
+            cb = self.on_candle_close
+            for sym, interval, candle in completed_callbacks:
+                try:
+                    cb(sym, interval, candle)
+                except Exception as e:
+                    logger.error(f"Candle close callback error: {e}")
 
     @staticmethod
     def _get_candle_start(now: datetime, period_seconds: int) -> datetime:
@@ -179,7 +202,11 @@ class TickAggregator:
         try/except guard that ``process_tick`` uses. We still append to
         ``_history`` first so the candle is recorded even if the
         downstream persistence step fails.
+
+        CONC-04 (audit 2026-05-28): mirror ``process_tick`` -- collect
+        callbacks under the lock, dispatch after release.
         """
+        completed_callbacks: List[tuple] = []
         with self._lock:
             for interval in self.intervals:
                 for symbol, builder in self._builders[interval].items():
@@ -190,14 +217,19 @@ class TickAggregator:
                         candle["interval"] = interval
                         self._history[interval][symbol].append(candle)
                         if self.on_candle_close:
-                            try:
-                                self.on_candle_close(symbol, interval, candle)
-                            except Exception as e:
-                                logger.error(
-                                    f"Candle close callback error on "
-                                    f"flush_all for {symbol} {interval}: {e}"
-                                )
+                            completed_callbacks.append((symbol, interval, candle))
                         builder.reset()
+
+        if completed_callbacks and self.on_candle_close:
+            cb = self.on_candle_close
+            for symbol, interval, candle in completed_callbacks:
+                try:
+                    cb(symbol, interval, candle)
+                except Exception as e:
+                    logger.error(
+                        f"Candle close callback error on "
+                        f"flush_all for {symbol} {interval}: {e}"
+                    )
 
     def cap_history(self, max_per_symbol: int) -> int:
         """Trim each per-symbol candle history to at most `max_per_symbol`.

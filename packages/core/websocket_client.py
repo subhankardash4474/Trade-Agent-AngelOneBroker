@@ -38,8 +38,17 @@ class WebSocketClient:
         self.on_connect: Optional[Callable] = None
         self.on_error: Optional[Callable] = None
 
-        # Map symbol -> token for subscription
+        # Map symbol -> token for subscription.
+        #
+        # CONC-06 (audit 2026-05-28): the WS thread iterates this map
+        # while the main thread mutates it via subscribe()/unsubscribe()
+        # /replace_subscriptions(). Without a lock the race surface is
+        # ``RuntimeError: dictionary changed size during iteration``
+        # whenever the operator hotloads a watchlist mid-session.
+        # Use a re-entrant lock so callers that already hold it can
+        # call helper methods that also take it.
         self._subscriptions: Dict[str, str] = {}
+        self._subscriptions_lock: threading.RLock = threading.RLock()
 
         # F-10 (audit 2026-05-27): broker WS payloads expose CUMULATIVE
         # session volume (`vol_traded_today` on Angel, `volume_traded` on
@@ -59,10 +68,15 @@ class WebSocketClient:
 
         Upserts each symbol into the subscription dict. Existing entries
         are NOT removed -- use ``set_subscriptions`` or ``unsubscribe``
-        for that. See P1 #14 for why surgical removal matters."""
-        for inst in instruments:
-            self._subscriptions[inst["symbol"]] = str(inst.get("token", ""))
-        logger.info(f"WebSocket subscriptions: {list(self._subscriptions.keys())}")
+        for that. See P1 #14 for why surgical removal matters.
+
+        CONC-06 (audit 2026-05-28): mutate under the subscriptions lock
+        so the WS thread's iteration cannot race with this writer."""
+        with self._subscriptions_lock:
+            for inst in instruments:
+                self._subscriptions[inst["symbol"]] = str(inst.get("token", ""))
+            keys = list(self._subscriptions.keys())
+        logger.info(f"WebSocket subscriptions: {keys}")
 
     def set_subscriptions(self, instruments: List[dict]):
         """P1 #14 (2026-05-17): replace the subscription set wholesale.
@@ -85,11 +99,15 @@ class WebSocketClient:
         new_map: Dict[str, str] = {}
         for inst in instruments:
             new_map[inst["symbol"]] = str(inst.get("token", ""))
-        old_tokens = set(self._subscriptions.values())
-        new_tokens = set(new_map.values())
-        removed = sorted(set(self._subscriptions) - set(new_map))
-        added = sorted(set(new_map) - set(self._subscriptions))
-        self._subscriptions = new_map
+        # CONC-06 (audit 2026-05-28): take the lock for the whole
+        # snapshot+mutate so the diff is consistent against what the
+        # WS thread sees on its next iteration.
+        with self._subscriptions_lock:
+            old_tokens = set(self._subscriptions.values())
+            new_tokens = set(new_map.values())
+            removed = sorted(set(self._subscriptions) - set(new_map))
+            added = sorted(set(new_map) - set(self._subscriptions))
+            self._subscriptions = new_map
         if added or removed:
             logger.info(
                 f"WebSocket subscriptions replaced: "
@@ -109,12 +127,26 @@ class WebSocketClient:
         F-11 (audit 2026-05-27): also pushes the removal to the live
         socket so the broker stops streaming ticks for the closed
         symbol immediately, not on next reconnect.
+
+        CONC-06 (audit 2026-05-28): mutate under the subscriptions
+        lock; release before calling out to the live socket so we
+        don't hold the lock across blocking broker I/O.
         """
-        token = self._subscriptions.pop(symbol, None)
+        with self._subscriptions_lock:
+            token = self._subscriptions.pop(symbol, None)
         if token is None:
             return False
         self._apply_subscription_delta(add_tokens=[], remove_tokens=[token])
         return True
+
+    def get_subscriptions_snapshot(self) -> Dict[str, str]:
+        """CONC-06 (audit 2026-05-28): thread-safe shallow copy of the
+        live subscriptions map. Use this from the WS thread (or any
+        consumer that needs to iterate) to avoid the
+        ``RuntimeError: dictionary changed size during iteration``
+        race against subscribe / unsubscribe / set_subscriptions."""
+        with self._subscriptions_lock:
+            return dict(self._subscriptions)
 
     def _apply_subscription_delta(
         self,
@@ -211,6 +243,42 @@ class WebSocketClient:
                 pass
         logger.info("WebSocket client stopped")
 
+    def join(self, timeout: float = 5.0) -> bool:
+        """CONC-09 (audit 2026-05-28): wait for the WS worker thread to
+        terminate after ``stop()``.
+
+        Pre-fix, ``TradingAgent._shutdown`` called ``ws_client.stop()`` and
+        immediately moved on. Because the WS worker is a daemon thread,
+        an in-flight ``_on_tick`` (broker I/O, sqlite write, trail
+        update) raced with ``_shutdown``'s portfolio teardown and could
+        observe half-torn-down state. Joining gives the worker up to
+        ``timeout`` seconds to drain.
+
+        Returns ``True`` if the thread exited within the timeout (or
+        was never started); ``False`` on timeout.
+        """
+        threads = []
+        for attr in ("_thread", "_reconnect_thread"):
+            t = getattr(self, attr, None)
+            if t is not None and t.is_alive():
+                threads.append(t)
+        if not threads:
+            return True
+        per_thread_budget = max(0.5, timeout / max(1, len(threads)))
+        all_joined = True
+        for t in threads:
+            try:
+                t.join(per_thread_budget)
+            except Exception:  # noqa: BLE001 - join must never crash shutdown
+                continue
+            if t.is_alive():
+                all_joined = False
+                logger.warning(
+                    f"[WS] thread {t.name!r} still alive after "
+                    f"{per_thread_budget:.1f}s join; continuing shutdown"
+                )
+        return all_joined
+
     # ── 2026-05-18 (P1) -- reconnect dispatcher ──────────────────────────
     #
     # Why this exists. The old code called ``self._reconnect_loop()``
@@ -254,6 +322,67 @@ class WebSocketClient:
         self._reconnect_thread = t
         t.start()
 
+    def _close_existing_ws(self) -> None:
+        """CONC-07 (audit 2026-05-28): before installing a new ws
+        client, close the previous one so its socket FD is freed.
+
+        Pre-fix the reconnect path simply did ``self._ws = new_ws``,
+        which left the previous SmartWebSocketV2 / KiteTicker (and its
+        underlying TCP socket) referenced only by whatever finalizer
+        eventually GC'd it. On a flaky network the agent would
+        accumulate FDs across hours of reconnect cycles -- eventually
+        hitting the container ulimit.
+
+        Idempotent and exception-tolerant: best-effort close, ignore
+        AttributeError / OSError, then drop the reference."""
+        old = self._ws
+        self._ws = None
+        if old is None:
+            return
+        for closer in ("close", "close_connection", "stop"):
+            fn = getattr(old, closer, None)
+            if callable(fn):
+                try:
+                    fn()
+                    break
+                except Exception:
+                    continue
+
+    def update_broker_session(
+        self, smart_api=None, *, force_reconnect: bool = True
+    ) -> None:
+        """ORD-06 (audit 2026-05-28): swap the broker handle and force a
+        fresh WebSocket connection with new auth/feed tokens.
+
+        Pre-fix: ``trading_agent._maybe_refresh_broker_session`` re-logged
+        the REST client at ~7h but never told the WS client about it.
+        The WS thread kept running on a stale auth_token + feed_token,
+        which the broker quietly stops servicing once the JWT expires
+        (~8h). The tick feed died silently for the rest of the session
+        with no exits firing.
+
+        New behaviour: caller (TradingAgent) calls this with the freshly
+        re-logged ``smart_api`` after ``_maybe_refresh_broker_session``.
+        We update ``self._api`` so the WS thread reads the new auth
+        token, close the old socket (CONC-07), and schedule a reconnect
+        which the existing reconnect-loop already wires up to the
+        right ``_run_*`` worker. Idempotent if ``_running`` is False.
+        """
+        if smart_api is not None:
+            self._api = smart_api
+        if not self._running:
+            return
+        if not force_reconnect:
+            return
+        try:
+            self._close_existing_ws()
+        finally:
+            self._schedule_reconnect()
+        logger.info(
+            f"[WS] broker session updated; reconnect scheduled "
+            f"(broker={self._broker})"
+        )
+
     # ── AngelOne WebSocket ───────────────────────────────────
 
     def _run_angelone(self):
@@ -270,7 +399,11 @@ class WebSocketClient:
             exchange = self._config.get("market", {}).get("exchange", "NSE")
             exchange_code = 1 if exchange == "NSE" else 2  # 1=NSE, 2=BSE
 
-            token_list = [{"exchangeType": exchange_code, "tokens": list(self._subscriptions.values())}]
+            # CONC-06 (audit 2026-05-28): snapshot under the lock so the
+            # iteration cannot race with subscribe()/replace_subscriptions()
+            # mutating the dict from the main thread.
+            with self._subscriptions_lock:
+                token_list = [{"exchangeType": exchange_code, "tokens": list(self._subscriptions.values())}]
             correlation_id = "trading_agent_ws"
 
             def on_data(wsapp, message):
@@ -330,6 +463,10 @@ class WebSocketClient:
             sws.on_error = on_error
             sws.on_close = on_close
 
+            # CONC-07 (audit 2026-05-28): close any prior socket
+            # before installing the new one so we don't leak the FD
+            # across reconnect cycles.
+            self._close_existing_ws()
             self._ws = sws
             sws.connect()
 
@@ -400,7 +537,10 @@ class WebSocketClient:
             broker_cfg = self._config.get("broker", {})
             kws = KiteTicker(broker_cfg.get("api_key", ""), broker_cfg.get("access_token", ""))
 
-            tokens = [int(t) for t in self._subscriptions.values() if t]
+            # CONC-06 (audit 2026-05-28): snapshot under the lock to
+            # avoid concurrent mutation during iteration.
+            with self._subscriptions_lock:
+                tokens = [int(t) for t in self._subscriptions.values() if t]
 
             def on_ticks(ws, ticks):
                 for tick_data in ticks:
@@ -525,11 +665,22 @@ class WebSocketClient:
         logger.info("Running in WebSocket SIMULATION mode")
 
         base_prices = {}
-        for symbol in self._subscriptions:
+        # CONC-06 (audit 2026-05-28): snapshot the keys before iterating
+        # so a mid-loop replace_subscriptions() doesn't raise a
+        # ``RuntimeError: dictionary changed size during iteration``.
+        with self._subscriptions_lock:
+            symbols_snapshot = list(self._subscriptions.keys())
+        for symbol in symbols_snapshot:
             base_prices[symbol] = random.uniform(100, 3000)
 
         while self._running:
-            for symbol in self._subscriptions:
+            # Re-snapshot each loop so we pick up live add/remove without
+            # holding the lock during the simulated tick generation.
+            with self._subscriptions_lock:
+                symbols_snapshot = list(self._subscriptions.keys())
+            for symbol in symbols_snapshot:
+                if symbol not in base_prices:
+                    base_prices[symbol] = random.uniform(100, 3000)
                 base = base_prices[symbol]
                 jitter = base * random.uniform(-0.002, 0.002)
                 base_prices[symbol] = base + jitter
@@ -588,7 +739,13 @@ class WebSocketClient:
         matches the stored "11536" (str). Previously dropped ticks silently
         ate the exit signal for the symbol."""
         token_s = str(token).strip()
-        for sym, tok in self._subscriptions.items():
+        # CONC-06 (audit 2026-05-28): snapshot under the lock; this is
+        # the hot path -- one call per WS tick. The snapshot copy is
+        # cheap (held tokens only) and isolates the iteration from
+        # concurrent watchlist mutations.
+        with self._subscriptions_lock:
+            items_snapshot = list(self._subscriptions.items())
+        for sym, tok in items_snapshot:
             if str(tok).strip() == token_s:
                 return sym
         return None

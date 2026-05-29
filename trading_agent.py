@@ -310,6 +310,23 @@ class TradingAgent:
             Path(self.config.get("logging", {}).get("log_dir", "logs"))
             / "boot_reconcile.ack"
         )
+        # STATE-03 (audit 2026-05-28): the reconcile block below uses
+        # ``self._stock_loss_today`` and ``self._max_losses_per_stock``
+        # to per-symbol-block on mismatch / broker_only. Pre-fix, those
+        # attributes were initialised much later in __init__ (line ~627
+        # / ~751) so the mismatch + broker_only handlers raised
+        # AttributeError -> caught by the bare except -> silent failure
+        # -> broker-only positions were NOT actually blocked. Initialise
+        # them eagerly here. The "real" init below (lines ~627/~751)
+        # still runs and rebuilds them from disk via
+        # ``load_cooldown_state``; that overlay is by-design idempotent
+        # because the loader returns at most a one-day-old snapshot and
+        # ``dict.update`` merges atomically.
+        robust_cfg_early = self.config.get("robustness", {})
+        self._max_losses_per_stock = robust_cfg_early.get(
+            "max_losses_per_stock_per_day", 2
+        )
+        self._stock_loss_today: Dict[str, int] = {}
         # ORD-03 (audit 2026-05-28): symbols whose atomic-entry rollback
         # could not be fully completed (e.g. broker counter-flatten
         # failed mid-way). Caller-side gate refuses new entries on
@@ -637,6 +654,28 @@ class TradingAgent:
             robust_cfg.get("heartbeat_interval_seconds", 300)
         )
         self._last_heartbeat_ts: float = 0.0
+        # STATE-08 (audit 2026-05-28): debounced trail-state persist.
+        # Updated by ``_persist_trailing_states`` on success.
+        self._last_trail_persist_ts: float = 0.0
+        # CONC-05 / PERF-05 (audit 2026-05-28): WS tick buffer. Pre-fix
+        # every WS tick took its own sqlite3 connection (open + WAL
+        # pragma + INSERT + commit + close ~ 2-5ms each). At 50
+        # subscribed symbols x 1 tick/s that's ~50 connections/s plus
+        # WAL lock contention with the main loop. We buffer ticks in
+        # memory and flush as a single ``store_ticks_batch`` once size
+        # crosses ``_TICK_FLUSH_SIZE`` or ``_TICK_FLUSH_INTERVAL_SEC``
+        # has elapsed since the last flush. Lock is held only while
+        # appending; the actual DB write happens outside the lock.
+        from collections import deque as _deque  # local import to avoid module-top churn
+        self._tick_buffer: "_deque[dict]" = _deque(maxlen=5000)
+        self._tick_buffer_lock = threading.Lock()
+        self._tick_last_flush_ts: float = time.monotonic()
+        self._TICK_FLUSH_SIZE: int = int(
+            (self.config.get("data_pipeline", {}) or {}).get("tick_buffer_flush_size", 100)
+        )
+        self._TICK_FLUSH_INTERVAL_SEC: float = float(
+            (self.config.get("data_pipeline", {}) or {}).get("tick_buffer_flush_interval_sec", 1.0)
+        )
         self._eod_summary_time = robust_cfg.get("eod_summary_time", "15:20")
         self._max_cycle_errors = robust_cfg.get("max_cycle_errors", 5)
 
@@ -748,7 +787,13 @@ class TradingAgent:
         # side info is lost and we conservatively fall back to bare-symbol
         # blocking until the next exit refreshes the side).
         self._cooldown_side_map: Dict[str, str] = {}
-        self._stock_loss_today: Dict[str, int] = {}        # symbol → loss count today
+        # STATE-03 (audit 2026-05-28): the reconcile block at boot may
+        # already have populated ``self._stock_loss_today`` (per-symbol
+        # block on mismatch / broker_only). Do NOT clobber those here;
+        # ``load_cooldown_state`` below merges via ``update`` so this is
+        # the only spot that could erase the block.
+        if not hasattr(self, "_stock_loss_today"):
+            self._stock_loss_today: Dict[str, int] = {}        # symbol → loss count today
         self._consec_tp_today: Dict[str, int] = {}         # symbol → consecutive TPs today (trend continuation)
 
         # Per-symbol streak of consecutive data-quality rejections. Routine
@@ -936,6 +981,36 @@ class TradingAgent:
             self._cooldown_side_map.update(restored_side)
         except Exception as exc:  # noqa: BLE001 - persistence must not block startup
             logger.warning(f"[COOLDOWN-PERSIST] load failed at init: {exc!r}")
+
+        # STATE-09 (audit 2026-05-28): if the cooldown loader detected
+        # CORRUPT JSON it wrote ``data/cooldowns_corrupt.flag``. Engage
+        # a fail-closed gate that refuses new entries until the
+        # operator deletes the flag (after restoring / accepting state
+        # loss). Pre-fix, the loader returned empty maps and the daemon
+        # cheerfully traded -- a blacklisted stock (3 losses today) was
+        # tradeable again on the next cycle.
+        self._cooldowns_corrupt_flag_path: Path = Path("data/cooldowns_corrupt.flag")
+        self._cooldown_state_corrupt: bool = (
+            self._cooldowns_corrupt_flag_path.exists()
+        )
+        if self._cooldown_state_corrupt:
+            logger.critical(
+                f"[COOLDOWN-PERSIST] corrupt-state flag present at "
+                f"{self._cooldowns_corrupt_flag_path}; new entries BLOCKED "
+                f"until the flag is removed."
+            )
+            self._pending_boot_alerts.append({
+                "title": "[CRITICAL] cooldown state CORRUPT",
+                "message": (
+                    f"data/cooldowns.json was unreadable at boot. "
+                    f"Cooldown / blacklist / rejection counters are "
+                    f"BLANK. Daemon refuses new entries until the "
+                    f"operator restores the file (or accepts the loss "
+                    f"and deletes "
+                    f"{self._cooldowns_corrupt_flag_path})."
+                ),
+                "level": "critical",
+            })
 
         # P2 restart-cluster (2026-05-17) -- LIVE-MODE SAFETY: rehydrate the
         # three intraday runtime state buckets so a mid-day restart doesn't
@@ -1375,6 +1450,33 @@ class TradingAgent:
         if self._use_websocket:
             self._start_websocket()
 
+        # CONC-08 (audit 2026-05-28): pre-fix, ``run()`` only honoured
+        # ``KeyboardInterrupt``. ``run_daemon.py`` installs a SIGTERM
+        # handler that sets a module-level flag, but the agent loop never
+        # consults it -- so ``docker stop`` (SIGTERM, 10s grace, then
+        # SIGKILL) interrupted whatever broker call was in flight rather
+        # than letting the cycle drain. Install our own SIGTERM/SIGINT
+        # handler that flips ``_running = False``; the next loop check
+        # sees it and exits via ``_shutdown`` cleanly. Wrapped in
+        # try/except because signal.signal raises ``ValueError`` when
+        # called outside the main thread (unit tests / the dashboard
+        # runner do this).
+        import signal as _signal_mod
+        def _shutdown_handler(_sig, _frame):  # noqa: ANN001 - signal handler signature
+            try:
+                logger.info(f"[SHUTDOWN] signal {_sig} received -- draining cycle and exiting")
+            except Exception:
+                pass
+            self._running = False
+        for _sig_name in ("SIGINT", "SIGTERM"):
+            _sig = getattr(_signal_mod, _sig_name, None)
+            if _sig is None:
+                continue
+            try:
+                _signal_mod.signal(_sig, _shutdown_handler)
+            except (ValueError, OSError):
+                pass
+
         logger.info(f"Agent started (poll={poll_interval}s, instruments={len(self.instruments)})")
 
         try:
@@ -1653,8 +1755,17 @@ class TradingAgent:
         tick_ts = tick.get("timestamp")
         self.tick_aggregator.process_tick(symbol, price, volume, timestamp=tick_ts)
         try:
-            self.database.store_tick(symbol, price, volume,
-                                     bid=tick.get("bid", 0), ask=tick.get("ask", 0))
+            # CONC-05 / PERF-05 (audit 2026-05-28): buffer + batch
+            # flush instead of one INSERT per tick (~50 connections/s
+            # under load).
+            self._buffer_tick(
+                symbol=symbol,
+                ltp=price,
+                volume=volume,
+                bid=tick.get("bid", 0),
+                ask=tick.get("ask", 0),
+                timestamp=tick.get("timestamp"),
+            )
         except Exception as exc:
             # OBS-09 (audit 2026-05-28): pre-fix this swallowed the
             # store_tick failure silently. The aggregator still has the
@@ -1681,11 +1792,39 @@ class TradingAgent:
         if symbol not in self.portfolio.positions:
             return
 
+        # CONC-02 (audit 2026-05-28): pre-fix, the WS thread called
+        # ``risk_manager.update_trailing_stop`` WITHOUT holding
+        # ``_exit_check_lock`` while the main thread was already inside
+        # ``_check_position_exits_locked`` mutating the same
+        # ``TrailingStop`` objects. Two concurrent mutations of the same
+        # ``highest_since_entry`` / ``trailing_active`` fields can drop
+        # the trail high (peak unrealised R erased mid-session) or
+        # toggle ``breakeven_armed`` between the two threads' read &
+        # write. Route both reads and the mutation through
+        # ``_exit_check_lock`` so the existing main-thread call site at
+        # ``_check_position_exits_locked`` remains the sole serialiser.
         ts = self.risk_manager.get_trailing_stop(symbol)
         if ts:
-            new_sl = self.risk_manager.update_trailing_stop(symbol, price)
-            if ts.trailing_active:
+            with self._exit_check_lock:
+                pre_high = ts.highest_since_entry
+                pre_low = ts.lowest_since_entry
+                pre_active = ts.trailing_active
+                pre_break = ts.breakeven_armed
+                new_sl = self.risk_manager.update_trailing_stop(symbol, price)
+                trailing_active_now = ts.trailing_active
+                # STATE-08 (audit 2026-05-28): detect a real mutation so
+                # we don't burn debounce budget on no-op WS ticks. Only
+                # one of these flips when the trail actually advances.
+                trail_mutated = (
+                    ts.highest_since_entry != pre_high
+                    or ts.lowest_since_entry != pre_low
+                    or ts.trailing_active != pre_active
+                    or ts.breakeven_armed != pre_break
+                )
+            if trailing_active_now:
                 logger.debug(f"Trailing SL for {symbol}: \u20B9{new_sl:.2f}")
+            if trail_mutated:
+                self._persist_trailing_states_debounced()
 
         # Drive the exit check off this single-symbol price snapshot.
         # `_check_position_exits` is idempotent and handles the fact that
@@ -1874,8 +2013,103 @@ class TradingAgent:
         logged WARNING and swallowed."""
         try:
             save_trailing_states(self.risk_manager._trailing_stops)
+            self._last_trail_persist_ts = time.monotonic()
         except Exception as exc:  # noqa: BLE001 - persistence must not block trading
             logger.warning(f"[TRAIL-PERSIST] save failed: {exc!r}")
+
+    def _buffer_tick(
+        self,
+        *,
+        symbol: str,
+        ltp: float,
+        volume: float,
+        bid: float = 0.0,
+        ask: float = 0.0,
+        timestamp: Any = None,
+    ) -> None:
+        """CONC-05 / PERF-05 (audit 2026-05-28): batched tick persistence.
+
+        Appends a tick row to ``_tick_buffer`` under a small lock and
+        triggers a flush when either:
+          * the buffer length crosses ``_TICK_FLUSH_SIZE``, or
+          * ``_TICK_FLUSH_INTERVAL_SEC`` has elapsed since the previous
+            successful flush.
+
+        The actual ``store_ticks_batch`` happens OUTSIDE the buffer
+        lock so the WS thread can keep appending while another caller
+        is writing. Failure logs WARNING and re-queues nothing -- the
+        buffer is lossy by design (ticks are advisory data, not money-
+        at-risk state).
+        """
+        ts_str = timestamp
+        if ts_str is None:
+            ts_str = datetime.now(IST).isoformat()
+        elif hasattr(ts_str, "isoformat"):
+            ts_str = ts_str.isoformat()
+        else:
+            ts_str = str(ts_str)
+        row = {
+            "symbol": symbol,
+            "timestamp": ts_str,
+            "ltp": float(ltp),
+            "volume": float(volume or 0),
+            "bid": float(bid or 0),
+            "ask": float(ask or 0),
+        }
+        flush_now = False
+        with self._tick_buffer_lock:
+            self._tick_buffer.append(row)
+            buf_size = len(self._tick_buffer)
+        elapsed = time.monotonic() - self._tick_last_flush_ts
+        if buf_size >= self._TICK_FLUSH_SIZE or elapsed >= self._TICK_FLUSH_INTERVAL_SEC:
+            flush_now = True
+        if flush_now:
+            self._flush_tick_buffer()
+
+    def _flush_tick_buffer(self) -> int:
+        """Flush the in-memory tick buffer to the ticks table.
+
+        Returns the number of rows written. Best-effort: any failure
+        is logged WARNING and the rows are dropped (next flush starts
+        clean). Tick data is advisory; the candle aggregator already
+        holds the same data in-memory for strategy evaluation.
+        """
+        with self._tick_buffer_lock:
+            if not self._tick_buffer:
+                return 0
+            batch = list(self._tick_buffer)
+            self._tick_buffer.clear()
+        try:
+            self.database.store_ticks_batch(batch)
+            self._tick_last_flush_ts = time.monotonic()
+            return len(batch)
+        except Exception as exc:  # noqa: BLE001 - best-effort
+            logger.warning(
+                f"[TICK-FLUSH] store_ticks_batch failed for {len(batch)} rows: {exc!r}"
+            )
+            return 0
+
+    def _persist_trailing_states_debounced(self, min_interval_sec: float = 5.0) -> None:
+        """STATE-08 (audit 2026-05-28): debounced trail-state persist.
+
+        Pre-fix, the trail snapshot was only written at cycle end (every
+        15-60s). A crash 5s before the next cycle restored the wide
+        initial SL even if the trail had locked in 1.5R of profit.
+        Path-specific tests confirmed: WS tick at 14:32:10 promoting
+        ``highest_since_entry`` -> 1234.50; daemon SIGKILL at 14:32:13;
+        on restart ``highest_since_entry`` was the entry price.
+
+        New: after every WS-tick trail mutation, call this method. It
+        serialises the trailing-stop dict to disk if at least
+        ``min_interval_sec`` has elapsed since the last successful
+        persist. Caps disk I/O at one write per ``min_interval_sec``
+        even on a busy hot path while ensuring no mutation goes longer
+        than ``min_interval_sec`` without making it to disk.
+        """
+        last = getattr(self, "_last_trail_persist_ts", 0.0)
+        if (time.monotonic() - last) < min_interval_sec:
+            return
+        self._persist_trailing_states()
 
     def _maybe_refresh_broker_session(self) -> None:
         """P2 restart-cluster (2026-05-17): refresh the AngelOne JWT before
@@ -1928,11 +2162,32 @@ class TradingAgent:
             self._smart_api = api
             self.execution._api = api
             self.data_handler._api = api
+            # ORD-06 (audit 2026-05-28): pre-fix, the WebSocket thread was
+            # NOT told about the JWT swap. The WS kept running on the
+            # original auth_token + feed_token, which the broker stops
+            # servicing once the original JWT actually expires (~8h).
+            # The tick feed died silently for the rest of the session
+            # with no exits firing on held positions. update_broker_session
+            # closes the old WS socket (CONC-07), updates ``ws._api`` to
+            # the fresh handle, and schedules a reconnect that the
+            # existing reconnect-loop wires up to the right ``_run_*``
+            # worker. Idempotent if the WS isn't running yet.
+            try:
+                self.ws_client.update_broker_session(api, force_reconnect=True)
+            except Exception as ws_exc:  # noqa: BLE001 - WS reconnect must not crash the trading loop
+                logger.critical(
+                    f"[JWT-REFRESH] WS update_broker_session FAILED "
+                    f"({type(ws_exc).__name__}: {ws_exc!r}). REST is on the "
+                    f"new JWT but WS may still be on the old token; "
+                    f"feed could die silently. Operator action: monitor "
+                    f"tick freshness."
+                )
             self._broker_session_started_at = datetime.now(IST)
             logger.warning(
                 f"[JWT-REFRESH] AngelOne session refreshed at "
                 f"{self._broker_session_started_at.isoformat()} "
-                f"(old session age was {age}). Trading continues."
+                f"(old session age was {age}). REST + WS reconnected. "
+                f"Trading continues."
             )
         except Exception as exc:  # noqa: BLE001 - must not crash trading
             logger.critical(
@@ -1959,6 +2214,58 @@ class TradingAgent:
         """Reset per-day trackers at the start of each new trading day."""
         today = datetime.now(IST).date()
         if self._daily_tracker_date != today:
+            # STATE-12 (audit 2026-05-28): pre-fix, the daily reset only
+            # cleared in-memory maps. ``open_positions`` (SQLite) still
+            # held yesterday's MIS rows. On a pre-market boot just before
+            # the new session, the daemon "restored" yesterday's stale
+            # MIS positions -- which the broker had auto-flattened at
+            # the prior session close -- and then logged a phantom open.
+            # Now: at the day boundary we sweep open positions whose
+            # ``entry_time`` is strictly before today (IST) and force-
+            # close them DB-side with reason ``stale_overnight_mis_sweep``
+            # at their entry price (zero P&L, true broker fill price
+            # unknown). The next reconcile call will catch any genuine
+            # overnight position the broker is actually holding.
+            try:
+                stale_positions: List[str] = []
+                for sym, pos in list(self.portfolio.positions.items()):
+                    entry_time = getattr(pos, "entry_time", None)
+                    if entry_time is None:
+                        continue
+                    try:
+                        if entry_time.tzinfo is None:
+                            entry_time = IST.localize(entry_time)
+                        entry_date = entry_time.astimezone(IST).date()
+                    except Exception:
+                        continue
+                    if entry_date < today:
+                        stale_positions.append(sym)
+                for sym in stale_positions:
+                    pos = self.portfolio.positions.get(sym)
+                    if pos is None:
+                        continue
+                    try:
+                        self.portfolio.close_position(
+                            symbol=sym,
+                            exit_price=pos.entry_price,  # zero P&L
+                            exit_time=datetime.now(IST),
+                            exit_reason="stale_overnight_mis_sweep",
+                        )
+                        logger.critical(
+                            f"[STALE-MIS-SWEEP] {sym} entry_date="
+                            f"{entry_time.astimezone(IST).date().isoformat()} "
+                            f"< today={today.isoformat()}; closed DB-side "
+                            f"with zero P&L (true broker fill price unknown). "
+                            f"Reconcile will catch any actual overnight "
+                            f"holding."
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        logger.critical(
+                            f"[STALE-MIS-SWEEP] {sym} sweep failed: {exc!r}; "
+                            f"position remains in DB. Manual cleanup required."
+                        )
+            except Exception as exc:  # noqa: BLE001 - daily reset must not block
+                logger.warning(f"[STALE-MIS-SWEEP] sweep raised {exc!r}; continuing")
             self._stock_loss_today.clear()
             self._cooldown_map.clear()
             # 2026-05-18 regression fix: parallel side tracker must reset
@@ -4483,6 +4790,33 @@ class TradingAgent:
             self._audit_reject(signal, current_price, "rollback_block:incomplete")
             return
 
+        # STATE-09 (audit 2026-05-28): cooldown / blacklist persistence
+        # was corrupt at boot. The loader returned blank counters which
+        # would otherwise let a previously-blacklisted stock trade
+        # again. Refuse new entries until the operator deletes the
+        # corrupt flag (after restoring or accepting the state loss).
+        # Re-check the flag every call so deleting the file lifts the
+        # gate without a daemon restart.
+        if getattr(self, "_cooldown_state_corrupt", False):
+            try:
+                if not self._cooldowns_corrupt_flag_path.exists():
+                    self._cooldown_state_corrupt = False
+                    logger.warning(
+                        f"[COOLDOWN-CORRUPT-GATE] flag cleared at "
+                        f"{self._cooldowns_corrupt_flag_path}; lifting gate."
+                    )
+            except Exception:
+                pass
+        if getattr(self, "_cooldown_state_corrupt", False):
+            logger.warning(
+                f"[COOLDOWN-CORRUPT-GATE] Refusing new {direction_label} on "
+                f"{symbol}: cooldown / blacklist state was corrupt at boot. "
+                f"Delete {self._cooldowns_corrupt_flag_path} after manual "
+                f"review to lift the gate."
+            )
+            self._audit_reject(signal, current_price, "cooldown_state_corrupt")
+            return
+
         # Single-shot enforcement (Stage 3 e2e safety, --single-shot flag).
         # Once a symbol has had a full round-trip today, refuse re-entry. This
         # caps the maximum number of fills per symbol per day at 2 (one entry,
@@ -5641,7 +5975,30 @@ class TradingAgent:
         logger.info("Shutting down...")
         self._running = False
         self.ws_client.stop()
+        # CONC-09 (audit 2026-05-28): wait for the WS worker thread (and
+        # the reconnect thread, if any) to actually drain before we tear
+        # down the portfolio / close the DB. Pre-fix, the daemon WS
+        # thread would race with portfolio close, occasionally writing
+        # a tick to a half-closed sqlite handle.
+        try:
+            joined = self.ws_client.join(timeout=5.0)
+            if not joined:
+                logger.warning(
+                    "[SHUTDOWN] WS threads did not drain within 5s; "
+                    "proceeding -- daemon-thread fallback will tear them down"
+                )
+        except Exception as exc:  # noqa: BLE001 - shutdown must never crash
+            logger.warning(f"[SHUTDOWN] ws_client.join raised {exc!r}; continuing")
         self.tick_aggregator.flush_all()
+        # CONC-05 / PERF-05 (audit 2026-05-28): final tick-buffer flush
+        # so any buffered ticks reach the ticks table before we tear
+        # down the DB connection.
+        try:
+            flushed = self._flush_tick_buffer()
+            if flushed:
+                logger.info(f"[SHUTDOWN] flushed {flushed} buffered ticks to DB")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"[SHUTDOWN] tick-buffer flush failed: {exc!r}")
 
         if self.portfolio.open_position_count > 0:
             self._square_off_all("shutdown")

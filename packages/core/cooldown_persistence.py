@@ -146,24 +146,52 @@ def save_cooldown_state(
     # lock to serialise overlapping daemon restarts (the atomic temp+
     # rename keeps the file on disk consistent but does not prevent a
     # later writer from clobbering an earlier writer's update).
+    #
+    # STATE-06 (audit 2026-05-28): pre-fix, a 2s lock timeout fell back
+    # to writing WITHOUT the lock so a stuck lock would not lose
+    # protective state forever -- but that fallback is itself the
+    # clobber bug it was trying to avoid. The correct behaviour during
+    # a rolling restart (old container draining state while new one
+    # boots) is to retry with backoff and only give up after we've
+    # tried hard enough that an unlocked write is more dangerous than
+    # losing this single mutation. We retry 3x with timeouts 1s/3s/5s.
+    # If we still cannot acquire, log CRITICAL and DO NOT WRITE; the
+    # next mutation will retry. Total wall-clock budget on the bad
+    # path is ~9s, well within the 60s poll interval.
     try:
         from core.file_lock import file_lock as _file_lock
-        with _file_lock(path, timeout=2.0):
-            _atomic_write_json(path, payload)
-    except TimeoutError:
-        # Best-effort fallback: write without the lock so a stuck lock
-        # does not lose protective state forever.
-        try:
-            _atomic_write_json(path, payload)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning(f"[COOLDOWN-PERSIST] save failed (post-timeout): {exc!r}")
     except ImportError:
+        # No platform lock support -- fall through to unlocked write
+        # with WARNING. This branch only fires on platforms that
+        # advertise neither fcntl nor msvcrt (effectively never on
+        # the trader VM or local dev).
         try:
             _atomic_write_json(path, payload)
         except Exception as exc:  # noqa: BLE001
             logger.warning(f"[COOLDOWN-PERSIST] save failed (no file_lock): {exc!r}")
-    except Exception as exc:  # noqa: BLE001 - persistence must not raise
-        logger.warning(f"[COOLDOWN-PERSIST] save failed: {exc!r}")
+        return
+
+    last_err: Optional[Exception] = None
+    for attempt, timeout_s in enumerate((1.0, 3.0, 5.0), start=1):
+        try:
+            with _file_lock(path, timeout=timeout_s):
+                _atomic_write_json(path, payload)
+            return
+        except TimeoutError as exc:
+            last_err = exc
+            logger.warning(
+                f"[COOLDOWN-PERSIST] file_lock timeout attempt "
+                f"{attempt}/3 ({timeout_s}s); retrying"
+            )
+            continue
+        except Exception as exc:  # noqa: BLE001 - persistence must not raise
+            logger.warning(f"[COOLDOWN-PERSIST] save failed: {exc!r}")
+            return
+    logger.critical(
+        f"[COOLDOWN-PERSIST] file_lock contended for >9s "
+        f"({last_err!r}); SKIPPING this save to avoid clobbering "
+        f"another writer. Next mutation will retry."
+    )
 
 
 def load_cooldown_state(
@@ -224,11 +252,35 @@ def load_cooldown_state(
         # container, restore data/cooldowns.json from the most recent
         # known-good snapshot (data/.cooldowns.*.tmp leftover or a
         # backup), and restart.
+        #
+        # STATE-09 (audit 2026-05-28): pre-fix, returning empty maps was
+        # fail-OPEN -- a blacklisted stock was tradeable again on the
+        # very next cycle. Now we additionally write a sentinel file
+        # ``data/cooldowns_corrupt.flag`` that ``TradingAgent.__init__``
+        # consults to engage a global fail-closed gate. Operator clears
+        # the gate by deleting the flag (after restoring or accepting
+        # the loss of state). Best-effort: a sentinel-write failure
+        # logs WARNING but does not crash startup.
         logger.critical(
             f"[COOLDOWN-PERSIST] CORRUPT snapshot at {path}: {exc!r}. "
             "Cooldown / blacklist / rejection state has been LOST. "
             "Manual recovery required -- see runbook."
         )
+        try:
+            flag_path = data_dir / "cooldowns_corrupt.flag"
+            flag_path.parent.mkdir(parents=True, exist_ok=True)
+            flag_path.write_text(
+                f"corrupt_at={datetime.now(IST).isoformat()}\n"
+                f"reason={type(exc).__name__}: {exc!r}\n"
+                f"snapshot_path={path}\n"
+                f"action_required=Inspect/restore data/cooldowns.json then "
+                f"delete this flag to lift the entry block.\n",
+                encoding="utf-8",
+            )
+        except Exception as flag_exc:  # noqa: BLE001 - flag write must not crash startup
+            logger.warning(
+                f"[COOLDOWN-PERSIST] could not write corrupt-state flag: {flag_exc!r}"
+            )
         return {}, {}, {}, {}
 
     snapshot_version_raw = payload.get("version", 1)

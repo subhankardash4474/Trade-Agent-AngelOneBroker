@@ -123,17 +123,39 @@ def save_runtime_state(
         },
     }
     # C-29 (audit 2026-05-26): see cooldown_persistence for rationale.
+    # STATE-06 (audit 2026-05-28): retry with backoff on lock timeout
+    # instead of falling back to an unlocked write that itself causes
+    # the clobber bug. ImportError (no platform lock support) still
+    # falls through to unlocked write.
     try:
         from core.file_lock import file_lock as _file_lock
-        with _file_lock(path, timeout=2.0):
-            _atomic_write_json(path, payload)
-    except (TimeoutError, ImportError):
+    except ImportError:
         try:
             _atomic_write_json(path, payload)
         except Exception as exc:  # noqa: BLE001
-            logger.warning(f"[RUNTIME-PERSIST] save failed (post-fallback): {exc!r}")
-    except Exception as exc:  # noqa: BLE001 - persistence must not raise
-        logger.warning(f"[RUNTIME-PERSIST] save failed: {exc!r}")
+            logger.warning(f"[RUNTIME-PERSIST] save failed (no file_lock): {exc!r}")
+        return
+    last_err: Optional[Exception] = None
+    for attempt, timeout_s in enumerate((1.0, 3.0, 5.0), start=1):
+        try:
+            with _file_lock(path, timeout=timeout_s):
+                _atomic_write_json(path, payload)
+            return
+        except TimeoutError as exc:
+            last_err = exc
+            logger.warning(
+                f"[RUNTIME-PERSIST] file_lock timeout attempt "
+                f"{attempt}/3 ({timeout_s}s); retrying"
+            )
+            continue
+        except Exception as exc:  # noqa: BLE001 - persistence must not raise
+            logger.warning(f"[RUNTIME-PERSIST] save failed: {exc!r}")
+            return
+    logger.critical(
+        f"[RUNTIME-PERSIST] file_lock contended for >9s "
+        f"({last_err!r}); SKIPPING this save to avoid clobbering "
+        f"another writer."
+    )
 
 
 def load_runtime_state(

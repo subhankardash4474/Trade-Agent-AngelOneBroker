@@ -27,12 +27,21 @@ from __future__ import annotations
 import csv
 import os
 import threading
+from collections import deque
 from datetime import datetime
-from typing import Any, Dict, Optional
+from typing import Any, Deque, Dict, Optional
 
 import pytz
 
 IST = pytz.timezone("Asia/Kolkata")
+
+# STATE-11 (audit 2026-05-28): when a CSV append fails (disk full,
+# permissions glitch, NFS hiccup), pre-fix the row was silently dropped
+# -- the EOD diagnostic then reported "0 signals today" even though
+# trades had landed. The retry queue holds up to ``_RETRY_QUEUE_MAX``
+# rows in memory and re-attempts a flush at the start of each new
+# log() call. Bounded so a sustained outage cannot consume RAM.
+_RETRY_QUEUE_MAX = 500
 
 _COLUMNS = [
     "timestamp", "symbol", "direction", "confidence", "regime", "price",
@@ -50,6 +59,13 @@ class SignalAudit:
         os.makedirs(log_dir, exist_ok=True)
         self._current_date: Optional[str] = None
         self._path: Optional[str] = None
+        # STATE-11 (audit 2026-05-28): bounded in-memory retry queue
+        # for rows that failed to land on disk (disk-full, perms,
+        # transient NFS error). Flushed best-effort on every log()
+        # call. Drops the oldest row on overflow so a sustained
+        # outage cannot starve the daemon of memory.
+        self._retry_queue: Deque[Dict[str, Any]] = deque(maxlen=_RETRY_QUEUE_MAX)
+        self._retry_overflow_count: int = 0
 
     def _path_for_today(self) -> str:
         today = datetime.now(IST).strftime("%Y-%m-%d")
@@ -97,6 +113,10 @@ class SignalAudit:
             "quantity": quantity if quantity is not None else "",
         }
         path = self._path_for_today()
+        # STATE-11 (audit 2026-05-28): drain any retry-queued rows
+        # before writing the new one. Order is preserved (FIFO) so the
+        # CSV reads chronologically once the underlying error clears.
+        self._drain_retry_queue(path)
         try:
             with self._lock, open(path, "a", newline="", encoding="utf-8") as f:
                 w = csv.DictWriter(f, fieldnames=_COLUMNS)
@@ -107,11 +127,68 @@ class SignalAudit:
             # would silently report "0 signals today" instead of flagging
             # the storage problem. Now we log WARNING so the operator
             # sees the failure in the daemon log.
+            #
+            # STATE-11 (audit 2026-05-28): also stash the row in a
+            # bounded retry queue so the next successful write picks
+            # it up. Without this, a 1s NFS hiccup permanently lost
+            # the row.
             try:
                 from loguru import logger as _logger
                 _logger.warning(
                     f"[SIGNAL-AUDIT] CSV write to {path} failed: {e!r}. "
-                    f"This row will be missing from EOD diagnostics."
+                    f"Row queued for retry on next log() call."
+                )
+            except Exception:
+                pass
+            with self._lock:
+                if len(self._retry_queue) >= _RETRY_QUEUE_MAX:
+                    self._retry_overflow_count += 1
+                self._retry_queue.append(row)
+
+    def _drain_retry_queue(self, path: str) -> None:
+        """STATE-11 (audit 2026-05-28): best-effort flush of queued rows.
+
+        Called at the top of every ``log()`` call. If a queued append
+        fails again, leaves the row in place so the next call retries.
+        Acquires the same writer lock as ``log()`` for FIFO semantics.
+        """
+        with self._lock:
+            if not self._retry_queue:
+                return
+            queued = list(self._retry_queue)
+            self._retry_queue.clear()
+        succeeded = 0
+        try:
+            with open(path, "a", newline="", encoding="utf-8") as f:
+                w = csv.DictWriter(f, fieldnames=_COLUMNS)
+                for row in queued:
+                    w.writerow(row)
+                    succeeded += 1
+        except Exception as e:  # noqa: BLE001 - retry must not crash log()
+            # Re-queue the rows that didn't land. ``succeeded`` ones
+            # are already on disk; the rest go back at the head of the
+            # deque so order is preserved.
+            with self._lock:
+                for row in queued[succeeded:]:
+                    if len(self._retry_queue) >= _RETRY_QUEUE_MAX:
+                        self._retry_overflow_count += 1
+                        continue
+                    self._retry_queue.appendleft(row)
+            try:
+                from loguru import logger as _logger
+                _logger.warning(
+                    f"[SIGNAL-AUDIT] retry-queue flush partially failed "
+                    f"({succeeded}/{len(queued)} rows recovered): {e!r}. "
+                    f"Remaining rows re-queued."
+                )
+            except Exception:
+                pass
+            return
+        if succeeded:
+            try:
+                from loguru import logger as _logger
+                _logger.info(
+                    f"[SIGNAL-AUDIT] retry-queue flushed {succeeded} row(s) to {path}"
                 )
             except Exception:
                 pass
