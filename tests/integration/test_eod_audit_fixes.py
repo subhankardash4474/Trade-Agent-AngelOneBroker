@@ -154,7 +154,12 @@ class TestEODDeduplication:
         src = agent_path.read_text(encoding="utf-8")
         i = src.find("def _shutdown(self):")
         assert i >= 0
-        body = src[i : i + 4000]
+        # Slice the entire _shutdown body up to the next def at the same
+        # 4-space indent so this pin doesn't break every time
+        # _shutdown grows (e.g. CONC-09's WS join, CONC-10's heartbeat
+        # stop, CONC-05's tick-buffer flush).
+        next_def = src.find("\n    def ", i + 1)
+        body = src[i:next_def] if next_def != -1 else src[i:]
         # Both must be present
         assert "send_daily_report" in body, "shutdown still calls send_daily_report"
         assert "_eod_summary_sent" in body, (

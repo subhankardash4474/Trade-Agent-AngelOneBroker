@@ -668,6 +668,31 @@ class TradingAgent:
             robust_cfg.get("heartbeat_interval_seconds", 300)
         )
         self._last_heartbeat_ts: float = 0.0
+        # CONC-10 (audit 2026-05-28): pre-fix, ``health.json`` was
+        # written only at the end of each main-loop cycle. A long
+        # ``get_multiple_ltp(300)`` (3-4 min pre-PERF-01) or a
+        # broker call hung in the kernel left ``health.json`` stale
+        # for the entire stall, so the cloud watchdog flagged the
+        # daemon as dead and SIGTERM'd a perfectly healthy process.
+        # We now run a dedicated heartbeat thread that writes
+        # ``health.json`` every ``_health_pulse_interval_seconds``
+        # *independent* of cycle completion. Default cadence is
+        # 30s -- much tighter than the per-cycle cadence so a 3-min
+        # cycle still drops six liveness pulses. The main-loop
+        # ``_log_heartbeat()`` call is preserved for the loguru
+        # summary line; the JSON write is now thread-only to
+        # avoid double writes contending on the file.
+        self._health_pulse_interval_seconds: float = float(
+            robust_cfg.get("health_pulse_interval_seconds", 30)
+        )
+        self._heartbeat_stop_event: threading.Event = threading.Event()
+        self._heartbeat_thread: Optional[threading.Thread] = None
+        # Snapshot the latest "rich" payload published by the main
+        # loop so the heartbeat thread can mirror it without
+        # racing on ``portfolio.positions`` mid-mutation. Plain
+        # dict assignment is atomic under the GIL, so the thread
+        # only ever observes a consistent in-flight snapshot.
+        self._heartbeat_snapshot: Dict[str, Any] = {}
         # STATE-08 (audit 2026-05-28): debounced trail-state persist.
         # Updated by ``_persist_trailing_states`` on success.
         self._last_trail_persist_ts: float = 0.0
@@ -1508,6 +1533,14 @@ class TradingAgent:
                 pass
 
         logger.info(f"Agent started (poll={poll_interval}s, instruments={len(self.instruments)})")
+
+        # CONC-10 (audit 2026-05-28): start the dedicated heartbeat
+        # thread BEFORE the main loop so health.json is fresh from
+        # cycle 0. The first heartbeat tick may have nothing to
+        # publish yet (snapshot empty); that's fine -- the thread
+        # silently no-ops and tries again on the next tick once
+        # _log_heartbeat() has run at least once.
+        self._start_heartbeat_thread()
 
         try:
             while self._running:
@@ -2888,7 +2921,15 @@ class TradingAgent:
             return absolute_floor
 
     def _log_heartbeat(self):
-        """Periodic health summary for remote monitoring."""
+        """Periodic health summary for remote monitoring.
+
+        Logs a one-line ``[HEARTBEAT]`` summary to loguru and
+        publishes a fresh rich-snapshot for the heartbeat thread
+        (CONC-10) to mirror to ``health.json``. The snapshot also
+        contains a fast-path liveness key so the thread can keep
+        the file fresh even when the main loop is stuck inside a
+        slow broker call.
+        """
         now = datetime.now(IST)
         risk = self.risk_manager.get_risk_summary()
         positions = list(self.portfolio.positions.keys())
@@ -2902,11 +2943,49 @@ class TradingAgent:
             f"Cooldowns={list(self._cooldown_map.keys())} | "
             f"Blacklisted={[s for s, c in self._stock_loss_today.items() if c >= self._max_losses_per_stock]}"
         )
-        # Best-effort: write JSON snapshot for the watchdog/preflight to read.
+        # CONC-10 (audit 2026-05-28): publish the rich snapshot so
+        # the dedicated heartbeat thread can mirror it. We DO NOT
+        # write health.json directly from the main loop anymore --
+        # that's the thread's job, so a stuck cycle never starves
+        # the watchdog.
         try:
-            self._write_health_json(now, risk, positions)
+            self._publish_heartbeat_snapshot(now, risk, positions)
         except Exception as e:
-            logger.warning(f"[HEARTBEAT] health.json write failed: {e}")
+            logger.warning(f"[HEARTBEAT] snapshot publish failed: {e}")
+
+    def _publish_heartbeat_snapshot(
+        self, now, risk: dict, positions: list
+    ) -> None:
+        """CONC-10: build the rich payload and atomically swap it
+        onto ``self._heartbeat_snapshot``.
+
+        Single-statement dict assignment is atomic under the GIL,
+        so the heartbeat thread reading ``self._heartbeat_snapshot``
+        will always see either the previous complete snapshot or
+        this one -- never a half-built mix.
+        """
+        snap = {
+            "ts": now.isoformat(timespec="seconds"),
+            "ts_unix": int(now.timestamp()),
+            "pid": os.getpid(),
+            "mode": (self.config.get("broker", {}) or {}).get("mode", "unknown"),
+            "cycle_count": int(self._cycle_count),
+            "running": bool(self._running),
+            "open_positions": list(positions),
+            "open_position_count": len(positions),
+            "cash": round(float(self.portfolio.cash), 2),
+            "daily_pnl": round(float(risk.get("daily_pnl", 0.0)), 2),
+            "daily_trades": int(risk.get("daily_trades", 0)),
+            "consecutive_losses": int(risk.get("consecutive_losses", 0)),
+            "drawdown_pct": round(float(risk.get("drawdown_pct", 0.0)), 2),
+            "drawdown_tier": risk.get("drawdown_tier", "NORMAL"),
+            "cooldowns": list(self._cooldown_map.keys()),
+            "blacklisted": [
+                s for s, c in self._stock_loss_today.items()
+                if c >= self._max_losses_per_stock
+            ],
+        }
+        self._heartbeat_snapshot = snap
 
     def _write_health_json(self, now, risk: dict, positions: list) -> None:
         """Write a lightweight JSON health snapshot to `logs/health.json`.
@@ -2914,6 +2993,13 @@ class TradingAgent:
         Designed to be cheap (small payload, atomic write) so it can run
         every heartbeat. Watchdogs / preflight should treat a stale `ts_unix`
         (older than ~3x heartbeat_interval x poll_seconds) as a hung daemon.
+
+        CONC-10 (audit 2026-05-28): this method is now the
+        canonical writer used by both the main-loop publish path
+        (only as a one-shot pre-thread bootstrap; see ``run()``)
+        and the dedicated heartbeat thread. The atomic write
+        (write-to-.tmp + rename) means concurrent readers never
+        see a half-written file.
         """
         import json
         from pathlib import Path
@@ -2948,6 +3034,129 @@ class TradingAgent:
         # never see a half-written file.
         tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
         tmp.replace(path)
+
+    def _write_health_json_from_snapshot(self) -> bool:
+        """CONC-10 (audit 2026-05-28): heartbeat-thread health.json
+        writer.
+
+        Reads ``self._heartbeat_snapshot`` (single dict assignment,
+        atomic under the GIL), patches the ``ts`` / ``ts_unix``
+        fields with the *current* wall-clock so a stuck main loop
+        doesn't make the file appear stale, and writes the
+        atomic-rename pair. Returns True on success, False on
+        exception.
+
+        We deliberately do NOT call ``_log_heartbeat`` from the
+        thread -- a) loguru file IO can be expensive on a slow
+        disk, b) it would race the main loop's loguru records.
+        The summary line stays a main-loop concern; the thread is
+        purely about keeping the JSON file fresh for watchdogs.
+        """
+        import json
+        from pathlib import Path
+
+        snap = self._heartbeat_snapshot
+        if not snap:
+            # Main loop hasn't published anything yet (boot
+            # phase). Skip silently.
+            return False
+        try:
+            now = datetime.now(IST)
+            payload = dict(snap)
+            payload["ts"] = now.isoformat(timespec="seconds")
+            payload["ts_unix"] = int(now.timestamp())
+            # The `running` flag must reflect *current* daemon
+            # state, not whatever was true at last
+            # publish_heartbeat_snapshot. If the thread is still
+            # writing during shutdown the watchdog should see
+            # running=False immediately.
+            payload["running"] = bool(self._running)
+            log_dir = Path(self.config.get("logging", {}).get("log_dir", "logs"))
+            log_dir.mkdir(parents=True, exist_ok=True)
+            path = log_dir / "health.json"
+            tmp = log_dir / "health.json.tmp"
+            tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+            tmp.replace(path)
+            return True
+        except Exception as exc:  # noqa: BLE001 - watchdog write must never crash
+            logger.warning(
+                f"[CONC-10] heartbeat-thread health.json write failed: {exc!r}"
+            )
+            return False
+
+    def _run_heartbeat_thread(self) -> None:
+        """CONC-10 (audit 2026-05-28): dedicated heartbeat thread.
+
+        Wakes every ``_health_pulse_interval_seconds`` (default
+        30s) and writes ``health.json`` from the latest snapshot
+        published by the main loop, with a freshly-stamped
+        ``ts_unix``. This is the one thing watchdogs read to
+        decide "is the daemon alive", so it MUST keep ticking
+        even when the main loop is wedged inside a slow broker
+        call (a 200-stock LTP scan can pre-PERF-01 take 3-4 min;
+        a hung broker call can take longer).
+
+        The thread:
+          * exits cleanly when ``_heartbeat_stop_event`` is set,
+          * uses ``Event.wait(timeout)`` instead of ``time.sleep``
+            so shutdown latency is bounded by ~1 wakeup,
+          * never raises -- a logging warning is the worst case.
+        """
+        interval = max(0.1, float(self._health_pulse_interval_seconds))
+        logger.info(
+            f"[CONC-10] heartbeat thread started (interval={interval:.1f}s)"
+        )
+        try:
+            while not self._heartbeat_stop_event.is_set():
+                # Write *first*, then wait, so the file is fresh
+                # the moment the thread starts. Subsequent ticks
+                # use the same write-then-wait order.
+                try:
+                    self._write_health_json_from_snapshot()
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        f"[CONC-10] heartbeat tick raised {exc!r}"
+                    )
+                self._heartbeat_stop_event.wait(timeout=interval)
+        finally:
+            logger.info("[CONC-10] heartbeat thread exiting")
+
+    def _start_heartbeat_thread(self) -> None:
+        """CONC-10: spawn the heartbeat thread once at the top of
+        ``run()``. Idempotent: a second call is a no-op.
+        """
+        if self._health_pulse_interval_seconds <= 0:
+            logger.info(
+                "[CONC-10] heartbeat thread disabled "
+                "(health_pulse_interval_seconds <= 0)"
+            )
+            return
+        if self._heartbeat_thread is not None and self._heartbeat_thread.is_alive():
+            return
+        self._heartbeat_stop_event.clear()
+        t = threading.Thread(
+            target=self._run_heartbeat_thread,
+            name="heartbeat",
+            daemon=True,
+        )
+        t.start()
+        self._heartbeat_thread = t
+
+    def _stop_heartbeat_thread(self, timeout: float = 2.0) -> bool:
+        """CONC-10: signal the heartbeat thread to exit and wait
+        up to ``timeout`` seconds for it. Returns True if the
+        thread joined cleanly, False if it's still alive (the
+        daemon=True flag will tear it down with the process).
+        """
+        if self._heartbeat_thread is None:
+            return True
+        self._heartbeat_stop_event.set()
+        try:
+            self._heartbeat_thread.join(timeout=timeout)
+        except Exception as exc:  # noqa: BLE001 - shutdown must not crash
+            logger.warning(f"[CONC-10] heartbeat-thread join raised {exc!r}")
+            return False
+        return not self._heartbeat_thread.is_alive()
 
     def _maybe_audit_checkpoint(self) -> None:
         """Write an audit checkpoint at most once per IST hour during market hours.
@@ -6390,6 +6599,15 @@ class TradingAgent:
     def _shutdown(self):
         logger.info("Shutting down...")
         self._running = False
+        # CONC-10 (audit 2026-05-28): stop the heartbeat thread
+        # FIRST so a final SIGTERM propagated to a Docker container
+        # produces one clean "running=false" health.json before the
+        # broker / DB teardown begins. The thread is a daemon so
+        # even if the join times out the process can still exit.
+        try:
+            self._stop_heartbeat_thread(timeout=2.0)
+        except Exception as exc:  # noqa: BLE001 - shutdown must not crash
+            logger.warning(f"[SHUTDOWN] heartbeat-thread stop raised {exc!r}")
         self.ws_client.stop()
         # CONC-09 (audit 2026-05-28): wait for the WS worker thread (and
         # the reconnect thread, if any) to actually drain before we tear

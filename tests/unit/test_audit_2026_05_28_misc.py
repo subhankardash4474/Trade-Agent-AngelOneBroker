@@ -67,6 +67,28 @@ Findings covered in this file:
   (20-40 s per 20-variant battery). Mtime-gated fallback to
   live hashing keeps the OBS-20 audit log identical when the
   sidecar is missing or stale (Group G).
+* **STATE-07** (Medium) -- trade-CSV + signal-audit-CSV durability.
+  ``portfolio.py:_log_trade`` now holds a per-portfolio
+  ``threading.Lock`` across the open / write / flush / fsync
+  / close cycle. ``signal_audit.py:log`` already had a lock;
+  added matching ``flush + fsync`` so a kernel panic in the
+  OS write-back window cannot drop signal rows. Both writers
+  fail soft on platforms that refuse fsync (Windows shares,
+  CIFS) -- the row stays in the page cache, no worse than
+  pre-fix (Group H).
+* **CONC-10** (Medium)  -- dedicated heartbeat thread.
+  ``health.json`` was previously written only at the end of
+  each main-loop cycle, so a 3-4 min ``get_multiple_ltp(300)``
+  or a hung broker call left the file stale and the cloud
+  watchdog SIGTERM'd a healthy daemon. New
+  ``_run_heartbeat_thread`` daemon thread writes
+  ``health.json`` from a main-loop-published snapshot every
+  ``health_pulse_interval_seconds`` (default 30s)
+  *independent* of cycle completion, with a freshly-stamped
+  ``ts_unix``. Started at the top of ``run()`` before the
+  cycle loop and stopped first thing in ``_shutdown`` so
+  a clean ``running=false`` pulse lands before broker
+  teardown (Group H).
 """
 
 from __future__ import annotations
@@ -2297,3 +2319,702 @@ class TestPERF13BatteryCacheSidecar:
         assert "def _read_sidecar_hash(" in src
         assert ".sha256" in src
 
+
+# ============================================================
+# STATE-07 -- trade-CSV + signal-audit-CSV durability (Group H)
+# ============================================================
+
+class TestSTATE07TradeCsvDurability:
+    """Pin the locking + fsync contract on ``Portfolio._log_trade``.
+
+    Why this matters
+    ----------------
+    The DB ``trades`` table (written atomically by
+    ``Database.close_position_atomic`` -- STATE-04) is the source
+    of truth, but ``trades.csv`` is consumed by tooling
+    (``tools/ledger_diff.py``, friday review prep, EOD report
+    generators) that doesn't have the DB. Pre-fix the CSV write
+    path opened the file, wrote one row, and closed -- no lock,
+    no fsync. Two failure modes:
+
+      * Two concurrent close_position calls (e.g. SL fill + manual
+        flatten on different symbols) could interleave bytes.
+      * A kernel panic / SIGKILL between the close and the next
+        write could lose the row even though the daemon reported
+        success and the DB had the row.
+
+    The fix wraps the open / write / flush / fsync / close cycle
+    in a per-Portfolio ``threading.Lock`` and forces
+    ``flush + os.fsync`` before releasing.
+
+    Tests below construct a minimal ``Portfolio`` and exercise
+    the path directly so the runtime stays sub-second.
+    """
+
+    def _make_portfolio(self, tmp_path):
+        from core.portfolio import Portfolio
+        return Portfolio(
+            initial_balance=1_000_000.0,
+            log_dir=str(tmp_path),
+            commission_pct=0.0,
+            product_type="INTRADAY",
+            reset_balance=True,
+        )
+
+    def _make_record(self, symbol="HDFCBANK", pnl=12.34):
+        from datetime import datetime
+        from core.portfolio import TradeRecord
+        return TradeRecord(
+            symbol=symbol,
+            side="BUY",
+            entry_price=100.0,
+            exit_price=101.0,
+            quantity=10,
+            entry_time=datetime(2026, 5, 29, 10, 0, 0),
+            exit_time=datetime(2026, 5, 29, 10, 15, 0),
+            pnl=pnl,
+            pnl_pct=1.0,
+            strategy="t",
+            exit_reason="t",
+            commission=1.0,
+        )
+
+    def test_log_trade_acquires_lock(self, tmp_path):
+        """If we replace the lock with a tripwire context manager,
+        the helper must enter / exit it exactly once.
+        """
+        port = self._make_portfolio(tmp_path)
+        rec = self._make_record()
+
+        class TripwireLock:
+            def __init__(self):
+                self.entered = 0
+                self.exited = 0
+
+            def __enter__(self):
+                self.entered += 1
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                self.exited += 1
+                return False
+
+        trip = TripwireLock()
+        port._trade_log_lock = trip
+        port._log_trade(rec)
+        assert trip.entered == 1, (
+            "STATE-07 regression: _log_trade did not acquire the "
+            "trade-log lock; concurrent writers could tear CSV lines."
+        )
+        assert trip.exited == 1
+
+    def test_log_trade_fsyncs_after_write(self, tmp_path, monkeypatch):
+        """Pin that ``os.fsync`` is invoked at least once on the
+        descriptor that just wrote the row.
+        """
+        import os as _os
+        port = self._make_portfolio(tmp_path)
+        rec = self._make_record()
+
+        fsync_calls = []
+        original_fsync = _os.fsync
+
+        def tripwire(fd):
+            fsync_calls.append(fd)
+            return original_fsync(fd)
+
+        monkeypatch.setattr(_os, "fsync", tripwire)
+        port._log_trade(rec)
+        assert len(fsync_calls) >= 1, (
+            "STATE-07 regression: _log_trade did not fsync after "
+            "the row write; a kernel panic in the OS write-back "
+            "window could lose the CSV row."
+        )
+
+    def test_log_trade_survives_fsync_oserror(self, tmp_path, monkeypatch):
+        """Some filesystems (Windows shares, CIFS) refuse fsync.
+        We must log a warning and carry on -- not crash the close
+        path.
+        """
+        import os as _os
+        port = self._make_portfolio(tmp_path)
+        rec = self._make_record()
+
+        def angry_fsync(fd):
+            raise OSError("fsync not supported on this filesystem")
+
+        monkeypatch.setattr(_os, "fsync", angry_fsync)
+
+        # Must not raise.
+        port._log_trade(rec)
+
+        # And the row must still be on disk (just unsynced).
+        with open(port._trade_log_path, "r", encoding="utf-8") as f:
+            text = f.read()
+        assert "HDFCBANK" in text, (
+            "STATE-07 regression: fsync OSError should be soft-failed "
+            "but the row didn't make it into the file at all."
+        )
+
+    def test_log_trade_concurrent_writes_do_not_tear(self, tmp_path):
+        """Stress test: 8 threads each write 50 rows; the resulting
+        CSV must contain exactly (header + 8*50) lines and every
+        row must parse cleanly. Without the lock this would
+        intermittently torn-write under high contention.
+        """
+        import csv
+        import threading
+
+        port = self._make_portfolio(tmp_path)
+        n_threads = 8
+        per_thread = 50
+
+        def worker(tid):
+            for i in range(per_thread):
+                port._log_trade(self._make_record(
+                    symbol=f"S{tid:02d}", pnl=float(i),
+                ))
+
+        threads = [threading.Thread(target=worker, args=(t,))
+                   for t in range(n_threads)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        with open(port._trade_log_path, "r", encoding="utf-8") as f:
+            reader = csv.reader(f)
+            rows = list(reader)
+        # Header + n_threads*per_thread data rows.
+        assert len(rows) == 1 + n_threads * per_thread, (
+            f"STATE-07 regression: expected {1 + n_threads * per_thread} "
+            f"rows, got {len(rows)}. Some writes likely tore."
+        )
+        # Spot-check that every data row has the right column count.
+        header = rows[0]
+        for i, r in enumerate(rows[1:], start=1):
+            assert len(r) == len(header), (
+                f"STATE-07 regression: row {i} has {len(r)} cols, "
+                f"expected {len(header)}: {r}"
+            )
+
+    def test_portfolio_init_creates_trade_log_lock(self, tmp_path):
+        """Source pin: the lock must be initialised in __init__
+        BEFORE any close_position can run."""
+        import threading
+        port = self._make_portfolio(tmp_path)
+        assert hasattr(port, "_trade_log_lock"), (
+            "STATE-07 regression: Portfolio.__init__ no longer "
+            "creates _trade_log_lock; _log_trade will AttributeError."
+        )
+        # Must be a real lock-like object.
+        assert hasattr(port._trade_log_lock, "__enter__")
+        assert hasattr(port._trade_log_lock, "__exit__")
+        # Belt-and-suspenders: the default should be threading.Lock
+        # / RLock so concurrent Portfolio instances don't share
+        # state. Any mutex implementing the context-manager
+        # protocol is acceptable but the default should be the
+        # boring one.
+        assert isinstance(
+            port._trade_log_lock,
+            (type(threading.Lock()), type(threading.RLock())),
+        )
+
+
+class TestSTATE07SignalAuditDurability:
+    """Pin the fsync contract on ``SignalAudit.log``."""
+
+    def _make_audit(self, tmp_path):
+        from core.signal_audit import SignalAudit
+        return SignalAudit(log_dir=str(tmp_path))
+
+    def test_log_fsyncs_after_write(self, tmp_path, monkeypatch):
+        import os as _os
+        audit = self._make_audit(tmp_path)
+
+        fsync_calls = []
+        original_fsync = _os.fsync
+
+        def tripwire(fd):
+            fsync_calls.append(fd)
+            return original_fsync(fd)
+
+        monkeypatch.setattr(_os, "fsync", tripwire)
+        audit.log(
+            symbol="HDFCBANK", direction="BUY", confidence=0.7,
+            regime="trending_up", price=100.0, strategy="t",
+            contributing={"t": 1.0}, outcome="ACCEPTED",
+        )
+        assert len(fsync_calls) >= 1, (
+            "STATE-07 regression: SignalAudit.log did not fsync; "
+            "a kernel panic in the OS write-back window could "
+            "drop the signal-audit row even though the daemon "
+            "reported success."
+        )
+
+    def test_log_survives_fsync_oserror(self, tmp_path, monkeypatch):
+        import os as _os
+        audit = self._make_audit(tmp_path)
+
+        def angry_fsync(fd):
+            raise OSError("fsync refused")
+        monkeypatch.setattr(_os, "fsync", angry_fsync)
+
+        # Must not raise.
+        audit.log(
+            symbol="HDFCBANK", direction="BUY", confidence=0.7,
+            regime="trending_up", price=100.0, strategy="t",
+            contributing={"t": 1.0}, outcome="ACCEPTED",
+        )
+        # The row must still be on disk (in the page cache).
+        path = audit._path_for_today()
+        with open(path, "r", encoding="utf-8") as f:
+            text = f.read()
+        assert "HDFCBANK" in text
+
+    def test_drain_retry_queue_also_fsyncs(self, tmp_path, monkeypatch):
+        """The retry-queue flush path must fsync too -- otherwise
+        rows recovered from a transient outage are durable only
+        if the OS happens to flush before the next crash, which
+        is exactly the race STATE-07 was supposed to close.
+        """
+        import os as _os
+
+        audit = self._make_audit(tmp_path)
+        # Manually queue a row.
+        audit._retry_queue.append({
+            "timestamp": "2026-05-29T10:00:00+05:30",
+            "symbol": "HDFCBANK", "direction": "BUY",
+            "confidence": "0.700", "regime": "trending_up",
+            "price": "100.00", "strategy": "t",
+            "contributing": "t:1.00", "outcome": "ACCEPTED",
+            "reason": "", "stop_loss": "", "take_profit": "",
+            "quantity": "",
+        })
+
+        fsync_calls = []
+        original_fsync = _os.fsync
+
+        def tripwire(fd):
+            fsync_calls.append(fd)
+            return original_fsync(fd)
+
+        monkeypatch.setattr(_os, "fsync", tripwire)
+        audit._drain_retry_queue(audit._path_for_today())
+        assert len(fsync_calls) >= 1, (
+            "STATE-07 regression: _drain_retry_queue did not "
+            "fsync after flushing the queued rows."
+        )
+
+    def test_source_pin_state07_anchors(self):
+        """The audit IDs + the flush/fsync calls must be visible
+        in source so a refactor that drops them is caught.
+        """
+        port_path = os.path.join(PROJECT_ROOT, "packages", "core", "portfolio.py")
+        sa_path = os.path.join(PROJECT_ROOT, "packages", "core", "signal_audit.py")
+        with open(port_path, "r", encoding="utf-8") as fh:
+            port_src = fh.read()
+        with open(sa_path, "r", encoding="utf-8") as fh:
+            sa_src = fh.read()
+
+        # Portfolio
+        assert "STATE-07" in port_src
+        # _log_trade body must contain both flush + fsync
+        i = port_src.find("def _log_trade(")
+        assert i >= 0
+        j = port_src.find("\n    def ", i + 1)
+        body = port_src[i:j]
+        assert "f.flush()" in body, (
+            "STATE-07 regression: _log_trade no longer flushes "
+            "the buffer before fsync."
+        )
+        assert "os.fsync" in body, (
+            "STATE-07 regression: _log_trade no longer fsyncs."
+        )
+        assert "_trade_log_lock" in body, (
+            "STATE-07 regression: _log_trade no longer takes the "
+            "trade-log lock; concurrent writers can tear lines."
+        )
+
+        # SignalAudit
+        assert "STATE-07" in sa_src
+        i = sa_src.find("def log(")
+        assert i >= 0
+        j = sa_src.find("\n    def ", i + 1)
+        body = sa_src[i:j]
+        assert "f.flush()" in body
+        assert "os.fsync" in body
+
+
+# ============================================================
+# CONC-10 -- dedicated heartbeat thread (Group H)
+# ============================================================
+
+class TestCONC10HeartbeatThread:
+    """Pin the dedicated heartbeat thread + snapshot contract.
+
+    Why this matters
+    ----------------
+    Pre-fix ``health.json`` was written only at the end of each
+    main-loop cycle. A 3-min ``get_multiple_ltp(300)`` (now
+    PERF-01-fixed but the underlying watchdog model needs to
+    handle any future slow path) or a hung broker call left the
+    file stale and the cloud watchdog SIGTERM'd a healthy
+    daemon. The fix:
+
+      * Main loop publishes a snapshot dict atomically (single
+        assignment, GIL-protected).
+      * A dedicated daemon thread reads the snapshot, stamps
+        the current ``ts`` / ``ts_unix`` / ``running`` values,
+        and atomically writes ``health.json`` every
+        ``health_pulse_interval_seconds``.
+
+    These tests work directly on the helper methods -- spinning
+    up a real ``TradingAgent`` would pull in the broker, DB,
+    and scheduler.
+    """
+
+    def _make_stub(self, tmp_path):
+        """Build a stand-in with the minimum surface area the
+        heartbeat helpers touch.
+        """
+        import threading as _t
+        from types import SimpleNamespace
+        from unittest.mock import MagicMock
+
+        agent = SimpleNamespace()
+        agent._heartbeat_snapshot = {}
+        agent._heartbeat_stop_event = _t.Event()
+        agent._heartbeat_thread = None
+        agent._health_pulse_interval_seconds = 30.0
+        agent._running = True
+        agent._cycle_count = 0
+        agent.config = {
+            "logging": {"log_dir": str(tmp_path / "logs")},
+            "broker": {"mode": "paper"},
+        }
+        agent.portfolio = SimpleNamespace(
+            cash=1_000_000.0,
+            positions={},
+            open_position_count=0,
+        )
+        agent.risk_manager = SimpleNamespace(
+            get_risk_summary=MagicMock(return_value={
+                "daily_pnl": 0.0, "daily_trades": 0,
+                "consecutive_losses": 0, "drawdown_pct": 0.0,
+                "drawdown_tier": "NORMAL",
+            }),
+        )
+        agent._cooldown_map = {}
+        agent._stock_loss_today = {}
+        agent._max_losses_per_stock = 2
+        return agent
+
+    def _bind(self, agent, name):
+        from trading_agent import TradingAgent
+        return getattr(TradingAgent, name).__get__(agent)
+
+    def test_publish_snapshot_atomically_swaps_dict(self, tmp_path):
+        from datetime import datetime
+        import pytz
+
+        agent = self._make_stub(tmp_path)
+        publish = self._bind(agent, "_publish_heartbeat_snapshot")
+
+        agent._cycle_count = 42
+        publish(datetime.now(pytz.timezone("Asia/Kolkata")),
+                {"daily_pnl": 12.34, "daily_trades": 3,
+                 "consecutive_losses": 0, "drawdown_pct": 0.0,
+                 "drawdown_tier": "NORMAL"},
+                ["HDFCBANK", "RELIANCE"])
+        snap = agent._heartbeat_snapshot
+        assert snap["cycle_count"] == 42
+        assert snap["daily_pnl"] == 12.34
+        assert snap["open_positions"] == ["HDFCBANK", "RELIANCE"]
+        assert snap["open_position_count"] == 2
+        assert snap["pid"] > 0
+
+    def test_write_from_snapshot_no_op_when_empty(self, tmp_path):
+        agent = self._make_stub(tmp_path)
+        write = self._bind(agent, "_write_health_json_from_snapshot")
+        ok = write()
+        assert ok is False, (
+            "CONC-10 regression: writing from an empty snapshot "
+            "should no-op and return False so the boot phase "
+            "doesn't emit a misleading half-blank health.json."
+        )
+        # Must NOT have created the file either.
+        assert not (tmp_path / "logs" / "health.json").exists()
+
+    def test_write_from_snapshot_stamps_current_ts(self, tmp_path):
+        import json
+        import time
+
+        agent = self._make_stub(tmp_path)
+        # Pre-populate with a STALE timestamp.
+        agent._heartbeat_snapshot = {
+            "ts": "2020-01-01T00:00:00",
+            "ts_unix": 0,
+            "pid": 99999, "mode": "paper", "cycle_count": 7,
+            "running": True,
+            "open_positions": [], "open_position_count": 0,
+            "cash": 1.0, "daily_pnl": 0.0, "daily_trades": 0,
+            "consecutive_losses": 0, "drawdown_pct": 0.0,
+            "drawdown_tier": "NORMAL",
+            "cooldowns": [], "blacklisted": [],
+        }
+        before = int(time.time())
+        write = self._bind(agent, "_write_health_json_from_snapshot")
+        ok = write()
+        after = int(time.time())
+        assert ok is True
+
+        path = tmp_path / "logs" / "health.json"
+        payload = json.loads(path.read_text())
+        # CONC-10: ts_unix must reflect the pulse time, NOT the
+        # snapshot's stale timestamp -- otherwise the watchdog
+        # would still flag a stuck-loop snapshot as live.
+        assert before <= payload["ts_unix"] <= after, (
+            "CONC-10 regression: heartbeat thread did not stamp "
+            "current ts_unix; watchdog can no longer detect a "
+            "stuck main loop."
+        )
+        # Other fields preserved from the snapshot.
+        assert payload["cycle_count"] == 7
+        assert payload["mode"] == "paper"
+
+    def test_write_from_snapshot_reflects_current_running(self, tmp_path):
+        import json
+        agent = self._make_stub(tmp_path)
+        agent._heartbeat_snapshot = {
+            "ts": "stale", "ts_unix": 0, "pid": 99999,
+            "mode": "paper", "cycle_count": 1,
+            "running": True,  # snapshot said running
+            "open_positions": [], "open_position_count": 0,
+            "cash": 1.0, "daily_pnl": 0.0, "daily_trades": 0,
+            "consecutive_losses": 0, "drawdown_pct": 0.0,
+            "drawdown_tier": "NORMAL",
+            "cooldowns": [], "blacklisted": [],
+        }
+        # But the daemon has since started shutting down.
+        agent._running = False
+        write = self._bind(agent, "_write_health_json_from_snapshot")
+        write()
+        payload = json.loads(
+            (tmp_path / "logs" / "health.json").read_text()
+        )
+        assert payload["running"] is False, (
+            "CONC-10 regression: heartbeat thread did not reflect "
+            "the current daemon running state; a SIGTERM'd daemon "
+            "still appears live to watchdogs."
+        )
+
+    def test_write_from_snapshot_atomic_via_tmp_rename(self, tmp_path, monkeypatch):
+        """The write goes via a .tmp file that is then renamed.
+        Concurrent readers must never see a half-written file.
+        """
+        from pathlib import Path as _Path
+        import pathlib
+
+        agent = self._make_stub(tmp_path)
+        agent._heartbeat_snapshot = {
+            "ts": "stale", "ts_unix": 0, "pid": 1,
+            "mode": "paper", "cycle_count": 1, "running": True,
+            "open_positions": [], "open_position_count": 0,
+            "cash": 1.0, "daily_pnl": 0.0, "daily_trades": 0,
+            "consecutive_losses": 0, "drawdown_pct": 0.0,
+            "drawdown_tier": "NORMAL",
+            "cooldowns": [], "blacklisted": [],
+        }
+
+        write_text_calls = []
+        original_write_text = pathlib.Path.write_text
+
+        def spy_write_text(self, *a, **kw):
+            write_text_calls.append(str(self))
+            return original_write_text(self, *a, **kw)
+
+        replace_calls = []
+        original_replace = pathlib.Path.replace
+
+        def spy_replace(self, target):
+            replace_calls.append((str(self), str(target)))
+            return original_replace(self, target)
+
+        monkeypatch.setattr(pathlib.Path, "write_text", spy_write_text)
+        monkeypatch.setattr(pathlib.Path, "replace", spy_replace)
+
+        write = self._bind(agent, "_write_health_json_from_snapshot")
+        write()
+
+        # The write must hit a .tmp path, then rename to health.json.
+        assert any(p.endswith(".tmp") for p in write_text_calls), (
+            "CONC-10 regression: heartbeat write did not go via "
+            "a .tmp file; concurrent readers can see a torn JSON."
+        )
+        assert any(
+            src.endswith(".tmp") and tgt.endswith("health.json")
+            for src, tgt in replace_calls
+        ), (
+            "CONC-10 regression: heartbeat write did not rename "
+            ".tmp -> health.json; the atomic-replace contract is "
+            "broken."
+        )
+
+    def _bind_all_heartbeat_methods(self, agent):
+        """Bind the heartbeat-thread methods that call each
+        other onto the SimpleNamespace stub so the helpers can
+        find each other via ``self.``.
+        """
+        from trading_agent import TradingAgent
+        agent._write_health_json_from_snapshot = (
+            TradingAgent._write_health_json_from_snapshot.__get__(agent)
+        )
+        agent._run_heartbeat_thread = (
+            TradingAgent._run_heartbeat_thread.__get__(agent)
+        )
+
+    def test_run_thread_exits_on_stop_event(self, tmp_path):
+        import time
+        import threading as _t
+
+        agent = self._make_stub(tmp_path)
+        # Tight cadence so the test is fast.
+        agent._health_pulse_interval_seconds = 0.05
+        # Pre-populate the snapshot so the thread has something
+        # to write.
+        agent._heartbeat_snapshot = {
+            "ts": "stale", "ts_unix": 0, "pid": 1,
+            "mode": "paper", "cycle_count": 1, "running": True,
+            "open_positions": [], "open_position_count": 0,
+            "cash": 1.0, "daily_pnl": 0.0, "daily_trades": 0,
+            "consecutive_losses": 0, "drawdown_pct": 0.0,
+            "drawdown_tier": "NORMAL",
+            "cooldowns": [], "blacklisted": [],
+        }
+        self._bind_all_heartbeat_methods(agent)
+
+        t = _t.Thread(target=agent._run_heartbeat_thread, daemon=True)
+        t.start()
+        # Let it run for ~3 cycles.
+        time.sleep(0.2)
+        agent._heartbeat_stop_event.set()
+        t.join(timeout=2.0)
+        assert not t.is_alive(), (
+            "CONC-10 regression: heartbeat thread did not exit "
+            "within 2s of stop_event. SIGTERM shutdown will hang "
+            "or rely on daemon-thread teardown."
+        )
+
+        # And it must have written health.json at least once.
+        assert (tmp_path / "logs" / "health.json").exists()
+
+    def test_start_thread_idempotent(self, tmp_path):
+        import time
+        agent = self._make_stub(tmp_path)
+        agent._health_pulse_interval_seconds = 0.05
+        self._bind_all_heartbeat_methods(agent)
+
+        from trading_agent import TradingAgent
+        start = TradingAgent._start_heartbeat_thread.__get__(agent)
+        stop = TradingAgent._stop_heartbeat_thread.__get__(agent)
+
+        start()
+        first = agent._heartbeat_thread
+        # Second call must NOT spawn a second thread while the
+        # first is alive (would leak threads on JWT-refresh
+        # restart paths etc.).
+        start()
+        second = agent._heartbeat_thread
+        assert first is second, (
+            "CONC-10 regression: _start_heartbeat_thread spawned "
+            "a duplicate thread instead of being idempotent."
+        )
+        # Cleanup
+        stop(timeout=1.0)
+
+    def test_start_thread_disabled_when_interval_zero(self, tmp_path):
+        agent = self._make_stub(tmp_path)
+        agent._health_pulse_interval_seconds = 0.0
+
+        from trading_agent import TradingAgent
+        start = TradingAgent._start_heartbeat_thread.__get__(agent)
+        start()
+        # Must NOT spawn a thread when explicitly disabled.
+        assert agent._heartbeat_thread is None, (
+            "CONC-10 regression: heartbeat thread spawned even "
+            "though health_pulse_interval_seconds <= 0 explicitly "
+            "disables it."
+        )
+
+    def test_run_method_starts_heartbeat_thread(self):
+        """Source pin: ``run()`` must call
+        ``_start_heartbeat_thread`` BEFORE the cycle loop. Otherwise
+        the file is only refreshed at cycle end and the watchdog
+        regression returns.
+        """
+        path = os.path.join(PROJECT_ROOT, "trading_agent.py")
+        with open(path, "r", encoding="utf-8") as fh:
+            src = fh.read()
+        idx = src.find("def run(self")
+        assert idx >= 0
+        next_def = src.find("\n    def ", idx + 1)
+        body = src[idx:next_def]
+        assert "_start_heartbeat_thread" in body, (
+            "CONC-10 regression: run() no longer starts the "
+            "heartbeat thread; health.json reverts to per-cycle "
+            "cadence and watchdogs will SIGTERM the daemon during "
+            "any slow cycle."
+        )
+        # Must come BEFORE the main while loop.
+        spawn_idx = body.find("_start_heartbeat_thread")
+        loop_idx = body.find("while self._running")
+        assert 0 <= spawn_idx < loop_idx, (
+            "CONC-10 regression: heartbeat thread spawned AFTER "
+            "the main loop entry; the first cycle is unprotected."
+        )
+
+    def test_shutdown_stops_heartbeat_thread(self):
+        """Source pin: ``_shutdown`` must stop the heartbeat
+        thread first so a final running=false pulse lands before
+        broker / DB teardown.
+        """
+        path = os.path.join(PROJECT_ROOT, "trading_agent.py")
+        with open(path, "r", encoding="utf-8") as fh:
+            src = fh.read()
+        idx = src.find("def _shutdown(")
+        assert idx >= 0
+        next_def = src.find("\n    def ", idx + 1)
+        body = src[idx:next_def]
+        assert "_stop_heartbeat_thread" in body, (
+            "CONC-10 regression: _shutdown no longer stops the "
+            "heartbeat thread; the daemon-thread fallback will "
+            "tear it down with the process but a final "
+            "running=false pulse won't land."
+        )
+        # Must come BEFORE ws_client.stop / portfolio teardown.
+        stop_idx = body.find("_stop_heartbeat_thread")
+        ws_stop_idx = body.find("ws_client.stop")
+        assert 0 <= stop_idx <= ws_stop_idx, (
+            "CONC-10 regression: heartbeat thread stop is "
+            "scheduled AFTER ws_client.stop; the watchdog can't "
+            "tell the difference between a healthy shutdown and "
+            "a hang during shutdown."
+        )
+
+    def test_init_seeds_heartbeat_attributes(self):
+        """Source pin: TradingAgent.__init__ must seed all four
+        heartbeat-thread attributes before run() can use them.
+        """
+        path = os.path.join(PROJECT_ROOT, "trading_agent.py")
+        with open(path, "r", encoding="utf-8") as fh:
+            src = fh.read()
+        cls_idx = src.find("class TradingAgent")
+        init_idx = src.find("def __init__(", cls_idx)
+        assert init_idx >= 0
+        next_def = src.find("\n    def ", init_idx + 1)
+        body = src[init_idx:next_def]
+        assert "_heartbeat_snapshot" in body
+        assert "_heartbeat_stop_event" in body
+        assert "_heartbeat_thread" in body
+        assert "_health_pulse_interval_seconds" in body

@@ -175,6 +175,17 @@ class Portfolio:
         self._db = database
         self._log_dir = log_dir
         self._trade_log_path = os.path.join(log_dir, "trades.csv")
+        # STATE-07 (audit 2026-05-28): trades.csv was append-only with
+        # no lock and no fsync. The DB (``trades`` table via STATE-04
+        # atomic close) is the source of truth, but the CSV is a
+        # research / dashboard artefact and a torn line or a row lost
+        # to the OS write-back window damages downstream tools that
+        # ingest it (``tools/ledger_diff.py``, the friday review
+        # tooling, the EOD report generators). The lock guarantees
+        # write atomicity within the daemon (single-process by
+        # design); the post-write ``flush + fsync`` guarantees that
+        # a kernel panic or SIGKILL cannot drop the row.
+        self._trade_log_lock = threading.Lock()
         self._ensure_trade_log()
         # Stash the flag so _restore_positions can decide whether to override
         # cash from the equity_curve snapshot. Pre-2026-05-05, --reset-balance
@@ -841,15 +852,54 @@ class Portfolio:
             logger.error(f"Failed to persist post-event state: {e}")
 
     def _log_trade(self, record: TradeRecord):
+        """Append one row to ``trades.csv``.
+
+        STATE-07 (audit 2026-05-28): hold ``_trade_log_lock`` across
+        the whole open / write / flush / fsync / close cycle so:
+
+        * Two threads writing concurrently cannot tear a CSV line
+          (without the lock the order of bytes hitting the kernel
+          buffer between two ``writerow`` calls is undefined).
+        * The row is forced through the OS write-back cache
+          (``flush + os.fsync``) before the lock releases, so a
+          kernel panic / SIGKILL that hits between the close and
+          the next write cannot lose this row.
+        * ``fsync`` is best-effort: on platforms / filesystems
+          where it raises (Windows network shares, certain CIFS
+          mounts) we log and continue -- the row is already in the
+          page cache and the unsynced loss window is no worse
+          than pre-fix.
+
+        The DB (``trades`` table, written atomically by
+        ``Database.close_position_atomic`` -- STATE-04) remains
+        the source of truth; this CSV is a derived projection
+        kept in sync for downstream tooling.
+        """
         try:
-            with open(self._trade_log_path, "a", newline="") as f:
-                writer = csv.writer(f)
-                writer.writerow([
-                    record.symbol, record.side, record.entry_price, record.exit_price,
-                    record.quantity, record.entry_time.isoformat(), record.exit_time.isoformat(),
-                    round(record.pnl, 2), round(record.pnl_pct, 2), record.strategy,
-                    record.exit_reason, round(record.commission, 2),
-                ])
+            with self._trade_log_lock:
+                with open(self._trade_log_path, "a", newline="") as f:
+                    writer = csv.writer(f)
+                    writer.writerow([
+                        record.symbol, record.side, record.entry_price, record.exit_price,
+                        record.quantity, record.entry_time.isoformat(), record.exit_time.isoformat(),
+                        round(record.pnl, 2), round(record.pnl_pct, 2), record.strategy,
+                        record.exit_reason, round(record.commission, 2),
+                    ])
+                    f.flush()
+                    try:
+                        os.fsync(f.fileno())
+                    except OSError as fsync_exc:
+                        # Some filesystems (e.g. some Windows shares,
+                        # certain CIFS mounts) refuse fsync. Don't
+                        # take the daemon down for an audit-trail
+                        # nicety; just log and carry on.
+                        logger.warning(
+                            f"[STATE-07] fsync on trades.csv failed: "
+                            f"{fsync_exc!r}. Row remains in OS page "
+                            f"cache; on a hard kernel panic in the "
+                            f"next ~30s it could be lost. DB row "
+                            f"(source of truth) is unaffected."
+                        )
         except Exception as e:
             logger.error(f"Failed to log trade: {e}")
 

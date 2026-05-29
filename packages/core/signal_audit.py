@@ -118,9 +118,38 @@ class SignalAudit:
         # CSV reads chronologically once the underlying error clears.
         self._drain_retry_queue(path)
         try:
+            # STATE-07 (audit 2026-05-28): hold the lock across the
+            # whole write + flush + fsync cycle so:
+            #   * Two threads cannot tear a row (the existing lock
+            #     already prevented this; we keep the same lock).
+            #   * The row is durable on disk before the lock
+            #     releases. Pre-fix, a kernel panic in the OS
+            #     write-back window (~30s) could lose every signal
+            #     row from the last cycle even though the daemon
+            #     reported success. The EOD diagnostic then read
+            #     "0 signals today" with no trace of the loss.
+            #   * ``fsync`` is best-effort -- some filesystems
+            #     refuse it; we log and continue (the row is at
+            #     least in the page cache, no worse than pre-fix).
             with self._lock, open(path, "a", newline="", encoding="utf-8") as f:
                 w = csv.DictWriter(f, fieldnames=_COLUMNS)
                 w.writerow(row)
+                f.flush()
+                try:
+                    os.fsync(f.fileno())
+                except OSError as fsync_exc:
+                    try:
+                        from loguru import logger as _logger
+                        _logger.warning(
+                            f"[STATE-07] fsync on {path} failed: "
+                            f"{fsync_exc!r}. Row is in OS page "
+                            f"cache; lost only on a hard kernel "
+                            f"panic in the next ~30s."
+                        )
+                    except Exception:
+                        # If even loguru is unavailable
+                        # (interpreter shutdown), swallow.
+                        pass
         except Exception as e:
             # P2 logic-edges (2026-05-17): the OLD ``except: pass`` made
             # disk-full / permission-denied invisible. The EOD diagnostics
@@ -159,11 +188,26 @@ class SignalAudit:
             self._retry_queue.clear()
         succeeded = 0
         try:
+            # STATE-07 (audit 2026-05-28): same flush+fsync as the
+            # main log() path so retry-queue rows are durable
+            # too. We don't hold the writer lock across the whole
+            # batch (it's already a recovery path; another log()
+            # arriving mid-batch is fine), but we do flush+fsync
+            # at the end so the recovered rows are durable
+            # before we declare success.
             with open(path, "a", newline="", encoding="utf-8") as f:
                 w = csv.DictWriter(f, fieldnames=_COLUMNS)
                 for row in queued:
                     w.writerow(row)
                     succeeded += 1
+                f.flush()
+                try:
+                    os.fsync(f.fileno())
+                except OSError:
+                    # Same fail-soft policy as the main log()
+                    # path; row is at least in the OS page
+                    # cache.
+                    pass
         except Exception as e:  # noqa: BLE001 - retry must not crash log()
             # Re-queue the rows that didn't land. ``succeeded`` ones
             # are already on disk; the rest go back at the head of the

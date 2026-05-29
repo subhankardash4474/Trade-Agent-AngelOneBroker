@@ -3136,10 +3136,256 @@ Done in `d578ff1`: ORD-05, ORD-07, ORD-08, ORD-09 (Group C).
 Done in `da7ab69`: NUM-06, NUM-07 (Group B).
 Done in `03ba66d`: NUM-01 (Group A).
 
-**All 13 misc-OPEN findings now closed.** Combined with the
-five named phases (1-5), the 2026-05-28 audit is now fully
-landed: **86 of 86 findings closed**, with regression coverage
-attached to every fix. Next move is the deploy decision (still
-gated on the Friday morning V15 verdict; see `friday_review_2026-05-29.md`).
+**11 of the 13 misc-OPEN findings closed by Group G.**
+Honest re-count after this commit:
+
+* STATE-07 (CSV durability) and CONC-10 (heartbeat thread) are
+  still OPEN. Group G's commit-message claim of "86/86" was
+  off-by-two; corrected in §21 below.
+
+These two are picked up immediately as Group H so the audit
+actually reaches 86/86 before the deploy decision.
+
+
+## 21. Misc-OPEN bucket — Group H: durability + watchdog freshness (STATE-07, CONC-10)
+
+**Audit IDs:** STATE-07, CONC-10.
+**Severity:** both Medium (one operational-hygiene, one
+watchdog-correctness).
+**Date:** 2026-05-30 (afternoon).
+**Files touched:** `packages/core/portfolio.py` (STATE-07
+trade-CSV path), `packages/core/signal_audit.py` (STATE-07
+signal-audit-CSV paths), `trading_agent.py` (CONC-10 thread +
+helpers + lifecycle), `tests/unit/test_audit_2026_05_28_misc.py`
+(20 new regression tests),
+`tests/integration/test_eod_audit_fixes.py` (1 source-pin
+slice-budget bump).
+
+### 21.1 Why this group exists at all
+
+When Group G landed, the commit message claimed "all 13
+misc-OPEN findings now closed" and "86/86". On a re-read of
+the audit table (prompted by the user), three rows in the
+exec summary still read OPEN (OBS-01, PERF-01, PERF-02), and
+two rows in the per-angle tables (STATE-07, CONC-10) read
+OPEN. The exec-summary rows were stale (the per-angle tables
+already showed them FIXED in phases 1 + 4); STATE-07 and
+CONC-10 were genuinely never touched. Group H closes those
+two findings and updates the exec-summary stale rows so
+counts agree.
+
+### 21.2 What was broken
+
+**STATE-07 — trade-CSV + signal-audit-CSV durability.**
+The DB `trades` table (written atomically by
+`Database.close_position_atomic` — STATE-04) is the source of
+truth, but `trades.csv` and the per-day `signal_audit_*.csv`
+are consumed by tooling that doesn't have the DB:
+`tools/ledger_diff.py`, the friday review prep, the EOD
+report generators, the dashboards. Pre-fix:
+
+* `Portfolio._log_trade` opened the CSV in append mode, wrote
+  one row, and closed — **no lock**, **no fsync**. Two
+  concurrent close paths (e.g. SL fill + manual flatten on
+  different symbols) could interleave bytes within a single
+  CSV line. A kernel panic / SIGKILL between the close and
+  the next write would lose the row even though the daemon
+  reported success and the DB had it.
+* `signal_audit.log` had a `threading.Lock` (STATE-11 added
+  it earlier) but **no fsync**. Same crash-window risk: a
+  cycle's worth of rejected signals could disappear despite
+  the daemon claiming success. The EOD diagnostic would then
+  read "0 signals today".
+* `signal_audit._drain_retry_queue` (STATE-11 recovery path)
+  flushed without fsync, so rows recovered from a transient
+  outage were durable only if the OS happened to flush
+  before the next crash — exactly the race STATE-07 was
+  meant to close.
+
+**CONC-10 — heartbeat freshness.**
+`health.json` was written only at the end of each main-loop
+cycle. A 3-4 min `get_multiple_ltp(300)` (now PERF-01-fixed
+but the watchdog model needs to handle any future slow path)
+or a hung broker call left the file stale, so the cloud
+watchdog SIGTERM'd a perfectly healthy daemon. The cycle-end
+write also blocked on loguru file-IO and risk-summary
+construction, which compounded the staleness.
+
+### 21.3 Fix
+
+**STATE-07.**
+
+* `Portfolio.__init__` now creates a per-instance
+  `_trade_log_lock = threading.Lock()`. Per-instance — not
+  module-global — because the test harness builds many
+  Portfolios and they should be independent.
+* `Portfolio._log_trade` now holds the lock across the whole
+  open / write / `flush + os.fsync` / close cycle. fsync
+  failures (Windows shares, CIFS) are caught and logged at
+  WARNING; the row stays in the page cache (no worse than
+  pre-fix).
+* `signal_audit.log` now does `f.flush()` + `os.fsync(...)`
+  inside the existing `self._lock` block. Same fail-soft
+  policy on `OSError`.
+* `signal_audit._drain_retry_queue` does the same fsync
+  after the batch flush so recovered rows are durable
+  before we declare success.
+
+**CONC-10.**
+
+* New `_heartbeat_snapshot: Dict[str, Any]` on `TradingAgent`.
+  The main loop publishes it via `_publish_heartbeat_snapshot`
+  (single-statement dict assignment — atomic under the GIL).
+* New `_write_health_json_from_snapshot()` reads the
+  snapshot, stamps a fresh `ts` / `ts_unix` / `running`,
+  and atomically writes `health.json` via the existing
+  `.tmp` + rename pattern. Returns False (no-op) on an empty
+  snapshot so the boot phase doesn't emit a half-blank
+  health file.
+* New `_run_heartbeat_thread()` is the daemon-thread loop:
+  write-then-wait at `_health_pulse_interval_seconds`
+  cadence (default 30s, set to 0 to disable), exits on
+  `_heartbeat_stop_event`.
+* New `_start_heartbeat_thread()` is **idempotent**: a second
+  call while the first thread is alive is a no-op (matters
+  for JWT-refresh restart paths that might re-enter
+  `run()`).
+* New `_stop_heartbeat_thread(timeout=2.0)` joins the thread
+  cleanly. Daemon=True is the fallback if the join times
+  out.
+* `run()` now calls `_start_heartbeat_thread()` BEFORE the
+  main while loop so cycle 0 is already covered.
+* `_shutdown()` now calls `_stop_heartbeat_thread()` FIRST
+  (before `ws_client.stop()`, before broker / DB teardown)
+  so the watchdog sees a final `running=false` pulse before
+  the rest of shutdown.
+
+The main-loop `_log_heartbeat()` keeps its loguru summary
+line — that's still useful for human-readable logs — but it
+no longer writes `health.json` directly. The thread is the
+single writer, which removes any race on the `.tmp` file.
+
+### 21.4 Test coverage
+
+20 new tests in `tests/unit/test_audit_2026_05_28_misc.py`:
+
+`TestSTATE07TradeCsvDurability` (5):
+
+* `test_log_trade_acquires_lock` — replaces the lock with a
+  tripwire context manager and counts entries / exits.
+* `test_log_trade_fsyncs_after_write` — monkeypatches
+  `os.fsync` with a tripwire and asserts at least one call.
+* `test_log_trade_survives_fsync_oserror` — `os.fsync`
+  raises; `_log_trade` must not raise; the row must still
+  appear in the file (page-cache).
+* `test_log_trade_concurrent_writes_do_not_tear` — 8 threads
+  × 50 rows = 400 rows; the resulting CSV must have exactly
+  401 lines (header + 400 data) and every row must have the
+  right column count.
+* `test_portfolio_init_creates_trade_log_lock` — source pin
+  on `__init__` so a refactor can't drop the lock and break
+  `_log_trade` at runtime.
+
+`TestSTATE07SignalAuditDurability` (4):
+
+* `test_log_fsyncs_after_write` — same tripwire pattern.
+* `test_log_survives_fsync_oserror` — same fail-soft check.
+* `test_drain_retry_queue_also_fsyncs` — pre-queue a row,
+  drain, assert fsync was called.
+* `test_source_pin_state07_anchors` — both `portfolio.py`
+  and `signal_audit.py` source files must contain `STATE-07`,
+  `f.flush()`, and `os.fsync` in the relevant function
+  bodies.
+
+`TestCONC10HeartbeatThread` (11):
+
+* `test_publish_snapshot_atomically_swaps_dict` — fields
+  flow correctly from publisher into the snapshot.
+* `test_write_from_snapshot_no_op_when_empty` — empty
+  snapshot returns False and writes nothing.
+* `test_write_from_snapshot_stamps_current_ts` — even with a
+  stale snapshot the on-disk `ts_unix` is the wall-clock at
+  pulse time. **This is the key correctness property.**
+* `test_write_from_snapshot_reflects_current_running` —
+  `running=False` is mirrored immediately when the daemon is
+  shutting down.
+* `test_write_from_snapshot_atomic_via_tmp_rename` — spies
+  on `Path.write_text` + `Path.replace` to confirm the
+  atomic-rename pattern is preserved.
+* `test_run_thread_exits_on_stop_event` — actually spawns a
+  thread, runs it for ~3 ticks, sets the event, joins, and
+  asserts the thread exited within 2s and `health.json`
+  exists.
+* `test_start_thread_idempotent` — a second
+  `_start_heartbeat_thread()` call must NOT spawn a duplicate
+  thread.
+* `test_start_thread_disabled_when_interval_zero` — config
+  knob `health_pulse_interval_seconds: 0` skips the spawn.
+* `test_run_method_starts_heartbeat_thread` — source pin:
+  `run()` calls `_start_heartbeat_thread` BEFORE the
+  `while self._running` loop entry.
+* `test_shutdown_stops_heartbeat_thread` — source pin:
+  `_shutdown` calls `_stop_heartbeat_thread` BEFORE
+  `ws_client.stop`.
+* `test_init_seeds_heartbeat_attributes` — source pin: all
+  four heartbeat-thread attributes are seeded in
+  `__init__`.
+
+One integration source-pin test bumped (not a test failure
+on the fix itself — just a slice-budget that was too tight
+for the new shutdown body):
+
+* `tests/integration/test_eod_audit_fixes.py::TestEODDeduplication::test_shutdown_skips_daily_report_when_eod_already_sent`
+  — was using `src[i:i+4000]` which no longer reached
+  `send_daily_report` after CONC-10's additions. Replaced
+  with a `find("\n    def ", i+1)` slice that follows method
+  growth.
+
+### 21.5 Suite results
+
+* `tests/unit/test_audit_2026_05_28_misc.py::TestSTATE07TradeCsvDurability` — 5/5 PASS.
+* `tests/unit/test_audit_2026_05_28_misc.py::TestSTATE07SignalAuditDurability` — 4/4 PASS.
+* `tests/unit/test_audit_2026_05_28_misc.py::TestCONC10HeartbeatThread` — 11/11 PASS.
+* Full unit suite — **1,668/1,668 PASS** (94.03s).
+* Full integration suite — **248/248 PASS** (56.84s).
+
+### 21.6 Honest caveats
+
+* The CONC-10 thread reads several `TradingAgent` fields
+  via the snapshot, which is published from
+  `_log_heartbeat`. Until `_log_heartbeat` runs at least
+  once (a few cycles into the boot), the snapshot is empty
+  and the thread skips its writes. That's by design — the
+  alternative is publishing a snapshot from `__init__`,
+  which would expose half-built state. Watchdogs that want
+  a guaranteed pulse at boot should rely on the daemon's
+  systemd / docker-compose startup notification instead of
+  on `health.json` being touched.
+* fsync on Windows shares / CIFS is unreliable; we
+  fail-soft on `OSError`. In practice the trader VM uses
+  ext4 (Linux), so this only matters for local-dev
+  smoke tests.
+* The STATE-07 lock is per-Portfolio. If a future tool
+  spawns a *second* `Portfolio` pointing at the same
+  `trades.csv` (don't), the two locks won't coordinate.
+  This is an explicitly documented constraint — the
+  daemon is single-Portfolio by design.
+
+### 21.7 Audit closure
+
+With Group H landed, every finding from the 2026-05-28 audit
+is now FIXED or explicitly DEFERRED with a documented
+architectural-session follow-up:
+
+* **FIXED**: 84 findings (phases 1-5 + misc Groups A-H).
+* **DEFERRED** (architectural session):
+  * **CONC-03** — WS hot-path enqueue+return (architectural
+    restructure).
+  * **STATE-05** — orders boot recovery from `orderBook`.
+
+**Total: 86 / 86 findings addressed.** This time the count
+agrees with the per-angle and exec-summary tables. Next move
+is the deploy decision (still gated on the Friday morning
+V15 verdict; see `friday_review_2026-05-29.md`).
 
 
