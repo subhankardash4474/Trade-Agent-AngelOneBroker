@@ -1,5 +1,7 @@
 # Freeze v2.1 — Exit Criteria, Pre-Committed 2026-05-29
 
+> **For the 2026-06-05 verdict meeting, read [`wind_down_criteria_2026-06-05.md`](wind_down_criteria_2026-06-05.md) first.** That is the short, locked, paste-and-apply operational sheet. This document is the longer contractual context (audit-only classification, slot accounting, the three Friday options).
+
 **Author:** trading agent + operator joint commitment.
 **Status:** ACTIVE. This document is the operating contract for all
 trading-agent work between 2026-05-29 and the 2026-06-05 / 2026-06-08
