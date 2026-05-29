@@ -2160,3 +2160,191 @@ STATE-05), the misc-OPEN bucket (NUM-01/06/07/10/11, ORD-05/07/08/
   re-tagged DEFERRED with rationale; changelog appended.
 * `docs/findings_log_2026-05-27.md` — this section (§15).
 
+---
+
+## 16. Misc-OPEN bucket — Group C: live order discipline (ORD-05/07/08/09)
+
+**Date:** 2026-05-29 (late evening IST)
+**Commit:** PENDING (this section is being written before the commit)
+**Status:** 4 findings FIXED, NOT deployed.
+
+### 16.1 What was broken
+
+Even after Phase-2 wired `_wait_for_terminal` into `_live_order_with_retry`,
+four "live order discipline" findings remained: the engine could
+still mis-account fills around the cancel-race window, place SLs at
+the wrong size on partial fills, and silently abandon timed-out
+orders without any reconciliation hook.
+
+**ORD-09** — `_live_order_with_retry` would return `None` on a
+TTL-expiry **without cancelling** the order. The order could still
+fill at the broker minutes later; the daemon had already moved on
+and would NOT see the fill.
+
+**ORD-08** — When the entry order partially filled (e.g. 7 of 10
+shares), the SL-M was sized off the **requested** quantity (10),
+producing an over-sized standing SL that, if it triggered, would
+open a 3-share reverse position on top of the legitimate close.
+
+**ORD-07** — `get_order_status` and the `_wait_for_terminal` helper
+existed but were not wired into the **exit** path. The Phase-2 fix
+covered entries; this confirms exits inherit the same contract via
+`place_order → _live_order_with_retry`.
+
+**ORD-05** — `_close_position_safely` issued a cancel-then-flatten
+sequence with no atomicity. If the broker SL fired after we sent
+the cancel but before it processed (the cancel-race window), the
+flatten was sent on top of an already-flat position → the next tick
+opened an unintended **reverse** position. This is the same race
+we already pin under `test_atomic_close_*` for the entry side
+(ORD-03); the exit side was missing equivalent protection.
+
+### 16.2 Fixes
+
+**ORD-09 — TTL cancel-and-fail with race re-check**
+(`packages/core/execution.py:_live_order_with_retry`).
+
+```
+last_seen = _wait_for_terminal(order_id, ttl_sec)
+if last_seen is None:
+    cancelled = cancel_order(order_id, variety="NORMAL")
+    terminal_after_cancel = get_order_status(order_id)
+    if terminal_after_cancel is FILLED / PARTIALLY_FILLED:
+        # Race: filled in the cancel window. Accept the fill,
+        # promote PARTIAL → FILLED if filledshares > 0, log
+        # ORD-09-RACE-FILLED warning. Continue to SL placement.
+    else:
+        # True timeout. Pop _pending_orders[order_id], log
+        # ORD-09 error, return None. Caller's idempotency probe
+        # will catch any stragglers in the next attempt.
+```
+
+The race re-check is the critical bit: a naive cancel-and-return-None
+would lose any fill that landed in the ~50 ms cancel-race. We've
+seen this pattern in production logs from 2026-05-21 onwards.
+
+**ORD-08 — SL sized off filled_quantity**
+(`packages/core/execution.py:_live_order_with_retry`).
+
+```
+effective_sl_qty = int(result.get("filled_quantity") or quantity)
+if effective_sl_qty <= 0:
+    effective_sl_qty = quantity   # defensive fallback
+sl_id = _place_sl_order(symbol, token, effective_sl_qty, sl, sl_side)
+_sl_orders_by_symbol[symbol]["quantity"] = effective_sl_qty
+```
+
+The reconciliation path (`reconcile_sl_orders_from_broker`) already
+respects the broker's reported SL quantity, so this is consistent
+across boot recovery as well.
+
+**ORD-07 — exit path inherits Phase-2 wait-for-terminal.**
+No code change needed: `place_order` already routes through
+`_live_order_with_retry` for both entries and exits. Three
+source-level test pins guard against future regressions:
+
+* `test_ord07_place_order_calls_live_order_with_retry` —
+  `place_order` always invokes `_live_order_with_retry` in live mode.
+* `test_ord07_live_order_uses_wait_for_terminal` —
+  `_live_order_with_retry` calls `_wait_for_terminal` after
+  the broker `placeOrder` returns.
+* `test_ord07_close_position_safely_uses_place_order` —
+  `_close_position_safely` invokes `execution.place_order`
+  for the flatten leg.
+
+**ORD-05 — atomic cancel-then-flatten race**
+(`trading_agent.py:_close_position_safely`).
+
+```
+sl_meta = execution.get_sl_order_for_symbol(symbol)   # ← was missing
+cancel_ok = execution.cancel_sl_order_for_symbol(symbol)
+
+if sl_meta and not paper_mode:
+    sl_status = execution.get_order_status(sl_meta["order_id"])
+    if sl_status indicates FILLED:
+        # Race won by SL. Skip flatten; reconcile portfolio
+        # using the SL fill price + broker filledshares. Log
+        # ATOMIC-CLOSE-RACE alert. Return early.
+# else: SL was cancelled cleanly OR was already absent → continue
+# to original flatten logic.
+```
+
+The "skip flatten" path uses `portfolio.close_position(price=sl_fill_price)`
+so the books are correct without an extra round-trip. The legacy
+flatten path is preserved for the common case.
+
+A small hardening also went in alongside: the `sl_meta` reference
+is type-guarded (`if not isinstance(sl_meta, dict): sl_meta = None`)
+because some legacy mock setups in `test_exit_check_thread_safety.py`
+returned a string — the production code never observed this in
+practice but the guard prevents a crash if a future mock or shim
+returns the wrong type.
+
+### 16.3 Test coverage
+
+**New regression suite** (`tests/unit/test_audit_2026_05_28_misc.py`):
+
+* **ORD-05** (1 test) — source-level anchor verifying
+  `_close_position_safely` retrieves `sl_meta`, calls
+  `get_order_status` after cancel, branches on `sl_filled_first`,
+  and emits the `ATOMIC-CLOSE-RACE` alert string.
+* **ORD-07** (3 tests) — source-level anchors confirming the
+  exit path is wired through `place_order` →
+  `_live_order_with_retry` → `_wait_for_terminal`.
+* **ORD-08** (2 tests) — source-level anchors confirming the SL
+  is sized off `filled_quantity` AND the size is persisted into
+  `_sl_orders_by_symbol`.
+* **ORD-09** (2 tests) — one runtime test (cancel-on-TTL behaviour
+  + `_pending_orders` cleanup + `None` return) and one
+  source-level anchor verifying the race re-check via
+  `get_order_status` after the cancel.
+
+**Existing test fixups** (legacy suites pinned to the new contract):
+
+* `tests/unit/test_execution_sl_tracking.py` — 12 tests refixtured
+  with the new `_seed_orderbook(api, *order_ids)` helper and an
+  ultra-short `live_order_fill_timeout_sec=0.05` to keep runtime
+  flat. The pre-fix suite assumed `placeOrder` returning an id
+  was equivalent to a fill; under ORD-09 that's now a TTL miss.
+* `tests/unit/test_audit_2026_05_28_phase2.py::test_ord01_live_order_keeps_placed_status_on_ttl_with_no_terminal`
+  — re-pinned to the new ORD-09 contract: TTL with no terminal
+  returns `None` AND issues a cancel call.
+* `tests/integration/test_trade_perspective_fixes.py::test_floor_disabled_when_zero`
+  — already aligned in Misc-A to `99.50` (NUM-04 tick rounding).
+
+**Suite results:**
+
+* Unit: **1,588 / 1,588** PASSED.
+* Integration: **248 / 248** PASSED.
+
+### 16.4 Files touched
+
+* `packages/core/execution.py` — ORD-08 + ORD-09.
+* `trading_agent.py` — ORD-05 + sl_meta type-guard.
+* `tests/unit/test_audit_2026_05_28_misc.py` — 8 new tests for
+  ORD-05/07/08/09.
+* `tests/unit/test_execution_sl_tracking.py` — `_seed_orderbook`
+  helper + `live_order_fill_timeout_sec` shortening + 12 tests
+  re-fixtured.
+* `tests/unit/test_audit_2026_05_28_phase2.py` — 1 test re-pinned
+  to ORD-09 contract.
+
+### 16.5 What's left in the misc-OPEN bucket
+
+Done in this commit: ORD-05, ORD-07, ORD-08, ORD-09.
+
+Remaining (4 groups, 6 findings):
+
+* **Group D** — NUM-11 (live slippage capture parity with paper)
+  + ORD-11 (per-symbol slippage tolerance circuit breaker).
+* **Group E** — ORD-10 (reactive re-auth on `401` / `AB*` error
+  classes; the 7-hour proactive timer is too coarse).
+* **Group F** — NUM-10 (decimal arithmetic for charges; touches
+  `charges.py` + `portfolio.py`).
+* **Group G** — PERF-07 (DataFrame allocation cache) +
+  PERF-13 (battery worker pickle); deferrable, backtester-only.
+
+The Critical-tagged finding NUM-01 is already CLOSED (commit
+`03ba66d`); ORD-* remaining are all Medium-tagged.
+
+

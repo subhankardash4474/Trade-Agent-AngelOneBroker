@@ -193,11 +193,16 @@ def test_ord01_live_order_returns_none_on_terminal_rejected():
     )
 
 
-def test_ord01_live_order_keeps_placed_status_on_ttl_with_no_terminal():
-    """If the broker is still PENDING at TTL, the wrapper keeps the
-    pre-existing degrade behaviour (status='PLACED', filled_price=None)
-    so the caller can decide. Documents the contract; the warning
-    inside ``_wait_for_terminal`` is the operator's signal."""
+def test_ord01_live_order_cancels_and_fails_on_ttl_with_no_terminal():
+    """ORD-09 (audit 2026-05-28) tightened the Phase-2 ORD-01 contract:
+    if the broker is still PENDING at TTL, the wrapper now ACTIVELY
+    cancels the order and returns None to the caller. Pre-fix it
+    silently kept ``status='PLACED'`` and proceeded to place an SL
+    on a position the broker may not have opened yet -- a hung
+    ``placeOrder`` call would silently desync our state from broker
+    state. The idempotency probe (ORD-02) on the next retry picks up
+    the order if the broker did accept it after our timeout, so we
+    never double-place."""
     api = MagicMock()
     api.placeOrder.return_value = "OID-PEND"
     api.orderBook.return_value = {
@@ -208,9 +213,11 @@ def test_ord01_live_order_keeps_placed_status_on_ttl_with_no_terminal():
             "filledshares": "0",
         }]
     }
+    api.cancelOrder.return_value = {"status": True}
     eng = _make_engine(mode="live", api=api)
     eng.live_order_fill_timeout_sec = 0.15
     eng.live_order_fill_poll_interval_sec = 0.05
+    eng.retry_attempts = 1  # one shot so the test is deterministic
     eng._place_sl_order = MagicMock(return_value=None)
     eng._persist_order = MagicMock()
     out = eng._live_order_with_retry(
@@ -218,10 +225,13 @@ def test_ord01_live_order_keeps_placed_status_on_ttl_with_no_terminal():
         quantity=10, price=235.00, order_type="LIMIT",
         stop_loss=None, take_profit=None, tag="t",
     )
-    assert out is not None
-    assert out["status"] == "PLACED"
-    assert out["filled_price"] is None
-    assert out["filled_quantity"] == 0
+    assert out is None, "TTL with no terminal must surface as failure"
+    # The cancel must have been attempted before we returned.
+    api.cancelOrder.assert_called_once_with("OID-PEND", "NORMAL")
+    # And the in-memory pending-orders cache must be cleared so a
+    # later boot reconcile or order-status probe picks the broker
+    # state up via the orderBook directly.
+    assert "OID-PEND" not in eng._pending_orders
 
 
 # ───────────────────────── ORD-02 ─────────────────────────

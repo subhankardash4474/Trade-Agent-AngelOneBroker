@@ -4674,8 +4674,111 @@ class TradingAgent:
                 )
                 return None, None
 
-            sl_existed = self.execution.get_sl_order_for_symbol(symbol) is not None
+            # ORD-05 (audit 2026-05-28): capture the SL meta BEFORE we
+            # cancel so we can verify whether the broker actually
+            # cancelled it OR whether it filled in the cancel race
+            # window. Pre-fix, a stop-loss that triggered between our
+            # decision-to-exit and our cancel call would still see us
+            # send a flatten -- effectively double-flattening (the
+            # broker side was already flat from the SL fill), opening
+            # an unintended reverse position. Defensive: legacy unit
+            # tests sometimes mock ``get_sl_order_for_symbol`` with a
+            # plain string sentinel, so coerce non-dict returns to
+            # None before reading off them.
+            sl_meta = self.execution.get_sl_order_for_symbol(symbol)
+            if not isinstance(sl_meta, dict):
+                sl_meta = None
+            sl_existed = sl_meta is not None
+            sl_order_id = sl_meta.get("order_id") if sl_meta else None
             cancel_ok = self.execution.cancel_sl_order_for_symbol(symbol)
+
+            sl_filled_first = False
+            sl_fill_price: Optional[float] = None
+            if sl_existed and sl_order_id and self.execution.is_paper_mode() is False:
+                try:
+                    sl_status_row = self.execution.get_order_status(sl_order_id)
+                except Exception as sl_status_exc:
+                    sl_status_row = None
+                    logger.warning(
+                        f"[ORD-05] {symbol}: get_order_status raised on "
+                        f"SL {sl_order_id}: {type(sl_status_exc).__name__}: "
+                        f"{sl_status_exc!r}; assuming SL was cancelled cleanly."
+                    )
+                if isinstance(sl_status_row, dict):
+                    raw_status = (
+                        sl_status_row.get("status")
+                        or sl_status_row.get("orderstatus")
+                        or ""
+                    )
+                    norm_status = str(raw_status).strip().lower()
+                    # AngelOne uses "complete" / "filled" / "executed"
+                    # for terminal-filled state. Treat anything that
+                    # has filled qty > 0 as "the SL fired during the
+                    # cancel race".
+                    is_completed = any(
+                        kw in norm_status
+                        for kw in ("complete", "filled", "executed")
+                    )
+                    try:
+                        filled_shares = int(
+                            float(
+                                sl_status_row.get("filledshares")
+                                or sl_status_row.get("filledquantity")
+                                or 0
+                            )
+                        )
+                    except (TypeError, ValueError):
+                        filled_shares = 0
+                    if is_completed and filled_shares > 0:
+                        sl_filled_first = True
+                        try:
+                            sl_fill_price = float(
+                                sl_status_row.get("averageprice")
+                                or sl_status_row.get("averagePrice")
+                                or 0.0
+                            ) or None
+                        except (TypeError, ValueError):
+                            sl_fill_price = None
+
+            if sl_filled_first:
+                effective_price = sl_fill_price or price
+                logger.critical(
+                    f"[ORD-05] {symbol}: broker SL {sl_order_id} fired "
+                    f"during cancel race (tag={tag}, reason={exit_reason}). "
+                    f"Skipping flatten (would double-exit / reverse). "
+                    f"Closing in-memory position at SL fill price "
+                    f"Rs {effective_price:.2f}."
+                )
+                try:
+                    self.alert_manager.send_alert(
+                        f"INFO: SL race resolved cleanly on {symbol}",
+                        f"{symbol}: stop-loss filled during exit cancel "
+                        f"window. Skipping flatten to avoid reverse "
+                        f"position. Closed in-memory position at "
+                        f"Rs {effective_price:.2f}. tag={tag} "
+                        f"reason={exit_reason}.",
+                        level="warning",
+                    )
+                except Exception:
+                    pass
+                race_record = self.portfolio.close_position(
+                    symbol,
+                    effective_price,
+                    exit_reason=f"sl_filled_during_close_race:{exit_reason}",
+                )
+                if race_record is not None:
+                    self.risk_manager.record_trade(race_record.pnl)
+                    self.risk_manager.remove_trailing_stop(symbol)
+                    self._persist_trailing_states()
+                    self._record_exit(
+                        symbol,
+                        race_record.pnl,
+                        exit_reason=f"sl_filled_during_close_race:{exit_reason}",
+                        side=getattr(race_record, "side", None),
+                    )
+                    self._on_trade_closed(race_record)
+                return None, race_record
+
             if sl_existed and not cancel_ok:
                 logger.critical(
                     f"[SAFE-EXIT] {symbol}: broker SL cancel FAILED before flatten "

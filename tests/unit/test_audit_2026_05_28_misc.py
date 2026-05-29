@@ -13,6 +13,20 @@ Findings covered in this file:
 * **NUM-07** (Medium)   -- features rolling-75 session bleed; switch
   ``dist_from_high_pct`` / ``dist_from_low_pct`` to a session-grouped
   cumulative max/min (Group B).
+* **ORD-05** (High)     -- atomic cancel-then-flatten in
+  ``_close_position_safely``; if the SL filled in the cancel race
+  window, skip flatten and reconcile in-memory portfolio at the SL
+  fill price (Group C).
+* **ORD-07** (High)     -- closed in Phase 2 by routing
+  ``_close_position_safely`` through ``place_order`` ->
+  ``_live_order_with_retry`` -> ``_wait_for_terminal``. Pinned here
+  with a source-level guard so a refactor cannot silently drop the
+  wait helper from the exit path (Group C).
+* **ORD-08** (Medium)   -- SL-M sized off broker-confirmed
+  ``filled_quantity`` rather than the requested quantity (Group C).
+* **ORD-09** (Medium)   -- order-fill TTL now actively cancels the
+  pending order and fails the call instead of silently keeping
+  ``status='PLACED'`` (Group C).
 """
 
 from __future__ import annotations
@@ -685,3 +699,184 @@ class TestNUM07FeatureSessionReset:
         assert "groupby(day).cummax()" in body
         assert "groupby(day).cummin()" in body
         assert "NUM-07" in body
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Group C: live order discipline (ORD-05 / ORD-07 / ORD-08 / ORD-09)
+# ─────────────────────────────────────────────────────────────────────
+
+
+class TestORD05CancelThenFlattenRace:
+    """If a stop-loss triggers between our exit decision and our
+    cancel call, the broker side has already flattened. Pre-fix the
+    exit path still sent a flatten -- effectively double-flattening
+    and opening an unintended reverse position. The fix peeks the
+    SL's terminal status after cancel and, on a fired SL, skips the
+    flatten entirely and reconciles the in-memory portfolio at the
+    SL's fill price.
+    """
+
+    def test_close_position_safely_has_ord05_anchor(self):
+        path = os.path.join(PROJECT_ROOT, "trading_agent.py")
+        with open(path, "r", encoding="utf-8") as fh:
+            src = fh.read()
+        idx = src.find("def _close_position_safely(")
+        assert idx != -1, "_close_position_safely not found"
+        next_def = src.find("\n    def ", idx + 1)
+        body = src[idx:next_def]
+        assert "ORD-05" in body
+        assert "sl_filled_first" in body
+        assert "get_order_status" in body
+        # The race-resolution path must reconcile through
+        # portfolio.close_position with a clear exit_reason.
+        assert "sl_filled_during_close_race" in body
+
+
+class TestORD07ExitWaitForTerminalAtSource:
+    """ORD-07 was structurally closed by Phase 2: live exits route
+    through ``place_order`` -> ``_live_order_with_retry`` ->
+    ``_wait_for_terminal``. The contract is enforced at source
+    here so a future refactor cannot silently drop the wait helper
+    from the exit path."""
+
+    def test_place_order_routes_live_to_wait_for_terminal(self):
+        path = os.path.join(PROJECT_ROOT, "packages", "core", "execution.py")
+        with open(path, "r", encoding="utf-8") as fh:
+            src = fh.read()
+        # place_order must delegate to _live_order_with_retry in live mode.
+        po_idx = src.find("def place_order(")
+        assert po_idx != -1
+        po_next = src.find("\n    def ", po_idx + 1)
+        po_body = src[po_idx:po_next]
+        assert "_live_order_with_retry" in po_body
+
+        # _live_order_with_retry must call _wait_for_terminal on the
+        # placeOrder response (entries AND exits go through this).
+        lor_idx = src.find("def _live_order_with_retry(")
+        assert lor_idx != -1
+        lor_next = src.find("\n    def ", lor_idx + 1)
+        lor_body = src[lor_idx:lor_next]
+        assert "_wait_for_terminal" in lor_body
+
+    def test_close_position_safely_uses_place_order_for_flatten(self):
+        path = os.path.join(PROJECT_ROOT, "trading_agent.py")
+        with open(path, "r", encoding="utf-8") as fh:
+            src = fh.read()
+        idx = src.find("def _close_position_safely(")
+        next_def = src.find("\n    def ", idx + 1)
+        body = src[idx:next_def]
+        # The flatten must go through self.execution.place_order so
+        # it inherits _wait_for_terminal.
+        assert "self.execution.place_order(" in body
+
+
+class TestORD08SLSizedOffFilledQty:
+    """SL-M placed on a partial entry must size to ``filled_quantity``
+    (what the broker actually opened), not the ``quantity`` we
+    requested. Pre-fix, a PARTIALLY_FILLED entry got an SL that was
+    over-sized and the residual qty was unprotected.
+    """
+
+    def test_live_order_with_retry_sizes_sl_off_filled_qty(self):
+        path = os.path.join(PROJECT_ROOT, "packages", "core", "execution.py")
+        with open(path, "r", encoding="utf-8") as fh:
+            src = fh.read()
+        idx = src.find("def _live_order_with_retry(")
+        next_def = src.find("\n    def ", idx + 1)
+        body = src[idx:next_def]
+        # Source-level: the SL placement must compute an effective
+        # SL qty from result["filled_quantity"] (with a defensive
+        # fallback to the requested qty).
+        assert "ORD-08" in body
+        assert "effective_sl_qty" in body
+        assert "_place_sl_order(" in body
+        # _place_sl_order is invoked with effective_sl_qty, not the
+        # raw 'quantity' arg. Find the _place_sl_order call line and
+        # check its 3rd positional.
+        sl_call_idx = body.find("self._place_sl_order(")
+        assert sl_call_idx != -1
+        sl_call_end = body.find(")", sl_call_idx)
+        sl_call = body[sl_call_idx:sl_call_end]
+        assert "effective_sl_qty" in sl_call
+
+    def test_sl_meta_records_effective_sl_qty(self):
+        path = os.path.join(PROJECT_ROOT, "packages", "core", "execution.py")
+        with open(path, "r", encoding="utf-8") as fh:
+            src = fh.read()
+        idx = src.find("def _live_order_with_retry(")
+        next_def = src.find("\n    def ", idx + 1)
+        body = src[idx:next_def]
+        # The _sl_orders_by_symbol meta dict must persist
+        # effective_sl_qty as ``quantity`` so trail-modify and
+        # cancel paths see consistent qty.
+        meta_idx = body.find("self._sl_orders_by_symbol[symbol] = {")
+        assert meta_idx != -1
+        meta_end = body.find("}", meta_idx)
+        meta = body[meta_idx:meta_end]
+        assert '"quantity": effective_sl_qty' in meta
+
+
+class TestORD09TTLCancelAndFail:
+    """On TTL expiry without terminal observation, the pre-fix code
+    kept ``status='PLACED'`` and proceeded to place SL on a position
+    the broker may never have actually opened. ORD-09 changes that
+    contract: cancel the order, drop in-memory tracking, and surface
+    None to the caller. The next retry's idempotency probe (ORD-02)
+    picks up the order if the broker did accept it after our timeout.
+    """
+
+    def test_ttl_expiry_attempts_cancel_and_returns_none(self):
+        from unittest.mock import MagicMock
+
+        from core.execution import ExecutionEngine
+
+        api = MagicMock()
+        api.placeOrder.return_value = "OID-TTL"
+        api.orderBook.return_value = {
+            "data": [{
+                "orderid": "OID-TTL",
+                "status": "open",  # never terminal
+                "averageprice": "0",
+                "filledshares": "0",
+            }]
+        }
+        api.cancelOrder.return_value = {"status": True}
+
+        cfg = {
+            "execution": {
+                "live_order_fill_timeout_sec": 0.15,
+                "live_order_fill_poll_interval_sec": 0.05,
+                "retry_attempts": 1,
+            },
+            "instruments": [],
+        }
+        eng = ExecutionEngine(cfg, smart_api=api)
+        eng.mode = "live"
+        eng._api = api
+        eng.retry_attempts = 1
+        eng._place_sl_order = MagicMock(return_value=None)
+        eng._persist_order = MagicMock()
+
+        out = eng._live_order_with_retry(
+            symbol="X", token="0", tx_type="BUY",
+            quantity=10, price=100.0, order_type="LIMIT",
+            stop_loss=None, take_profit=None, tag="t",
+        )
+        assert out is None
+        api.cancelOrder.assert_called_once_with("OID-TTL", "NORMAL")
+        # SL never gets placed if entry TTL'd out.
+        eng._place_sl_order.assert_not_called()
+        # Pending tracking cleared so the boot reconcile / probe
+        # picks up the broker state authoritatively.
+        assert "OID-TTL" not in eng._pending_orders
+
+    def test_ord09_anchor_in_source(self):
+        path = os.path.join(PROJECT_ROOT, "packages", "core", "execution.py")
+        with open(path, "r", encoding="utf-8") as fh:
+            src = fh.read()
+        idx = src.find("def _live_order_with_retry(")
+        next_def = src.find("\n    def ", idx + 1)
+        body = src[idx:next_def]
+        assert "ORD-09" in body
+        # The TTL branch must invoke cancel_order before returning.
+        assert "self.cancel_order(" in body

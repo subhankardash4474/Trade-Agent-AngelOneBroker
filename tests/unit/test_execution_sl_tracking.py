@@ -26,12 +26,61 @@ from core.execution import ExecutionEngine
 
 
 def _live_engine_with_mock_api(api_mock):
+    """Live ExecutionEngine wired to ``api_mock``.
+
+    Phase 2 / ORD-09 (audit 2026-05-28): ``_live_order_with_retry``
+    now blocks on a ``_wait_for_terminal`` poll loop and treats a
+    TTL with no terminal observation as a hard failure. The legacy
+    SL-tracking tests in this file pre-date that contract; they
+    assumed ``placeOrder`` returning an id is "fill". To preserve
+    their original intent (verifying the SL-tracking surface, not
+    fill semantics) without slowing the suite to ~10s/test, this
+    helper:
+
+    * sets ``live_order_fill_timeout_sec`` to a tiny value so the
+      poll loop wraps up in ~50ms when no orderBook fixture is set;
+    * pre-configures the orderBook mock with a generic FILLED
+      response keyed by ``orderid``; tests that exercise specific
+      multi-order id sequences should call ``_seed_orderbook(api,
+      *ids)`` after constructing the engine to ensure each id
+      resolves to a FILLED row.
+    """
     cfg = {
         "broker": {"mode": "live"},
-        "execution": {"order_type": "LIMIT", "product_type": "INTRADAY"},
+        "execution": {
+            "order_type": "LIMIT",
+            "product_type": "INTRADAY",
+            "live_order_fill_timeout_sec": 0.05,
+            "live_order_fill_poll_interval_sec": 0.02,
+        },
         "market": {"exchange": "NSE"},
     }
-    return ExecutionEngine(cfg, smart_api=api_mock)
+    eng = ExecutionEngine(cfg, smart_api=api_mock)
+
+    # If the test doesn't customise ``orderBook``, default to an
+    # empty book. Specific tests opt in by calling
+    # ``_seed_orderbook`` below.
+    if not isinstance(api_mock.orderBook.return_value, dict):
+        api_mock.orderBook.return_value = {"status": True, "data": []}
+    return eng
+
+
+def _seed_orderbook(api_mock, *order_ids: str, qty: int = 10,
+                    price: float = 1500.0, status: str = "complete"):
+    """Pre-populate ``api_mock.orderBook`` with FILLED rows for the
+    given order ids. Mirrors the AngelOne payload shape that
+    ``_wait_for_terminal`` and ``get_order_status`` consume.
+    """
+    rows = [
+        {
+            "orderid": oid,
+            "status": status,
+            "averageprice": str(price),
+            "filledshares": str(qty),
+        }
+        for oid in order_ids
+    ]
+    api_mock.orderBook.return_value = {"status": True, "data": rows}
 
 
 # ── Tracking on entry ─────────────────────────────────────────────────────
@@ -41,6 +90,7 @@ def test_entry_with_sl_tracks_broker_order_id():
     api = MagicMock()
     # First placeOrder = entry order, second = SL-M
     api.placeOrder.side_effect = ["ENTRY-ORD-1", "SL-ORD-1"]
+    _seed_orderbook(api, "ENTRY-ORD-1")
     eng = _live_engine_with_mock_api(api)
 
     res = eng.place_order(
@@ -58,6 +108,7 @@ def test_entry_with_sl_tracks_broker_order_id():
 def test_short_entry_tracks_buy_side_sl():
     api = MagicMock()
     api.placeOrder.side_effect = ["ENTRY-ORD-2", "SL-ORD-2"]
+    _seed_orderbook(api, "ENTRY-ORD-2")
     eng = _live_engine_with_mock_api(api)
     eng.place_order(
         symbol="HDFCBANK", token="123", transaction_type="SELL",
@@ -84,6 +135,7 @@ def test_entry_without_sl_does_not_track():
 def test_cancel_sl_order_for_symbol_calls_broker():
     api = MagicMock()
     api.placeOrder.side_effect = ["ENTRY-1", "SL-1"]
+    _seed_orderbook(api, "ENTRY-1")
     api.cancelOrder.return_value = "OK"
     eng = _live_engine_with_mock_api(api)
     eng.place_order(
@@ -110,6 +162,7 @@ def test_failed_cancel_retracks_id_for_retry():
     must remember the id so a later retry doesn't abandon a live SL."""
     api = MagicMock()
     api.placeOrder.side_effect = ["ENTRY-1", "SL-1"]
+    _seed_orderbook(api, "ENTRY-1")
     api.cancelOrder.return_value = None    # broker refuses
     eng = _live_engine_with_mock_api(api)
     eng.place_order(
@@ -130,6 +183,7 @@ def test_failed_cancel_retracks_id_for_retry():
 def test_update_sl_trigger_calls_modify_on_broker():
     api = MagicMock()
     api.placeOrder.side_effect = ["ENTRY-1", "SL-1"]
+    _seed_orderbook(api, "ENTRY-1")
     api.modifyOrder.return_value = "OK"
     eng = _live_engine_with_mock_api(api)
     eng.place_order(
@@ -154,6 +208,7 @@ def test_update_sl_trigger_idempotent_when_trigger_unchanged():
     every tick / poll cycle."""
     api = MagicMock()
     api.placeOrder.side_effect = ["ENTRY-1", "SL-1"]
+    _seed_orderbook(api, "ENTRY-1")
     api.modifyOrder.return_value = "OK"
     eng = _live_engine_with_mock_api(api)
     eng.place_order(
@@ -179,6 +234,7 @@ def test_list_tracked_sl_orders_returns_copy():
     SL by .pop'ing the dict)."""
     api = MagicMock()
     api.placeOrder.side_effect = ["ENTRY-1", "SL-1"]
+    _seed_orderbook(api, "ENTRY-1")
     eng = _live_engine_with_mock_api(api)
     eng.place_order(
         symbol="HDFCBANK", token="123", transaction_type="BUY",
@@ -227,6 +283,7 @@ def test_sl_failure_after_entry_returns_none_and_does_not_track():
     api = MagicMock()
     # First call = entry succeeds, second call = SL placement fails (None)
     api.placeOrder.side_effect = ["ENTRY-ORD-1", None]
+    _seed_orderbook(api, "ENTRY-ORD-1")
     eng = _live_engine_with_mock_api(api)
 
     res = eng.place_order(
@@ -247,6 +304,7 @@ def test_sl_failure_triggers_counter_flatten_market_order():
     the opposite side. Manual intervention is too slow for a live tick."""
     api = MagicMock()
     api.placeOrder.side_effect = ["ENTRY-ORD-1", None, "FLATTEN-ORD-1"]
+    _seed_orderbook(api, "ENTRY-ORD-1")
     eng = _live_engine_with_mock_api(api)
 
     eng.place_order(
@@ -268,6 +326,7 @@ def test_short_entry_sl_failure_flattens_with_buy():
     """Mirror image: SHORT entry with failed SL must counter-flatten BUY."""
     api = MagicMock()
     api.placeOrder.side_effect = ["ENTRY-ORD-S", None, "FLATTEN-ORD-S"]
+    _seed_orderbook(api, "ENTRY-ORD-S")
     eng = _live_engine_with_mock_api(api)
 
     res = eng.place_order(
@@ -286,6 +345,7 @@ def test_sl_failure_cleans_pending_order_tracking():
     after the rollback."""
     api = MagicMock()
     api.placeOrder.side_effect = ["ENTRY-ORD-1", None, "FLATTEN-ORD-1"]
+    _seed_orderbook(api, "ENTRY-ORD-1")
     eng = _live_engine_with_mock_api(api)
 
     eng.place_order(
@@ -305,6 +365,7 @@ def test_counter_flatten_failure_still_returns_none():
     and the CRITICAL logs are the only signal ops has."""
     api = MagicMock()
     api.placeOrder.side_effect = ["ENTRY-ORD-1", None, Exception("network down")]
+    _seed_orderbook(api, "ENTRY-ORD-1")
     eng = _live_engine_with_mock_api(api)
 
     res = eng.place_order(
@@ -321,6 +382,7 @@ def test_entry_without_sl_request_unaffected_by_rollback():
     path is bypassed entirely and the entry returns successfully."""
     api = MagicMock()
     api.placeOrder.return_value = "ENTRY-ORD-1"
+    _seed_orderbook(api, "ENTRY-ORD-1")
     eng = _live_engine_with_mock_api(api)
 
     res = eng.place_order(
@@ -845,6 +907,7 @@ def test_modify_sl_propagates_false_through_update_trigger():
     the trail loop knows the propagation failed."""
     api = MagicMock()
     api.placeOrder.side_effect = ["ENTRY-1", "SL-1"]
+    _seed_orderbook(api, "ENTRY-1")
     api.modifyOrder.return_value = {"status": False, "message": "invalid"}
     eng = _live_engine_with_mock_api(api)
     eng.place_order(

@@ -932,27 +932,153 @@ class ExecutionEngine:
                         # so downstream order-status queries see the truth.
                         self._pending_orders[response] = result
                     else:
-                        # TTL expired with no terminal observation. Keep
-                        # ``status="PLACED"`` and ``filled_price=None``
-                        # so the caller can decide whether to proceed
-                        # (current behaviour: caller treats PLACED as
-                        # FILLED for the in-memory position). Logging
-                        # the TTL warning is already done by _wait_for_terminal.
-                        result["filled_quantity"] = 0
+                        # ORD-09 (audit 2026-05-28): TTL expired with no
+                        # terminal observation. Pre-fix the code kept
+                        # ``status="PLACED"`` and proceeded to place an
+                        # SL on a position the broker may not have
+                        # opened yet -- a single hung placeOrder call
+                        # would silently leave the broker side and the
+                        # in-memory state desynchronised. Now we
+                        # actively cancel + reconcile:
+                        #   1. Try to cancel the order.
+                        #   2. Re-read the broker order status. If the
+                        #      order actually FILLED in the cancel-
+                        #      race window, accept that fill (the
+                        #      broker side is real, we just missed
+                        #      seeing it during the polling loop).
+                        #   3. Otherwise drop the in-memory tracking
+                        #      and surface the TTL as a hard failure
+                        #      to the caller. The idempotency probe
+                        #      (ORD-02) on the next retry picks it up
+                        #      if the broker accepted it after our
+                        #      timeout, so we never double-place.
+                        cancelled = False
+                        try:
+                            cancelled = self.cancel_order(
+                                response, variety="NORMAL"
+                            )
+                        except Exception as cancel_exc:
+                            logger.error(
+                                f"[ORD-09] cancel_order raised on TTL "
+                                f"expiry for {response}: "
+                                f"{type(cancel_exc).__name__}: "
+                                f"{cancel_exc!r}"
+                            )
+                        # Reconcile: did the order fill in the cancel
+                        # race window? get_order_status reads the
+                        # broker's authoritative orderBook one more
+                        # time.
+                        terminal_after_cancel = None
+                        try:
+                            terminal_after_cancel = self.get_order_status(
+                                response
+                            )
+                        except Exception as gs_exc:
+                            logger.warning(
+                                f"[ORD-09] get_order_status raised "
+                                f"during TTL reconcile for {response}: "
+                                f"{type(gs_exc).__name__}: {gs_exc!r}"
+                            )
+                        race_filled = False
+                        if isinstance(terminal_after_cancel, dict):
+                            race_status = self._normalise_status(
+                                terminal_after_cancel
+                            )
+                            race_filled_price = self._extract_avg_fill_price(
+                                terminal_after_cancel
+                            )
+                            race_filled_qty = self._extract_filled_qty(
+                                terminal_after_cancel
+                            )
+                            if (
+                                race_status in self._TERMINAL_FILLED
+                                and race_filled_qty > 0
+                            ):
+                                race_filled = True
+                                result["status"] = "FILLED"
+                                result["filled_price"] = (
+                                    race_filled_price or price
+                                )
+                                result["filled_quantity"] = race_filled_qty
+                                if (
+                                    result["filled_price"]
+                                    and price
+                                    and price > 0
+                                ):
+                                    result["slippage"] = round(
+                                        abs(result["filled_price"] - price),
+                                        4,
+                                    )
+                                self._pending_orders[response] = result
+                                logger.warning(
+                                    f"[ORD-09-RACE] {symbol}: order "
+                                    f"{response} FILLED in cancel-race "
+                                    f"window (TTL elapsed but broker "
+                                    f"completed it before our cancel "
+                                    f"reached). Accepting the fill."
+                                )
+                            elif race_status in self._TERMINAL_PARTIAL:
+                                race_filled = True
+                                result["status"] = "PARTIALLY_FILLED"
+                                result["filled_price"] = (
+                                    race_filled_price or price
+                                )
+                                result["filled_quantity"] = race_filled_qty
+                                self._pending_orders[response] = result
+                                logger.warning(
+                                    f"[ORD-09-RACE] {symbol}: order "
+                                    f"{response} PARTIALLY filled in "
+                                    f"cancel-race window. Accepting "
+                                    f"the partial fill."
+                                )
+                        if not race_filled:
+                            logger.error(
+                                f"[ORD-09] {symbol}: order {response} "
+                                f"did not reach terminal within "
+                                f"{self.live_order_fill_timeout_sec:.1f}s; "
+                                f"cancel_attempt={cancelled}. Treating "
+                                f"as failed entry; caller will retry "
+                                f"under the idempotency probe."
+                            )
+                            self._pending_orders.pop(response, None)
+                            return None
 
                     # Place SL order after entry (opposite side). Track its
                     # id by symbol so we can cancel/modify it on close/trail.
                     if stop_loss is not None:
                         sl_side = "SELL" if tx_type == "BUY" else "BUY"
+                        # ORD-08 (audit 2026-05-28): size the SL-M to
+                        # the qty the broker ACTUALLY filled, not the
+                        # qty we requested. PARTIALLY_FILLED entries
+                        # used to receive an SL sized to the full
+                        # request -- the residual qty was unprotected
+                        # AND the SL was over-sized. The fallback to
+                        # ``quantity`` is defensive: if the terminal
+                        # row didn't surface a numeric ``filledshares``
+                        # we'd rather an over-sized SL than no SL,
+                        # because the broker rejects oversize SL-M.
+                        try:
+                            effective_sl_qty = int(
+                                result.get("filled_quantity") or quantity
+                            )
+                        except (TypeError, ValueError):
+                            effective_sl_qty = quantity
+                        if effective_sl_qty <= 0:
+                            effective_sl_qty = quantity
                         sl_id = self._place_sl_order(
-                            symbol, token, quantity, stop_loss, sl_side
+                            symbol, token, effective_sl_qty, stop_loss, sl_side
                         )
                         if sl_id:
                             self._sl_orders_by_symbol[symbol] = {
                                 "order_id": sl_id,
                                 "trigger": float(stop_loss),
                                 "side": sl_side,
-                                "quantity": quantity,
+                                # ORD-08: track the qty the SL was sized
+                                # for (= broker-confirmed fill on the
+                                # entry). Trail-modify and cancel paths
+                                # read this so the broker sees consistent
+                                # qty across SL lifecycle events.
+                                "quantity": effective_sl_qty,
                                 "token": token,
                             }
                         else:
