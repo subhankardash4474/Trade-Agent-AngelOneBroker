@@ -12,7 +12,7 @@ gate makes sure we're not killing an hour off n=2 noise. (Sample-size
 discipline is the entire point of "Phase A first, Phase B second" -- we
 don't blacklist hours based on hunches.)
 
-Output: docs/phase_b_hourly_blackout_candidates.md (overwritten on
+Output: docs/phases/phase_b_hourly_blackout_candidates.md (overwritten on
 re-run) plus a console summary. Re-run safely whenever the trade table
 grows.
 

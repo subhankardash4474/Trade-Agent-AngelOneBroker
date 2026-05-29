@@ -1,6 +1,6 @@
 [Unit]
 Description=Trading Agent battery queue scheduler (freeze-v2.1)
-Documentation=file:/opt/trading-agent/docs/FREEZE_v2.1.md
+Documentation=file:/opt/trading-agent/docs/freeze/FREEZE_v2.1.md
 After=docker.service network-online.target
 Wants=docker.service network-online.target
 

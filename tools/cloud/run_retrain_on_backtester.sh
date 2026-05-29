@@ -2,7 +2,7 @@
 # =============================================================================
 # XGBoost retrain runner — backtester VM
 # =============================================================================
-# Phase 2 + Phase 3 of the §5.9 retrain runbook (`docs/findings_log_2026-05-27.md`).
+# Phase 2 + Phase 3 of the §5.9 retrain runbook (`docs/findings/findings_log_2026-05-27.md`).
 # Designed to run on the backtester VM after slot-3 of the trimmed queue
 # finishes (V19 ETA ~17:00 IST tonight 2026-05-29).
 #

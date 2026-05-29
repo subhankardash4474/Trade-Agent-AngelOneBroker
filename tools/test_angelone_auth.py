@@ -279,7 +279,7 @@ def main() -> int:
         print("  1. Stage 1 (AMO order place + cancel) -- target: Saturday")
         print("  2. Stage 2 (live single-stock 5-min round-trip) -- Saturday or Sunday")
         print("  3. Stage 3 (5-stock basket via daemon in live mode) -- weekend after")
-        print("  See docs/e2e_broker_test_plan.md for the full ladder.")
+        print("  See docs/e2e/e2e_broker_test_plan.md for the full ladder.")
         return 0
     else:
         print(f"SUMMARY: {passed}/{total_stages} stages PASS, FAILED at stage {passed+1}.")

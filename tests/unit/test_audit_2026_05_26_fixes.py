@@ -1,6 +1,6 @@
 """Regression tests for the 2026-05-26 audit fixes.
 
-Each test maps 1:1 to a finding in `docs/audit_2026-05-25/BUG_REPORT.md`
+Each test maps 1:1 to a finding in `docs/audits/audit_2026-05-25_bug_report.md`
 or the C-series follow-up. Naming convention: `test_<finding>_<one_line_intent>`.
 
 These tests are intentionally small and fast — they are the "no new

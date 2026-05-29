@@ -6,7 +6,7 @@
 the Bug I closure verdict, and the kick-off of the 5-day diagnostic sprint
 proposed by the advisor memo on the morning of 2026-05-27.
 
-Continuation of `docs/findings_log_2026-05-25.md` (sections 1?17). New
+Continuation of `docs/findings/findings_log_2026-05-25.md` (sections 1?17). New
 numbering in this file starts at 1 for local readability; cross-references
 to the prior log use the form `findings_log_2026-05-25.md ?N`.
 

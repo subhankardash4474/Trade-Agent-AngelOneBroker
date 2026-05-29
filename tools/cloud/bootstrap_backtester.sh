@@ -155,7 +155,7 @@ remote "
              ${TRADER_HOME}/models
 
     # ------------------------------------------------------------------
-    # Bug J fix (2026-05-28). See docs/findings_log_2026-05-27.md §1.
+    # Bug J fix (2026-05-28). See docs/findings/findings_log_2026-05-27.md §1.
     #
     # The backtester VM has TWO writers with DIFFERENT UIDs:
     #

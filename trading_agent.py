@@ -754,7 +754,7 @@ class TradingAgent:
         #     short trades AT ALL?" Default True for backwards-compat.
         #     Setting False is the cheapest possible long-only experiment
         #     given freeze-v2.1 evidence that the short side has
-        #     structurally negative edge (see docs/findings_log_2026-05-25.md
+        #     structurally negative edge (see docs/findings/findings_log_2026-05-25.md
         #     §3.2 for the 339+ short trades over 90d that confirm this).
         #
         # Effective short-open permission =
@@ -4912,7 +4912,7 @@ class TradingAgent:
                 # trades over 90 days (-Rs 379 / -Rs 398 respectively).
                 # `risk.allow_shorts: false` (default True) blocks every
                 # new short before the capability/regime gates fire.
-                # See docs/findings_log_2026-05-25.md §3 for evidence.
+                # See docs/findings/findings_log_2026-05-25.md §3 for evidence.
                 if not getattr(self, "_allow_shorts", True):
                     logger.info(
                         f"[ALLOW-SHORTS] Skipping new SHORT for {symbol}: "

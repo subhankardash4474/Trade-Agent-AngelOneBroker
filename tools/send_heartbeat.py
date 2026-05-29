@@ -4,7 +4,7 @@ Why this script exists
 ======================
 
 The 2026-05-19 external verdict flagged *silent operational failures*
-as a HIGH-probability freeze-killer (`docs/freeze_contingencies.md` §C1).
+as a HIGH-probability freeze-killer (`docs/freeze/freeze_contingencies.md` §C1).
 The most insidious form is "the daemon is down but I think it's up
 because nothing told me otherwise." A daily heartbeat email -- one
 explicit message per market day before 09:15 IST -- inverts that:
@@ -294,7 +294,7 @@ def compose_body(now_ist: datetime,
             lines.append(f"- **Risk state:** {' | '.join(risk_bits)}")
     else:
         lines.append(f"- **Daemon:** UNREACHABLE -- {health.get('reason', 'unknown')}")
-        lines.append("- **Action:** see `docs/freeze_contingencies.md` §C1.a")
+        lines.append("- **Action:** see `docs/freeze/freeze_contingencies.md` §C1.a")
 
     lines.append("")
 
@@ -342,7 +342,7 @@ def compose_body(now_ist: datetime,
     lines.append("---")
     lines.append("")
     lines.append("*If you didn't receive this email by 09:25 IST, follow*")
-    lines.append("*`docs/freeze_contingencies.md` §C1.b (alert pipeline broken).*")
+    lines.append("*`docs/freeze/freeze_contingencies.md` §C1.b (alert pipeline broken).*")
     return "\n".join(lines)
 
 

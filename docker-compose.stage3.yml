@@ -1,5 +1,5 @@
 # =============================================================================
-# Stage 3 -- controlled 5-stock live basket (see docs/e2e_broker_test_plan.md)
+# Stage 3 -- controlled 5-stock live basket (see docs/e2e/e2e_broker_test_plan.md)
 # =============================================================================
 # Override that swaps the daemon command for the Stage 3 launch flags. Run as:
 #

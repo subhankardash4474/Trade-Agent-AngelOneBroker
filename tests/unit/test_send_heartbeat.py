@@ -3,7 +3,7 @@
 Why this test exists
 --------------------
 The heartbeat email is the operator's silent-failure detector
-(`docs/freeze_contingencies.md` §C1.b). If it stops working without
+(`docs/freeze/freeze_contingencies.md` §C1.b). If it stops working without
 the operator noticing, the freeze loses its main "is the daemon alive?"
 signal -- which is precisely the failure mode the verdict flagged as
 HIGH-probability.

@@ -216,7 +216,7 @@ def classify_regime(market_context: Optional[Dict]) -> str:
     emits a single ``[REGIME-INPUT]`` line at INFO so the advisor's "is the
     classifier seeing the right inputs?" question can be answered without
     reconstructing state. Behaviour is unchanged -- this is observability-
-    only and does not consume a freeze slot (see ``docs/FREEZE_v2.1.md``
+    only and does not consume a freeze slot (see ``docs/freeze/FREEZE_v2.1.md``
     "What is NOT frozen" section).
     """
     trend: Optional[int] = None

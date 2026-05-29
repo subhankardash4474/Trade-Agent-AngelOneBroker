@@ -1,8 +1,8 @@
 """Regression tests for the 2026-05-27 audit fixes.
 
 Each test maps 1:1 to a finding ID in
-``docs/findings_2026-05-27.md`` and the corresponding fix in
-``docs/changes_done_2026-05-27.md``. Naming convention:
+``docs/findings/findings_2026-05-27.md`` and the corresponding fix in
+``docs/changes/changes_done_2026-05-27.md``. Naming convention:
 ``test_<finding>_<one_line_intent>``.
 
 Tests are intentionally small/fast -- they are the "no new issues"

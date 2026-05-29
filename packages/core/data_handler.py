@@ -56,7 +56,7 @@ IST = pytz.timezone("Asia/Kolkata")
 # 2026-06-26 (Muharram, Friday). The list below was cross-checked
 # against Samco / Upstox / Zerodha / ET / Outlook Business -- all 5
 # sources agree on the 16 holidays for 2026. See
-# docs/findings_log_2026-05-27.md section 12 (Bug L).
+# docs/findings/findings_log_2026-05-27.md section 12 (Bug L).
 #
 # CONTRACT for future curators: every entry MUST carry the festival
 # name + day-of-week as a comment. A bare ISO date with no comment is

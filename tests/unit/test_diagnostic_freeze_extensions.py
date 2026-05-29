@@ -2,7 +2,7 @@
 
 These tests pin the behaviour of the six observability additions to
 ``packages/research/diagnostic.py`` that the freeze-v2.1 contingency
-plan (`docs/freeze_contingencies.md` §C2 + §C8) depends on:
+plan (`docs/freeze/freeze_contingencies.md` §C2 + §C8) depends on:
 
   * ``bootstrap_pf_ci()``               -- PF lower/upper 95 % CI
   * ``pf_excluding_max_trade()``        -- "one lucky trade" guard

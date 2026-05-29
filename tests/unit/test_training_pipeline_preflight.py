@@ -3,7 +3,7 @@
 Pins the 7 known training-pipeline bug fixes that produced the
 broken 2026-05-14 .pkl when they were absent or partially absent
 from the panic-patch deploy. The forensic audit
-(`docs/findings_log_2026-05-27.md` §5) catalogued these explicitly;
+(`docs/findings/findings_log_2026-05-27.md` §5) catalogued these explicitly;
 the next retrain MUST inherit all seven, otherwise we ship a model
 with the same training-time leakage that took XGBoost from useful
 to "95% SELL on validation" between 2026-05-11 and 2026-05-19.
@@ -41,7 +41,7 @@ smoke test in step E + the §5.9 step 3 held-out validation
 during the actual training run).
 
 Cross-references:
-* `docs/findings_log_2026-05-27.md` §5 (forensic audit) and §5.9
+* `docs/findings/findings_log_2026-05-27.md` §5 (forensic audit) and §5.9
   (retrain runbook) and §5.10 (pre-flight checklist).
 * `packages/training/prepare_dataset.py` — source of P1 #7 / P1 #8 /
   P1 #9 / F-24 / F-70 fixes.

@@ -3,7 +3,7 @@
 
 Background
 ----------
-Stage 3 (see ``docs/e2e_broker_test_plan.md``) demands a controlled
+Stage 3 (see ``docs/e2e/e2e_broker_test_plan.md``) demands a controlled
 5-stock live basket with caps that differ from the day-to-day paper
 config (5 instruments, Rs 5k cap, max_open_positions=5,
 trading_hours 09:30-12:30). Pre-2026-05-14 the only way to express

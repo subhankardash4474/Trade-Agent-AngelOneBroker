@@ -134,7 +134,7 @@ strategies:
     #   Re-enable ONLY after: (a) clean retrain on the corrected pipeline,
     #   (b) held-out backtest validation showing edge, (c) explicit
     #   freeze-bypass:critical-bug-fix slot consumption.
-    #   Evidence: docs/findings_log_2026-05-27.md (audit synthesis to be
+    #   Evidence: docs/findings/findings_log_2026-05-27.md (audit synthesis to be
     #   appended), signal_audit_2026-05-{06..26}.csv.
     # Uncomment after training the LSTM model:
     # - lstm_price_model
@@ -311,7 +311,7 @@ risk:
   # IS a behaviour change and consumes one freeze-v2.1 bypass slot.
   #
   # Evidence for considering a flip to `false` is documented in
-  # docs/findings_log_2026-05-25.md §3.2 and docs/post_freeze_v4_proposal.md
+  # docs/findings/findings_log_2026-05-25.md §3.2 and docs/reviews/post_freeze_v4_proposal.md
   # §10. Live agent has traded 100% shorts since 2026-05-13 in the
   # bear_high_vol regime (28 trades, -Rs 1,505); the 2026-05-18 90d
   # battery showed the short side losing on 339+ trades regardless of

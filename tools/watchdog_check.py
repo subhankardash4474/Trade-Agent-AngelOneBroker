@@ -190,7 +190,7 @@ def _compose_alert(status: str, age_seconds: Optional[float],
             "- SSH to VM and `sudo docker logs --tail 200 trader`",
             "- If logs frozen: `sudo docker compose restart trader`",
             "- Check open_positions in DB: any stuck positions need manual exit",
-            "- See `docs/freeze_contingencies.md` -SS-C2 (silent-hang playbook)",
+            "- See `docs/freeze/freeze_contingencies.md` -SS-C2 (silent-hang playbook)",
         ])
     elif status == "RECOVERED":
         subject = f"[WATCHDOG] Daemon recovered (was silent {stuck_min:.0f}m)"

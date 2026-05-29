@@ -381,7 +381,7 @@ class TestBugOTradesCsvIsolation:
     production trade log on the trader VM. Same class of bug as
     Bug M (alert spool path leak). The DB was correctly isolated to
     ``tmp_path/test.db``; the CSV path defaulted to ``"logs"``.
-    See ``docs/findings_log_2026-05-27.md`` §24.
+    See ``docs/findings/findings_log_2026-05-27.md`` §24.
     """
 
     def test_close_position_writes_to_log_dir_not_cwd(self, tmp_path, monkeypatch):

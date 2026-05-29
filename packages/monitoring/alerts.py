@@ -76,7 +76,7 @@ _BACKOFF_DELAYS = [0, 2, 8, 24]
 # this fix `_spool_failed_alert` resolved this constant directly, which made
 # the test `test_resend_spool_payload_persists_level` leak ~150 bogus
 # "Test/boom/critical" entries onto the trader VM between 2026-05-19 and
-# 2026-05-29. See docs/findings_log_2026-05-27.md §13. Kept as the public
+# 2026-05-29. See docs/findings/findings_log_2026-05-27.md §13. Kept as the public
 # default so an `AlertManager` constructed without a `failed_alerts_dir`
 # config still uses the legacy location (matters for the drain path on
 # upgrade -- existing pre-fix spool files at `logs/failed_alerts/` must

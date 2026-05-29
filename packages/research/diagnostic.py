@@ -914,7 +914,7 @@ def build_report(trades: list[dict], stats: dict[str, StratStats],
                 f"| Inclusive (all days)   | {port['trades']}       | Rs {port['total_pnl']:+,.0f}       | {port['profit_factor']:.2f}       | {port['win_rate']*100:.1f}       | {port['kelly']:+.3f}       |",
                 f"| Exclusive (clean days) | {clean_port['trades']} | Rs {clean_port['total_pnl']:+,.0f} | {clean_port['profit_factor']:.2f} | {clean_port['win_rate']*100:.1f} | {clean_port['kelly']:+.3f} |",
                 "",
-                "_Edge claim uses **Exclusive**; risk-tolerance check uses Inclusive. Contamination is pre-defined as VIX > 25 OR |NIFTY %| > 2.5 (see `docs/freeze_contingencies.md` §C8 / `logs/contaminated_days.csv`)._",
+                "_Edge claim uses **Exclusive**; risk-tolerance check uses Inclusive. Contamination is pre-defined as VIX > 25 OR |NIFTY %| > 2.5 (see `docs/freeze/freeze_contingencies.md` §C8 / `logs/contaminated_days.csv`)._",
                 "",
             ] if excluded_n > 0 else []
         ),

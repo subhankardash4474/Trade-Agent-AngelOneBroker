@@ -1,7 +1,7 @@
 """Regression tests for the 2026-05-27 backtester perf sweep (P-01..P-12).
 
 Each test maps 1:1 to a finding ID in the perf section of
-``docs/changes_done_2026-05-27.md``. The behaviour-equivalence tests are
+``docs/changes/changes_done_2026-05-27.md``. The behaviour-equivalence tests are
 deliberately strict: any drift in trade list, equity curve, or final
 metrics is treated as a regression. The perf assertions assert structural
 shape (e.g. "heapq.merge is used", "_bump_equity exists") rather than

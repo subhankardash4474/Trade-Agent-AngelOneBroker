@@ -2,7 +2,7 @@
 
 Background
 ----------
-docs/findings_log_2026-05-27.md §1 documents Bug J: the bootstrap
+docs/findings/findings_log_2026-05-27.md §1 documents Bug J: the bootstrap
 script unconditionally chowned the entire ``/opt/trading-agent`` tree
 to UID 1001 (the in-container ``trader`` user), which broke the
 host-side ``battery-scheduler.service`` that runs as the SSH bootstrap
@@ -57,7 +57,7 @@ def test_no_blanket_1001_chown_of_full_tree(script_text: str) -> None:
         "line that chowns logs+data+models to 1001:1001 in one shot. The host-"
         "side battery-scheduler.service will crash with PermissionError on its "
         "first data/battery_queue_state.json.tmp write. See "
-        "docs/findings_log_2026-05-27.md §1 for the root cause and the "
+        "docs/findings/findings_log_2026-05-27.md §1 for the root cause and the "
         "three-way ownership split that fixes it."
     )
 

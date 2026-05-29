@@ -565,7 +565,7 @@ class EnsembleBacktester:
             # Direction of the finding is preserved (shorts still bleed),
             # but the magnitude in production will differ.
             #
-            # Tracked as a follow-up in docs/findings_log_2026-05-25.md
+            # Tracked as a follow-up in docs/findings/findings_log_2026-05-25.md
             # §11. Fix would require:
             #   1. Adding Nifty/VIX bars to market_data.pkl
             #   2. Computing regime per-bar from rolling Nifty/VIX

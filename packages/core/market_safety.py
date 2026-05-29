@@ -336,7 +336,7 @@ NSE_SECTOR_MAP: Dict[str, str] = {
     # than Chemicals. GNFC's specialty-chemicals segment dominates its
     # intraday price action, so Chemicals is the correct bucket -- and
     # is what the original entry (now retained) intended. See
-    # docs/audit_2026-05-25/BUG_REPORT.md §B-5 and
+    # docs/audits/audit_2026-05-25_bug_report.md §B-5 and
     # tests/unit/test_sector_map_no_duplicate_keys.py.
     "COROMANDEL": "Agri", "DEEPAKFERT": "Agri",
     "BAYERCROP": "Agri", "DHANUKA": "Agri", "PIINDIA": "Agri",

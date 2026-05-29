@@ -41,7 +41,7 @@
 # 2026-05-27 TRIM (audit-only, freeze-v2.1 docs-class). Rationale:
 # the xgboost_classifier was disabled live in slot-2 yesterday (commit
 # f32009c) because the 2026-05-14 .pkl was confirmed broken (forensic
-# audit, see docs/findings_log_2026-05-27.md §5). The four long-history
+# audit, see docs/findings/findings_log_2026-05-27.md §5). The four long-history
 # v2_* jobs that previously sat in slots #3-6 of this queue were
 # designed to characterise the SHIPPED ensemble across multiple
 # windows / regimes. With xgboost out of strategies.active, those
@@ -75,7 +75,7 @@
 #                                  only after retrain is live.
 #
 # Net compute saved: ~144h ≈ 6 days. Once the retrained xgboost model
-# is qualified (sprint Day 4-5, see docs/diagnosis_sprint_2026-05-27.md),
+# is qualified (sprint Day 4-5, see docs/diagnoses/diagnosis_sprint_2026-05-27.md),
 # we will queue a SEPARATE block of long-history jobs that validate
 # the new ensemble — those replace what we removed here, but on the
 # post-retrain config rather than the broken-xgb config.
@@ -131,7 +131,7 @@ jobs:
   # therefore refused to swap it. We swapped manually on backtester
   # ONLY (trader VM untouched, xgboost_classifier disabled live; old
   # pkl backed up at xgboost_model_pre_override_20260529T1233Z.pkl).
-  # Rationale + audit trail: docs/findings_log_2026-05-27.md §5.10.2.
+  # Rationale + audit trail: docs/findings/findings_log_2026-05-27.md §5.10.2.
   #
   # This job runs the 5 variants whose behaviour depends on the pkl:
   #   * V1_baseline_current_shipped — control, NOT pkl-dependent. If

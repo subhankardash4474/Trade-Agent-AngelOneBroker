@@ -113,7 +113,7 @@ def test_bakri_id_2026_in_set() -> None:
         "Bug L regression: 2026-05-28 (Bakri Id, Thursday) missing from "
         "NSE_HOLIDAYS. This was the exact gap that caused the live "
         "daemon to burn ~7h of compute on 2026-05-28 scanning a closed "
-        "market. See docs/findings_log_2026-05-27.md section 12."
+        "market. See docs/findings/findings_log_2026-05-27.md section 12."
     )
 
 

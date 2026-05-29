@@ -106,7 +106,7 @@ def is_market_window() -> bool:
     return False the instant the agent self-exits, so the supervisor's
     next iteration goes into ``sleep_until_market`` as the
     2026-05-13 patch intended. See
-    ``docs/findings_log_2026-05-27.md`` §13 for the full RCA.
+    ``docs/findings/findings_log_2026-05-27.md`` §13 for the full RCA.
     """
     now = datetime.now(IST)
     if now.weekday() >= 5:
@@ -505,7 +505,7 @@ def main():
                     # sleep loop here-and-now instead of falling
                     # through into another ``start_agent`` /
                     # ``run_once`` round-trip. See
-                    # docs/findings_log_2026-05-27.md §13.
+                    # docs/findings/findings_log_2026-05-27.md §13.
                     sleep_until_market(args.config)
                     continue
             break

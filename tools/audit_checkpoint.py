@@ -423,7 +423,7 @@ def _section_per_strategy(
 
     Why this exists
     ---------------
-    Exit criterion #4 in docs/FREEZE_v2.1.md: "audit_checkpoint.py and
+    Exit criterion #4 in docs/freeze/FREEZE_v2.1.md: "audit_checkpoint.py and
     the EOD diagnostic produce strategy-level reports without manual
     SQL." The EOD email already calls into packages/research/diagnostic,
     but the per-5-min checkpoint did not -- so during the day the
@@ -554,7 +554,7 @@ def _section_self_sufficiency() -> Dict[str, Any]:
 # detector below catches the same pattern next time the calendar
 # misses a holiday: weekday in IST, past midday, multiple cycles ran
 # in the window but signal pipeline produced essentially nothing AND
-# zero trades closed today. See docs/findings_log_2026-05-27.md
+# zero trades closed today. See docs/findings/findings_log_2026-05-27.md
 # section 12 (Bug L) for the reference incident.
 #
 # Conservative on purpose: it only fires when ALL of {weekday, past
@@ -640,7 +640,7 @@ def _possible_missed_holiday_verdict(
             f"declared an unscheduled closure. Cross-check the NSE "
             f"calendar; if today IS a trading holiday, add it to "
             f"packages/core/data_handler.py:NSE_HOLIDAYS. See "
-            f"docs/findings_log_2026-05-27.md section 12 (Bug L)."
+            f"docs/findings/findings_log_2026-05-27.md section 12 (Bug L)."
         )
 
     return None

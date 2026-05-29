@@ -271,7 +271,7 @@ def test_config_disables_xgboost_classifier_pending_retrain():
     confront the criteria, not bypass them.
 
     See:
-      * docs/findings_log_2026-05-27.md §6 (forensic audit synthesis)
+      * docs/findings/findings_log_2026-05-27.md §6 (forensic audit synthesis)
       * commit f32009c (DISABLE rationale + re-enable criteria)
       * FREEZE_v2.1.md §Bypass ledger (slot 2 of 3 used)
     """

@@ -1,7 +1,7 @@
 """Regression tests for the 2026-05-28 audit follow-up Phase-4 fixes.
 
 Each test maps 1:1 (or 1:few) to a finding ID in
-``docs/audit_2026-05-28_followup.md``. Naming convention:
+``docs/audits/audit_2026-05-28_followup.md``. Naming convention:
 ``test_<finding>_<one_line_intent>``.
 
 Phase-4 scope (this file): runtime performance.

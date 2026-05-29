@@ -2,7 +2,7 @@
 B-5, B-11).
 
 Each `class TestB*` corresponds to one finding in
-`docs/audit_2026-05-25/BUG_REPORT.md`. Every test is structured so that
+`docs/audits/audit_2026-05-25_bug_report.md`. Every test is structured so that
 it would FAIL on the pre-fix tree (the bug-as-shipped state) and PASS
 after the corresponding source change. That is the spec.
 
@@ -166,7 +166,7 @@ class TestB5SectorMapNoDuplicateKeys:
         assert "GNFC" in NSE_SECTOR_MAP
         assert NSE_SECTOR_MAP["GNFC"] == "Chemicals", (
             f"GNFC must map to Chemicals; got {NSE_SECTOR_MAP['GNFC']!r}. "
-            f"See docs/audit_2026-05-25/BUG_REPORT.md §B-5."
+            f"See docs/audits/audit_2026-05-25_bug_report.md §B-5."
         )
 
 

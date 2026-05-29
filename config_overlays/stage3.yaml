@@ -1,5 +1,5 @@
 # ----------------------------------------------------------------------
-# Stage 3 - controlled live basket (see docs/e2e_broker_test_plan.md)
+# Stage 3 - controlled live basket (see docs/e2e/e2e_broker_test_plan.md)
 # ----------------------------------------------------------------------
 #
 # Applied to the base config via:

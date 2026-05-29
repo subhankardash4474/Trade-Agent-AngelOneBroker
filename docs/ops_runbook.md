@@ -370,7 +370,7 @@ sudo systemctl start battery-scheduler.service
 
 The `--resume <run_id>` vs `--run-id <run_id>` distinction is handled by
 `tools/run_battery_queue.py` automatically based on the `resuming` field
-in the state file (fixed 2026-05-25; see `docs/findings_log_2026-05-25.md` §10).
+in the state file (fixed 2026-05-25; see `docs/findings/findings_log_2026-05-25.md` §10).
 
 ---
 
@@ -669,10 +669,10 @@ Multiple defense layers were missing on May 22:
 |--------------------------------------------|---------------------------------------------------|
 | Launch Stage 3 (real money)                | `docs/stage3_runbook.md`                          |
 | Recover from a backtester isolation guard  | `docs/backtester_vm_runbook.md`                   |
-| Understand the freeze policy               | `docs/FREEZE_v2.1.md`                             |
-| See current weekly freeze log              | `docs/freeze_log_week1.md`                        |
-| Audit findings from May 25 deep scan       | `docs/findings_log_2026-05-25.md`                 |
-| Audit changes log from May 25              | `docs/changes_done_2026-05-25.md`                 |
+| Understand the freeze policy               | `docs/freeze/FREEZE_v2.1.md`                             |
+| See current weekly freeze log              | `docs/freeze/freeze_log_week1.md`                        |
+| Audit findings from May 25 deep scan       | `docs/findings/findings_log_2026-05-25.md`                 |
+| Audit changes log from May 25              | `docs/changes/changes_done_2026-05-25.md`                 |
 | Architecture overview                      | `docs/ARCHITECTURE.md`                            |
 
 If you find a command in this document that fails, the document is
