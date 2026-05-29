@@ -1,8 +1,10 @@
 # Friday review — 2026-05-29
 
-**Status:** Draft prepared 2026-05-28 (market holiday). Final
-verdicts/decisions get appended Friday morning after slot #3 of the
-backtester queue completes.
+**Status:** Draft prepared 2026-05-28; verdicts appended
+2026-05-29 14:08 IST after slot #3 V15 result landed (V15
+result is the decisive cell). Section 10 below is the
+landed-data verdict; everything above stays as the original
+draft for traceability.
 
 **Audience:** operator + advisor reviewing whether the freeze-v2.1
 diagnostic sprint has produced enough evidence to (a) promote a new
@@ -287,10 +289,12 @@ confidence.
 
 ### 5.2 Recommended decision
 
-**Do NOT promote V4 to live yet.** The 4-strategy ensemble's best
-variant still bleeds money over 60d on the live universe. Promoting
-V4 buys us a 30% PnL improvement on a strategy that is fundamentally
-unprofitable -- we'd be sailing slightly slower onto the same rocks.
+**[VERDICT, 2026-05-29 14:08 IST]** Do NOT promote V4 to live.
+The 4-strategy ensemble's best variant still bleeds money over
+60d on the live universe (V4 confirmed at -₹489 / PF 0.84
+across slots #2 and #3). Promoting V4 buys us a 30% PnL
+improvement on a strategy that is fundamentally unprofitable --
+we'd be sailing slightly slower onto the same rocks.
 
 **Instead:**
 
@@ -363,7 +367,7 @@ a one-off, possibly a config snapshot issue.
 | PF > 1.05 on 232 stocks | Strong positive transfer | **Consume bypass slot-3, execute retrain runbook (`findings_log_2026-05-27.md §5.9`) next sprint week.** |
 | 1.00 < PF < 1.05 on 232 stocks | Weak positive transfer, possibly noise | Hold; queue one more confirmatory run (e.g. V15 on a 90d window, or V15 with `--days 30` start-of-month boundary). |
 | 0.95 < PF < 1.00 on 232 stocks | Ambiguous, slot-1 likely small-universe noise | Defer retrain. Investigate WHY slot-1 was positive (window-specific artifact?). |
-| PF < 0.95 on 232 stocks | Slot-1 V15 was small-universe noise | Defer retrain indefinitely. Look for alpha elsewhere (regime classifier, entry-lag, position sizing). |
+| **PF < 0.95 on 232 stocks** | **[LANDED, V15 PF=0.94]** Slot-1 V15 was small-universe noise | **DEFER retrain indefinitely. Look for alpha elsewhere (regime classifier, entry-lag, position sizing).** See §10.2. |
 
 ---
 
@@ -373,8 +377,10 @@ a one-off, possibly a config snapshot issue.
 |------|----------|---------|------------------|
 | Bug K fix (move slice before cache save) + unit test | HIGH | None | ~30 min code + 1h test/CI |
 | Re-queue a real holdout-30d batch after Bug K fix | HIGH | Bug K fix lands first | One overnight run |
-| **XGBoost retrain -- PRE-FLIGHT (steps A-E)** | HIGH (if §7 says GO) | Friday morning V15 transfer result | ~2h, local only, no VM impact. Full checklist in `findings_log_2026-05-27.md §5.10`. |
-| **XGBoost retrain -- TRAINING (steps 2-5 of §5.9)** | HIGH (if §7 says GO) | Pre-flight A-E complete + slot #3 finished | ~30h wall-clock (train ~18h + validate 30min + bench ~6h + deploy 15min). Slot-3 of bypass ledger consumed at deploy. |
+| **XGBoost retrain -- PRE-FLIGHT (steps A-E)** | **DEFERRED INDEFINITELY (§7 = NO-GO)** | -- | Was gated on V15 transferring; V15 PF=0.94 on slot #3 = no-go. Pre-flight stays in the runbook (`findings_log_2026-05-27.md §5.10`) for re-activation if H1/H3 forensics later argue retrain is the next move. |
+| **XGBoost retrain -- TRAINING (steps 2-5 of §5.9)** | **DEFERRED INDEFINITELY (§7 = NO-GO)** | -- | Same reasoning as PRE-FLIGHT row. |
+| Hypothesis H3 forensic (entry-lag, never measured) | **HIGH (next sprint week)** | None | ~3-4 days. Concrete deliverable: histogram of `(broker_fill_ts - strategy_emit_ts)` from the last 30d of trader logs vs the backtester ideal-fill model. |
+| Hypothesis H1 diagnostic (regime classifier mis-fire) | **HIGH (next sprint week)** | Slot-3 must finish (V18+V19 still in flight as of 14:08 IST) | ~1-2 days. Per-regime PnL slice for V1+V10+V15 from slot-3 data; tests whether regime tagging is the root of the cross-universe PF degrade. |
 | V18 anomaly RCA | LOW | None | ~1h code-read + ~1h test |
 | Trader VM trades.csv cleanup | DONE | -- | Verified clean 2026-05-28 11:55 IST, no work needed |
 | Bug J permanent fix | DONE | -- | Landed `31703bc` 2026-05-28 |
@@ -437,3 +443,180 @@ and defer further retrains until the root cause is understood.
   landed today.
 * `tests/unit/test_bootstrap_backtester_perms.py` -- 7 Bug J
   regression tests.
+
+---
+
+## 10. Friday-morning verdict (data-landed)
+
+**Status:** appended 2026-05-29 14:08 IST. Slot #3's V15 result
+landed at 10:26 IST today. V18 still in flight (64.1% as of this
+write); V19 just started. Verdict below is locked because V15
+is the single decisive cell from the §7 matrix; V18/V19 are
+informational only and do not change the action. Final
+slot-#3 wrap is expected ~17:00 IST tonight; if V18 / V19
+deliver any unexpected positive variant, we'll re-open this
+section. Otherwise §10 is the closing call for the diagnostic
+sprint's H1+H2 read-out.
+
+### 10.1 Headline verdict — DEFER retrain, KEEP capital paused
+
+| Question | Answer | Source |
+|----------|--------|--------|
+| Does V15 transfer profitably to the 232-stock universe? | **NO** | Slot #3, 14:08 IST |
+| Does any variant in 257 backtests turn profitable? | **NO** | Slots #1+#2+#3, all 17/19 done in #3 |
+| Promote V4_threshold_3pct to live? | **NO** | §5.2, unchanged |
+| Consume bypass slot-3 on XGBoost retrain? | **NO** -- §7 matrix DEFER branch | §10.2 below |
+| Keep capital paused under freeze-v2.1? | **YES** | §5.2 + §10.2 |
+
+### 10.2 V15 transfer test — the decisive cell
+
+Slot #1 (50 stocks, 60d): **PF 1.02, +₹10, 56 trades, WR 50.0%, MaxDD 1.92%.**
+Slot #3 (232 stocks, 60d): **PF 0.94, -₹326, 444 trades, WR 47.3%, MaxDD 8.8%.**
+
+Per §7 matrix `PF < 0.95 on 232 stocks` row:
+
+> Slot-1 V15 was small-universe noise. Defer retrain
+> indefinitely. Look for alpha elsewhere (regime classifier,
+> entry-lag, position sizing).
+
+**Reading:**
+* PnL flipped sign across universes: +₹10 → -₹326. Trade
+  count scaled 56 → 444 (~8× on a 5× universe size, so the
+  MR strategy fires more aggressively on the bigger
+  universe; the extra trades land net-negative).
+* WR is still the highest of any variant in slot #3 (47.3%
+  vs the next-best V4 at 38.4%) -- but PF 0.94 means the
+  losers, while individually less frequent, are bigger than
+  the winners. This is consistent with mean-reversion entries
+  that get caught in trending moves.
+* Cross-universe rank stability HOLDS (V15 is still the best
+  variant in slot #3 by PF), but **best-in-class is no longer
+  profitable** on the production universe. That's the new
+  evidence.
+
+**What this kills:**
+* The "XGBoost retrain unblocks the alpha" hypothesis from
+  the diagnostic sprint's H2. The current XGB pkl is broken
+  (forensic audit §5 of `findings_log_2026-05-27.md`), but
+  even the variant that ONLY uses MR + that broken XGB doesn't
+  transfer profitably to the live universe. Retraining XGB
+  might still help -- but on the strength of slot-#3 data
+  alone, retrain is **not** the highest-leverage next move.
+
+**What stays alive (now top of the next-sprint backlog):**
+* Entry-lag forensic (Hypothesis H3 from
+  `docs/diagnosis_sprint_2026-05-27.md`). Live trades may be
+  systematically late vs the backtester's ideal-fill model;
+  if so, the backtester's PnL is an *upper bound* on what
+  live can deliver. Worth measuring before any new strategy
+  hypothesis.
+* Regime-classifier mis-firing (H1). The cross-universe
+  PF degradation (slot-1 V10/V15 around PF 0.9-1.0 vs slot-3
+  V10/V15 at PF 0.79-0.94) suggests the regime classifier
+  may be tagging winning windows differently across
+  universe sizes. Diagnostic: log per-regime PnL across
+  V1+V10+V15 from slot-3.
+
+### 10.3 Slot-#3 ranking (17 of 19 variants done)
+
+| Rank | Variant | Trades | WR% | PnL | PF | MaxDD% | Ret% | Cross-universe stable? |
+|-----:|---------|------:|----:|----:|----:|------:|-----:|:--|
+| 1 | V15_mr_xgb_only | 444 | 47.3 | -₹326 | **0.94** | 8.80 | -3.23% | NO -- profit lost on transfer |
+| 2 | V5_threshold_7pct | 253 | 37.2 | -₹451 | 0.86 | 7.73 | -4.26% | n/a (was not in slot #1) |
+| 3 | V4_threshold_3pct | 229 | 38.4 | -₹489 | 0.84 | 7.99 | -4.80% | YES -- still rank 1 in slot #2 |
+| 4 | V6_threshold_10pct | 257 | 35.8 | -₹626 | 0.81 | 8.16 | -6.01% | n/a |
+| 5 | V10_confidence_060 | 225 | 36.0 | -₹636 | 0.79 | 8.29 | -6.11% | NO -- rank 2 in slot #1 |
+| 6= | V1=V12=V13=V14 (cluster) | 235 | 36.2 | -₹693 | 0.78 | 8.77 | -6.68% | YES |
+| 7 | V11_confidence_050 | 235 | 36.2 | -₹694 | 0.78 | 8.78 | -6.69% | n/a |
+| 8 | V17_long_only_shipped | 236 | 36.0 | -₹711 | 0.78 | 8.63 | -6.86% | YES (≈V1, expected) |
+| 9= | V8=V9 | 263 | 33.5 | -₹809 | 0.74 | 9.75 | -7.85% | n/a |
+| 10= | V2=V3=V7 | 266 | 34.6 | -₹981 | 0.69 | 11.21 | -9.58% | YES (≈V2 cluster, expected) |
+| 17 | V16_completely_naked | **4890** | 32.6 | **-₹6771** | **0.39** | **67.65** | **-67.64%** | YES (catastrophic on both) |
+| -- | V18 | in flight | -- | -- | -- | -- | -- | pending §10.4 |
+| -- | V19 | in flight | -- | -- | -- | -- | -- | pending §10.4 |
+
+**Reading new entries (V5/V6/V11/V12/V13/V14 — first time on the
+big universe):**
+* V5 (threshold 7%) edges out V4 (threshold 3%) by ₹38. Tighter
+  AND looser thresholds both beat the shipped 5% (V1) -- the
+  shipped value is a local minimum. Worth re-running V5 on a
+  different 60d window to check it's not window-specific.
+* V11 (confidence 0.5) is essentially identical to V1 -- so
+  loosening the confidence floor below 0.7 doesn't help on
+  the 232-stock universe. Slot-1's V10 advantage (confidence
+  0.6) doesn't transfer.
+* V12/V13/V14 are all ≡ V1. Confirms peak-giveback,
+  window-cap-8, and opening-lockout-off are no-ops on the
+  current strategy stack.
+* V16 (no filters at all) loses 67.64% over 60d. The current
+  filter stack is preventing -₹6,000 of additional loss vs
+  what a naked stack would do; that's still real protective
+  value, even though we're losing money WITH the filters.
+
+### 10.4 Pending finalisations
+
+| Item | Expected by | Effect on §10.1 verdict |
+|------|------|------|
+| V18 result lands | ~16:00 IST tonight | Resolves §6 V18-anomaly question. V18=V2 (266 trades, -₹981, PF 0.69) → universe-specific override-merge bug. V18=V4 (229 trades, -₹489, PF 0.84) → slot-#2 V18 was a one-off. Either outcome is informational; no change to §10.1. |
+| V19 result lands | ~17:00 IST tonight | Should be V19=V2 by symmetry (long-only-filters-off ≡ all-filters-off when shorts are already disabled live). Confirmation only. |
+
+### 10.5 Recommended next moves
+
+In priority order, with rough effort estimates. The capital
+remains paused throughout; this is research / forensic
+queue.
+
+1. **(today, 30 min)** Append the V15 verdict to
+   `findings_log_2026-05-27.md` so the operational log carries
+   the same conclusion as this review. New §10 mirroring §10
+   here.
+2. **(today, ~5 min)** Stop the model-retrain pre-flight todo
+   from being on the active queue. The `model_retrain` todo
+   moves from PENDING-(gated-on-V15) → DEFERRED-INDEFINITELY
+   per §10.2.
+3. **(post-Friday week, ~2h)** Bug K fix: move the
+   holdout-slice block to BEFORE `_save_market_data_cache` in
+   `packages/research/battery.py`; add the unit test from
+   `findings_log_2026-05-27.md §9`. Re-queue an actual
+   holdout-30d batch for the following weekend. This is the
+   only way to get walk-forward evidence.
+4. **(next sprint week, 3-4 days)** Hypothesis H3 forensic
+   from the diagnostic sprint -- measure live entry lag.
+   Concrete deliverable: histogram of `(broker_fill_ts -
+   strategy_emit_ts)` from the last 30d of trader logs vs the
+   backtester's ideal-fill model.
+5. **(next sprint week, 1-2 days)** Hypothesis H1 -- per-regime
+   PnL slice for V1+V10+V15 from slot-3 data. Tests whether
+   regime classifier mis-firing (cross-universe instability)
+   is the underlying cause of the cross-universe PF degrade.
+6. **(low priority, ~1h)** V18 anomaly RCA from §6 once V18's
+   slot-#3 cell lands. Not decision-affecting (since no V*
+   variant is being promoted) but cheap to close.
+
+### 10.6 What this means for the diagnostic sprint
+
+The Friday checkpoint of the 5-day Option-A sprint
+(`docs/diagnosis_sprint_2026-05-27.md`) was meant to read out
+H1+H2+H3. With the V15 verdict:
+
+* **H2 (XGBoost broken model is the cause of live losses):**
+  partially refuted. The *current* broken pkl IS broken
+  (validated forensic in §5), but retraining it is not
+  sufficient to turn the system profitable on the 232-stock
+  universe -- because the only variant that even hinted at
+  using XGB profitably (V15 in slot #1) didn't transfer.
+  Retrain stays in the backlog as a "would help if combined
+  with H1/H3 fixes" rather than a standalone unblock.
+* **H1 (regime classifier mis-firing):** strengthened by
+  cross-universe instability data. Top of the next-sprint
+  backlog (§10.5 item 5).
+* **H3 (entry-lag inflating live losses):** unchanged --
+  still un-measured. Top-priority forensic for the next
+  sprint week (§10.5 item 4).
+
+Capital remains paused under freeze-v2.1. The sprint produced
+clean evidence on H2 (negative result, but conclusive) and a
+strong steer toward H1+H3 as the next-sprint focus. That's a
+successful sprint outcome even though the headline answer is
+"nothing to ship today."
+
