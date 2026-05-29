@@ -228,6 +228,85 @@ class AngelOneDataSource(DataSource):
             logger.error(f"Error fetching LTP for {symbol}: {e}")
         return None
 
+    def get_ltp_batch(
+        self, instruments: List[dict], chunk_size: int = 50,
+    ) -> Dict[str, Optional[float]]:
+        """PERF-01 (audit 2026-05-28): batch LTP via AngelOne
+        ``getMarketData`` (mode=LTP).
+
+        Pre-fix the agent looped over symbols and called ``ltpData``
+        (one symbol per REST call, rate-limited to 3/sec). With 300
+        symbols a cycle's LTP phase took 100s+ before network latency.
+        ``getMarketData`` accepts up to 50 tokens per call (broker
+        documented limit) so 300 symbols collapse to ~6 REST calls.
+
+        Returns ``{symbol: price_or_None}``. On any per-chunk failure
+        the symbols in that chunk are returned as ``None`` so the
+        caller (which already handles ``None``) degrades gracefully
+        rather than aborting the entire cycle. Caller is expected to
+        retry through the per-symbol fallback path if it cares about
+        the single-symbol semantics.
+        """
+        if not instruments:
+            return {}
+        exchange = self._config.get("exchange", "NSE")
+        prices: Dict[str, Optional[float]] = {}
+        # Map token -> symbol for response demux. Symbols without a
+        # token are returned as None up-front (and skipped from the
+        # batch payload entirely).
+        tokens: List[str] = []
+        token_to_symbol: Dict[str, str] = {}
+        for inst in instruments:
+            sym = inst.get("symbol")
+            tok = str(inst.get("token") or "").strip()
+            if not sym:
+                continue
+            if not tok:
+                prices[sym] = None
+                continue
+            tokens.append(tok)
+            token_to_symbol[tok] = sym
+        for chunk_start in range(0, len(tokens), max(1, chunk_size)):
+            chunk = tokens[chunk_start: chunk_start + chunk_size]
+            self._rate_limiter.wait()
+            try:
+                resp = self._api.getMarketData(
+                    mode="LTP",
+                    exchangeTokens={exchange: list(chunk)},
+                )
+            except Exception as e:
+                logger.warning(
+                    f"[LTP-BATCH] getMarketData failed for chunk of "
+                    f"{len(chunk)} tokens: {e!r}"
+                )
+                for tok in chunk:
+                    prices[token_to_symbol[tok]] = None
+                continue
+            if not resp or not resp.get("status"):
+                for tok in chunk:
+                    prices[token_to_symbol[tok]] = None
+                continue
+            fetched = (resp.get("data") or {}).get("fetched") or []
+            seen_tokens: set = set()
+            for row in fetched:
+                tok = str(row.get("symbolToken") or "").strip()
+                if not tok or tok not in token_to_symbol:
+                    continue
+                ltp = row.get("ltp")
+                if ltp is None:
+                    ltp = row.get("close")
+                try:
+                    prices[token_to_symbol[tok]] = float(ltp) if ltp is not None else None
+                except (TypeError, ValueError):
+                    prices[token_to_symbol[tok]] = None
+                seen_tokens.add(tok)
+            # Tokens the broker did NOT return -> mark None so caller
+            # can decide whether to fall back per-symbol.
+            for tok in chunk:
+                if tok not in seen_tokens:
+                    prices.setdefault(token_to_symbol[tok], None)
+        return prices
+
     def get_order_book(self, symbol: str, token: str) -> Optional[dict]:
         self._rate_limiter.wait()
         try:
@@ -503,14 +582,36 @@ class DataHandler:
         return None
 
     def get_multiple_ltp(self, instruments: List[dict]) -> Dict[str, Optional[float]]:
-        """Get LTP for multiple instruments with per-symbol error isolation."""
-        prices = {}
-        for inst in instruments:
+        """Get LTP for multiple instruments with per-symbol error isolation.
+
+        PERF-01 (audit 2026-05-28): when the AngelOne broker is wired
+        we prefer the batch ``getMarketData`` endpoint (50 tokens /
+        call) over the legacy N-sequential ``ltpData`` loop. Symbols
+        that came back as None from the batch path fall back to the
+        per-symbol path so transient per-token errors don't cascade.
+        """
+        if not instruments:
+            return {}
+        prices: Dict[str, Optional[float]] = {}
+        if self._angelone is not None:
             try:
-                prices[inst["symbol"]] = self.get_ltp(inst["symbol"], inst.get("token", ""))
+                batch = self._angelone.get_ltp_batch(instruments)
+                prices.update(batch)
             except Exception as e:
-                logger.error(f"LTP error for {inst['symbol']}: {e}")
-                prices[inst["symbol"]] = None
+                logger.warning(
+                    f"[LTP-BATCH] degraded to per-symbol fallback: {e!r}"
+                )
+        for inst in instruments:
+            sym = inst.get("symbol")
+            if not sym:
+                continue
+            if prices.get(sym) is not None:
+                continue
+            try:
+                prices[sym] = self.get_ltp(sym, inst.get("token", ""))
+            except Exception as e:
+                logger.error(f"LTP error for {sym}: {e}")
+                prices[sym] = None
         return prices
 
     def get_order_book(self, symbol: str, token: str) -> Optional[dict]:

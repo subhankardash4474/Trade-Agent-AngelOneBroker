@@ -93,9 +93,21 @@ services:
 
     # Resource caps (paper daemon measured at ~600MB; this is comfortable
     # headroom and prevents a runaway from OOM'ing the whole VM).
+    #
+    # PERF-15 (audit 2026-05-28): pre-fix the trader had no CPU cap.
+    # On the 2-vCPU OCI box, a long _trading_cycle could saturate both
+    # CPUs while the WS thread, healthcheck, and audit checkpoint
+    # competed for time -- WS tick latency (and therefore exit
+    # latency on held positions) rose under starvation. Cap at 1.5
+    # vCPUs so at least 0.5 vCPU is always available to the WS
+    # thread + healthcheck + audit_checkpoint sidecars. Reserve 0.5
+    # so the scheduler keeps it warm. Override locally in
+    # docker-compose.override.yml if you need full headroom.
     deploy:
       resources:
         limits:
           memory: 1500M
+          cpus: "1.5"
         reservations:
           memory: 600M
+          cpus: "0.5"

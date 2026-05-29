@@ -1517,10 +1517,15 @@ class TradingAgent:
                     # Periodic rescan to rotate into better stocks. Skip if the
                     # market is closed — scans cost ~3 minutes and we'd just
                     # throw the result away when we shut down this cycle.
+                    #
+                    # PERF-14 (audit 2026-05-28): off-load to a background
+                    # thread so the main loop continues processing exits /
+                    # signals while the scan is in flight. Atomic watchlist
+                    # swap on completion.
                     if (self._auto_scan
                             and self.scanner.needs_rescan()
                             and self.data_handler.is_market_open()):
-                        self._run_scan()
+                        self._run_scan_async()
 
                     self._trading_cycle()
                     self._consecutive_cycle_errors = 0
@@ -1634,6 +1639,29 @@ class TradingAgent:
                 self._check_position_exits(fast_prices)
             except Exception as e:
                 logger.debug(f"[FAST-EXITS] poll failed (non-fatal): {e}")
+
+    def _run_scan_async(self) -> bool:
+        """PERF-14 (audit 2026-05-28): run the scanner on a background
+        thread so the main loop is not blocked for ~3 minutes every
+        30 minutes (Yahoo fetches across 500+ NSE stocks). Atomic
+        watchlist swap on completion.
+
+        Returns True if a scan was scheduled; False if one is already
+        in flight (idempotent: skipping is safe -- the in-flight scan
+        will produce a fresh watchlist soon enough).
+        """
+        existing = getattr(self, "_scan_thread", None)
+        if existing is not None and existing.is_alive():
+            logger.info(
+                "[SCAN] previous scan still running; skipping this trigger"
+            )
+            return False
+        thread = threading.Thread(
+            target=self._run_scan, name="scanner-worker", daemon=True
+        )
+        self._scan_thread = thread
+        thread.start()
+        return True
 
     def _run_scan(self):
         """Run the stock scanner and update the instrument watchlist."""
@@ -3397,16 +3425,25 @@ class TradingAgent:
         try:
             import os as _os
             import requests as _req
-            sess = _req.Session()
-            # B-3 (audit 2026-05-25): respect TRADER_DISABLE_SSL_VERIFY
-            # instead of hard-coding verify=False. Default secure (verify
-            # enabled); only bypassed when explicitly set in the local .env.
-            # Same env-flag semantics as main.py / run_daemon.py / scanner.
-            _bypass = _os.environ.get("TRADER_DISABLE_SSL_VERIFY", "false").lower() in (
-                "1", "true", "yes",
-            )
-            sess.verify = not _bypass
-            sess.headers.update({"User-Agent": "Mozilla/5.0"})
+            # PERF-09 (audit 2026-05-28): pre-fix this method created a
+            # fresh ``requests.Session`` on every refresh -- 4-5 sequential
+            # Yahoo calls per refresh paid the TCP+TLS handshake cost
+            # ~5 times every 10 minutes. Reuse a single session attached
+            # to the agent so the same TCP connection (HTTPS keep-alive)
+            # is reused across all calls in this refresh AND across
+            # refreshes within a session.
+            sess = getattr(self, "_yahoo_session", None)
+            if sess is None:
+                sess = _req.Session()
+                # B-3 (audit 2026-05-25): respect TRADER_DISABLE_SSL_VERIFY
+                # instead of hard-coding verify=False. Default secure (verify
+                # enabled); only bypassed when explicitly set in the local .env.
+                _bypass = _os.environ.get("TRADER_DISABLE_SSL_VERIFY", "false").lower() in (
+                    "1", "true", "yes",
+                )
+                sess.verify = not _bypass
+                sess.headers.update({"User-Agent": "Mozilla/5.0"})
+                self._yahoo_session = sess
             _chart_url = "https://query1.finance.yahoo.com/v8/finance/chart/{ticker}"
 
             def _fetch_close(ticker: str, range_str: str = "5d", interval: str = "1d"):
@@ -4959,8 +4996,23 @@ class TradingAgent:
                 self._audit_reject(signal, current_price, f"pattern:{pat_reason}")
                 return
 
-        # Stop-loss / take-profit (side-aware)
-        atr = self._get_latest_atr(symbol)
+        # PERF-04 (audit 2026-05-28): pre-fix the entry path triple-
+        # fetched the same 6h 5min window: ``_get_indicator_snapshot``
+        # built ``snap`` (already containing atr_pct), then
+        # ``_get_latest_atr`` re-fetched the SAME window and recomputed
+        # ATR(14). Now we derive the absolute ATR from
+        # ``snap.atr_pct * current_price / 100`` and only fall back to
+        # the explicit fetch when the snapshot is empty (e.g. <14 bars
+        # available). Saves ~1-2s per entry attempt before gate logic.
+        atr = None
+        snap_atr_pct = snap.get("atr_pct") if snap else None
+        if snap_atr_pct is not None and current_price > 0:
+            try:
+                atr = float(snap_atr_pct) / 100.0 * float(current_price)
+            except (TypeError, ValueError):
+                atr = None
+        if atr is None:
+            atr = self._get_latest_atr(symbol)
         # Strategy-supplied SLs MUST be routed through `enforce_sl_floor` --
         # otherwise a sub-noise SL (e.g. supertrend's 3*ATR on a quiet stock)
         # bypasses the `min_stop_loss_pct` floor and the position gets

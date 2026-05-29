@@ -733,7 +733,18 @@ class TradeAnalyzer:
             return 0.0, "learning_disabled"
 
         try:
-            patterns = self._db.load_trade_patterns(limit=self.pattern_lookback)
+            # PERF-06 (audit 2026-05-28): push (strategy, regime)
+            # filter to SQL so the pattern-load returns the targeted
+            # subset directly. Falls back to legacy behaviour for
+            # older Database builds that don't accept the kwargs.
+            try:
+                patterns = self._db.load_trade_patterns(
+                    limit=self.pattern_lookback,
+                    strategy=strategy,
+                    regime=regime,
+                )
+            except TypeError:
+                patterns = self._db.load_trade_patterns(limit=self.pattern_lookback)
         except Exception as exc:
             # OBS-15 (audit 2026-05-28): pre-fix this swallowed the DB
             # error with no log. Pattern-learning silently disables

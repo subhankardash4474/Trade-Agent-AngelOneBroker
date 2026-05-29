@@ -85,6 +85,13 @@ class Database:
         conn = sqlite3.connect(self._db_path, timeout=10)
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=NORMAL")
+        # PERF-10 (audit 2026-05-28): bump page cache to 64MB
+        # (negative value -> KB units). Default 2MB starves point
+        # lookups across trades / equity_curve / patterns once those
+        # tables grow past a few thousand rows. The pragma is per-
+        # connection; setting it on every _conn() open ensures
+        # short-lived script contexts also benefit.
+        conn.execute("PRAGMA cache_size=-64000")
         conn.row_factory = sqlite3.Row
         try:
             yield conn
@@ -250,6 +257,21 @@ class Database:
             self._ensure_column(conn, "trades", "regime", "TEXT")
             self._ensure_column(conn, "trades", "holding_minutes", "REAL")
 
+            # PERF-10 (audit 2026-05-28): missing covering indexes caused
+            # 10x degradation as the DB aged past 30 days. Created
+            # AFTER the column-add migrations because
+            # ``trades(strategy, regime)`` references a column the
+            # initial CREATE TABLE doesn't include -- the migration
+            # adds it idempotently above.
+            conn.executescript("""
+                CREATE INDEX IF NOT EXISTS idx_trades_symbol_exit
+                    ON trades(symbol, exit_time);
+                CREATE INDEX IF NOT EXISTS idx_trades_strategy_regime
+                    ON trades(strategy, regime);
+                CREATE INDEX IF NOT EXISTS idx_equity_ts
+                    ON equity_curve(timestamp);
+            """)
+
             # Create indexes that depend on the migrated columns
             try:
                 conn.execute(
@@ -275,18 +297,29 @@ class Database:
     # ── Candle Data ──────────────────────────────────────────
 
     def store_candles(self, symbol: str, timeframe: str, df: pd.DataFrame):
-        """Upsert OHLCV candle data."""
+        """Upsert OHLCV candle data.
+
+        PERF-08 (audit 2026-05-28): pre-fix this iterated rows in
+        Python and called ``conn.execute`` per row. With WS on full
+        watchlist + 3 intervals this fired ~900 single-row INSERTs at
+        every minute boundary. ``executemany`` ships the same payload
+        in one round-trip and reuses the prepared statement -- ~5-10x
+        faster on busy minute-boundary writes.
+        """
         if df.empty:
             return
+        rows = [
+            (symbol, timeframe, str(ts), row["open"], row["high"],
+             row["low"], row["close"], row.get("volume", 0))
+            for ts, row in df.iterrows()
+        ]
         with self._conn() as conn:
-            for ts, row in df.iterrows():
-                conn.execute(
-                    """INSERT OR REPLACE INTO candles
-                       (symbol, timeframe, timestamp, open, high, low, close, volume)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-                    (symbol, timeframe, str(ts), row["open"], row["high"],
-                     row["low"], row["close"], row.get("volume", 0)),
-                )
+            conn.executemany(
+                """INSERT OR REPLACE INTO candles
+                   (symbol, timeframe, timestamp, open, high, low, close, volume)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                rows,
+            )
         logger.debug(f"Stored {len(df)} candles for {symbol}/{timeframe}")
 
     def load_candles(
@@ -667,12 +700,43 @@ class Database:
                  datetime.now().isoformat()),
             )
 
-    def load_trade_patterns(self, limit: int = 200) -> List[dict]:
+    def load_trade_patterns(
+        self,
+        limit: int = 200,
+        *,
+        strategy: Optional[str] = None,
+        regime: Optional[str] = None,
+    ) -> List[dict]:
+        """PERF-06 (audit 2026-05-28): server-side filter for the
+        learning-loop's pattern lookup.
+
+        Pre-fix every entry attempt loaded the most recent ``limit``
+        rows regardless of strategy / regime, then filtered Python-side
+        in ``TradeAnalyzer.evaluate_setup``. With ``limit=200`` and 4
+        active strategies, ~150 of every 200 rows were discarded right
+        after the fetch. Server-side filtering on
+        ``(strategy, regime)`` lets the existing
+        ``idx_trades_strategy_regime`` index satisfy the query and
+        cuts both the DB read AND the Python-side filter loop.
+
+        Backward-compatible: legacy callers passing only ``limit``
+        continue to get the original behaviour.
+        """
+        sql = "SELECT * FROM trade_patterns"
+        clauses: List[str] = []
+        params: List = []
+        if strategy:
+            clauses.append("strategy = ?")
+            params.append(strategy)
+        if regime:
+            clauses.append("(regime IS NULL OR regime = ? OR regime = '')")
+            params.append(regime)
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+        sql += " ORDER BY created_at DESC LIMIT ?"
+        params.append(limit)
         with self._conn() as conn:
-            rows = conn.execute(
-                "SELECT * FROM trade_patterns ORDER BY created_at DESC LIMIT ?",
-                (limit,),
-            ).fetchall()
+            rows = conn.execute(sql, params).fetchall()
         return [dict(r) for r in rows]
 
     def load_patterns_by_outcome(self, outcome: str, limit: int = 100) -> List[dict]:
