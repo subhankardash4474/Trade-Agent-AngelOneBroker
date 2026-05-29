@@ -1897,3 +1897,266 @@ backtester re-run policy.
 * `tests/unit/test_audit_2026_05_28_phase2.py` — new (27 regression tests).
 * `docs/audit_2026-05-28_followup.md` — Status column updated for the 6 Phase-2 FIXED findings; new "Phase-2 landed" header section.
 * `docs/findings_log_2026-05-27.md` — this section (§14).
+
+---
+
+## 15. Phases 3-5 sprint (2026-05-29) — concurrency, performance, and frozen-file closure
+
+### 15.1 Where we landed
+
+After Phase 2 closed the money-at-risk truth-telling cluster (ORD-01,
+STATE-01/02, ORD-02/03, OBS-05), the remaining 38 audit findings split
+naturally into three buckets:
+
+* **Phase 3** — concurrency + state hygiene (CONC-02..09, STATE-03/04/06/08/09/11/12, ORD-06).
+* **Phase 4** — runtime performance (PERF-01/04/05/06/08/09/10/14/15).
+* **Phase 5** — frozen-file semantic correctness (NUM-02/03/04/05/08/09/12/15, OBS-04/10/19, CONC-01).
+
+All three were landed back-to-back on 2026-05-29 with NO deploy. The
+trader VM remains on `430069c` and the backtester on `84f5acd`.
+
+### 15.2 Phase 3 (commit `d1beea5`)
+
+15 findings closed. Highlights:
+
+* **ORD-06** — JWT refresh now propagates the new SmartConnect handle
+  to `ws_client.update_broker_session(force_reconnect=True)`. Pre-fix
+  the WS thread kept running on the stale auth_token + feed_token
+  until AngelOne stopped servicing them, which silently killed the
+  tick feed for the rest of the session. CRITICAL log on WS-update
+  failure makes the partial-state visible to the operator.
+
+* **CONC-02 / CONC-04 / CONC-06** — three race conditions on the WS
+  hot path: trail mutation outside the exit lock, candle-close
+  callback fired under the aggregator lock (DB writes blocked tick
+  ingestion), and `_subscriptions` iteration paths racing watchlist
+  hot-loads. All three closed by lock-placement edits.
+
+* **CONC-08 / CONC-09** — `TradingAgent.run` installs SIGTERM/SIGINT
+  handlers that flip `_running = False`; `_shutdown` joins the WS
+  worker (5s budget) before tearing down the DB. Eliminates the
+  daemon-thread WS race that occasionally wrote a tick to a half-
+  closed sqlite handle.
+
+* **STATE-04** — atomic close. `Database.close_position_atomic`
+  wraps DELETE open_positions + INSERT trades + INSERT equity_curve
+  in one commit. `Portfolio.close_position` routes through it; the
+  CSV append happens AFTER the DB commit so a crash mid-close can
+  no longer leave the on-disk record set inconsistent.
+
+* **STATE-06** — file-lock retry-with-backoff (1s -> 3s -> 5s) across
+  cooldown / runtime-state / trail persistence. The pre-fix unlocked-
+  fallback was itself the clobber-on-restart bug it was trying to
+  avoid.
+
+* **STATE-08** — debounced (5s) trail persist on every WS-tick
+  mutation. A `trail_mutated` gate (highest / lowest / active /
+  breakeven flips) prevents no-op ticks from burning the debounce
+  budget. Closes the "crash 5s before next persist restored the
+  wide initial SL" hole.
+
+* **STATE-09** — corrupt cooldown JSON now writes
+  `data/cooldowns_corrupt.flag`; `TradingAgent` reads it at boot
+  and engages a fail-closed gate that refuses new entries until
+  the operator deletes the flag. Replaces the previous "graceful
+  empty-dict load" that quietly let blacklisted symbols trade
+  again.
+
+* **STATE-11** — signal-audit retry queue. Bounded (500-row) deque;
+  flushed best-effort on every `log()` call. A 1s NFS hiccup no
+  longer permanently loses a row.
+
+* **STATE-12** — daily reset stale-MIS sweep. Any open position with
+  `entry_time.date() < today (IST)` is closed via
+  `close_position(..., reason="stale_overnight_mis_sweep")` BEFORE
+  the in-memory maps clear. The next reconcile catches anything the
+  broker is genuinely holding.
+
+* **CONC-05 / PERF-05** — tick batching. Per-tick INSERT replaced
+  with a 5000-row in-memory deque; flushed at 100 rows or 1s. Final
+  flush in `_shutdown`. Eliminates the ~50 sqlite connections/sec
+  WS hot path on a 50-symbol watchlist.
+
+**Architectural deferrals**: CONC-03 (WS enqueue+return + worker
+thread) and STATE-05 (boot recovery of `_pending_orders`) are
+queued for a focused architectural session. The phase-3 surgical
+fixes above close the most painful concurrency hot spots; the
+worker-thread restructure changes the threading model end-to-end
+and deserves its own session.
+
+Test coverage: 28 new tests in `tests/unit/test_audit_2026_05_28_phase3.py`.
+Full suite: 1,511 / 1,511.
+
+### 15.3 Phase 4 (commit `4b96024`)
+
+9 PERF findings closed. Highlights:
+
+* **PERF-01** — `AngelOneDataSource.get_ltp_batch` wraps
+  `getMarketData(mode=LTP)` with 50-token chunking + per-chunk
+  rate-limited dispatch. `DataHandler.get_multiple_ltp` now prefers
+  the batch endpoint and falls back to the per-symbol `ltpData`
+  loop only for tokens the batch returned None for. At 300
+  symbols/cycle this collapses ~300 REST calls into ~6.
+
+* **PERF-04** — entry-path ATR derived from `snap.atr_pct *
+  current_price / 100` instead of a redundant 6h fetch. Saves
+  ~1-2 s per entry attempt before gate logic fires. Falls back
+  to the explicit fetch when snap is empty.
+
+* **PERF-06** — server-side filter on `(strategy, regime)` in
+  `Database.load_trade_patterns` (covered by the new
+  `idx_trades_strategy_regime` index). Pre-fix every entry attempt
+  loaded the most recent 200 rows then Python-filtered ~150 of
+  them away.
+
+* **PERF-08 / PERF-09 / PERF-10** — candle-store via `executemany`,
+  Yahoo session reuse across refreshes, and three covering DB
+  indexes + 64MB per-conn `cache_size` pragma. Together prevent
+  the 10x degradation we'd see as the trades / equity_curve / patterns
+  tables age past 30 days.
+
+* **PERF-14** — `TradingAgent._run_scan_async` runs the scanner on a
+  daemon thread; the periodic-rescan call site uses it. Atomic
+  watchlist swap on completion. Boot-time + pre-market warm-up still
+  call `_run_scan` synchronously because the initial watchlist has
+  to settle before trading starts.
+
+* **PERF-15** — `docker-compose.yml` caps trader at 1.5 vCPUs (and
+  reserves 0.5) so the WS thread, healthcheck, and audit_checkpoint
+  always have headroom on the 2-vCPU OCI box.
+
+**Deferrals**: PERF-07 (DataFrame allocation profiling) and PERF-13
+(battery worker pickle).
+
+Test coverage: 17 new tests in `tests/unit/test_audit_2026_05_28_phase4.py`.
+Full suite: 1,528 / 1,528.
+
+### 15.4 Phase 5 (commit `ec957ef`, freeze-bypass slot 3 of 3)
+
+12 findings closed. Touches three frozen files
+(`risk_manager.py`, `_trend_context.py`, `base_strategy.py`) -- this
+commit consumed the 3rd FREEZE_v2.1 bypass slot. NOT deployed.
+
+Highlights:
+
+* **NUM-02** — Kelly post-sizing zero now audit-rejects
+  `sizing:zero_qty` instead of forcing 1 share. F-34 regression
+  closed.
+
+* **NUM-03** — new `RiskManager.sync_balance_from_mtm(equity)`,
+  called BEFORE `can_trade` each cycle so sizing / drawdown reads
+  fresh equity. Pre-fix the balance only updated on closes, leaving
+  sizing math blind to mid-session drawdown.
+
+* **NUM-04** — `round_to_tick(price, side, kind, tick=0.05)`
+  helper added; `get_atr_stop_loss` and `enforce_sl_floor` route
+  SL prices through it (round AWAY from entry). `execution.py`
+  adoption queued for next session.
+
+* **NUM-05 / NUM-15** — `_trend_context._fetch_daily(symbol,
+  as_of_date=...)` drops the LAST daily bar when its date >= the
+  as-of date (defaults to today IST). Cache key includes the as-of
+  date so backtest sweeps with different cutoffs no longer cross-
+  pollute. Closes the live-lookahead in every strategy with
+  `trend_filter_pct` set.
+
+* **NUM-08** — `is_trade_worth_taking` short-side
+  `compute_round_trip` mapping: explicit `(buy_leg, sell_leg) =
+  (TP, entry)` for shorts. Pre-fix the symmetric max/min mapping
+  fed the charges calculator the WRONG leg (STT undercounted ~20%
+  on shorts).
+
+* **NUM-09** — `classify_regime` (regime.py, NOT frozen) now uses
+  `_is_finite_number` so NaN/inf VIX returns "unknown" instead of
+  falling through to `bull_low_vol` with full multipliers.
+
+* **NUM-12 / OBS-19** — `regime_size_multiplier` returns the
+  configured `unknown` multiplier (default flipped 1.00 -> 0.50)
+  when regime is None / "unknown". Cold-boot before first
+  market_context refresh now sizes at HALF instead of full.
+
+* **OBS-04** — `is_trade_worth_taking` fail-closes on
+  `compute_round_trip` exception (CRITICAL log + `(False,
+  "charges_compute_failed")`). Replaces the previous fabricated
+  0.1% charges fallback.
+
+* **OBS-10** — `BaseStrategy._atr` logs WARNING with `type +
+  repr(exc)` on exception (and on EWM-NaN result). Returns 0.0 so
+  existing zero-ATR guards in `RiskManager` fire as designed.
+
+* **CONC-01** — `TradingAgent` calls
+  `risk_manager.update_open_positions(portfolio.open_position_count)`
+  immediately after `create_trailing_stop`. Pre-fix the count
+  refreshed only at cycle end, allowing two consecutive entries
+  in the same cycle to BOTH read the pre-cycle count and breach
+  `max_open_positions` by 1.
+
+Test coverage: 18 new tests in `tests/unit/test_audit_2026_05_28_phase5.py`,
+plus 2 existing tests in `test_risk_manager.py` updated to pin the
+new conservative-default contract. Full suite: 1,546 / 1,546.
+
+### 15.5 Bypass ledger
+
+* **Slot 1** — `8e1e926` (allow_shorts=false durable).
+* **Slot 2** — `f32009c` (xgboost_classifier disable).
+* **Slot 3** — `ec957ef` (Phase 5 frozen-file fixes; NOT deployed).
+
+All three slots are now consumed. Any further frozen-file edit
+before the freeze lifts on 2026-06-08 requires explicit lift /
+override.
+
+### 15.6 Severity reassessment after all 5 phases
+
+The 8 audit-tagged Critical findings are now:
+
+* **ORD-01 / STATE-01** — CLOSED (Phase 2).
+* **ORD-02** — CLOSED (Phase 2).
+* **ORD-03** — CLOSED (Phase 2).
+* **STATE-02** — CLOSED (Phase 2).
+* **OBS-01** — CLOSED (Phase 1).
+* **PERF-02** — CLOSED (Phase 1).
+* **PERF-01** — CLOSED (Phase 4).
+* **NUM-01** — OPEN (backtester sizing; awaits the post-Friday
+  policy review and a separate fix in `portfolio.py`).
+
+So **7 of 8 audit-tagged Critical findings are now FIXED in code**.
+The one remaining (NUM-01) is a backtester-only correctness issue;
+the live trader is unaffected.
+
+Total findings closed across phases 1-5: **63 of 86** (73%). The
+remaining 23 are split between architectural deferrals (CONC-03,
+STATE-05), the misc-OPEN bucket (NUM-01/06/07/10/11, ORD-05/07/08/
+09/10/11), and the two PERF deferrals (PERF-07/13).
+
+### 15.7 Files touched (phases 3-5)
+
+* `packages/core/cooldown_persistence.py` — STATE-06, STATE-09.
+* `packages/core/database.py` — STATE-04, PERF-06, PERF-08, PERF-10.
+* `packages/core/data_handler.py` — PERF-01.
+* `packages/core/portfolio.py` — STATE-04.
+* `packages/core/regime.py` — NUM-09.
+* `packages/core/risk_manager.py` — NUM-03, NUM-04, NUM-08, NUM-12,
+  OBS-04, OBS-19. (Frozen file; freeze-bypass slot 3.)
+* `packages/core/runtime_state_persistence.py` — STATE-06.
+* `packages/core/signal_audit.py` — STATE-11.
+* `packages/core/tick_aggregator.py` — CONC-04.
+* `packages/core/trade_analyzer.py` — PERF-06.
+* `packages/core/trailing_stop_persistence.py` — STATE-06.
+* `packages/core/websocket_client.py` — CONC-06, CONC-09.
+* `packages/strategies/_trend_context.py` — NUM-05, NUM-15. (Frozen.)
+* `packages/strategies/base_strategy.py` — OBS-10. (Frozen.)
+* `trading_agent.py` — ORD-06, CONC-02, CONC-08, STATE-03, STATE-08,
+  STATE-09 gate, STATE-12, CONC-05/PERF-05 buffer, NUM-02, NUM-03
+  call site, CONC-01 wiring, PERF-04 ATR derivation, PERF-09 session
+  reuse, PERF-14 async scan dispatcher.
+* `docker-compose.yml` — PERF-15.
+* `tests/unit/test_audit_2026_05_28_phase3.py` — new (28 tests).
+* `tests/unit/test_audit_2026_05_28_phase4.py` — new (17 tests).
+* `tests/unit/test_audit_2026_05_28_phase5.py` — new (18 tests).
+* `tests/unit/test_risk_manager.py` — 2 tests updated to pin the
+  NUM-12 conservative-default contract.
+* `docs/audit_2026-05-28_followup.md` — Status column updated for
+  the remaining 36 newly-FIXED findings; CONC-03 and STATE-05
+  re-tagged DEFERRED with rationale; changelog appended.
+* `docs/findings_log_2026-05-27.md` — this section (§15).
+
