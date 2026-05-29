@@ -557,8 +557,8 @@ big universe):**
 
 | Item | Expected by | Effect on §10.1 verdict |
 |------|------|------|
-| V18 result lands | ~16:00 IST tonight | Resolves §6 V18-anomaly question. V18=V2 (266 trades, -₹981, PF 0.69) → universe-specific override-merge bug. V18=V4 (229 trades, -₹489, PF 0.84) → slot-#2 V18 was a one-off. Either outcome is informational; no change to §10.1. |
-| V19 result lands | ~17:00 IST tonight | Should be V19=V2 by symmetry (long-only-filters-off ≡ all-filters-off when shorts are already disabled live). Confirmation only. |
+| ~~V18 result lands~~ | **DONE 15:25 IST 2026-05-29** | V18 = 229 trades, PF 0.85, -₹473 — **almost identical to V4** (229 trades, PF 0.84, -₹489). The slot-#2 V18=V2 anomaly was a one-off (stale config snapshot at slot-#2 startup, NOT a universe-specific override-merge bug). §6.2 hypothesis (b) ruled out; §6 RCA priority drops to LOW. |
+| V19 result lands | ~17:40 IST tonight (52.3% as of 15:57 IST) | Should be V19=V2 by symmetry (long-only-filters-off ≡ all-filters-off when shorts are already disabled live). Confirmation only. |
 
 ### 10.5 Recommended next moves
 
