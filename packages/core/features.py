@@ -333,11 +333,27 @@ class FeatureEngine:
         # 6h15 = 375 min = exactly 75 five-minute candles. The previous
         # window of 78 leaked ~15 min of the prior session's prints
         # into today's "day high/low", which moved breakout / mean-rev
-        # decisions near the open. 75 is the right number for 5-min
-        # bars; this remains an approximation for other intervals
-        # (better: groupby session date, deferred).
-        rolling_high = high.rolling(75).max()
-        rolling_low = low.rolling(75).min()
+        # decisions near the open.
+        #
+        # NUM-07 (audit 2026-05-28): the rolling-75 window was still an
+        # APPROXIMATION even after F-44. At 09:20 IST the rolling
+        # window is 74 bars short of session-internal data and pulls
+        # in the last 74 closed bars of YESTERDAY -- so the breakout /
+        # mean-reversion decisions at the very open of every session
+        # were measured against yesterday's range. VWAP and OBV above
+        # already use ``groupby(df.index.date).cumsum`` to reset at
+        # midnight; do the same for the day-high / day-low here so the
+        # window EXPANDS through the session and starts fresh on the
+        # next IST date. Falls back to the legacy rolling window when
+        # the index does not expose ``.date`` (numeric / RangeIndex
+        # paths used by some unit tests).
+        if hasattr(df.index, "date"):
+            day = df.index.date
+            rolling_high = high.groupby(day).cummax()
+            rolling_low = low.groupby(day).cummin()
+        else:
+            rolling_high = high.rolling(75).max()
+            rolling_low = low.rolling(75).min()
         df["dist_from_high_pct"] = (rolling_high - close) / close * 100
         df["dist_from_low_pct"] = (close - rolling_low) / close * 100
 

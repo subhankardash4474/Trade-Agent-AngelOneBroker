@@ -3990,8 +3990,78 @@ class TradingAgent:
             return cached
         self._historical_cache_misses += 1
         data = self.data_handler.get_historical_data(symbol, timeframe, start, end)
+        # NUM-06 (audit 2026-05-28): the WS tick aggregator only ever
+        # exposes CLOSED candles. The REST fallback (Yahoo + AngelOne
+        # historical) routinely returns the still-forming intraday
+        # bar -- ``timestamp`` is at the start of the interval but
+        # the bar isn't sealed until ``timestamp + interval`` has
+        # elapsed. Pre-fix, every cycle that fell through to REST
+        # silently fed strategies a half-formed last bar (lower high,
+        # higher low, partial volume), drifting indicators away from
+        # what the aggregator path produced for the same symbol.
+        # Drop that bar so the two data sources are byte-symmetric.
+        data = self._drop_forming_intraday_bar(data, timeframe)
         self._historical_cache[key] = data
         return data
+
+    def _drop_forming_intraday_bar(
+        self,
+        df: "pd.DataFrame",
+        timeframe: str,
+    ) -> "pd.DataFrame":
+        """NUM-06 (audit 2026-05-28): drop the last row of an intraday
+        DataFrame if it has not yet sealed.
+
+        ``timeframe`` is the strategy interval (``5min``, ``15min``,
+        ``1h`` etc). Daily / weekly frames are returned as-is because
+        the trend-context module already handles the today's-bar
+        lookahead via ``as_of_date`` (see NUM-05/15 in Phase 5). On any
+        error we fail OPEN and return the frame unchanged -- this is a
+        best-effort hygiene check, not a hard gate, and we'd rather
+        let the strategy evaluate on a slightly-stale tail than block
+        the cycle entirely.
+        """
+        try:
+            if df is None or df.empty:
+                return df
+            if not isinstance(timeframe, str):
+                return df
+            tf = timeframe.lower()
+            # Compute the bar duration in seconds. Match the formats the
+            # rest of the codebase actually emits: ``Nmin``, ``Nh``,
+            # ``1d`` etc. ``1d`` and longer have no in-progress problem
+            # at intraday cadence (they seal at midnight UTC) so leave
+            # them untouched -- _trend_context handles them.
+            if tf.endswith("min"):
+                interval_sec = int(tf.replace("min", "")) * 60
+            elif tf.endswith("h"):
+                interval_sec = int(tf.replace("h", "")) * 3600
+            else:
+                return df
+            if interval_sec <= 0:
+                return df
+            last_ts = df.index[-1]
+            try:
+                if last_ts.tzinfo is None:
+                    last_ts = IST.localize(last_ts)
+            except Exception:
+                # pandas Timestamp without tz: localise via tz_localize.
+                try:
+                    last_ts = last_ts.tz_localize(IST)
+                except Exception:
+                    return df
+            now_ist = datetime.now(IST)
+            seal_at = last_ts + timedelta(seconds=interval_sec)
+            if seal_at > now_ist:
+                return df.iloc[:-1]
+            return df
+        except Exception as exc:
+            # Fail-open: never block the cycle on a hygiene check.
+            logger.debug(
+                f"[NUM-06] _drop_forming_intraday_bar skipped for "
+                f"timeframe={timeframe!r}: {exc!r}"
+            )
+            return df
 
     def _evaluate_strategy(self, strategy: BaseStrategy, symbol: str, token: str) -> Optional[TradeSignal]:
         try:

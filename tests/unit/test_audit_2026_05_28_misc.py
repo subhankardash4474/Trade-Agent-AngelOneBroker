@@ -5,17 +5,14 @@ phases (1-5). Each finding has its own block. Tests are by-source for
 contract assertions and by-runtime where the behaviour is observable
 end-to-end without spawning a daemon.
 
-Findings covered in this initial commit:
+Findings covered in this file:
 
-* **NUM-01** (Critical) -- short MIS margin model. Backtester pre-fix
-  locked 100% of short notional as collateral; live broker reality is
-  ~20% (MIS margin). New ``Portfolio.mis_short_margin_pct`` knob,
-  default 1.0 in code (legacy preservation) and 0.20 in production
-  config. Per-position ``cash_locked`` field + DB column persists the
-  exact lock so a daemon restart between open and close still
-  releases the right amount.
-
-Group A in the misc-OPEN sequencing.
+* **NUM-01** (Critical) -- short MIS margin model (Group A).
+* **NUM-06** (High)     -- drop forming intraday bar from REST
+  fallback (Group B).
+* **NUM-07** (Medium)   -- features rolling-75 session bleed; switch
+  ``dist_from_high_pct`` / ``dist_from_low_pct`` to a session-grouped
+  cumulative max/min (Group B).
 """
 
 from __future__ import annotations
@@ -357,3 +354,334 @@ class TestNUM01TraderConfigWiring:
         with open(path, "r", encoding="utf-8") as fh:
             src = fh.read()
         assert "mis_short_margin_pct: 0.20" in src
+
+
+# ─────────────────────────────────────────────────────────────────────
+# NUM-06: drop forming intraday bar from REST fallback
+# ─────────────────────────────────────────────────────────────────────
+
+
+class TestNUM06DropFormingIntradayBar:
+    """The WS tick aggregator only ever exposes CLOSED candles. The
+    REST fallback (Yahoo + AngelOne historical) returns the still-
+    forming intraday bar. Pre-fix, every cycle that fell through to
+    REST silently fed strategies a half-formed last bar -- the two
+    paths were not symmetric. The fix adds a hygiene helper invoked
+    from ``_get_historical_cached`` that drops the last row when its
+    seal time (``timestamp + interval``) is still in the future.
+    """
+
+    @staticmethod
+    def _make_helper():
+        # The helper lives on TradingAgent, but it is a pure function
+        # of (df, timeframe) and we don't want to spin up the whole
+        # daemon for a hygiene check. Bind it to a stub object so the
+        # ``self`` binding is a no-op.
+        import importlib
+
+        ta_mod = importlib.import_module("trading_agent")
+        return ta_mod.TradingAgent._drop_forming_intraday_bar
+
+    def _make_df(self, n_bars: int, interval_min: int, last_offset_min: int):
+        """Build a synthetic intraday DataFrame whose last bar's
+        timestamp is ``last_offset_min`` minutes BEFORE 'now'.
+        ``last_offset_min < interval_min`` means the bar has not
+        sealed yet.
+        """
+        import numpy as np
+        import pandas as pd
+        import pytz
+
+        IST = pytz.timezone("Asia/Kolkata")
+        now = pd.Timestamp.now(tz=IST).floor("1min")
+        last_ts = now - pd.Timedelta(minutes=last_offset_min)
+        index = pd.date_range(
+            end=last_ts, periods=n_bars, freq=f"{interval_min}min", tz=IST
+        )
+        return pd.DataFrame(
+            {
+                "open": np.arange(n_bars, dtype=float) + 100.0,
+                "high": np.arange(n_bars, dtype=float) + 101.0,
+                "low": np.arange(n_bars, dtype=float) + 99.0,
+                "close": np.arange(n_bars, dtype=float) + 100.5,
+                "volume": np.full(n_bars, 1000.0),
+            },
+            index=index,
+        )
+
+    def test_drops_forming_5min_bar_when_seal_in_future(self):
+        helper = self._make_helper()
+        df = self._make_df(n_bars=20, interval_min=5, last_offset_min=2)
+
+        out = helper(self=None, df=df, timeframe="5min")
+        assert len(out) == 19
+        # Dropped row was the one that hadn't sealed.
+        assert out.index[-1] == df.index[-2]
+
+    def test_keeps_sealed_5min_bar(self):
+        helper = self._make_helper()
+        # last bar 6 min in the past -> already sealed
+        df = self._make_df(n_bars=20, interval_min=5, last_offset_min=6)
+
+        out = helper(self=None, df=df, timeframe="5min")
+        assert len(out) == 20
+        assert out.index[-1] == df.index[-1]
+
+    def test_handles_15min_timeframe(self):
+        helper = self._make_helper()
+        # bar 10 min old, 15-min interval -> not sealed
+        df = self._make_df(n_bars=20, interval_min=15, last_offset_min=10)
+        out = helper(self=None, df=df, timeframe="15min")
+        assert len(out) == 19
+
+    def test_handles_1h_timeframe(self):
+        helper = self._make_helper()
+        df = self._make_df(n_bars=20, interval_min=60, last_offset_min=30)
+        out = helper(self=None, df=df, timeframe="1h")
+        assert len(out) == 19
+
+    def test_returns_unchanged_for_daily_timeframe(self):
+        # Daily / weekly is _trend_context's responsibility (NUM-05/15).
+        # The intraday helper must not touch daily frames.
+        helper = self._make_helper()
+        df = self._make_df(n_bars=10, interval_min=5, last_offset_min=2)
+        out = helper(self=None, df=df, timeframe="1d")
+        assert len(out) == len(df)
+
+    def test_returns_unchanged_for_empty_frame(self):
+        import pandas as pd
+
+        helper = self._make_helper()
+        out = helper(self=None, df=pd.DataFrame(), timeframe="5min")
+        assert out.empty
+
+    def test_returns_unchanged_for_none(self):
+        helper = self._make_helper()
+        out = helper(self=None, df=None, timeframe="5min")
+        assert out is None
+
+    def test_fail_open_on_garbage_timeframe(self):
+        helper = self._make_helper()
+        df = self._make_df(n_bars=10, interval_min=5, last_offset_min=2)
+        out = helper(self=None, df=df, timeframe="not-a-tf")
+        # Unrecognised timeframe -> hygiene check passes through.
+        assert len(out) == len(df)
+
+    def test_fail_open_on_zero_interval(self):
+        helper = self._make_helper()
+        df = self._make_df(n_bars=10, interval_min=5, last_offset_min=2)
+        out = helper(self=None, df=df, timeframe="0min")
+        assert len(out) == len(df)
+
+    def test_handles_naive_timestamp_index(self):
+        # Some legacy paths return naive (tz-less) timestamps. The
+        # helper must coerce them to IST and not throw.
+        import numpy as np
+        import pandas as pd
+        import pytz
+
+        helper = self._make_helper()
+        IST = pytz.timezone("Asia/Kolkata")
+        # Build a naive index whose last entry is 2 minutes ago in IST.
+        now_naive = pd.Timestamp.now(tz=IST).tz_localize(None).floor("1min")
+        last_ts = now_naive - pd.Timedelta(minutes=2)
+        idx = pd.date_range(end=last_ts, periods=10, freq="5min")
+        df = pd.DataFrame(
+            {
+                "open": np.arange(10.0),
+                "high": np.arange(10.0) + 1,
+                "low": np.arange(10.0) - 1,
+                "close": np.arange(10.0),
+                "volume": np.full(10, 100.0),
+            },
+            index=idx,
+        )
+        out = helper(self=None, df=df, timeframe="5min")
+        # Last bar (2 min old, 5-min interval) -> dropped.
+        assert len(out) == 9
+
+    def test_get_historical_cached_invokes_helper_at_source(self):
+        # Source-level wiring: ``_get_historical_cached`` must call
+        # ``_drop_forming_intraday_bar`` on the REST result.
+        path = os.path.join(PROJECT_ROOT, "trading_agent.py")
+        with open(path, "r", encoding="utf-8") as fh:
+            src = fh.read()
+
+        cached_def = src.find("def _get_historical_cached(")
+        assert cached_def != -1, "_get_historical_cached not found"
+        # Slice up to the next ``def`` to bound the function body.
+        next_def = src.find("\n    def ", cached_def + 1)
+        body = src[cached_def:next_def]
+        assert "_drop_forming_intraday_bar" in body, (
+            "_drop_forming_intraday_bar not invoked from "
+            "_get_historical_cached"
+        )
+
+    def test_helper_documents_num06_anchor(self):
+        path = os.path.join(PROJECT_ROOT, "trading_agent.py")
+        with open(path, "r", encoding="utf-8") as fh:
+            src = fh.read()
+        assert "NUM-06" in src
+
+
+# ─────────────────────────────────────────────────────────────────────
+# NUM-07: features rolling-75 session bleed
+# ─────────────────────────────────────────────────────────────────────
+
+
+class TestNUM07FeatureSessionReset:
+    """Pre-fix the day-high / day-low features used a rolling-75 window.
+    At 09:20 IST the rolling window pulled in 74 bars of YESTERDAY,
+    so the breakout / mean-reversion decisions at the open were
+    measured against yesterday's range. The fix groups by session
+    date and uses ``cummax`` / ``cummin`` so the window EXPANDS through
+    the session and resets on each new IST date -- same pattern VWAP
+    and OBV already use.
+    """
+
+    def _make_two_day_5min(self, day1_high: float, day2_high: float):
+        """Two trading sessions of 5-min bars: day1 has highs around
+        ``day1_high``, day2 starts the next day with highs around
+        ``day2_high``."""
+        import numpy as np
+        import pandas as pd
+        import pytz
+
+        IST = pytz.timezone("Asia/Kolkata")
+        # Session 1: 09:15 -> 15:30 IST = 75 bars on day1.
+        day1_start = pd.Timestamp("2026-05-26 09:15", tz=IST)
+        day2_start = pd.Timestamp("2026-05-27 09:15", tz=IST)
+        idx1 = pd.date_range(start=day1_start, periods=75, freq="5min")
+        idx2 = pd.date_range(start=day2_start, periods=10, freq="5min")
+        idx = idx1.append(idx2)
+
+        # Day 1 high pegged at day1_high. Day 2 starts with closes
+        # around 100, well below day1_high, so a leaky rolling-75
+        # window would still see day1_high after the reset.
+        d1_close = np.full(75, 100.0)
+        d2_close = np.full(10, 100.0)
+        d1_high = np.full(75, day1_high)
+        d2_high = np.full(10, day2_high)
+        d1_low = np.full(75, 99.0)
+        d2_low = np.full(10, 99.5)
+
+        return pd.DataFrame(
+            {
+                "open": np.concatenate([d1_close, d2_close]),
+                "high": np.concatenate([d1_high, d2_high]),
+                "low": np.concatenate([d1_low, d2_low]),
+                "close": np.concatenate([d1_close, d2_close]),
+                "volume": np.full(85, 1000.0),
+            },
+            index=idx,
+        )
+
+    def test_dist_from_high_resets_at_session_boundary(self):
+        from core.features import FeatureEngine
+
+        df = self._make_two_day_5min(day1_high=110.0, day2_high=101.0)
+        out = FeatureEngine().compute_all(df)
+
+        # First bar of day 2 is row 75. Its dist_from_high must
+        # reflect day-2's running max (101 - 100) / 100 * 100 = 1.0,
+        # NOT day-1's 110 leaking in (which would be 10.0).
+        first_d2 = out["dist_from_high_pct"].iloc[75]
+        assert first_d2 == pytest.approx(1.0, abs=0.01), (
+            f"day 2 first bar leaked yesterday's high: dist={first_d2:.3f} "
+            f"(expected ~1.0)"
+        )
+
+    def test_dist_from_low_resets_at_session_boundary(self):
+        from core.features import FeatureEngine
+
+        # Day 1 low far below day 2 low.
+        df = self._make_two_day_5min(day1_high=110.0, day2_high=101.0)
+        # Override day 1 low to be much lower so leakage shows up.
+        df.loc[df.index[:75], "low"] = 80.0
+        out = FeatureEngine().compute_all(df)
+
+        # Day 2 row 0: low is 99.5, close 100. dist_from_low = 0.5.
+        # If day 1 leaked in, the running min would still be 80 ->
+        # dist = (100 - 80) / 100 * 100 = 20.0.
+        first_d2 = out["dist_from_low_pct"].iloc[75]
+        assert first_d2 < 1.0, (
+            f"day 2 first bar leaked yesterday's low: dist={first_d2:.3f} "
+            f"(expected < 1.0)"
+        )
+
+    def test_dist_from_high_grows_through_session(self):
+        # Within a single session, the running max should be
+        # non-decreasing (cummax property), so dist_from_high_pct
+        # cannot suddenly drop because an old high "fell out" of the
+        # rolling window.
+        import numpy as np
+        import pandas as pd
+        import pytz
+
+        from core.features import FeatureEngine
+
+        IST = pytz.timezone("Asia/Kolkata")
+        idx = pd.date_range(
+            start="2026-05-27 09:15", periods=75, freq="5min", tz=IST
+        )
+        # Highs spike to 110 at bar 5 then drop back to 100.
+        highs = np.full(75, 100.0)
+        highs[5] = 110.0
+        df = pd.DataFrame(
+            {
+                "open": np.full(75, 100.0),
+                "high": highs,
+                "low": np.full(75, 99.0),
+                "close": np.full(75, 100.0),
+                "volume": np.full(75, 1000.0),
+            },
+            index=idx,
+        )
+        out = FeatureEngine().compute_all(df)
+
+        # After bar 5, every subsequent bar's running max is 110.
+        # dist_from_high_pct = (110 - 100) / 100 * 100 = 10.0 from
+        # bar 5 onward.
+        for i in range(5, 75):
+            assert out["dist_from_high_pct"].iloc[i] == pytest.approx(
+                10.0, abs=0.01
+            ), f"bar {i} dropped its session high: {out['dist_from_high_pct'].iloc[i]}"
+
+    def test_falls_back_to_legacy_rolling_when_index_has_no_date(self):
+        # RangeIndex / numeric index path used by some legacy unit
+        # tests. The fallback must remain rolling-75.
+        import numpy as np
+        import pandas as pd
+
+        from core.features import FeatureEngine
+
+        df = pd.DataFrame(
+            {
+                "open": np.full(100, 100.0),
+                "high": np.linspace(100, 110, 100),
+                "low": np.linspace(100, 90, 100),
+                "close": np.full(100, 100.0),
+                "volume": np.full(100, 1000.0),
+            }
+        )
+        out = FeatureEngine().compute_all(df)
+        # Series should be present with no NaN once the rolling
+        # window fills.
+        assert "dist_from_high_pct" in out.columns
+        assert not out["dist_from_high_pct"].iloc[80:].isna().any()
+
+    def test_features_source_uses_groupby_cummax(self):
+        # Source-level guard: the rolling-75 window in the day-high
+        # feature must be replaced by ``groupby(...).cummax`` /
+        # ``cummin`` (matching VWAP and OBV).
+        path = os.path.join(PROJECT_ROOT, "packages", "core", "features.py")
+        with open(path, "r", encoding="utf-8") as fh:
+            src = fh.read()
+
+        derived = src.find("def _add_derived_features(")
+        assert derived != -1, "_add_derived_features not found"
+        next_def = src.find("\n    @staticmethod", derived + 1)
+        body = src[derived:next_def]
+        assert "groupby(day).cummax()" in body
+        assert "groupby(day).cummin()" in body
+        assert "NUM-07" in body
