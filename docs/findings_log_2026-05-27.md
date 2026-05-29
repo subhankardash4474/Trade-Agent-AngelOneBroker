@@ -2512,4 +2512,220 @@ Remaining (3 groups, 4 findings):
 * **Group G** — PERF-07 (DataFrame allocation cache) +
   PERF-13 (battery worker pickle); deferrable, backtester-only.
 
+---
+
+## 18. Misc-OPEN bucket — Group E: reactive re-auth on auth-class broker errors (ORD-10)
+
+**Date:** 2026-05-30 (early morning IST)
+**Commit:** PENDING (this section is being written before the commit)
+**Status:** 1 finding FIXED, NOT deployed.
+
+### 18.1 What was broken
+
+Pre-fix, `TradingAgent._maybe_refresh_broker_session` re-logged in
+**only** when the local clock said the JWT was older than 7 hours.
+That covered the most common AngelOne case (8h JWT lifetime) but
+missed every scenario where the broker invalidates the token EARLIER:
+
+* operator logs in from another device → AngelOne force-logs out the
+  original session,
+* broker-side session reset for compliance / RMS reasons,
+* network MITM strips the auth header so AngelOne returns 401 even
+  though our clock says the JWT is fresh.
+
+In any of those cases, every API call comes back with an auth-class
+error (`AB1010`, `AB1011`, `AB2001`, `Session Expired`, `Invalid
+Token`, 401/403). `_live_order_with_retry` would burn its three
+retry attempts on a stale JWT and silently report
+`"Order FAILED after 3 attempts"`. Held positions could end up
+without a working broker connection until the proactive 7-hour
+timer kicked in -- which, on a freshly-restarted daemon, was hours
+away.
+
+### 18.2 Fix design
+
+Three pieces:
+
+**(1) Module-level error classifier in `execution.py`.**
+
+```python
+def classify_smartapi_error(payload) -> str:
+    # Returns one of: "auth", "rate_limit", "transient", "fatal".
+```
+
+`payload` may be an exception, a SmartAPI dict
+(`{"status": False, "errorcode": "AB1011", "message": "..."}`), or a
+plain string. The classifier looks at:
+
+* Known AngelOne codes: `AB1010`, `AB1011`, `AB1014`, `AB1019`,
+  `AB2001`, `AB2002`, `AB2003`.
+* Word-fenced 401 / 403 status hints (so an order id like
+  `OID-4012345` doesn't trip the heuristic).
+* Ten string phrases: `invalid token`, `token invalid`,
+  `token expired`, `session expired`, `not logged in`,
+  `unauthorized`, `unauthorised`, `logged out`, `please login`,
+  `jwt expired`.
+* Rate-limit phrases (`AB429`, `too many requests`, `rate limit`,
+  `throttle`) take **precedence** over auth heuristics so an
+  `AB429 Session ...` blob still classifies as rate_limit.
+
+Conservative default: anything we don't recognise is `transient`.
+Auto-halting on a contract drift would do more damage than the bug
+itself.
+
+**(2) Auth callback hook on `ExecutionEngine`.**
+
+```python
+class ExecutionEngine:
+    def __init__(...):
+        self._auth_failure_callback = None
+        self._auth_refresh_attempted = False  # per-call latch
+
+    def set_auth_refresh_callback(self, callback):
+        self._auth_failure_callback = callback
+
+    def _maybe_invoke_auth_refresh(self, payload) -> bool:
+        if classify_smartapi_error(payload) != "auth":
+            return False
+        if self._auth_failure_callback is None:
+            return False
+        if self._auth_refresh_attempted:
+            return False
+        self._auth_refresh_attempted = True
+        try:
+            return bool(self._auth_failure_callback())
+        except Exception:
+            # Callback must not crash trading.
+            return False
+```
+
+The per-call latch (`_auth_refresh_attempted`) is critical: a
+misbehaving callback that returns True without actually refreshing
+the JWT must NOT loop the retry budget. The latch is reset at the
+top of every `_live_order_with_retry` invocation.
+
+`_live_order_with_retry`'s `except` block now calls
+`self._maybe_invoke_auth_refresh(e)` after logging the failure.
+If the callback succeeded the next retry sees the fresh
+`self._api`; if it didn't, the retry loop falls back to the
+existing `time.sleep(retry_delay)` between attempts.
+
+**(3) `TradingAgent` wires the callback.**
+
+```python
+class TradingAgent:
+    def __init__(...):
+        self.execution = ExecutionEngine(...)
+        ...
+        self.execution.set_auth_refresh_callback(
+            self._handle_broker_auth_failure
+        )
+
+    def _handle_broker_auth_failure(self) -> bool:
+        try:
+            return bool(self._maybe_refresh_broker_session(force=True))
+        except Exception:
+            return False
+
+    def _maybe_refresh_broker_session(self, *, force: bool = False) -> bool:
+        # When force=True, bypass the 7h age gate AND the 1h backoff.
+        # Returns True iff the swap succeeded.
+        ...
+```
+
+`_maybe_refresh_broker_session` now also returns True/False so the
+callback chain can communicate success up to the retry loop.
+
+### 18.3 What does NOT change
+
+* The proactive 7h timer still runs. The reactive path is
+  **complementary**, not a replacement -- so a daemon that's still
+  running at hour 8 still gets refreshed even if no auth error
+  ever surfaces.
+* Cancel / modify / orderBook paths are NOT wired to the auth
+  callback yet. They live in the same retry pattern so adding the
+  hook is mechanical, but it's deliberately out of scope for this
+  audit closure; the entry/exit path is where the user-visible
+  damage materialises.
+* Rate-limit and transient errors continue to flow through the
+  existing retry loop unchanged.
+
+### 18.4 Test coverage
+
+**`TestORD10ErrorClassifier`** (9 tests):
+
+* All 7 known auth codes classify as `auth`.
+* Each of 9 string phrases (Invalid Token / Session Expired / JWT
+  Expired / etc.) classifies as `auth`.
+* `401 Unauthorized` and `403 Forbidden` classify as `auth`.
+* `OID-4012345` style strings DO NOT misfire.
+* Rate-limit phrases classify as `rate_limit`.
+* Unknown errors (`Connection reset`, `RMS rejected`) classify as
+  `transient` (the conservative default).
+* Dict payloads with `error_code` field work.
+* `None` payloads classify as `transient`.
+* `AB429 session ...` resolves to `rate_limit`, not `auth`.
+
+**`TestORD10AuthCallbackHook`** (8 tests):
+
+* `set_auth_refresh_callback` installs the hook.
+* Auth-class exception triggers the callback.
+* Callback fires at most once per top-level call (3 retries → 1
+  callback invocation).
+* Transient exception does NOT trigger the callback.
+* Callback raising does NOT crash the retry loop.
+* Per-call latch resets between top-level calls (2 calls → 2
+  invocations).
+* Source-level pin: `TradingAgent.__init__` wires the callback.
+* Source-level pin: `_maybe_refresh_broker_session` exposes a
+  `force` kwarg that bypasses the 7h age gate.
+
+**Suite results:**
+
+* Unit: **1,617 / 1,617** PASSED.
+* Integration: **248 / 248** PASSED.
+* Combined: **1,865 / 1,865**.
+
+### 18.5 Files touched
+
+* `packages/core/execution.py` -- `classify_smartapi_error` module
+  helper + `_AUTH_CODES` / `_AUTH_PHRASES` / `_RATE_LIMIT_PHRASES`
+  constants + `_auth_failure_callback` attribute +
+  `set_auth_refresh_callback` method + `_maybe_invoke_auth_refresh`
+  + per-call latch reset + retry-loop wiring.
+* `trading_agent.py` -- `_handle_broker_auth_failure` method +
+  `set_auth_refresh_callback` wiring in `__init__` +
+  `_maybe_refresh_broker_session(force=False)` kwarg + return
+  type changed to `bool`.
+* `tests/unit/test_audit_2026_05_28_misc.py` -- 17 new tests.
+
+### 18.6 Honest caveat
+
+The reactive re-auth path is engineered to be **safe by default**:
+unknown errors are transient, callback exceptions are absorbed, the
+per-call latch prevents callback loops. The cost is that we will
+occasionally miss an auth error whose phrasing doesn't match any of
+the 17 signatures the classifier knows about (the `_AUTH_CODES` and
+`_AUTH_PHRASES` tuples). When that happens the daemon falls back
+to the pre-fix behaviour: burn three retries on a stale JWT then
+fail the order. Ops should monitor `[ORD-10]` log entries for the
+first few weeks and feed any new phrasings back into
+`_AUTH_PHRASES`. The classifier is a single-file change; updating
+it does NOT need a freeze-bypass slot.
+
+### 18.7 What's left in the misc-OPEN bucket
+
+Done in this commit: ORD-10.
+Done in `f7d90cc`: NUM-11, ORD-11.
+Done in `d578ff1`: ORD-05, ORD-07, ORD-08, ORD-09.
+Done in `da7ab69`: NUM-06, NUM-07.
+Done in `03ba66d`: NUM-01.
+
+Remaining (2 groups, 3 findings):
+
+* **Group F** — NUM-10 (decimal arithmetic for charges; touches
+  `charges.py` + `portfolio.py`).
+* **Group G** — PERF-07 (DataFrame allocation cache) +
+  PERF-13 (battery worker pickle); deferrable, backtester-only.
+
 

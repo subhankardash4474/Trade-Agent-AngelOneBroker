@@ -37,6 +37,11 @@ Findings covered in this file:
   ``execution.halt_symbol_on_slippage_breach`` is set) blocks new
   entries on the symbol until ``clear_slippage_block`` is called
   (Group D).
+* **ORD-10** (Medium)   -- reactive re-auth on AngelOne auth-class
+  errors (AB1010 / AB1011 / 401 / 403 / "Session Expired" / "Invalid
+  Token"). New ``classify_smartapi_error`` classifier + auth callback
+  hook on ExecutionEngine + force-refresh path on
+  ``TradingAgent._maybe_refresh_broker_session`` (Group E).
 """
 
 from __future__ import annotations
@@ -1206,3 +1211,261 @@ class TestORD11SlippageCircuitBreaker:
         # Anchors so future refactors can grep for the audit ID.
         assert "ORD-11-SLIPPAGE" in src
         assert "halt_symbol_on_slippage_breach" in src
+
+
+# ─────────────────────────────────────────────────────────────────────
+# ORD-10: reactive re-auth on auth-class broker errors
+# ─────────────────────────────────────────────────────────────────────
+
+
+class TestORD10ErrorClassifier:
+    """``classify_smartapi_error`` must recognise the AngelOne auth +
+    rate-limit signatures we know about and conservatively default to
+    "transient" for unknown shapes so a future broker-contract drift
+    doesn't accidentally halt trading.
+    """
+
+    def test_recognises_known_auth_codes(self):
+        from core.execution import classify_smartapi_error
+
+        for code in ("AB1010", "AB1011", "AB1014", "AB1019",
+                     "AB2001", "AB2002", "AB2003"):
+            err = {"status": False, "errorcode": code, "message": "x"}
+            assert classify_smartapi_error(err) == "auth", (
+                f"AngelOne code {code} should classify as auth"
+            )
+
+    def test_recognises_string_phrases(self):
+        from core.execution import classify_smartapi_error
+
+        for phrase in (
+            "Invalid Token",
+            "Token Invalid",
+            "Token Expired",
+            "Session Expired",
+            "Not logged in",
+            "Unauthorized",
+            "Logged out",
+            "Please login",
+            "JWT Expired",
+        ):
+            assert classify_smartapi_error(Exception(phrase)) == "auth", (
+                f"phrase {phrase!r} should classify as auth"
+            )
+
+    def test_recognises_401_and_403_status(self):
+        from core.execution import classify_smartapi_error
+
+        assert classify_smartapi_error(Exception("HTTP 401 Unauthorized")) == "auth"
+        assert classify_smartapi_error(Exception("403 Forbidden")) == "auth"
+
+    def test_does_not_misfire_on_order_id_with_401_substring(self):
+        from core.execution import classify_smartapi_error
+
+        # Order id like "OID-401-X" must NOT trigger the 401 heuristic.
+        assert classify_smartapi_error(Exception("Order OID-4012345 rejected")) == "transient"
+
+    def test_recognises_rate_limit(self):
+        from core.execution import classify_smartapi_error
+
+        for phrase in ("Too Many Requests", "rate limit exceeded",
+                       "throttle exceeded", "AB429"):
+            assert classify_smartapi_error(Exception(phrase)) == "rate_limit"
+
+    def test_unknown_error_defaults_to_transient(self):
+        from core.execution import classify_smartapi_error
+
+        # Conservative default: don't accidentally halt trading on
+        # unknown broker contract drift.
+        assert classify_smartapi_error(Exception("Connection reset by peer")) == "transient"
+        assert classify_smartapi_error(Exception("RMS rejected: insufficient margin")) == "transient"
+
+    def test_dict_payload_with_error_code_field(self):
+        from core.execution import classify_smartapi_error
+
+        err = {"status": False, "error_code": "AB1011", "message": "..."}
+        assert classify_smartapi_error(err) == "auth"
+
+    def test_handles_none_payload(self):
+        from core.execution import classify_smartapi_error
+
+        assert classify_smartapi_error(None) == "transient"
+
+    def test_rate_limit_takes_precedence_over_auth_words(self):
+        from core.execution import classify_smartapi_error
+
+        # An "AB429 session" message: rate-limit wins over auth-phrase
+        # heuristic.
+        err = {"errorcode": "AB429", "message": "session too many requests"}
+        assert classify_smartapi_error(err) == "rate_limit"
+
+
+class TestORD10AuthCallbackHook:
+    """The hook plumbing on ``ExecutionEngine`` must:
+      * accept a callback via ``set_auth_refresh_callback``,
+      * fire the callback on auth-class exceptions during
+        ``_live_order_with_retry``,
+      * fire AT MOST ONCE per top-level call (so a misbehaving
+        callback can't infinite-loop the retry budget),
+      * tolerate a callback that raises (must not crash).
+    """
+
+    def _engine(self):
+        from unittest.mock import MagicMock
+
+        from core.execution import ExecutionEngine
+
+        cfg = {
+            "broker": {"mode": "live"},
+            "execution": {
+                "order_type": "LIMIT",
+                "product_type": "INTRADAY",
+                "live_order_fill_timeout_sec": 0.05,
+                "live_order_fill_poll_interval_sec": 0.02,
+                "retry_attempts": 3,
+                "retry_delay_seconds": 0,
+            },
+            "market": {"exchange": "NSE"},
+        }
+        api = MagicMock()
+        eng = ExecutionEngine(cfg, smart_api=api)
+        return eng, api
+
+    def test_set_auth_refresh_callback_installs_hook(self):
+        eng, _ = self._engine()
+        called = []
+        eng.set_auth_refresh_callback(lambda: called.append(True) or True)
+        assert eng._auth_failure_callback is not None
+
+    def test_auth_class_exception_invokes_callback(self):
+        from unittest.mock import MagicMock
+
+        eng, api = self._engine()
+        api.placeOrder.side_effect = Exception("Invalid Token")
+
+        called = MagicMock(return_value=False)
+        eng.set_auth_refresh_callback(called)
+
+        out = eng._live_order_with_retry(
+            symbol="X", token="0", tx_type="BUY",
+            quantity=10, price=100.0, order_type="LIMIT",
+            stop_loss=None, take_profit=None, tag="t",
+        )
+        assert out is None
+        # Callback fired -- regardless of return value.
+        assert called.call_count == 1, (
+            "ORD-10 regression: auth-class exception did not invoke "
+            "the auth_failure_callback. Reactive re-auth is broken."
+        )
+
+    def test_callback_is_invoked_at_most_once_per_top_level_call(self):
+        """Three retries that all raise auth errors must still call
+        the callback only ONCE. Prevents a misbehaving callback from
+        burning the budget."""
+        from unittest.mock import MagicMock
+
+        eng, api = self._engine()
+        api.placeOrder.side_effect = Exception("Session Expired")
+
+        called = MagicMock(return_value=False)
+        eng.set_auth_refresh_callback(called)
+
+        eng._live_order_with_retry(
+            symbol="X", token="0", tx_type="BUY",
+            quantity=10, price=100.0, order_type="LIMIT",
+            stop_loss=None, take_profit=None, tag="t",
+        )
+        assert called.call_count == 1
+
+    def test_transient_exception_does_not_invoke_callback(self):
+        from unittest.mock import MagicMock
+
+        eng, api = self._engine()
+        api.placeOrder.side_effect = Exception("Connection reset by peer")
+
+        called = MagicMock(return_value=True)
+        eng.set_auth_refresh_callback(called)
+
+        eng._live_order_with_retry(
+            symbol="X", token="0", tx_type="BUY",
+            quantity=10, price=100.0, order_type="LIMIT",
+            stop_loss=None, take_profit=None, tag="t",
+        )
+        assert called.call_count == 0
+
+    def test_callback_raising_does_not_crash_retry_loop(self):
+        from unittest.mock import MagicMock
+
+        eng, api = self._engine()
+        api.placeOrder.side_effect = Exception("AB1010 Invalid Token")
+
+        called = MagicMock(side_effect=RuntimeError("callback boom"))
+        eng.set_auth_refresh_callback(called)
+
+        # Must not propagate the callback's RuntimeError.
+        out = eng._live_order_with_retry(
+            symbol="X", token="0", tx_type="BUY",
+            quantity=10, price=100.0, order_type="LIMIT",
+            stop_loss=None, take_profit=None, tag="t",
+        )
+        assert out is None
+
+    def test_callback_per_call_latch_resets_between_top_level_calls(self):
+        """Two distinct ``_live_order_with_retry`` calls must each get
+        their own one-shot auth-refresh budget."""
+        from unittest.mock import MagicMock
+
+        eng, api = self._engine()
+        api.placeOrder.side_effect = Exception("Token Expired")
+
+        called = MagicMock(return_value=False)
+        eng.set_auth_refresh_callback(called)
+
+        eng._live_order_with_retry(
+            symbol="X", token="0", tx_type="BUY",
+            quantity=10, price=100.0, order_type="LIMIT",
+            stop_loss=None, take_profit=None, tag="t",
+        )
+        eng._live_order_with_retry(
+            symbol="Y", token="0", tx_type="BUY",
+            quantity=10, price=100.0, order_type="LIMIT",
+            stop_loss=None, take_profit=None, tag="t",
+        )
+        # Two top-level calls -> two callback invocations.
+        assert called.call_count == 2
+
+    def test_anchor_in_trading_agent_init(self):
+        """Source-level pin: TradingAgent.__init__ must wire the
+        callback. A future refactor that drops the wiring would silently
+        leave the daemon on a stale JWT after a force-logout."""
+        path = os.path.join(PROJECT_ROOT, "trading_agent.py")
+        with open(path, "r", encoding="utf-8") as fh:
+            src = fh.read()
+        idx = src.find("def __init__(self, config")
+        assert idx >= 0
+        next_def = src.find("\n    def ", idx + 1)
+        body = src[idx:next_def]
+        assert "set_auth_refresh_callback" in body, (
+            "ORD-10 regression: TradingAgent.__init__ no longer wires "
+            "the auth_refresh_callback. The reactive re-auth path is "
+            "now disconnected from the JWT-refresh logic."
+        )
+        assert "_handle_broker_auth_failure" in body or \
+               "_handle_broker_auth_failure" in src, (
+            "ORD-10 regression: _handle_broker_auth_failure helper is "
+            "missing."
+        )
+
+    def test_force_refresh_kwarg_bypasses_age_gate(self):
+        """``_maybe_refresh_broker_session(force=True)`` must not
+        bail out on the 7h age gate."""
+        path = os.path.join(PROJECT_ROOT, "trading_agent.py")
+        with open(path, "r", encoding="utf-8") as fh:
+            src = fh.read()
+        idx = src.find("def _maybe_refresh_broker_session(")
+        assert idx >= 0
+        next_def = src.find("\n    def ", idx + 1)
+        body = src[idx:next_def]
+        assert "force" in body
+        # The force=True branch must skip the 7h age check.
+        assert "if not force" in body or "if force" in body

@@ -224,6 +224,17 @@ class TradingAgent:
         )
         self._smart_api = smart_api  # kept for re-login swap
         self._jwt_refresh_attempted_at: Optional[datetime] = None
+
+        # ORD-10 (audit 2026-05-28): wire the reactive re-auth hook so
+        # the ExecutionEngine can trigger an immediate JWT refresh on
+        # an auth-class broker error (AB1010 / AB1011 / 401 /
+        # "Session Expired") instead of burning its retry budget on
+        # a stale token.
+        try:
+            self.execution.set_auth_refresh_callback(self._handle_broker_auth_failure)
+        except AttributeError:
+            # Older ExecutionEngine on hot-reload; ignore.
+            pass
         self.portfolio = Portfolio(
             initial_balance=effective_balance,
             commission_pct=self.config.get("backtest", {}).get("commission_pct", 0.03),
@@ -2142,7 +2153,7 @@ class TradingAgent:
             return
         self._persist_trailing_states()
 
-    def _maybe_refresh_broker_session(self) -> None:
+    def _maybe_refresh_broker_session(self, *, force: bool = False) -> bool:
         """P2 restart-cluster (2026-05-17): refresh the AngelOne JWT before
         the 8h lifetime expires.
 
@@ -2151,23 +2162,39 @@ class TradingAgent:
         login keeps failing. Re-login swaps ``self.execution._api`` and
         ``self.data_handler._api`` so the next API call uses the fresh JWT.
 
-        Skipped entirely in paper mode (``_smart_api`` is None)."""
+        Skipped entirely in paper mode (``_smart_api`` is None).
+
+        ORD-10 (audit 2026-05-28): added ``force`` kwarg. When True
+        (called from the reactive re-auth callback wired into
+        ``ExecutionEngine._auth_failure_callback``), the 7h age gate
+        and the 1h backoff are bypassed because the broker has
+        already told us the JWT is dead. Returns True iff the swap
+        succeeded so the caller knows whether to retry the failing
+        broker op.
+        """
         if self._smart_api is None or self._broker_session_started_at is None:
-            return
-        age = datetime.now(IST) - self._broker_session_started_at
-        # Refresh threshold: 7h. JWT expires at 8h, so we have a 1h grace
-        # window in case the re-login itself takes a few attempts.
-        if age < timedelta(hours=7):
-            return
-        # Don't retry more than once an hour
-        if self._jwt_refresh_attempted_at is not None:
-            if (datetime.now(IST) - self._jwt_refresh_attempted_at) < timedelta(hours=1):
-                return
+            return False
+        if not force:
+            age = datetime.now(IST) - self._broker_session_started_at
+            # Refresh threshold: 7h. JWT expires at 8h, so we have a 1h grace
+            # window in case the re-login itself takes a few attempts.
+            if age < timedelta(hours=7):
+                return False
+            # Don't retry more than once an hour
+            if self._jwt_refresh_attempted_at is not None:
+                if (datetime.now(IST) - self._jwt_refresh_attempted_at) < timedelta(hours=1):
+                    return False
+        else:
+            age = datetime.now(IST) - self._broker_session_started_at
+            logger.warning(
+                f"[ORD-10] Reactive re-auth requested (broker reported "
+                f"auth-class error). Bypassing 7h gate (current age={age})."
+            )
         self._jwt_refresh_attempted_at = datetime.now(IST)
 
         broker_cfg = self.config.get("broker", {})
         if broker_cfg.get("mode") == "paper":
-            return
+            return False
         try:
             from SmartApi import SmartConnect  # type: ignore
             import pyotp  # type: ignore
@@ -2188,7 +2215,7 @@ class TradingAgent:
                     f"AngelOne re-login at session age {age} failed: {msg}",
                     level="critical",
                 )
-                return
+                return False
             # Swap the API objects everywhere the daemon holds a reference.
             self._smart_api = api
             self.execution._api = api
@@ -2220,12 +2247,37 @@ class TradingAgent:
                 f"(old session age was {age}). REST + WS reconnected. "
                 f"Trading continues."
             )
+            return True
         except Exception as exc:  # noqa: BLE001 - must not crash trading
             logger.critical(
                 f"[JWT-REFRESH] re-login raised {exc!r}. Next attempt in "
                 f"~1h. Old JWT will expire at "
                 f"{(self._broker_session_started_at + timedelta(hours=8)).isoformat()}."
             )
+            return False
+
+    def _handle_broker_auth_failure(self) -> bool:
+        """ORD-10 (audit 2026-05-28): reactive re-auth callback wired
+        into ``ExecutionEngine`` via ``set_auth_refresh_callback``.
+
+        Invoked when ``_live_order_with_retry`` catches an auth-class
+        broker error (AB1010 / AB1011 / AB2001 / 401 / 403 / "Session
+        Expired"). Bypasses the 7h proactive timer and the 1h
+        backoff so the daemon doesn't burn its retry budget on a
+        stale JWT.
+
+        Returns True iff the swap succeeded and the next broker
+        call should see the fresh JWT.
+        """
+        try:
+            return bool(self._maybe_refresh_broker_session(force=True))
+        except Exception as exc:  # noqa: BLE001 - callback must not crash trading
+            logger.critical(
+                f"[ORD-10] _handle_broker_auth_failure raised "
+                f"{type(exc).__name__}: {exc!r}. The retry loop "
+                f"will continue on the stale JWT."
+            )
+            return False
 
     def _persist_runtime_state(self) -> None:
         """P2 restart-cluster (2026-05-17): atomically snapshot the three

@@ -50,6 +50,113 @@ def _set_paper_seed(seed: Optional[int]) -> None:
         _paper_rng.seed(int(seed))
 
 
+# ── ORD-10 (audit 2026-05-28): SmartAPI error classifier ─────────────
+#
+# AngelOne SmartAPI surfaces failures via two channels:
+#   1. The Python SmartConnect wrapper raises an exception whose
+#      ``str()`` carries the underlying message (e.g. "Invalid Token",
+#      "Session Expired", "401 Client Error"); some versions also set
+#      a ``.code`` / ``.message`` attribute on the exception.
+#   2. The wrapper returns a dict ``{"status": False, "errorcode":
+#      "AB1010", "message": "..."}``.
+#
+# Pre-fix, every failure was treated as transient by the retry loop --
+# auth-class errors burnt the retry budget without re-authenticating.
+# The classifier below picks out four buckets so the caller can route:
+#
+#   * ``"auth"``        -- JWT / session expired / token mismatch /
+#                         force-logout. Caller should re-login + retry.
+#   * ``"rate_limit"``  -- broker throttling. Caller should back off.
+#   * ``"transient"``   -- everything else broker-side; retry per the
+#                         existing retry loop.
+#   * ``"fatal"``       -- (reserved) hard errors that should surface
+#                         immediately. Currently nothing classifies as
+#                         "fatal" -- the conservative default is
+#                         ``transient`` so a broker-contract drift
+#                         doesn't accidentally halt trading.
+#
+# Recognised auth signatures (case-insensitive substrings on the error
+# code or the message):
+#
+#   * AngelOne error codes: ``AB1010``, ``AB1011``, ``AB1014``,
+#     ``AB1019``, ``AB2001``, ``AB2002``, ``AB2003``.
+#   * HTTP status hints:    ``401``, ``403`` (fenced by word
+#     boundaries to avoid false-positives on order ids).
+#   * String hints:         ``invalid token``, ``token invalid``,
+#     ``token expired``, ``session expired``, ``not logged in``,
+#     ``unauthorized``, ``unauthorised``, ``logged out``,
+#     ``please login``, ``jwt expired``.
+#
+# Recognised rate-limit signatures: ``AB429``, ``too many requests``,
+# ``rate limit``, ``throttle``.
+
+_AUTH_CODES = (
+    "AB1010", "AB1011", "AB1014", "AB1019",
+    "AB2001", "AB2002", "AB2003",
+)
+_AUTH_PHRASES = (
+    "invalid token", "token invalid", "token expired",
+    "session expired", "session timed out",
+    "not logged in", "unauthorized", "unauthorised",
+    "logged out", "please login", "jwt expired",
+    "auth failed", "authentication failed",
+)
+_RATE_LIMIT_PHRASES = (
+    "ab429", "too many requests", "rate limit", "throttle",
+)
+
+
+def classify_smartapi_error(payload) -> str:
+    """ORD-10 (audit 2026-05-28): classify a broker error.
+
+    ``payload`` may be:
+      * a Python exception (the wrapped or raw SmartConnect
+        exception),
+      * a dict matching the SmartAPI failure shape
+        (``{"status": False, "errorcode": ..., "message": ...}``),
+      * a plain string.
+
+    Returns one of ``"auth"``, ``"rate_limit"``, ``"transient"``, or
+    ``"fatal"``. Conservatively defaults to ``"transient"`` so an
+    unknown broker contract drift doesn't accidentally halt trading.
+    """
+    code = ""
+    msg = ""
+    if payload is None:
+        return "transient"
+    if isinstance(payload, BaseException):
+        msg = str(payload)
+        code = str(getattr(payload, "code", "") or
+                   getattr(payload, "errorcode", "") or
+                   getattr(payload, "error_code", "") or "")
+    elif isinstance(payload, dict):
+        code = str(payload.get("errorcode") or payload.get("error_code") or
+                   payload.get("code") or "")
+        msg = str(payload.get("message") or payload.get("msg") or "")
+    else:
+        msg = str(payload)
+
+    blob = f"{code} {msg}".lower()
+
+    # Rate-limit takes precedence over auth heuristics: an "AB429" error
+    # carrying "session" verbiage is still a throttle, not an auth fail.
+    if any(p in blob for p in _RATE_LIMIT_PHRASES):
+        return "rate_limit"
+
+    if any(c.lower() in blob for c in _AUTH_CODES):
+        return "auth"
+    if any(p in blob for p in _AUTH_PHRASES):
+        return "auth"
+
+    # 401 / 403 hints. Fence with non-word chars so an order id like
+    # "OID-401" doesn't trip the classifier.
+    import re
+    if re.search(r"(?<!\d)40[13](?!\d)", blob):
+        return "auth"
+
+    return "transient"
+
+
 # Strings that AngelOne / Kite are known (or likely) to emit as a stringy
 # version of a boolean status field. Maintained at module scope so the
 # table is auditable. Lower-cased for the comparison.
@@ -221,6 +328,85 @@ class ExecutionEngine:
             exec_cfg.get("halt_symbol_on_slippage_breach", False)
         )
         self._slippage_breached_symbols: set[str] = set()
+
+        # ── ORD-10 (audit 2026-05-28) ─────────────────────────────────
+        # Reactive re-authentication hook. The pre-fix daemon refreshed
+        # JWT only on the proactive 7-hour timer in trading_agent.
+        # If AngelOne invalidates the JWT EARLIER (force-logout from
+        # another device, broker-side session reset, intermediate
+        # network MITM stripping headers), every API call returns an
+        # auth-class error AB10xx / 401 / "Session Expired" -- the
+        # daemon would burn its retry budget on a stale JWT and then
+        # silently report "Order FAILED after 3 attempts".
+        #
+        # The callback hook below lets ``trading_agent.TradingAgent``
+        # inject ``_handle_broker_auth_failure`` -- a thin wrapper
+        # around ``_maybe_refresh_broker_session(force=True)`` that
+        # bypasses the 7h gate. When ``_live_order_with_retry``
+        # catches an auth-class error, it invokes the callback once;
+        # if it returns True, the next retry attempt sees the fresh
+        # ``self._api`` (which the callback swapped in).
+        self._auth_failure_callback = None
+        # Per-call guard so we never invoke the callback more than
+        # once per ``_live_order_with_retry`` invocation -- a
+        # callback that misbehaves and returns True without actually
+        # fixing anything must NOT loop the retry budget.
+        self._auth_refresh_attempted: bool = False
+
+    def set_auth_refresh_callback(self, callback) -> None:
+        """ORD-10: install the reactive re-auth hook.
+
+        ``callback`` must be a zero-arg callable returning True iff
+        re-authentication succeeded (i.e. ``self._api`` now points
+        at a fresh SmartConnect handle). Called by ``trading_agent``
+        from ``__init__`` after both the ExecutionEngine and the
+        TradingAgent have finished initialising.
+        """
+        self._auth_failure_callback = callback
+
+    def _maybe_invoke_auth_refresh(self, payload) -> bool:
+        """Internal: classify ``payload`` and, if it's an auth error,
+        invoke the callback (once per call site).
+
+        Returns True iff a refresh was actually performed AND it
+        succeeded; the caller should treat this as "retry the broker
+        op once more before incrementing its retry counter".
+        """
+        if classify_smartapi_error(payload) != "auth":
+            return False
+        if self._auth_failure_callback is None:
+            logger.warning(
+                "[ORD-10] auth-class broker error detected but no "
+                "auth_failure_callback installed; falling through "
+                "to the regular retry loop on the stale JWT."
+            )
+            return False
+        if self._auth_refresh_attempted:
+            return False
+        self._auth_refresh_attempted = True
+        try:
+            ok = bool(self._auth_failure_callback())
+        except Exception as cb_exc:  # noqa: BLE001
+            logger.critical(
+                f"[ORD-10] auth_failure_callback raised: "
+                f"{type(cb_exc).__name__}: {cb_exc!r}. The retry "
+                f"loop will continue on the stale JWT; ops should "
+                f"investigate immediately."
+            )
+            return False
+        if ok:
+            logger.warning(
+                "[ORD-10] reactive re-auth succeeded; retrying the "
+                "broker call on the fresh JWT."
+            )
+        else:
+            logger.critical(
+                "[ORD-10] reactive re-auth callback returned False "
+                "-- the callback could not refresh the session. "
+                "The retry loop will continue on the stale JWT; "
+                "ops action required."
+            )
+        return ok
 
     def place_order(
         self,
@@ -862,6 +1048,11 @@ class ExecutionEngine:
             logger.error("SmartAPI not initialized for live trading")
             return None
 
+        # ORD-10: reset the per-call auth-refresh latch so each
+        # top-level entry/exit call gets exactly one reactive re-auth
+        # attempt across its retry budget.
+        self._auth_refresh_attempted = False
+
         order_params = {
             "variety": "NORMAL",
             "tradingsymbol": symbol,
@@ -1155,6 +1346,12 @@ class ExecutionEngine:
 
             except Exception as e:
                 logger.error(f"Order failed (attempt {attempt}): {e}")
+                # ORD-10 (audit 2026-05-28): if the failure looks
+                # auth-class, invoke the reactive re-auth hook
+                # before burning more retries. The hook fires AT
+                # MOST ONCE per ``_live_order_with_retry`` call so
+                # a misbehaving callback can't infinite-loop us.
+                self._maybe_invoke_auth_refresh(e)
 
             if attempt < self.retry_attempts:
                 time.sleep(self.retry_delay)
