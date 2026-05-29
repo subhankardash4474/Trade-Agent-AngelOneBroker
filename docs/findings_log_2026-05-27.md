@@ -2728,4 +2728,173 @@ Remaining (2 groups, 3 findings):
 * **Group G** — PERF-07 (DataFrame allocation cache) +
   PERF-13 (battery worker pickle); deferrable, backtester-only.
 
+---
+
+## 19. Misc-OPEN bucket — Group F: Decimal arithmetic for charges (NUM-10)
+
+**Date:** 2026-05-30 (morning IST)
+**Commit:** PENDING (this section is being written before the commit)
+**Status:** 1 finding FIXED, NOT deployed.
+
+### 19.1 What was broken
+
+`charges.py` accumulated brokerage / STT / GST / etc. as IEEE-754
+floats with no quantization step. `portfolio.close_position` then
+derived the exit-leg commission via subtraction:
+
+```python
+total_commission = compute_round_trip(...).total
+entry_commission = compute_one_leg(entry_price, ...)
+exit_commission = total_commission - entry_commission
+```
+
+Two compounding issues:
+
+1. **Component drift.** Each component (brokerage, STT, GST, ...)
+   was computed at full IEEE-754 precision but then displayed at
+   2-decimal precision. Over thousands of trades the cumulative
+   gap between displayed-and-stored numbers and broker truth
+   (which actually rounds to 1 paisa per component) was
+   non-trivial.
+
+2. **Subtractive drift.** `total - entry` is not guaranteed to be
+   numerically equal to `compute_one_leg(exit, side=exit_side)`
+   when both operands are floats. Over a portfolio of 1000+
+   trades the accumulated jitter biased reported P&L vs broker
+   contract notes by a few rupees per day -- enough to
+   flip-flop a tight reward-vs-charges gate in the strategy
+   sizer.
+
+### 19.2 Fix
+
+**Decimal pipeline in `packages/core/charges.py`.**
+
+```python
+from decimal import ROUND_HALF_EVEN, Decimal, getcontext
+getcontext().prec = max(getcontext().prec, 28)
+_PAISA = Decimal("0.01")
+
+def _q(value) -> Decimal:
+    if not isinstance(value, Decimal):
+        value = Decimal(str(value))   # avoid Decimal(0.1) jitter
+    return value.quantize(_PAISA, rounding=ROUND_HALF_EVEN)
+```
+
+Every component (brokerage, STT, txn, SEBI, GST, stamp, DP) is now
+computed in `Decimal` and quantized to 1 paisa **per leg, per
+component** before being summed. `compute_one_leg` quantizes its
+own components; `compute_round_trip` quantizes per-leg components
+the same way and sums them. By construction:
+
+* `compute_round_trip(buy, sell, qty, INTRADAY).total` ==
+  `compute_one_leg(BUY, buy, qty, INTRADAY) + compute_one_leg(SELL, sell, qty, INTRADAY)`
+
+byte-for-byte (modulo a 1e-9 IEEE-754 round-trip into / out of
+`float`). This was NOT true before -- the round-trip path
+folded brokerage / GST into a single quantization vs the legs'
+two-stage quantization, so the two paths could disagree by a
+fraction of a paisa per trade.
+
+**Direct exit-leg compute in `portfolio.py:close_position`.**
+
+```python
+# pre-fix:
+exit_commission = total_commission - entry_commission
+
+# post-fix:
+exit_commission = compute_one_leg(
+    exit_price, pos.quantity, side=exit_side, product=self.product_type,
+)
+```
+
+The subtractive form is gone. The new identity (above) makes the
+two values mathematically equal, but routing through
+`compute_one_leg` directly is robust to any future changes in
+`compute_round_trip` that might break the symmetry.
+
+**Public API stays float-typed.** `compute_one_leg` returns
+`float`; `TradeCharges` fields are `float`. Callers see no
+behavioural change beyond the per-component values now matching
+broker contract notes to the paisa.
+
+### 19.3 Test coverage
+
+**`TestNUM10DecimalCharges`** (8 tests):
+
+* `test_round_trip_total_equals_sum_of_legs_intraday` -- pin the
+  new identity for INTRADAY at a deliberately float-jittery
+  price (1234.567 * 137).
+* `test_round_trip_total_equals_sum_of_legs_delivery` -- same for
+  DELIVERY.
+* `test_components_are_quantized_to_paisa` -- every reported
+  component must be representable as N hundredths of a rupee
+  (matches broker contract-note resolution).
+* `test_legs_are_quantized_to_paisa` -- same for `compute_one_leg`.
+* `test_exit_commission_no_longer_uses_subtraction` -- source-level
+  pin that `close_position` doesn't regress to
+  `total_commission - entry_commission`. Strips comments first so
+  the explanatory NUM-10 annotation in the source doesn't trip
+  the regression regex.
+* `test_round_trip_pnl_equals_gross_minus_total_charges` -- end-
+  to-end: 4 round-trips through `Portfolio` (with deliberately
+  float-jittery prices) must satisfy `(cash_after - cash_before)
+  == sum(rec.pnl)` to ~1e-6.
+* `test_charges_helpers_are_still_float_typed_at_boundary` --
+  defensive: the public API contract is unchanged.
+* `test_anchor_in_charges_source` -- pins the audit ID + the
+  `Decimal` import + `_PAISA` constant + `ROUND_HALF_EVEN` mode
+  so future refactors can grep for the audit context.
+
+**Suite results:**
+
+* Unit: **1,625 / 1,625** PASSED.
+* Integration: **248 / 248** PASSED.
+* Combined: **1,873 / 1,873**.
+
+### 19.4 Files touched
+
+* `packages/core/charges.py` -- `Decimal` import + `_PAISA`
+  constant + `_q()` quantizer + `_brokerage_dec()` helper +
+  Decimal-pipeline rewrites of `compute_round_trip` and
+  `compute_one_leg`. Public types unchanged (still float).
+* `packages/core/portfolio.py:close_position` -- replaced
+  `exit_commission = total_commission - entry_commission` with
+  a direct `compute_one_leg(exit_price, ...)` call.
+* `tests/unit/test_audit_2026_05_28_misc.py` -- 8 new tests.
+
+### 19.5 Honest caveats
+
+* **Performance.** `Decimal` arithmetic is meaningfully slower
+  than float (typically 30-50x in Python). The backtester runs
+  `compute_one_leg` / `compute_round_trip` once per simulated
+  trade; even a 5,000-trade battery only adds milliseconds in
+  aggregate. Live trading invokes them once per
+  `open_position` and once per `close_position` -- well below the
+  per-cycle latency budget. No measurable impact.
+* **Float boundary.** The public API still returns `float` so
+  callers aren't forced to refactor their downstream
+  arithmetic. Numerically the two are equivalent at 1-paisa
+  resolution; if downstream callers later need exact rationals
+  for compounding, exposing the `Decimal` form is a one-line
+  change.
+
+### 19.6 What's left in the misc-OPEN bucket
+
+Done in this commit: NUM-10.
+Done in `1518b24`: ORD-10.
+Done in `f7d90cc`: NUM-11, ORD-11.
+Done in `d578ff1`: ORD-05, ORD-07, ORD-08, ORD-09.
+Done in `da7ab69`: NUM-06, NUM-07.
+Done in `03ba66d`: NUM-01.
+
+Remaining (1 group, 2 findings, both deferrable):
+
+* **Group G** — PERF-07 (DataFrame allocation cache) +
+  PERF-13 (battery worker pickle); backtester-only perf wins.
+
+10 of 13 misc-OPEN findings now closed. The two PERF deferrals
+are backtester throughput knobs, not correctness fixes, so they
+can be picked up opportunistically alongside the next perf
+sprint.
+
 

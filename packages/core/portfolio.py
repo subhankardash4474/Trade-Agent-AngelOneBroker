@@ -651,7 +651,17 @@ class Portfolio:
             entry_commission = compute_one_leg(
                 pos.entry_price, pos.quantity, side=entry_side, product=self.product_type,
             )
-            exit_commission = total_commission - entry_commission
+            # NUM-10 (audit 2026-05-28): pre-fix this was
+            # ``exit_commission = total_commission - entry_commission``
+            # which accumulated float subtraction drift over many
+            # trades and silently biased reported P&L vs broker truth.
+            # ``compute_one_leg`` is now Decimal-quantized internally
+            # so ``compute_one_leg(BUY) + compute_one_leg(SELL)``
+            # equals ``compute_round_trip(...).total`` byte-for-byte;
+            # computing the exit leg directly removes the drift.
+            exit_commission = compute_one_leg(
+                exit_price, pos.quantity, side=exit_side, product=self.product_type,
+            )
 
             # pnl reflects true realized profit net of all charges on both legs.
             # unrealized_pnl already handles sign for LONG vs SHORT.

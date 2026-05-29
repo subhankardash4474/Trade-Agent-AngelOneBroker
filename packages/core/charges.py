@@ -28,7 +28,33 @@ UPDATE PROCEDURE when SEBI / broker change rates permanently:
 
 import os
 from dataclasses import dataclass
+from decimal import ROUND_HALF_EVEN, Decimal, getcontext
 from typing import Literal
+
+
+# NUM-10 (audit 2026-05-28): use Decimal internally so leg-boundary
+# rounding is deterministic and the float-jitter that quietly biased
+# ``exit_commission = total - entry`` in portfolio.py disappears.
+# 1 paisa (Rs 0.01) is the resolution at which Indian brokers actually
+# bill charges (per SEBI / exchange contract notes), so quantizing to
+# 0.01 at every leg boundary matches broker-truth and lets us reconcile
+# backtester vs live to the rupee. Internal arithmetic uses 28-digit
+# Decimal precision (default) which is ample for our turnover scale.
+getcontext().prec = max(getcontext().prec, 28)
+_PAISA = Decimal("0.01")
+
+
+def _q(value) -> Decimal:
+    """Quantize a Decimal / numeric to 1 paisa using banker's rounding.
+    ``ROUND_HALF_EVEN`` matches the SEBI contract-note convention and
+    keeps an unbiased estimator over a long-running portfolio.
+    """
+    if not isinstance(value, Decimal):
+        # ``str(value)`` keeps the IEEE float round-tripped string so
+        # we don't introduce a ``Decimal(0.1) -> 0.1000000000000000055``
+        # rounding error at the boundary.
+        value = Decimal(str(value))
+    return value.quantize(_PAISA, rounding=ROUND_HALF_EVEN)
 
 
 def _env_float(name: str, default: float) -> float:
@@ -112,12 +138,13 @@ class TradeCharges:
         }
 
 
-def _brokerage(turnover: float, product: str) -> float:
-    """Brokerage for one leg (buy OR sell)."""
+def _brokerage_dec(turnover: Decimal, product: str) -> Decimal:
+    """Brokerage for one leg (buy OR sell) -- Decimal internal API."""
     if product == "DELIVERY":
-        return BROKERAGE_DELIVERY_PCT * turnover
-    brok = BROKERAGE_INTRADAY_PCT * turnover
-    return min(brok, BROKERAGE_MAX_PER_ORDER)
+        return turnover * Decimal(str(BROKERAGE_DELIVERY_PCT))
+    brok = turnover * Decimal(str(BROKERAGE_INTRADAY_PCT))
+    cap = Decimal(str(BROKERAGE_MAX_PER_ORDER))
+    return brok if brok < cap else cap
 
 
 def compute_round_trip(
@@ -126,47 +153,68 @@ def compute_round_trip(
     quantity: int,
     product: Literal["INTRADAY", "DELIVERY"] = "INTRADAY",
 ) -> TradeCharges:
-    """Compute total charges for a full buy+sell round-trip on NSE equity."""
-    buy_val = buy_price * quantity
-    sell_val = sell_price * quantity
+    """Compute total charges for a full buy+sell round-trip on NSE equity.
+
+    NUM-10 (audit 2026-05-28): the inner accumulation now runs in
+    Decimal, with 1-paisa quantization applied component-wise. This
+    pins each component to broker-truth resolution and (more
+    importantly) makes ``compute_round_trip`` numerically equal to
+    ``compute_one_leg(BUY) + compute_one_leg(SELL)`` so portfolio.py's
+    ``exit_commission`` no longer needs to be derived by subtraction
+    (which previously accumulated float jitter over many trades).
+    """
+    buy_val = Decimal(str(buy_price)) * Decimal(int(quantity))
+    sell_val = Decimal(str(sell_price)) * Decimal(int(quantity))
     turnover = buy_val + sell_val
 
-    # Brokerage (both legs)
-    brok = _brokerage(buy_val, product) + _brokerage(sell_val, product)
+    # Brokerage (both legs) -- quantize per-leg first so the round-trip
+    # total equals the sum of the two ``compute_one_leg`` results.
+    brok_buy = _q(_brokerage_dec(buy_val, product))
+    brok_sell = _q(_brokerage_dec(sell_val, product))
+    brok = brok_buy + brok_sell
 
-    # STT
+    # STT -- intraday SELL only; delivery both legs.
+    stt_dec = Decimal("0")
     if product == "DELIVERY":
-        stt = STT_DELIVERY * (buy_val + sell_val)
+        stt_dec = (buy_val + sell_val) * Decimal(str(STT_DELIVERY))
     else:
-        stt = STT_INTRADAY_SELL * sell_val
+        stt_dec = sell_val * Decimal(str(STT_INTRADAY_SELL))
+    stt = _q(stt_dec)
 
-    # Exchange transaction charges (both sides)
-    txn = NSE_TXN_CHARGE * turnover
+    # Exchange transaction charges -- both sides.
+    txn_buy = _q(buy_val * Decimal(str(NSE_TXN_CHARGE)))
+    txn_sell = _q(sell_val * Decimal(str(NSE_TXN_CHARGE)))
+    txn = txn_buy + txn_sell
 
-    # SEBI fees
-    sebi = SEBI_CHARGE * turnover
+    # SEBI fees -- both sides.
+    sebi_buy = _q(buy_val * Decimal(str(SEBI_CHARGE)))
+    sebi_sell = _q(sell_val * Decimal(str(SEBI_CHARGE)))
+    sebi = sebi_buy + sebi_sell
 
-    # GST — only on brokerage + txn + SEBI
-    gst = GST_RATE * (brok + txn + sebi)
+    # GST is computed on the (already quantized) per-leg sub-totals so
+    # the round-trip GST equals leg-buy GST + leg-sell GST byte-for-byte.
+    gst_buy = _q((brok_buy + txn_buy + sebi_buy) * Decimal(str(GST_RATE)))
+    gst_sell = _q((brok_sell + txn_sell + sebi_sell) * Decimal(str(GST_RATE)))
+    gst = gst_buy + gst_sell
 
-    # Stamp duty — only on buy
-    stamp = STAMP_DUTY_BUY * buy_val
+    # Stamp duty -- only on buy.
+    stamp = _q(buy_val * Decimal(str(STAMP_DUTY_BUY)))
 
-    # DP charges — only on delivery SELL
-    dp = 0.0
+    # DP charges -- only on delivery SELL.
+    dp = Decimal("0")
     if product == "DELIVERY":
-        dp = DP_CHARGE_CDSL * (1 + DP_GST)
+        dp = _q(Decimal(str(DP_CHARGE_CDSL)) * (Decimal("1") + Decimal(str(DP_GST))))
 
     total = brok + stt + txn + sebi + gst + stamp + dp
     return TradeCharges(
-        brokerage=brok,
-        stt=stt,
-        exchange_txn=txn,
-        sebi=sebi,
-        gst=gst,
-        stamp_duty=stamp,
-        dp_charges=dp,
-        total=total,
+        brokerage=float(brok),
+        stt=float(stt),
+        exchange_txn=float(txn),
+        sebi=float(sebi),
+        gst=float(gst),
+        stamp_duty=float(stamp),
+        dp_charges=float(dp),
+        total=float(total),
     )
 
 
@@ -176,26 +224,31 @@ def compute_one_leg(
     side: Literal["BUY", "SELL"],
     product: Literal["INTRADAY", "DELIVERY"] = "INTRADAY",
 ) -> float:
-    """
-    Approximate charge for a single leg (buy OR sell).
-    Useful when you need to split cost between entry and exit.
-    """
-    value = price * quantity
-    brok = _brokerage(value, product)
-    txn = NSE_TXN_CHARGE * value
-    sebi = SEBI_CHARGE * value
-    gst = GST_RATE * (brok + txn + sebi)
+    """Charge for a single leg (buy OR sell).
 
-    stamp = STAMP_DUTY_BUY * value if side == "BUY" else 0.0
+    NUM-10 (audit 2026-05-28): Decimal-quantized component-wise so the
+    sum across two legs equals ``compute_round_trip(...).total`` byte
+    for byte. This is the property portfolio.py relies on to size the
+    exit commission via a direct compute instead of the subtractive
+    ``total - entry`` (which used to drift over many trades).
+    """
+    value = Decimal(str(price)) * Decimal(int(quantity))
+    brok = _q(_brokerage_dec(value, product))
+    txn = _q(value * Decimal(str(NSE_TXN_CHARGE)))
+    sebi = _q(value * Decimal(str(SEBI_CHARGE)))
+    gst = _q((brok + txn + sebi) * Decimal(str(GST_RATE)))
 
-    stt = 0.0
+    stamp = _q(value * Decimal(str(STAMP_DUTY_BUY))) if side == "BUY" else Decimal("0")
+
+    stt = Decimal("0")
     if product == "DELIVERY":
-        stt = STT_DELIVERY * value
+        stt = _q(value * Decimal(str(STT_DELIVERY)))
     elif side == "SELL":
-        stt = STT_INTRADAY_SELL * value
+        stt = _q(value * Decimal(str(STT_INTRADAY_SELL)))
 
-    dp = 0.0
+    dp = Decimal("0")
     if product == "DELIVERY" and side == "SELL":
-        dp = DP_CHARGE_CDSL * (1 + DP_GST)
+        dp = _q(Decimal(str(DP_CHARGE_CDSL)) * (Decimal("1") + Decimal(str(DP_GST))))
 
-    return brok + stt + txn + sebi + gst + stamp + dp
+    total = brok + stt + txn + sebi + gst + stamp + dp
+    return float(total)

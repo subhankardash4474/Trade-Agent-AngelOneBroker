@@ -42,6 +42,15 @@ Findings covered in this file:
   Token"). New ``classify_smartapi_error`` classifier + auth callback
   hook on ExecutionEngine + force-refresh path on
   ``TradingAgent._maybe_refresh_broker_session`` (Group E).
+* **NUM-10** (Medium)   -- decimal arithmetic for charges. The inner
+  accumulators in ``charges.py`` now run in ``Decimal`` and quantize
+  to 1 paisa per component; ``compute_round_trip`` equals
+  ``compute_one_leg(BUY) + compute_one_leg(SELL)`` byte-for-byte; and
+  ``portfolio.close_position`` now derives ``exit_commission``
+  directly from ``compute_one_leg`` instead of via
+  ``total_commission - entry_commission`` so float subtraction
+  drift no longer biases reported P&L over long-running portfolios
+  (Group F).
 """
 
 from __future__ import annotations
@@ -1469,3 +1478,190 @@ class TestORD10AuthCallbackHook:
         assert "force" in body
         # The force=True branch must skip the 7h age check.
         assert "if not force" in body or "if force" in body
+
+
+# ─────────────────────────────────────────────────────────────────────
+# NUM-10: Decimal arithmetic for charges (audit 2026-05-28)
+# ─────────────────────────────────────────────────────────────────────
+
+
+class TestNUM10DecimalCharges:
+    """``charges.py`` now uses Decimal internally and quantizes per
+    component to 1 paisa. Two contracts must hold:
+
+      * Each component is rounded to broker-truth resolution (1 paisa)
+        so backtester and live can be reconciled to the rupee.
+      * ``compute_round_trip(buy, sell, qty).total`` ==
+        ``compute_one_leg(BUY, buy, qty) + compute_one_leg(SELL, sell, qty)``
+        byte-for-byte, so ``portfolio.close_position`` doesn't need
+        the subtractive ``total - entry`` derivation that used to
+        accumulate float drift.
+    """
+
+    def test_round_trip_total_equals_sum_of_legs_intraday(self):
+        # Pick a price/qty combination chosen to be float-jittery
+        # (1234.567 * 137 has a non-power-of-two mantissa).
+        rt = compute_round_trip(buy_price=1234.567, sell_price=1242.913,
+                                quantity=137, product="INTRADAY")
+        leg_buy = compute_one_leg(1234.567, 137, side="BUY", product="INTRADAY")
+        leg_sell = compute_one_leg(1242.913, 137, side="SELL", product="INTRADAY")
+        # NUM-10 identity: round-trip == sum of legs (byte-for-byte).
+        assert rt.total == pytest.approx(leg_buy + leg_sell, abs=1e-9), (
+            f"NUM-10 regression: round_trip total {rt.total} != "
+            f"leg sum {leg_buy + leg_sell}. portfolio.close_position's "
+            f"`exit_commission = compute_one_leg(exit)` derivation now "
+            f"depends on this identity."
+        )
+
+    def test_round_trip_total_equals_sum_of_legs_delivery(self):
+        rt = compute_round_trip(buy_price=2500.123, sell_price=2519.876,
+                                quantity=42, product="DELIVERY")
+        leg_buy = compute_one_leg(2500.123, 42, side="BUY", product="DELIVERY")
+        leg_sell = compute_one_leg(2519.876, 42, side="SELL", product="DELIVERY")
+        assert rt.total == pytest.approx(leg_buy + leg_sell, abs=1e-9)
+
+    def test_components_are_quantized_to_paisa(self):
+        """Every reported component should be representable as N
+        hundredths of a rupee (the broker contract-note resolution)."""
+        from decimal import Decimal
+
+        rt = compute_round_trip(buy_price=1234.567, sell_price=1242.913,
+                                quantity=137, product="INTRADAY")
+        for field in ("brokerage", "stt", "exchange_txn", "sebi", "gst",
+                      "stamp_duty", "dp_charges", "total"):
+            val = getattr(rt, field)
+            d = Decimal(str(val))
+            # Quantization to 0.01 means the fractional remainder after
+            # multiplying by 100 must be < 1e-9.
+            scaled = d * Decimal(100)
+            frac = abs(scaled - scaled.to_integral_value())
+            assert frac < Decimal("1e-9"), (
+                f"NUM-10 regression: charges.{field} = {val} is not "
+                f"paisa-quantized (residual {frac})."
+            )
+
+    def test_legs_are_quantized_to_paisa(self):
+        from decimal import Decimal
+
+        for side in ("BUY", "SELL"):
+            for product in ("INTRADAY", "DELIVERY"):
+                val = compute_one_leg(1234.567, 137, side=side, product=product)
+                scaled = Decimal(str(val)) * Decimal(100)
+                frac = abs(scaled - scaled.to_integral_value())
+                assert frac < Decimal("1e-9"), (
+                    f"NUM-10 regression: compute_one_leg({side}, "
+                    f"{product})={val} is not paisa-quantized."
+                )
+
+    def test_exit_commission_no_longer_uses_subtraction(self):
+        """portfolio.close_position used to do
+        ``exit_commission = total_commission - entry_commission``
+        which drifted as float ops accumulate. The fix replaces this
+        with a direct ``compute_one_leg`` call. Pin the source so a
+        future refactor can't silently re-introduce the subtraction.
+        """
+        path = os.path.join(PROJECT_ROOT, "packages", "core", "portfolio.py")
+        with open(path, "r", encoding="utf-8") as fh:
+            src = fh.read()
+        idx = src.find("def close_position(")
+        assert idx >= 0
+        next_def = src.find("\n    def ", idx + 1)
+        body = src[idx:next_def]
+        # The pre-fix line was ``exit_commission = total_commission - entry_commission``.
+        # Strip out comments + docstrings before scanning so the
+        # NUM-10 explanatory annotation in the source doesn't trip
+        # the regression regex.
+        import re
+        body_no_comments = re.sub(r"#[^\n]*", "", body)
+        body_no_comments = re.sub(r'"""[\s\S]*?"""', "", body_no_comments)
+        bad = re.search(
+            r"^\s*exit_commission\s*=\s*total_commission\s*-\s*entry_commission",
+            body_no_comments,
+            re.MULTILINE,
+        )
+        assert bad is None, (
+            "NUM-10 regression: close_position is once again deriving "
+            "exit_commission via subtraction (`total_commission - "
+            "entry_commission`). This drifts in float over many trades "
+            "and biases reported P&L vs broker truth. Use "
+            "`compute_one_leg(exit_price, ..., side=exit_side)` "
+            "directly."
+        )
+        # Positive form: must compute via compute_one_leg(exit_price ...).
+        assert re.search(
+            r"exit_commission\s*=\s*compute_one_leg\s*\(\s*exit_price",
+            body,
+        ) is not None, (
+            "NUM-10 regression: close_position no longer derives "
+            "exit_commission from compute_one_leg(exit_price, ...). "
+            "Add the direct call back."
+        )
+
+    def test_round_trip_pnl_equals_gross_minus_total_charges(self):
+        """End-to-end portfolio invariant under the new charges:
+        the Portfolio's reported pnl must equal
+        ``gross_pnl - total_commission`` to the rupee even after
+        many round-trips.
+        """
+        from datetime import datetime
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Database(db_path=os.path.join(tmp, "x.db"))
+            port = Portfolio(
+                initial_balance=1_000_000.0,
+                commission_pct=0.0,
+                log_dir=tmp,
+                database=db,
+                product_type="INTRADAY",
+                reset_balance=True,
+                mis_short_margin_pct=1.0,
+            )
+
+            # Open a LONG, close it, repeat with slightly different
+            # prices so float drift would have surfaced if any.
+            buys = [(1234.567, 1242.913, 137),
+                    (2500.123, 2519.876, 42),
+                    (845.555, 851.111, 91),
+                    (1567.890, 1577.890, 213)]
+            cash_before = port.cash
+            total_pnl = 0.0
+            for entry, exit_, qty in buys:
+                port.open_position(
+                    symbol="HDFCBANK", price=entry, quantity=qty,
+                    side="BUY", strategy="t",
+                    entry_time=datetime(2026, 5, 29),
+                )
+                rec = port.close_position(
+                    symbol="HDFCBANK", exit_price=exit_,
+                    exit_reason="t",
+                    exit_time=datetime(2026, 5, 29),
+                )
+                assert rec is not None
+                total_pnl += rec.pnl
+            cash_after = port.cash
+            # Net cash change after multiple round-trips must equal the
+            # sum of recorded pnls. The pre-fix subtractive
+            # exit_commission used to drift here.
+            assert (cash_after - cash_before) == pytest.approx(total_pnl, abs=1e-6)
+
+    def test_charges_helpers_are_still_float_typed_at_boundary(self):
+        """API contract: external callers see ``float`` -- not
+        ``Decimal`` -- so existing call sites are unaffected.
+        """
+        leg = compute_one_leg(1234.567, 137, side="BUY", product="INTRADAY")
+        assert isinstance(leg, float)
+        rt = compute_round_trip(buy_price=1234.567, sell_price=1242.913,
+                                quantity=137, product="INTRADAY")
+        for field in ("brokerage", "stt", "exchange_txn", "sebi",
+                      "gst", "stamp_duty", "dp_charges", "total"):
+            assert isinstance(getattr(rt, field), float)
+
+    def test_anchor_in_charges_source(self):
+        """Source-level pin: the audit ID + Decimal usage must remain."""
+        path = os.path.join(PROJECT_ROOT, "packages", "core", "charges.py")
+        with open(path, "r", encoding="utf-8") as fh:
+            src = fh.read()
+        assert "NUM-10" in src
+        assert "from decimal import" in src
+        assert "_PAISA = Decimal" in src
+        assert "ROUND_HALF_EVEN" in src
