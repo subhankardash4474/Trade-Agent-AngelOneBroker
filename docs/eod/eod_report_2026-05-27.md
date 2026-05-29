@@ -228,4 +228,4 @@ If V4 (or V18, the long-only variant of V4) survives all three jobs with positiv
 
 ---
 
-_Compiled by trading-agent operator audit pass. Cross-references: auto profit-diagnostic at `logs/diagnostics/eod_2026-05-27.md`, audit checkpoints at `logs/audit/2026-05-27/checkpoint_*.md` (20 hourly checkpoints), signal_audit at `logs/signal_audit_2026-05-27.csv` (29 rows, all REJECTED), findings log §5–§8 in `docs/findings_log_2026-05-27.md`, diagnosis sprint in `docs/diagnosis_sprint_2026-05-27.md`, freeze policy slot ledger in `docs/FREEZE_v2.1.md`, queue config in `data/battery_queue.yaml` at commit `84f5acd`._
+_Compiled by trading-agent operator audit pass. Cross-references: auto profit-diagnostic at `logs/diagnostics/eod_2026-05-27.md`, audit checkpoints at `logs/audit/2026-05-27/checkpoint_*.md` (20 hourly checkpoints), signal_audit at `logs/signal_audit_2026-05-27.csv` (29 rows, all REJECTED), findings log §5–§8 in `docs/findings/findings_log_2026-05-27.md`, diagnosis sprint in `docs/diagnoses/diagnosis_sprint_2026-05-27.md`, freeze policy slot ledger in `docs/freeze/FREEZE_v2.1.md`, queue config in `data/battery_queue.yaml` at commit `84f5acd`._

@@ -322,15 +322,15 @@ flag handles the *statistical* response.
 
 ## Cross-references
 
-- `docs/FREEZE_v2.1.md` — the contract itself (frozen settings, exit
+- `docs/freeze/FREEZE_v2.1.md` — the contract itself (frozen settings, exit
   criteria, kill criterion, bypass cap, capital-add lock,
   disagreement rules, operator commitments)
-- `docs/FREEZE_v2.1_revision.md` — Branch 1 contingency (battery-primary
+- `docs/freeze/FREEZE_v2.1_revision.md` — Branch 1 contingency (battery-primary
   if trade count is too low)
 - `docs/backtester_vm_runbook.md` — backtester operational scenarios
-- `docs/postmortem_phase_a_template.md` — Branch C (freeze fails)
+- `docs/postmortems/postmortem_phase_a_template.md` — Branch C (freeze fails)
   template; required to fill before any "let me try one more thing"
-- `docs/freeze_observability_extensions.md` — what the daily / weekly
+- `docs/freeze/freeze_observability_extensions.md` — what the daily / weekly
   / EOD diagnostic must produce, including the contamination handling
 
 ---

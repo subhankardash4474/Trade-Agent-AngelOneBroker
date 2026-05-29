@@ -9,10 +9,10 @@ discovery on 2026-05-26 14:30 IST.
 
 This document is a pointer / summary. The exhaustive evidence lives in:
 
-* `docs/findings_log_2026-05-25.md` §17 — full discovery + diff
+* `docs/findings/findings_log_2026-05-25.md` §17 — full discovery + diff
   breakdown, file-by-file justification, 5 modified-tracked + 6
   untracked.
-* `docs/findings_log_2026-05-27.md` §3 — closure verdict (the diff
+* `docs/findings/findings_log_2026-05-27.md` §3 — closure verdict (the diff
   is operationally real but **strategy-neutral**).
 * Commit `ee00bd0 Bug I -- log trader VM divergence (2 weeks of
   uncommitted hot-fixes)` — the immutable in-git record of what was

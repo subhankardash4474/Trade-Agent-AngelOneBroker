@@ -300,7 +300,7 @@ we'd be sailing slightly slower onto the same rocks.
 
 1. **Keep capital paused** (continue freeze-v2.1's protective stance
    that has kept losses at zero since 2026-05-27, see EOD report
-   `docs/eod_report_2026-05-27.md`).
+   `docs/eod/eod_report_2026-05-27.md`).
 2. **Use slot-3 of the bypass ledger ONLY if V15 transfers** (PF > 1.0
    on 232 stocks per slot #3 Friday morning data). The retrain
    runbook in `findings_log_2026-05-27.md §5.9` is ready to execute
@@ -424,7 +424,7 @@ and defer further retrains until the root cause is understood.
 
 ## 9. Cross-references
 
-* `docs/findings_log_2026-05-27.md` -- the operational log (§1-§9
+* `docs/findings/findings_log_2026-05-27.md` -- the operational log (§1-§9
   + executive summary).
   * §5 = forensic audit of the broken XGBoost pkl (provides context
     for the V15 interpretation in §3 here).
@@ -432,10 +432,10 @@ and defer further retrains until the root cause is understood.
     jump).
   * §8 = battery queue trim rationale.
   * §9 = Bug K disclosure (referenced from §4 here).
-* `docs/eod_report_2026-05-27.md` -- the trader-VM EOD report
+* `docs/eod/eod_report_2026-05-27.md` -- the trader-VM EOD report
   showing the protective freeze-v2.1 stance produced zero trades
   and zero losses on the diagnostic-sprint Day 1.
-* `docs/diagnosis_sprint_2026-05-27.md` -- the 10-hypothesis,
+* `docs/diagnoses/diagnosis_sprint_2026-05-27.md` -- the 10-hypothesis,
   5-day Option-A sprint plan. The Friday review is the H1+H2+H3
   read-out checkpoint.
 * `data/battery_queue.yaml` -- current queue. 3 jobs, ~36h total.
@@ -505,7 +505,7 @@ Per §7 matrix `PF < 0.95 on 232 stocks` row:
 
 **What stays alive (now top of the next-sprint backlog):**
 * Entry-lag forensic (Hypothesis H3 from
-  `docs/diagnosis_sprint_2026-05-27.md`). Live trades may be
+  `docs/diagnoses/diagnosis_sprint_2026-05-27.md`). Live trades may be
   systematically late vs the backtester's ideal-fill model;
   if so, the backtester's PnL is an *upper bound* on what
   live can deliver. Worth measuring before any new strategy
@@ -670,7 +670,7 @@ queue.
 ### 10.6 What this means for the diagnostic sprint
 
 The Friday checkpoint of the 5-day Option-A sprint
-(`docs/diagnosis_sprint_2026-05-27.md`) was meant to read out
+(`docs/diagnoses/diagnosis_sprint_2026-05-27.md`) was meant to read out
 H1+H2+H3. With the V15 verdict:
 
 * **H2 (XGBoost broken model is the cause of live losses):**
@@ -707,7 +707,7 @@ work begins.
 
 The pre-commitment landed in:
 
-**[`docs/freeze_v2.1_exit_criteria_2026-06-05.md`](freeze_v2.1_exit_criteria_2026-06-05.md)**
+**[`docs/freeze/freeze_v2.1_exit_criteria_2026-06-05.md`](../freeze/freeze_v2.1_exit_criteria_2026-06-05.md)**
 
 That document is the operating contract from 2026-05-29 forward.
 Three pre-committed thresholds:
@@ -735,7 +735,7 @@ exit-criteria doc §1.D.
 
 Bug O (test → prod `trades.csv` leak) and the audit-only
 reclassification refinement also landed in this review window. Full
-RCA in `docs/findings_log_2026-05-27.md` §24.
+RCA in `docs/findings/findings_log_2026-05-27.md` §24.
 
 The review's data-side conclusions are accepted. This file is
 preserved as the snapshot of what we believed and how we framed it

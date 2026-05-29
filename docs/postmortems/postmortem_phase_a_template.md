@@ -1,7 +1,7 @@
 # Phase A Postmortem — TEMPLATE (do NOT skip the questions)
 
 > **Status:** TEMPLATE. Fill out only if Branch C fires
-> (`docs/FREEZE_v2.1.md` §Forward-looking verdict — Branch C: PF stays
+> (`docs/freeze/FREEZE_v2.1.md` §Forward-looking verdict — Branch C: PF stays
 > < 0.8 across portfolio, no strategy at lower-CI > 1.0, or battery and
 > live disagree fundamentally).
 >

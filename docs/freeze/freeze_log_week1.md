@@ -1,7 +1,7 @@
 # Freeze-v2.1 — Week 1 running notes (2026-05-18 → 2026-05-22)
 
 > Created retroactively on 2026-05-19 post-EOD. Per
-> `docs/freeze_observability_extensions.md` daily checklist (10 min, after 16:00 IST):
+> `docs/freeze/freeze_observability_extensions.md` daily checklist (10 min, after 16:00 IST):
 > append **two** lines per trading session — one trade-flow line, one
 > audit-verdict line. No commentary. No decisions until Friday's
 > weekly review.
@@ -73,7 +73,7 @@ freeze contract). They are inputs for Friday and beyond.
      against floor 1.00.
    - **Freeze contract is explicit: the daily EOD verdict does NOT
      trigger action.** The kill criterion is "cumulative P&L <
-     -Rs 3,000 by 2026-05-29" (per `docs/FREEZE_v2.1.md` §Kill
+     -Rs 3,000 by 2026-05-29" (per `docs/freeze/FREEZE_v2.1.md` §Kill
      criterion); cumulative is currently -Rs 216, well clear.
    - Decision deferred.
 3. **`supertrend_follow` flagged KILL by per-strategy verdict.**
@@ -123,7 +123,7 @@ freeze contract). They are inputs for Friday and beyond.
      review decides whether to weight-zero it (= bypass slot 1 of 3,
      since `config.yaml` strategy block is frozen) or wait for
      Week 2 mid-freeze health check (Fri 2026-05-29) per
-     `docs/freeze_contingencies.md` §C2.
+     `docs/freeze/freeze_contingencies.md` §C2.
 7. **Long-side famine continued.**
    - 5/5 sessions since freeze start: regime detector pegged
      `bear_high_vol` for the entire session. **All 19 trades in
@@ -384,7 +384,7 @@ freeze contract). They are inputs for Friday and beyond.
 - No commit to `config.yaml`, `trading_agent.py`, or any strategy
   file since freeze start (= contract held).
 - `freeze-bypass:` ledger (reconciled 2026-05-20 11:00 IST per commit
-  `4276962`; ground truth lives in `docs/FREEZE_v2.1.md` §Bypass ledger):
+  `4276962`; ground truth lives in `docs/freeze/FREEZE_v2.1.md` §Bypass ledger):
   | Date | Commit | Slot? | Description |
   |---|---|---|---|
   | 2026-05-19 | 9cd7acd | audit-only (no frozen file) | observability: HTML email rendering + CI green-up |
@@ -396,7 +396,7 @@ freeze contract). They are inputs for Friday and beyond.
   | 2026-05-22 | 27b6b12 | audit-only (no frozen file) | scheduler bug fix: `-d` as docker flag, not python tail arg |
   - Bypass cap: **0 / 3 used** at end of Week 1. All seven
     `freeze-bypass:`-tagged commits touched only research / observability /
-    operational files; per `docs/FREEZE_v2.1.md` lines 135-138 these do
+    operational files; per `docs/freeze/FREEZE_v2.1.md` lines 135-138 these do
     NOT consume a slot. Cap test is "touches a frozen file" (strategies,
     risk gates, trading agent, sizing, config.yaml strategy/risk blocks,
     or model artefact). All three slots remain available for Weeks 2-3.
@@ -427,7 +427,7 @@ and the mid-freeze health check.
 | Per-strategy live-vs-battery table | **PENDING** — battery V1+V2 (nifty50_60d, run #2) was at ~70 % progress at Friday EOD; ETA ~03:00 IST Saturday. V1+V2 from May-18 v2_baseline (90d) already in hand at `logs/battery_pulled/`. | Build the table Saturday afternoon once V1 result JSON lands. |
 | Trade count vs contingency threshold (≥10 trades = stay on plan; <10 = activate `FREEZE_v2.1_revision.md` Branch 1) | **Week 1 closed at 7 trades.** Threshold of ≥10 NOT met. | **Branch 1 (extended window) is auto-activated** per the contract. Window extends from 5 Fridays to 7 Fridays (≈14 Jul 2026). Mid-freeze checkpoint moves to Fri 2026-06-05. **No code changes.** |
 | Battery first-completion check (V1 vs V2 evidence) | **V2_baseline (May-18 run, 90d v2 universe): IN HAND** ≈ ~390 trades, broader signal acceptance; PF and per-strategy comparison pending diagnostic re-run. **V2 (May-22 run, nifty50 60d): IN PROGRESS** completing Saturday early morning. | Saturday-Sunday: fold both V2 results into the regime evidence dump (item #20 above). |
-| Operator-skipped-days count (`docs/freeze_contingencies.md` §C6) | **0 / 5 sessions.** Daemon ran 5/5 trading days, audit verdicts GREEN 5/5, no manual intervention required. Silent hang on Friday 12:23 IST is logged but did NOT break the freeze (no positions held, no manual override). | None (no slot consumed). |
+| Operator-skipped-days count (`docs/freeze/freeze_contingencies.md` §C6) | **0 / 5 sessions.** Daemon ran 5/5 trading days, audit verdicts GREEN 5/5, no manual intervention required. Silent hang on Friday 12:23 IST is logged but did NOT break the freeze (no positions held, no manual override). | None (no slot consumed). |
 | Bypass slot consumption | **0 / 3 used.** Seven `freeze-bypass:`-tagged commits in Week 1, all audit-only (no frozen-file edits). All three slots remain. | None — slots fully preserved for Weeks 2-3 if a frozen-file emergency arises. |
 | Regime evidence dump (the Saturday 2026-05-23 deferred work) | **Scope intact**, deferred from Saturday morning to Saturday afternoon / Sunday. Frame is items #10 + #11 (binary 200-EMA test, unreachable `sideways` regime) + V2_all_filters_off as quantitative complement. | Saturday afternoon onwards (no live trading impact). |
 | Heartbeat email cron installation (`tools/cloud/install_heartbeat_cron.sh`) | **NEVER DEPLOYED on trader VM all of Week 1.** Friday's silent daemon hang at 12:23 IST went undetected for 11 hours — the exact failure mode this script was written to catch (2026-05-19). | **Highest-priority Week 2 carry-forward.** Schedule for Sunday 2026-05-24 evening alongside the regime evidence write-up. |
@@ -442,7 +442,7 @@ and the mid-freeze health check.
 | mean_reversion | 22 | 59.1 | 0.51 | -Rs 22.57 | KILL | INSUFFICIENT_DATA (n borderline) |
 | ensemble | 25 | 40.0 | 0.41 | -Rs 7.80 | KILL | **CONFIRMED no edge** (CI upper < 1.0) |
 
-**Reading rule (per `docs/FREEZE_v2.1.md` §C2 statistical-significance check):**
+**Reading rule (per `docs/freeze/FREEZE_v2.1.md` §C2 statistical-significance check):**
 verdicts above are **point estimates only** and explicitly do not trigger
 strategy disable / scale until n ≥ 30 with CI excluding 1.0. The only
 strategy that meets that bar this week is `ensemble` (CI upper < 1.0).

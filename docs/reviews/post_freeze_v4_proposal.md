@@ -233,7 +233,7 @@ the per-strategy one.
 - [ ] V4 vs live trade parity for 2026-05-12–21 documented
 - [ ] V7/V8/V9 reviewed — V4 still the best single-config recommendation
 - [ ] 90-day or 120-day run completed — V4-equivalent variant PF ≥ 1.0
-- [ ] Bypass slot accounting up to date (`docs/FREEZE_v2.1.md`)
+- [ ] Bypass slot accounting up to date (`docs/freeze/FREEZE_v2.1.md`)
 
 ### 5.2 Deploy steps
 
@@ -241,7 +241,7 @@ the per-strategy one.
    Reference this doc.
 2. **Edit `config.yaml`:** `5.0 → 3.0` on all six trend_filter_pct
    lines. Add `trend_filter_pct: 3.0` to mean_reversion block (parity).
-3. **Update `docs/FREEZE_v2.1.md`:** mark slot 1/3 consumed, log the
+3. **Update `docs/freeze/FREEZE_v2.1.md`:** mark slot 1/3 consumed, log the
    reason.
 4. **Run unit tests + battery dry-run** to confirm config loads.
 5. **Schedule deploy:** open of next trading day (not mid-session).

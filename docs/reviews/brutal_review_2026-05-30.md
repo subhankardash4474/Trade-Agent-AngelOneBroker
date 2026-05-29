@@ -25,10 +25,10 @@ engagement and the mandated output structure.
 * [`friday_review_2026-05-29.md`](friday_review_2026-05-29.md) —
   the operator's own Friday review; §10 is the diagnostic-sprint
   read-out and §11 is the freeze-exit pre-commitment summary.
-* [`freeze_v2.1_exit_criteria_2026-06-05.md`](freeze_v2.1_exit_criteria_2026-06-05.md) —
+* [`freeze_v2.1_exit_criteria_2026-06-05.md`](../freeze/freeze_v2.1_exit_criteria_2026-06-05.md) —
   the operating contract for 2026-05-29 → 2026-06-08. T1 / T2 / T3
   thresholds, the three Friday options, audit-only reclassification.
-* [`wind_down_criteria_2026-06-05.md`](wind_down_criteria_2026-06-05.md) —
+* [`wind_down_criteria_2026-06-05.md`](../freeze/wind_down_criteria_2026-06-05.md) —
   the short, locked, paste-and-apply operational sheet for the
   2026-06-05 verdict meeting.
 

@@ -20,7 +20,7 @@ territory.
    trader's EOD hook around 15:35 IST).
 2. Skim the **top section only** — portfolio PF and trade count.
    Do not read the per-strategy section yet on bad days; it biases.
-3. Open `docs/freeze_log_week<N>.md` (per-week running notes,
+3. Open `docs/freeze/freeze_log_week<N>.md` (per-week running notes,
    created Friday → next Friday). Append two lines:
    - `YYYY-MM-DD | longs N=__ PnL=Rs __ | shorts N=__ PnL=Rs __`
    - `YYYY-MM-DD | audit: GREEN / AMBER / RED — <one-line reason>`
@@ -224,7 +224,7 @@ gets a `weekly_variance.py` added — that's freeze-safe observability).
 - **The June 8 decision framework.** That's in `FREEZE_v2.1.md`
   §Forward-looking verdict.
 - **What to do if Phase A fails.** That's the postmortem template at
-  `docs/postmortem_phase_a_template.md`.
+  `docs/postmortems/postmortem_phase_a_template.md`.
 
 If a scenario isn't covered above or in the cross-references at the
 bottom of `freeze_contingencies.md`, the right move is: **stop, write

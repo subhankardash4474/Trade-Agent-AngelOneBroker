@@ -1,15 +1,15 @@
 # Changes Done — 2026-05-27
 
-> Companion to `docs/findings_2026-05-27.md`. This file is the
+> Companion to `docs/findings/findings_2026-05-27.md`. This file is the
 > **single-source-of-truth ledger** of every fix that landed in the
-> 2026-05-27 audit sweep. Format mirrors `docs/changes_done_2026-05-26.md`:
+> 2026-05-27 audit sweep. Format mirrors `docs/changes/changes_done_2026-05-26.md`:
 > one row per finding, grouped by tier, every entry citing exact files
 > + the comment tag (`F-NN (audit 2026-05-27)`) added to source so a
 > future reviewer can grep-find the rationale.
 
 ## Headline
 
-- **Findings raised:** 108 (`docs/findings_2026-05-27.md`).
+- **Findings raised:** 108 (`docs/findings/findings_2026-05-27.md`).
 - **Findings fixed this sweep:** 38 (Tiers A4 → C2).
 - **Findings already fixed in previous sweeps:** 65 (Tiers A1 / A2 / A3).
 - **Deferred (require user policy / large architectural change):** 5
@@ -244,7 +244,7 @@ Zero bypass slots consumed by this sweep:
 - `packages/research/*.py` — explicitly allowed mid-freeze under
   `FREEZE_v2.1.md` line 49–51 ("Backtester / battery infra").
 
-The bypass ledger in `docs/FREEZE_v2.1.md` is unchanged at 3 / 3.
+The bypass ledger in `docs/freeze/FREEZE_v2.1.md` is unchanged at 3 / 3.
 
 ---
 

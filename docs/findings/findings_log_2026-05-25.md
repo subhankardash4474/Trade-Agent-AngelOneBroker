@@ -1751,7 +1751,7 @@ The warning was visible from variant launch but no automated
 surface saw it. The `battery_status_remote.ps1` summary script
 shows variant progress, queue state, ETA — but does not grep
 worker logs for known fail-open warnings. **Post-Friday todo**
-(not part of this fix, captured in `docs/post_freeze_v4_proposal.md`):
+(not part of this fix, captured in `docs/reviews/post_freeze_v4_proposal.md`):
 
 > Add a "fail-open warning census" section to
 > `battery_status_remote.ps1`. Lines to count per worker log:
@@ -1925,6 +1925,6 @@ daemon alive — but they accumulated outside the audit trail.
 
 ### 17.7 Files touched in this finding
 
-* `docs/findings_log_2026-05-25.md` — this §17 added
-* `docs/changes_done_2026-05-25.md` — §16 mirror entry (next commit)
+* `docs/findings/findings_log_2026-05-25.md` — this §17 added
+* `docs/changes/changes_done_2026-05-25.md` — §16 mirror entry (next commit)
 * No code changes. No deploy. No restart. Pure documentation.

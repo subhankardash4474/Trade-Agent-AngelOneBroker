@@ -149,11 +149,11 @@ behaviour or the contract.
 2. Open positions are managed to exit on their own SL/TP/intraday-time
    stop — no forced flatten unless an open position is itself blowing
    up.
-3. Write `docs/halt_phase_a_2026-MM-DD.md` documenting the cumulative
+3. Write `docs/postmortems/halt_phase_a_2026-MM-DD.md` documenting the cumulative
    PnL, the per-strategy attribution, the contaminated-day exclusions
    (if any), and the decision.
 4. Move to Branch C (postmortem) per §"Forward-looking verdict /
-   Branch C" — write `docs/postmortem_phase_a.md` from the template
+   Branch C" — write `docs/postmortems/postmortem_phase_a.md` from the template
    before any further action.
 
 Why this number, specifically:
@@ -207,7 +207,7 @@ It does not happen mid-freeze.
 ## Contingency activation (added 2026-05-19)
 
 If the trade-count trajectory says the 100-trade gate is mathematically
-unreachable, the activation of `docs/FREEZE_v2.1_revision.md`
+unreachable, the activation of `docs/freeze/FREEZE_v2.1_revision.md`
 (Branch 1: battery-primary, live-parity) is **pre-authorised** by the
 trigger rules in that file. The activation is a mechanical SQL count
 + a single PR replacing §Exit criteria. It is NOT a freeze break.
@@ -217,7 +217,7 @@ trigger rules in that file. The activation is a mechanical SQL count
 In addition to the §Operator commitments above:
 
 1. **Daily 10-min EOD review** of `logs/diagnostics/eod_YYYY-MM-DD.md`.
-   Two-line append to `docs/freeze_log_weekN.md` per day:
+   Two-line append to `docs/freeze/freeze_log_weekN.md` per day:
    long/short trade counts and PnL today; any audit checkpoint that
    went RED or AMBER.
 2. **No watching the diagnostic during market hours.** It biases the
@@ -258,7 +258,7 @@ a slot.
                        preserving on the happy path, fixes latent
                        bugs on the unhappy path. 35 regression tests
                        added (tests/unit/test_audit_2026_05_26_fixes.py).
-                       Full ledger in docs/changes_done_2026-05-26.md.
+                       Full ledger in docs/changes/changes_done_2026-05-26.md.
                       audit-2026-05-27 critical-bug-fix sweep across
                        frozen surfaces (strategies/lstm_model.py,
                        strategies/xgboost_classifier.py,
@@ -274,7 +274,7 @@ a slot.
                        VWAP session-boundary cross-talk, etc.).
                        42 regression tests added in
                        tests/unit/test_audit_2026_05_27_fixes.py.
-                       Full ledger in docs/changes_done_2026-05-27.md.
+                       Full ledger in docs/changes/changes_done_2026-05-27.md.
                        See Slot #1 rationale below.
 ```
 
@@ -289,7 +289,7 @@ side losing on 339+ trades regardless of trend-filter setting:
 V1 shorts -₹379 (WR 41.7%), V2 shorts -₹398 (WR 46.4%). Combined
 with live data (28 short trades since 2026-05-13, -₹1,505), this
 identifies the short side as the structural loss-driver in the
-current `bear_high_vol` regime. See `docs/findings_log_2026-05-25.md`
+current `bear_high_vol` regime. See `docs/findings/findings_log_2026-05-25.md`
 §3 for full evidence.
 
 **This slot does NOT change live agent behaviour.** It adds:
@@ -378,14 +378,14 @@ not an investigation.
 **Tests.** 35 regression tests added in
 `tests/unit/test_audit_2026_05_26_fixes.py`, one per finding. Full
 suite passes (1556 tests). Detailed change log: see
-`docs/changes_done_2026-05-26.md`.
+`docs/changes/changes_done_2026-05-26.md`.
 
 **Deployment.** Not deployed in this session. The trader VM continues
 to run pre-fix code until the operator decides; tomorrow's 09:15 IST
 open is the natural cutover window because today's daily kill switch
 is already tripped.
 
-A fresh full-codebase audit (`docs/findings_2026-05-27.md`, 108
+A fresh full-codebase audit (`docs/findings/findings_2026-05-27.md`, 108
 findings) was applied across tiers A4 → C2. Of those, the following
 touched files in §What is frozen and therefore consume the slot
 collectively:
@@ -458,7 +458,7 @@ happy-path-neutrality argument as strict-enough behaviour preservation.
 **Tests.** 42 regression tests added in
 `tests/unit/test_audit_2026_05_27_fixes.py`, one per finding-fix.
 Full suite passes (1598 tests = 1556 pre-existing + 42 new). Detailed
-change log: see `docs/changes_done_2026-05-27.md`.
+change log: see `docs/changes/changes_done_2026-05-27.md`.
 
 **Deployment.** Not deployed in this session. The trader VM continues
 to run pre-fix code until the operator decides; tomorrow's 09:15 IST

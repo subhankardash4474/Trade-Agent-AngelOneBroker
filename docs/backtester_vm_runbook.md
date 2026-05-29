@@ -58,7 +58,7 @@ there?**", not "**how do I get past the guard?**"
    ```
 7. **Re-enable the scheduler:** `sudo systemctl restart battery-scheduler`.
 8. **Document.** Add a one-line `freeze-bypass:` entry to the bypass
-   ledger in `docs/FREEZE_v2.1.md` only if the fix touched a frozen
+   ledger in `docs/freeze/FREEZE_v2.1.md` only if the fix touched a frozen
    file (almost certainly it didn't — the fix is operational).
 
 The guard exists precisely so this can't go wrong silently. When it

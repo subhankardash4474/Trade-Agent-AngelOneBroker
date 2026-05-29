@@ -3,7 +3,7 @@
 **Scope**: First real-money production run. 5 large-cap NSE names,
 Rs 5,000 capital, single 09:30-12:30 IST session, hard rupee floor at
 -Rs 500. This document is the operational checklist; the strategic
-context lives in `docs/e2e_broker_test_plan.md`.
+context lives in `docs/e2e/e2e_broker_test_plan.md`.
 
 **Target day**: Monday, 18 May 2026 (first trading day after this prep).
 
@@ -242,7 +242,7 @@ exit
 
 ### 4.3 Decision: Stage 3 PASS / FAIL
 
-Per `docs/e2e_broker_test_plan.md` section "Pass criteria":
+Per `docs/e2e/e2e_broker_test_plan.md` section "Pass criteria":
 
 | Criterion | Pass | Fail |
 |---|---|---|

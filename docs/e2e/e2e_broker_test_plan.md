@@ -46,7 +46,7 @@ log out. No orders.
 order book, then cancel it.
 
 **Result**: PASSED in 29s. order_id=`260511000368479`. Zero rupees
-spent. Full post-mortem at [`docs/e2e_stage12_postmortem.md`](e2e_stage12_postmortem.md).
+spent. Full post-mortem at [`docs/e2e/e2e_stage12_postmortem.md`](e2e_stage12_postmortem.md).
 
 Key findings (now baked into the codebase):
 - AngelOne SmartAPI rejects `variety="AMO"` (AB1007). Valid varieties
@@ -79,7 +79,7 @@ real fills can happen.
 **Result**: PASSED in 69s. order_id=`260511000380328`. BUY LIMIT did
 not fill (limit below best bid) → cleanly cancelled → no exposure.
 Zero rupees spent. Full post-mortem at
-[`docs/e2e_stage12_postmortem.md`](e2e_stage12_postmortem.md).
+[`docs/e2e/e2e_stage12_postmortem.md`](e2e_stage12_postmortem.md).
 
 What got tested vs not (patient variant, laptop):
 - ✅ place_order during market hours (NORMAL/LIMIT/BUY/DELIVERY/1share)
@@ -97,7 +97,7 @@ What got tested vs not (patient variant, laptop):
 **Result**: PASSED in 9.1s. BUY filled at Rs 22.20, SELL filled at Rs 22.19.
 Net realised PnL **Rs −0.01** (one paisa) plus ~Rs 1-3 in regulatory
 charges (STT/exchange/GST/stamp). Full post-mortem at
-[`docs/e2e_stage21_postmortem.md`](e2e_stage21_postmortem.md).
+[`docs/e2e/e2e_stage21_postmortem.md`](e2e_stage21_postmortem.md).
 
 What this proved (and what's still open):
 - ✅ Fill detection (both legs filled <100ms after submission)

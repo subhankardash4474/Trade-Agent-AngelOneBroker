@@ -10,7 +10,7 @@ variants completed — speed patches + a cloud-aware battery progress
 tool.
 
 **All changes fall under categories the `freeze-v2.1` contract
-(`docs/FREEZE_v2.1.md`) explicitly leaves unfrozen** — observability
+(`docs/freeze/FREEZE_v2.1.md`) explicitly leaves unfrozen** — observability
 (email formatting, diagnostic stats, heartbeat), test infrastructure
 (skip guards), operational tooling (cron installer, runbooks), and
 decision frameworks (contingency docs, postmortem template).
@@ -81,7 +81,7 @@ absent, so the daemon never hard-fails on a minimal image.
 ### Freeze-v2.1 impact
 
 **None.** Observability and alert routing are explicitly listed under
-"What is NOT frozen" in `docs/FREEZE_v2.1.md`. No strategy weights,
+"What is NOT frozen" in `docs/freeze/FREEZE_v2.1.md`. No strategy weights,
 risk knobs, scanner config, or execution rules touched.
 
 ---
@@ -184,7 +184,7 @@ Five new sections appended (no frozen content edited):
 
 ### 3.2 New documents (5 files, decision-frameworks)
 
-- **`docs/FREEZE_v2.1_revision.md`** — Branch 1 contingency. Activates
+- **`docs/freeze/FREEZE_v2.1_revision.md`** — Branch 1 contingency. Activates
   if trade count is < 15 by Fri 05-22, < 40 by Fri 05-29, or < 70 by
   Fri 06-05. **Inverts the exit criteria**: battery becomes primary
   edge evidence (PF lower-CI > 1.0 across ≥3 battery runs); live
@@ -198,7 +198,7 @@ Five new sections appended (no frozen content edited):
   routine. Each has pre-decided commands and the "wrong move" called
   out so the operator at 02:00 IST doesn't improvise.
 
-- **`docs/postmortem_phase_a_template.md`** — the form Branch C
+- **`docs/postmortems/postmortem_phase_a_template.md`** — the form Branch C
   (freeze fails) must take. Six sections, all required: the three
   failure-mode questions (edge / regime-fragility / implementation),
   the three options (pivot timeframe / portfolio infrastructure /
@@ -206,7 +206,7 @@ Five new sections appended (no frozen content edited):
   and a 24-hour sleep-on-it sign-off rule. Designed so future-me
   cannot skip the questions.
 
-- **`docs/freeze_contingencies.md`** — consolidated pre-decided
+- **`docs/freeze/freeze_contingencies.md`** — consolidated pre-decided
   responses for the verdict's "long tail" scenarios: silent
   operational failures (§C1), statistical artefacts (§C2),
   battery-vs-live disagreement (§C3), frozen-model calibration drift
@@ -215,7 +215,7 @@ Five new sections appended (no frozen content edited):
   contamination (§C8). Each section is a one-page response with
   trigger / wrong move / right sequence.
 
-- **`docs/freeze_observability_extensions.md`** — daily checklist,
+- **`docs/freeze/freeze_observability_extensions.md`** — daily checklist,
   weekly review schema, EOD diagnostic required outputs, heartbeat
   contract, `logs/drift/` layout. The operator's manual for the
   3 weeks of freeze.
@@ -325,12 +325,12 @@ verdict warns about.
 
 ### Batch 2 (freeze pre-commitments)
 
-- `docs/FREEZE_v2.1.md` (+ 5 sections, no frozen content edited)
-- `docs/FREEZE_v2.1_revision.md` (new)
+- `docs/freeze/FREEZE_v2.1.md` (+ 5 sections, no frozen content edited)
+- `docs/freeze/FREEZE_v2.1_revision.md` (new)
 - `docs/backtester_vm_runbook.md` (new)
-- `docs/postmortem_phase_a_template.md` (new)
-- `docs/freeze_contingencies.md` (new)
-- `docs/freeze_observability_extensions.md` (new)
+- `docs/postmortems/postmortem_phase_a_template.md` (new)
+- `docs/freeze/freeze_contingencies.md` (new)
+- `docs/freeze/freeze_observability_extensions.md` (new)
 - `packages/research/diagnostic.py` (6 new helpers, 6 new sections)
 - `tools/send_heartbeat.py` (new)
 - `tools/cloud/install_heartbeat_cron.sh` (new)
@@ -635,7 +635,7 @@ critical V1 anchor intact, so the deploy plan is:
 
 > **Correction (2026-05-20 11:00 IST)**: an earlier draft of this
 > section called this "bypass slot 2/3 used". That was incorrect.
-> The contract (lines 135-138 of `docs/FREEZE_v2.1.md`) is explicit:
+> The contract (lines 135-138 of `docs/freeze/FREEZE_v2.1.md`) is explicit:
 >
 > > "If a bypass is purely operational (deploy script, CI fix,
 > > dependency update, etc.) and touches **no frozen file**, it does

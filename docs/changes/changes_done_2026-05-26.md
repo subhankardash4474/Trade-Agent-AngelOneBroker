@@ -153,7 +153,7 @@ freeze-lift on 2026-06-08.
 
 **Not deployed in this session.** Operator decision. Natural cutover
 window: tomorrow's 09:15 IST open, because today's daily kill switch is
-already tripped (per `docs/eod_report_2026-05-26.md`).
+already tripped (per `docs/eod/eod_report_2026-05-26.md`).
 
 Pre-deploy checklist (operator):
 1. `git status` → should show only the files listed above + this doc.

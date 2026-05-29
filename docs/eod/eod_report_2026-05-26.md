@@ -134,4 +134,4 @@ The Friday review depends on **at least V1–V3 completing on the backtester VM 
 
 ---
 
-_Compiled by trading-agent operator audit pass. Cross-references: auto profit-diagnostic at `logs/diagnostics/eod_2026-05-26.md`, trade-by-trade post-mortem at `logs/postmortem/2026-05-26.md`, findings log §16-17 in `docs/findings_log_2026-05-25.md`, change history §17 in `docs/changes_done_2026-05-25.md`, freeze policy slot ledger in `docs/FREEZE_v2.1.md`._
+_Compiled by trading-agent operator audit pass. Cross-references: auto profit-diagnostic at `logs/diagnostics/eod_2026-05-26.md`, trade-by-trade post-mortem at `logs/postmortem/2026-05-26.md`, findings log §16-17 in `docs/findings/findings_log_2026-05-25.md`, change history §17 in `docs/changes/changes_done_2026-05-25.md`, freeze policy slot ledger in `docs/freeze/FREEZE_v2.1.md`._

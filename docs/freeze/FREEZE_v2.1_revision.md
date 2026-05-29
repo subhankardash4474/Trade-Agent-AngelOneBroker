@@ -148,7 +148,7 @@ Worth saying out loud — this is not a free move:
 4. **The contingency may itself need to extend.** If by Week 3 the
    battery has produced < 3 runs (backtester VM down, queue scheduler
    failed, etc.), even this revision can't close. That's a Branch C
-   (postmortem) trigger — see `docs/postmortem_phase_a_template.md`.
+   (postmortem) trigger — see `docs/postmortems/postmortem_phase_a_template.md`.
 
 ---
 
@@ -178,21 +178,21 @@ audit trail; they do not return.
 These exist for the same reason — to take decisions in cold blood now
 so future-me can't improvise badly later:
 
-- `docs/FREEZE_v2.1.md` §Disagreement — how to read battery-vs-live
+- `docs/freeze/FREEZE_v2.1.md` §Disagreement — how to read battery-vs-live
   divergence (added 2026-05-19).
-- `docs/FREEZE_v2.1.md` §Kill — explicit halt criterion
+- `docs/freeze/FREEZE_v2.1.md` §Kill — explicit halt criterion
   (`if cumulative_phase_a_pnl < -X by Y, halt`).
-- `docs/FREEZE_v2.1.md` §Bypass — 3 bypasses max; the 4th means the
+- `docs/freeze/FREEZE_v2.1.md` §Bypass — 3 bypasses max; the 4th means the
   freeze is over and an explicit decision is required.
 - `docs/backtester_vm_runbook.md` — the response when the backtester
   isolation guard fires (do not retry until rooted).
-- `docs/postmortem_phase_a_template.md` — if Branch C fires, this is
+- `docs/postmortems/postmortem_phase_a_template.md` — if Branch C fires, this is
   the form the postmortem must take. No skipping the questions.
-- `docs/freeze_contingencies.md` — the operational scenarios beyond
+- `docs/freeze/freeze_contingencies.md` — the operational scenarios beyond
   trade-count (silent operational failures, statistical artifacts,
   battery-vs-live disagreement, frozen-model calibration drift,
   black-swan contamination, capital-add temptation).
-- `docs/freeze_observability_extensions.md` — daily-checklist and
+- `docs/freeze/freeze_observability_extensions.md` — daily-checklist and
   weekly-review schemas, plus the heartbeat-email contract.
 
 Read these together. The freeze is not the operator deciding what to

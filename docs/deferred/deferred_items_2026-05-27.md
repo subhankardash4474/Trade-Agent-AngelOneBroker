@@ -1,7 +1,7 @@
 # Deferred Items — 2026-05-27 Audit
 
-Companion to `docs/findings_2026-05-27.md` and
-`docs/changes_done_2026-05-27.md`.
+Companion to `docs/findings/findings_2026-05-27.md` and
+`docs/changes/changes_done_2026-05-27.md`.
 
 These are findings raised during the 2026-05-27 audit that were NOT
 fixed in this sweep, with the rationale and a required user decision
@@ -35,7 +35,7 @@ production will differ.
 `market_data.pkl`, (b) computing regime per-bar from a rolling
 Nifty/VIX window, (c) plumbing that regime into `ensemble.aggregate`
 + the sizing call. This is a multi-day infrastructure change, not a
-patch. Documented as a follow-up in `docs/findings_log_2026-05-25.md`
+patch. Documented as a follow-up in `docs/findings/findings_log_2026-05-25.md`
 §11.
 
 **Required user decision.** Confirm the trade-off: do we (a) accept the

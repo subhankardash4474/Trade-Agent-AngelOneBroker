@@ -144,7 +144,7 @@ slots may be consumed.
      post-bug-H data; not ready for Friday).
    * Option D: extend freeze 7 days; postpone decision.
 3. **Kill criteria** for the chosen candidate (K1–K5 framework per
-   `docs/post_freeze_v4_proposal.md` §5.3, if it still exists in the
+   `docs/reviews/post_freeze_v4_proposal.md` §5.3, if it still exists in the
    repo; otherwise from the advisor memo §rec 6 verbatim).
 4. **Slot 2 + 3 reclassification decision.** Per advisor memo §honest
    concern 2: if the slot-2 and slot-3 sweeps were genuinely
@@ -456,14 +456,14 @@ not a sprint-day decision.
 
 ## Cross-references
 
-* `docs/findings_log_2026-05-25.md` — sections 1–17 (the evidence base
+* `docs/findings/findings_log_2026-05-25.md` — sections 1–17 (the evidence base
   for H3, H4, H5, H6).
-* `docs/findings_log_2026-05-27.md` — sections 1–4 (today's findings;
+* `docs/findings/findings_log_2026-05-27.md` — sections 1–4 (today's findings;
   this sprint doc is referenced from §4 there).
-* `docs/FREEZE_v2.1.md` — slot ledger + frozen-surface definition.
-* `docs/changes_done_2026-05-27.md` — the formal audit-fix sweep (38
+* `docs/freeze/FREEZE_v2.1.md` — slot ledger + frozen-surface definition.
+* `docs/changes/changes_done_2026-05-27.md` — the formal audit-fix sweep (38
   items); orthogonal to this sprint.
-* `docs/findings_2026-05-27.md` — F-01..F-108 audit findings catalogue;
+* `docs/findings/findings_2026-05-27.md` — F-01..F-108 audit findings catalogue;
   also orthogonal.
 
 ---

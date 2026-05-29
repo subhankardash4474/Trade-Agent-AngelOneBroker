@@ -119,7 +119,7 @@ escalation path is **unexercised** by this run (no exposure to flatten).
 
 ## What's still open before Stage 3 (5-stock basket via daemon)
 
-These were already tracked in `docs/e2e_broker_test_plan.md`; status
+These were already tracked in `docs/e2e/e2e_broker_test_plan.md`; status
 updated below.
 
 | Gap | Status | Required for Stage 3? |
@@ -127,7 +127,7 @@ updated below.
 | `tools/test_angelone_auth.py` | DONE | yes (done) |
 | `tools/test_amo_lifecycle.py` (Stage 1) | **DONE** | yes (done) |
 | `tools/test_live_single_trade.py` (Stage 2) | **DONE -- no-fill variant** | partly |
-| **Stage 2.1: actual-fill variant** (LIMIT BUY at LTP+0.1% so the fill+exit path is empirically tested) | **DONE 2026-05-13** — cloud run, BUY+SELL filled in 9.1s, see `docs/e2e_stage21_postmortem.md` | yes (done) |
+| **Stage 2.1: actual-fill variant** (LIMIT BUY at LTP+0.1% so the fill+exit path is empirically tested) | **DONE 2026-05-13** — cloud run, BUY+SELL filled in 9.1s, see `docs/e2e/e2e_stage21_postmortem.md` | yes (done) |
 | `core/broker/angelone.py:cancel_order` | VERIFIED in Stage 1+2 (laptop) + Stage 1 (cloud 2026-05-13) | done |
 | AngelOne *Primary Static IP* whitelisted | **DONE for cloud IP `80.225.251.79`** (was `106.193.147.98` for laptop) | yes (done) |
 | `--max-loss-rs N` daemon flag | **DONE 2026-05-13** — argparse + RiskManager integration | yes (done) |

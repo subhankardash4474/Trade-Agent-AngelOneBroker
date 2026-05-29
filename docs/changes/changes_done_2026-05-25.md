@@ -17,7 +17,7 @@ explicit accounting for freeze-v2.1 bypass-slot consumption.
 |---|---|---|
 | Observability — heartbeat + watchdog deploy fixes | `tools/send_heartbeat.py`, `tools/cloud/install_*_cron.sh`, `tools/watchdog_check.py`, `tools/cloud/install_watchdog_cron.sh`, `docker-compose.yml` | Audit-only |
 | Observability — disk rotation tooling | `tools/cloud/prune_old_battery_runs.sh`, `tools/cloud/install_prune_cron.sh` | Audit-only |
-| Observability — 90d battery findings analysis | `docs/findings_log_2026-05-25.md`, `docs/post_freeze_v4_proposal.md` | Audit-only |
+| Observability — 90d battery findings analysis | `docs/findings/findings_log_2026-05-25.md`, `docs/reviews/post_freeze_v4_proposal.md` | Audit-only |
 | Observability — battery harness V17/V18/V19 + queue insert | `packages/research/battery.py`, `packages/research/backtest_ensemble.py`, `data/battery_queue.yaml` | Audit-only |
 | **`risk.allow_shorts` flag (pre-stage)** | **`trading_agent.py`, `config.yaml`** | **Slot 1 / 3** |
 | Tests | `tests/unit/test_short_selling.py` | Audit-only |
@@ -67,7 +67,7 @@ explicit accounting for freeze-v2.1 bypass-slot consumption.
 
 ### Why this consumes a bypass slot
 
-Per `docs/FREEZE_v2.1.md` §"What WOULD consume a slot":
+Per `docs/freeze/FREEZE_v2.1.md` §"What WOULD consume a slot":
 
 > A bypass commit is "slot-consuming" iff it modifies any file in:
 > - `packages/strategies/` (strategy core)
@@ -93,7 +93,7 @@ would also consume a slot but would lack:
 
 ### Evidence supporting the flag
 
-See `docs/findings_log_2026-05-25.md` §3 for full evidence. TL;DR:
+See `docs/findings/findings_log_2026-05-25.md` §3 for full evidence. TL;DR:
 
 | | 60d × 50 Nifty (post-patch) | 90d × 228 full universe (pre-patch) |
 |---|---|---|
@@ -235,7 +235,7 @@ the live agent has always been using). No live behaviour change.
 
 ## 5. Findings documentation (audit-only)
 
-### 5.1 `docs/findings_log_2026-05-25.md`
+### 5.1 `docs/findings/findings_log_2026-05-25.md`
 
 New append-only document that preserves the analysis from this
 session. Sections:
@@ -250,7 +250,7 @@ session. Sections:
 8. Friday review decision matrix
 9. Pointers to raw data
 
-### 5.2 `docs/post_freeze_v4_proposal.md` (updated today)
+### 5.2 `docs/reviews/post_freeze_v4_proposal.md` (updated today)
 
 Originally drafted as V4-only deploy proposal in the morning. Expanded
 in the afternoon (after the 90d × 228 re-analysis) into a 3-way
@@ -267,8 +267,8 @@ The Friday review now has decision-quality artefacts:
 |---|---|---|
 | `risk.allow_shorts` flag exists and defaults true | ✓ DONE today | Slot 1 / 3 consumed |
 | Validation queue insert (V1/V2/V4/V17/V18/V19 on 200-stock) | ✓ DONE today | Auto-starts after current run |
-| `docs/findings_log_2026-05-25.md` evidence trail | ✓ DONE today | Append-only |
-| `docs/post_freeze_v4_proposal.md` 3-way comparison | ✓ DONE today | §10 added |
+| `docs/findings/findings_log_2026-05-25.md` evidence trail | ✓ DONE today | Append-only |
+| `docs/reviews/post_freeze_v4_proposal.md` 3-way comparison | ✓ DONE today | §10 added |
 | Validation run completion | ⏳ Wed/Thu | Auto-scheduled |
 | Friday decision: flip `risk.allow_shorts: false` for 2026-06-08? | ⏳ depends on validation | Pre-staged |
 
@@ -289,7 +289,7 @@ Triggered by operator question "Why is the battery test degrading
 with time?" — log analysis revealed two latent bugs that had
 silently slowed every battery run since `enqueue=True` was added
 to the per-variant logger sinks. Full forensics in
-`docs/findings_log_2026-05-25.md` §10.
+`docs/findings/findings_log_2026-05-25.md` §10.
 
 ### Code changes (bug fixes, NO bypass slot consumed)
 
@@ -350,7 +350,7 @@ imported by `trading_agent.py` or `core/*`), `tools/run_battery_queue.py`
 Triggered by operator: "draw on a senior exp dev hat for this small
 role and do a full scan for backtester logic. Don't put down the
 algo expert hat so that we miss some other thing." Full forensics
-in `docs/findings_log_2026-05-25.md` §11.
+in `docs/findings/findings_log_2026-05-25.md` §11.
 
 ### Bugs found
 
@@ -520,7 +520,7 @@ ops runbook is pure documentation; no freeze-bypass slot consumed.
 ## §10. Audit 2026-05-25 quick wins (B-1, B-3, B-4, B-5, B-11)
 
 **Operator delivered** a senior-SWE / algo-trader audit report
-(`docs/audit_2026-05-25/BUG_REPORT.md` + `.json`) with 21 findings
+(`docs/audits/audit_2026-05-25_bug_report.md` + `.json`) with 21 findings
 classified Critical / High / Medium / Low. This session validates the
 report and ships the five "quick wins" the auditor identified as the
 highest leverage per minute.
@@ -663,7 +663,7 @@ the post-fix invariants — each would fail on the pre-fix tree.
 
 ### §10.4 Freeze-bypass slot accounting
 
-Audit-only entry per `docs/FREEZE_v2.1.md` §Audit-only entries. The
+Audit-only entry per `docs/freeze/FREEZE_v2.1.md` §Audit-only entries. The
 fixes touch:
 
 - **Slot-listed file:** `trading_agent.py` (one line, the
@@ -673,13 +673,13 @@ fixes touch:
   that drives the regime classifier (regime → strategy weights →
   order sizing). The fix is **behaviour-neutral on the happy path** —
   `verify=True` and `verify=False` produce identical results when no
-  MITM is in flight. See `docs/FREEZE_v2.1.md` "Note on the
+  MITM is in flight. See `docs/freeze/FREEZE_v2.1.md` "Note on the
   2026-05-25 audit-quick-wins entry" for the full justification.
 - **Non-slot files:** `stop_daemon.py`, `main.py`, `run_daemon.py`,
   `packages/core/stock_scanner.py`, `packages/core/data_handler.py`,
   `packages/core/market_safety.py`, `tests/unit/*`.
-- **Pure docs:** `docs/changes_done_2026-05-25.md`,
-  `docs/FREEZE_v2.1.md`.
+- **Pure docs:** `docs/changes/changes_done_2026-05-25.md`,
+  `docs/freeze/FREEZE_v2.1.md`.
 
 **Bypass-slot ledger: still 1/3 used** (the `risk.allow_shorts`
 flag remains the only slot-consuming entry of this freeze window).
@@ -693,7 +693,7 @@ flag remains the only slot-consuming entry of this freeze window).
   mock-broker harness, a decision on whether AngelOne's `ordertag`
   field is honoured for dedup, and a fresh slot-consumption
   discussion. Live cutover is gated on this. Tracked in
-  `docs/audit_2026-05-25/BUG_REPORT.md` §B-2.
+  `docs/audits/audit_2026-05-25_bug_report.md` §B-2.
 
 #### Operator-decision-pending
 - **B-6** — NSE holiday calendar 2027 freshness. Easy 10-min
@@ -730,8 +730,8 @@ flag remains the only slot-consuming entry of this freeze window).
 - `packages/core/data_handler.py` — B-3 (2 sites)
 - `trading_agent.py` — B-3 (1 site, justified under critical-bug-fix clause)
 - `tests/unit/test_audit_2026_05_25_quick_wins.py` — NEW, 13 tests
-- `docs/FREEZE_v2.1.md` — ledger row + note added
-- `docs/changes_done_2026-05-25.md` — this section
+- `docs/freeze/FREEZE_v2.1.md` — ledger row + note added
+- `docs/changes/changes_done_2026-05-25.md` — this section
 
 ---
 
@@ -860,8 +860,8 @@ Added to ops_runbook §Common Pitfalls.
 - `packages/research/backtest_ensemble.py` — `strategy_history_window`
   field + windowed `_merge_bars`
 - `tests/unit/test_strategy_history_window.py` — NEW, 13 tests
-- `docs/findings_log_2026-05-25.md` — §12 added
-- `docs/changes_done_2026-05-25.md` — this §11
+- `docs/findings/findings_log_2026-05-25.md` — §12 added
+- `docs/changes/changes_done_2026-05-25.md` — this §11
 
 ---
 
@@ -1014,8 +1014,8 @@ ETA at the post-Bug-E rate (~3.2 h per variant on 2 workers):
 - `packages/research/battery.py` — `max_tasks_per_child=1` +
   faulthandler init in worker entry point
 - `tests/unit/test_battery_worker_isolation.py` — NEW, 6 tests
-- `docs/findings_log_2026-05-25.md` — §13 added
-- `docs/changes_done_2026-05-25.md` — this §12
+- `docs/findings/findings_log_2026-05-25.md` — §13 added
+- `docs/changes/changes_done_2026-05-25.md` — this §12
 
 ---
 
@@ -1294,8 +1294,8 @@ gets all four fixes when it launches in ~37 h.
 - `tools/run_battery_queue.py` — `--rm` in argv + name-conflict
   recovery in `process_queue` + `failure_phase` markers
 - `tests/unit/test_battery_robustness.py` — NEW, 26 tests
-- `docs/findings_log_2026-05-25.md` — §14 added
-- `docs/changes_done_2026-05-25.md` — this §13
+- `docs/findings/findings_log_2026-05-25.md` — §14 added
+- `docs/changes/changes_done_2026-05-25.md` — this §13
 
 
 ## §14. Bug G self-audit fixes (2026-05-26 morning, audit-only, NOT deployed)
@@ -1390,9 +1390,9 @@ consumed. Bypass ledger remains 1/3 (still only
 - `packages/strategies/_trend_context.py` —
   `_yf_download_with_timeout` non-blocking shutdown
 - `tests/unit/test_battery_robustness.py` — +4 behavioural tests
-- `docs/findings_log_2026-05-25.md` — §15 added
-- `docs/changes_done_2026-05-25.md` — this §14
-- `docs/FREEZE_v2.1.md` — audit-only entry extended
+- `docs/findings/findings_log_2026-05-25.md` — §15 added
+- `docs/changes/changes_done_2026-05-25.md` — this §14
+- `docs/freeze/FREEZE_v2.1.md` — audit-only entry extended
 
 ---
 
@@ -1552,9 +1552,9 @@ Bypass ledger remains **1/3** (still only `risk.allow_shorts`).
   (`packages` parity + `models`)
 * `tests/unit/test_battery_queue_scheduler.py` — `+8` lines
   (assert + comment) on the existing mount-list test
-* `docs/findings_log_2026-05-25.md` — §16 added
-* `docs/changes_done_2026-05-25.md` — this §15
-* `docs/FREEZE_v2.1.md` — audit-only entry extended
+* `docs/findings/findings_log_2026-05-25.md` — §16 added
+* `docs/changes/changes_done_2026-05-25.md` — this §15
+* `docs/freeze/FREEZE_v2.1.md` — audit-only entry extended
 
 ---
 
@@ -1572,7 +1572,7 @@ verify default, host-side tools/ + packages/ bind-mounts, watchdog
 cron, OCI memory limits, etc.).
 
 Full details, file-by-file diff justification, and reconciliation
-plan are in `docs/findings_log_2026-05-25.md` §17.
+plan are in `docs/findings/findings_log_2026-05-25.md` §17.
 
 ### §16.1 What today's attempt did
 
@@ -1608,8 +1608,8 @@ on the trader. Slot count is unchanged.
 
 ### §16.4 Files touched
 
-* `docs/findings_log_2026-05-25.md` — §17 added (Bug I full detail).
-* `docs/changes_done_2026-05-25.md` — this §16 (Bug I mirror).
+* `docs/findings/findings_log_2026-05-25.md` — §17 added (Bug I full detail).
+* `docs/changes/changes_done_2026-05-25.md` — this §16 (Bug I mirror).
 * No source code, no tests, no config. No VM-side deploy.
 
 ---
@@ -1690,6 +1690,6 @@ counted).
 
 ### §17.6 Files touched in the repo (this commit)
 
-* `docs/changes_done_2026-05-25.md` — this §17 (deploy confirmation).
-* `docs/FREEZE_v2.1.md` — ledger entry updated from "pre-staged" to
+* `docs/changes/changes_done_2026-05-25.md` — this §17 (deploy confirmation).
+* `docs/freeze/FREEZE_v2.1.md` — ledger entry updated from "pre-staged" to
   "LIVE on trader VM as of 2026-05-26 15:19:55 IST".

@@ -73,7 +73,7 @@ mirror the new contract:
 These are still genuine guards — they catch the most dangerous
 misconfigurations — just less restrictive in the legitimate grey zone.
 
-### 5. New: `docs/FREEZE_v2.1.md`
+### 5. New: `docs/freeze/FREEZE_v2.1.md`
 
 Documents what is frozen, what is NOT, exit criteria, and operator
 commitments during the freeze. The contract for any future change
@@ -159,7 +159,7 @@ CI.
 
 ```
 config.yaml
-docs/FREEZE_v2.1.md                                    (NEW)
+docs/freeze/FREEZE_v2.1.md                                    (NEW)
 packages/research/battery.py                           (+ ~40 lines safety guard)
 tests/integration/test_post_backtest_2026_05_05_fixes.py (updated 2 guards)
 tests/unit/test_battery_backtester_isolation.py        (NEW, 24 tests)
@@ -201,7 +201,7 @@ commit message body.
    ```
 4. **Weekly review:** every Friday EOD, pull the latest battery output
    and the week's trade CSV. Compare per-strategy stats. Annotate
-   surprises directly in `docs/FREEZE_v2.1.md` under a "Week N notes"
+   surprises directly in `docs/freeze/FREEZE_v2.1.md` under a "Week N notes"
    section.
 5. **Freeze lift:** when the four exit criteria in `FREEZE_v2.1.md`
    are met. Target date 2026-06-08; slipping is fine.
@@ -250,7 +250,7 @@ safe.
 
 ### B. Per-strategy verdict in audit checkpoint
 
-Exit criterion #4 in `docs/FREEZE_v2.1.md` was:
+Exit criterion #4 in `docs/freeze/FREEZE_v2.1.md` was:
 
 > "audit_checkpoint.py and the EOD diagnostic produce strategy-level
 > reports without manual SQL."
