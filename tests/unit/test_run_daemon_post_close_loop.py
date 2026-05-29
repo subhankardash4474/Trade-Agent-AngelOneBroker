@@ -209,6 +209,96 @@ def test_weekend_clean_exit_breaks_not_sleeps():
     )
 
 
+def test_bug_n_is_market_window_closes_at_1530_ist():
+    """Bug N (2026-05-29): pin the upper bound of ``is_market_window``.
+
+    Pre-fix, the function used ``hour < 16`` (window stayed open until
+    15:59:59 IST). The agent self-exits at 15:30 IST, so between 15:30
+    and 16:00 the outer wrapper saw ``is_market_window()=True``, skipped
+    ``sleep_until_market``, and re-launched the agent on a 30-minute
+    spurious-restart loop -- 22 restarts/day on the trader VM, masked
+    by alert-dedup. The fix tightens the upper bound to ``< 15:30 IST``
+    so the next supervisor iteration immediately falls into the sleep
+    branch.
+
+    Test cases hand-picked across the 15:00-16:00 IST hour so a
+    regression that flips the comparison back to hour-resolution would
+    fail loudly.
+    """
+    from unittest.mock import patch as _patch
+
+    cases = [
+        # (hour, minute, expected, label)
+        (15, 29, True,  "15:29 IST -- still inside 15:30 cutoff"),
+        (15, 29, True,  "15:29 IST repeated -- determinism check"),
+        (15, 30, False, "15:30 IST EXACTLY -- agent self-exits here"),
+        (15, 31, False, "15:31 IST -- previously caused Bug N flap loop"),
+        (15, 45, False, "15:45 IST -- middle of the old-bug flap window"),
+        (15, 59, False, "15:59 IST -- pre-fix would still return True here"),
+        (16, 0,  False, "16:00 IST -- post-cutoff under any interpretation"),
+        (8,  0,  True,  "08:00 IST -- pre-market boot window opens"),
+        (7,  59, False, "07:59 IST -- before pre-market window opens"),
+    ]
+
+    for hour, minute, expected, label in cases:
+        # Weekday Tuesday (2026-05-12) so the weekend gate doesn't kick in.
+        fake_now = datetime(2026, 5, 12, hour, minute, 0, tzinfo=IST)
+        with _patch.object(run_daemon, "datetime") as mock_dt:
+            mock_dt.now.return_value = fake_now
+            assert run_daemon.is_market_window() is expected, (
+                f"is_market_window() failed at {label}: "
+                f"expected {expected} for {hour:02d}:{minute:02d} IST"
+            )
+
+
+def test_bug_n_post_close_loop_does_not_relaunch_agent():
+    """Bug N regression: even if a future change re-widens
+    ``is_market_window()`` to keep returning True past 15:30 IST,
+    the supervisor's ``past_close`` branch must NOT relaunch the agent.
+
+    Pre-fix:
+      iter1: is_market_window=True -> run_once (#1) -> agent self-exits
+             at 15:31 -> past_close=True -> continue
+      iter2: is_market_window=True (still!) -> run_once (#2) -> exit again
+      iter3: is_market_window=True -> run_once (#3) -> exit again
+      ... 22 times until is_market_window finally flips False at 16:00.
+
+    Post-fix: ``run_once`` is called exactly once, then the explicit
+    ``sleep_until_market`` (defence-in-depth) keeps us out of the
+    relaunch path even if ``is_market_window`` is wrong.
+    """
+    args = _FakeArgs(market_hours_only=True)
+
+    # Simulate the pre-fix is_market_window: returns True 10 times in a
+    # row, mimicking the 30-min flap window. If our supervisor logic
+    # is correct, the test will end inside the first iteration -- we
+    # should never consume more than 2-3 of those Trues.
+    is_window_seq = iter([True] * 10)
+
+    def stop_after_sleep(_n):
+        run_daemon._shutdown_requested = True
+
+    calls = _run_main_one_pass(
+        args=args,
+        run_once_side_effect=None,
+        is_market_window_seq=is_window_seq,
+        sleep_until_market_side_effect=stop_after_sleep,
+        # Every datetime.now(IST) inside the loop returns 15:31 IST.
+        now_seq=[datetime(2026, 5, 12, 15, 31, i, tzinfo=IST) for i in range(20)],
+    )
+
+    assert calls["run_once"] == 1, (
+        f"Bug N regression: agent was launched {calls['run_once']} times "
+        f"in the post-close branch instead of exactly 1. The supervisor "
+        f"is back in the 30-min flap loop."
+    )
+    assert calls["sleep_until_market"] == 1, (
+        f"Bug N regression: expected exactly 1 explicit "
+        f"sleep_until_market call (defence-in-depth in the past_close "
+        f"branch), got {calls['sleep_until_market']}."
+    )
+
+
 def test_non_market_hours_mode_does_not_trigger_post_close_branch():
     """When ``--market-hours-only`` is False (24/7 mode, used during
     paper-trading replays and integration tests), the post-close

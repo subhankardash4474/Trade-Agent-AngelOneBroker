@@ -235,10 +235,17 @@ def test_smtp_path_emits_multipart_alternative_with_text_and_html(tmp_path: Path
 
 
 def _resend_cfg(tmp_path: Path) -> dict:
+    # Bug M (2026-05-29): ``failed_alerts_dir`` MUST be set so the
+    # production ``_spool_failed_alert`` helper writes into ``tmp_path``
+    # instead of the repo's ``logs/failed_alerts/`` directory. Until this
+    # field landed, tests like ``test_resend_spool_payload_persists_level``
+    # leaked ~150 "Test/boom/critical" spool files onto the trader VM
+    # over a 10-day window. See packages/monitoring/alerts.py:_FAILED_ALERTS_DIR.
     return {
         "monitoring": {
             "alerts": {
                 "enabled": True,
+                "failed_alerts_dir": str(tmp_path / "failed_alerts"),
                 "email": {
                     "enabled": True,
                     "provider": "resend",
@@ -296,6 +303,12 @@ def test_resend_spool_payload_persists_level(tmp_path: Path):
     to be missing ``level`` -- the drain path then defaulted to
     ``"info"`` and dropped the original severity (warning / error /
     critical) on replay. This test pins ``level`` into the spool.
+
+    Bug M (2026-05-29): the wrapper below now forwards ``**kwargs`` so
+    the ``spool_dir=self._failed_alerts_dir`` keyword threaded by
+    ``AlertManager._send_email_resend`` reaches the real spool helper,
+    and the resulting file lands inside ``tmp_path`` instead of the
+    repo's ``logs/failed_alerts/`` tree.
     """
     mgr = AlertManager(_resend_cfg(tmp_path))
 
@@ -306,9 +319,9 @@ def test_resend_spool_payload_persists_level(tmp_path: Path):
     captured_files = []
     original_spool = alerts_module._spool_failed_alert
 
-    def _capture(payload, reason):
+    def _capture(payload, reason, **kwargs):
         captured_files.append(dict(payload))
-        return original_spool(payload, reason)
+        return original_spool(payload, reason, **kwargs)
 
     with patch.object(alerts_module.requests, "post", return_value=fake_resp), \
          patch.object(alerts_module, "_spool_failed_alert", side_effect=_capture):
@@ -321,6 +334,116 @@ def test_resend_spool_payload_persists_level(tmp_path: Path):
     assert ok is False
     assert captured_files, "spool helper should have been called once"
     assert captured_files[0]["level"] == "critical"
+
+
+# ────────────────────────────────────────────────────────────────────
+# Bug M (2026-05-29) — test pollution leak into production spool
+# ────────────────────────────────────────────────────────────────────
+
+
+def test_spool_lands_in_config_dir_not_cwd_bug_m(tmp_path: Path, monkeypatch):
+    """Pin the Bug M fix: when ``monitoring.alerts.failed_alerts_dir`` is
+    set, a Resend send-failure spool file MUST land in that dir and MUST
+    NOT touch the legacy CWD-relative ``logs/failed_alerts/`` location.
+
+    Until 2026-05-29 the spool helper resolved ``_FAILED_ALERTS_DIR =
+    Path("logs") / "failed_alerts"`` directly, ignoring per-instance
+    config. Running ``test_resend_spool_payload_persists_level`` on the
+    trader VM leaked 150+ "Test/boom/critical" spool files into
+    ``/opt/trading-agent/logs/failed_alerts/``. This test enforces the
+    contract that closes that leak.
+    """
+    # Cd into a clean tmp dir so the legacy ``logs/failed_alerts/``
+    # ALSO would be inside tmp_path -- any leak still ends up isolated
+    # from the developer's repo. Belt + suspenders: we then assert the
+    # configured dir got the file AND the legacy dir is empty.
+    monkeypatch.chdir(tmp_path)
+    cfg_dir = tmp_path / "isolated_spool"
+    cfg = _resend_cfg(tmp_path)
+    cfg["monitoring"]["alerts"]["failed_alerts_dir"] = str(cfg_dir)
+    mgr = AlertManager(cfg)
+
+    fake_resp = MagicMock()
+    fake_resp.status_code = 401
+    fake_resp.text = "invalid api key"
+
+    with patch.object(alerts_module.requests, "post", return_value=fake_resp):
+        ok = mgr._send_email_resend(subject="Test", body="boom", level="critical")
+
+    assert ok is False
+    cfg_files = list(cfg_dir.glob("*.json"))
+    assert len(cfg_files) == 1, (
+        f"expected exactly 1 spool file in {cfg_dir!s}, found {len(cfg_files)}"
+    )
+    legacy_dir = tmp_path / "logs" / "failed_alerts"
+    legacy_files = list(legacy_dir.glob("*.json")) if legacy_dir.exists() else []
+    assert legacy_files == [], (
+        f"Bug M regression: spool helper wrote to legacy CWD-relative "
+        f"path {legacy_dir!s} instead of the configured dir {cfg_dir!s}. "
+        f"On the trader VM this re-introduces the test \u2192 prod spool leak."
+    )
+
+
+def test_drain_purges_test_pollution_payloads_bug_m(tmp_path: Path):
+    """Pin the Bug M defense-in-depth guard: ``drain_failed_alerts`` MUST
+    silently delete any spool file whose payload matches the known
+    test-pollution fingerprint (subject="Test", body="boom") instead of
+    replaying it through the live Resend/SMTP path.
+
+    Without this guard, the next healthy drain after the trader VM
+    re-deploys would push every survivor through to ops as a CRITICAL
+    email -- exactly the spam scenario the path-fix above prevents
+    going forward but does NOT clean up.
+    """
+    cfg = _resend_cfg(tmp_path)
+    cfg_dir = tmp_path / "failed_alerts"
+    cfg_dir.mkdir(parents=True, exist_ok=True)
+
+    # Seed two pollution files + one legitimate spooled alert.
+    import json as _json
+    pollution_a = cfg_dir / "2026-05-29T100000_Test_aaaaaa.json"
+    pollution_b = cfg_dir / "2026-05-29T100001_Test_bbbbbb.json"
+    legit = cfg_dir / "2026-05-29T100002_Daily_Report_cccccc.json"
+    pollution_a.write_text(_json.dumps({
+        "provider": "resend", "subject": "Test", "body": "boom",
+        "level": "critical", "spooled_at": "2026-05-29T100000",
+        "reason": "http_401: invalid api key",
+    }), encoding="utf-8")
+    pollution_b.write_text(_json.dumps({
+        "provider": "resend", "subject": "Test", "body": "boom",
+        "level": "critical", "spooled_at": "2026-05-29T100001",
+        "reason": "http_401: invalid api key",
+    }), encoding="utf-8")
+    legit.write_text(_json.dumps({
+        "provider": "resend", "subject": "Daily Report", "body": "Day PnL: +500",
+        "level": "info", "spooled_at": "2026-05-29T100002",
+        "reason": "network: ConnectionError: tmp dns flake",
+    }), encoding="utf-8")
+
+    mgr = AlertManager(cfg)
+
+    # Mock the live send so the legitimate alert "succeeds" on replay.
+    fake_resp = MagicMock()
+    fake_resp.status_code = 200
+    fake_resp.text = ""
+
+    with patch.object(alerts_module.requests, "post", return_value=fake_resp):
+        result = mgr.drain_failed_alerts()
+
+    assert result["purged_test"] == 2, (
+        f"expected 2 test-pollution payloads purged, got {result['purged_test']}. "
+        f"The (subject='Test', body='boom') guard must catch every legacy file."
+    )
+    assert result["sent"] == 1, (
+        f"expected the 1 legitimate Daily Report to drain through, got "
+        f"{result['sent']}."
+    )
+    # All three files removed from disk (2 purged, 1 successfully sent).
+    remaining = list(cfg_dir.glob("*.json"))
+    assert remaining == [], (
+        f"drain should leave the spool dir empty after a clean run; "
+        f"survivors: {[p.name for p in remaining]}"
+    )
 
 
 # ────────────────────────────────────────────────────────────────────

@@ -28,7 +28,7 @@ import signal
 import ssl
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, time as dt_time
 from pathlib import Path
 
 import pytz
@@ -84,12 +84,35 @@ def _signal_handler(sig, frame):
 
 
 def is_market_window() -> bool:
-    """Returns True if within 08:30-16:00 IST on a weekday (pre-market + post-cleanup window)."""
+    """Returns True if within 08:00-15:30 IST on a weekday — the window in
+    which the agent should be running.
+
+    Bug N (2026-05-29): the upper bound used to be hour-resolution
+    ``hour < 16`` (i.e. window stayed open until 15:59:59 IST). That
+    misaligned with ``TradingAgent._trading_cycle``'s self-exit at
+    15:30 IST, so the supervisor's "skipping restart loop" branch in
+    ``main()`` would call ``continue``, the next outer iteration would
+    see ``is_market_window()=True``, skip ``sleep_until_market``, and
+    re-launch the agent -- which then self-exited again on its first
+    cycle. Result: ~22 spurious agent restarts every trading day
+    between 15:30 and 16:00 IST (verified in trader-VM logs
+    2026-05-29: 22 ``[AUDIT-CHECKPOINT]_HHMM`` writes with ``Cycle=1``
+    each, plus 36 ``[ALERT-SUPPRESSED]`` lines from the dedup'd
+    EOD/Scanner alerts that fired on every restart). Symptom was
+    masked by alert-dedup so the 2026-05-13 "11 EOD emails" surface
+    incident never resurfaced -- but the underlying loop ran every day.
+
+    Tightening the upper bound to 15:30 makes ``is_market_window()``
+    return False the instant the agent self-exits, so the supervisor's
+    next iteration goes into ``sleep_until_market`` as the
+    2026-05-13 patch intended. See
+    ``docs/findings_log_2026-05-27.md`` §13 for the full RCA.
+    """
     now = datetime.now(IST)
     if now.weekday() >= 5:
         return False
-    hour = now.hour
-    return 8 <= hour < 16
+    t = now.time()
+    return dt_time(8, 0) <= t < dt_time(15, 30)
 
 
 def _write_idle_heartbeat(config_path: str) -> None:
@@ -470,6 +493,20 @@ def main():
                     )
                     backoff = 2
                     crash_count = 0
+                    # Bug N (2026-05-29): the *primary* fix lives in
+                    # ``is_market_window()`` (upper bound tightened
+                    # from 16:00 IST to 15:30 IST so the next outer
+                    # iteration's gate flips False the instant the
+                    # agent self-exits). The explicit
+                    # ``sleep_until_market`` call below is defence-in-
+                    # depth: if a future operator widens
+                    # ``is_market_window()`` without fixing this branch,
+                    # the call still routes us into the off-hours
+                    # sleep loop here-and-now instead of falling
+                    # through into another ``start_agent`` /
+                    # ``run_once`` round-trip. See
+                    # docs/findings_log_2026-05-27.md §13.
+                    sleep_until_market(args.config)
                     continue
             break
         except KeyboardInterrupt:

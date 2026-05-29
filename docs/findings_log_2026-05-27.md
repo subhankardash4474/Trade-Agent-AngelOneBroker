@@ -200,6 +200,37 @@ landed during the holiday window while the trader VM idled:
     forensic + H1 regime classifier; the focus battery just gives
     us the V15-PF delta to confirm or surprise.
 
+**Update 2026-05-29 18:40 IST (Friday evening, trader-VM audit + 2 latent bugs).**
+
+17. **§23 Trader VM 2026-05-29 audit + Bug M (alert spool path leak)
+    + Bug N (post-close restart loop).** Operator pulled today's
+    trader logs after market close and asked for an "any issues / any
+    fix needed" review. Day was operationally GREEN: 0 trades, ₹+0
+    PnL, 0 errors / 0 criticals / 0 tracebacks, 1 benign warning,
+    Resend EOD email delivered cleanly. Two latent bugs surfaced:
+    **Bug M** — `_FAILED_ALERTS_DIR = Path("logs") / "failed_alerts"`
+    is a CWD-relative module-level constant, so test invocations
+    leak `Test/boom/critical` spool files into production. Trader VM
+    was already clean (0 files); local dev tree had 72 files, all
+    purged. Fixed by config-driving the path on `AlertManager` +
+    defense-in-depth purge-guard in `drain_failed_alerts` that
+    silently drops `(subject="Test", body="boom")` payloads even if
+    pollution survives. **Bug N** — `is_market_window()` returned
+    True until 16:00 IST while the agent self-exits at 15:30 IST,
+    producing a 30-min flap-loop: ~22 spurious agent restarts
+    every trading day, each running one cycle and exiting, all
+    masked by alert-dedup so the symptoms (22 audit checkpoints
+    with `Cycle=1`, 36 `[ALERT-SUPPRESSED]` lines) never surfaced
+    to ops. Real cause traced from `Cycle=1` reset pattern in
+    `trading_agent_2026-05-29.log` to the
+    `is_market_window()` upper bound. Fixed by tightening to
+    `dt_time(8, 0) <= t < dt_time(15, 30)` + defense-in-depth
+    explicit `sleep_until_market` call in the `past_close` branch.
+    4 new regression tests (2 Bug M + 2 Bug N), full unit
+    **1,717/1,717** green. Both fixes NOT deployed to trader VM
+    today (freeze policy; trader continues to run commit `8f35593`).
+    Severity MEDIUM each; no capital/safety impact today.
+
 ---
 
 ## 1. Bug J — `tools/cloud/bootstrap_backtester.sh` chowns to container UID, breaking host-side scheduler
@@ -3873,4 +3904,297 @@ though the headline answer is "nothing to ship today" -- a
 loud "do not deploy" signal that prevents another round of
 capital decay is a valuable result.
 
+
+
+## 23. Trader VM 2026-05-29 audit + Bug M (alert spool path leak) + Bug N (post-close restart loop)
+
+**Triggered by:** operator pulled today's trader-VM logs after market
+close and asked for an "any issues / any fix needed" review. The day
+ran flat (0 trades, P&L ₹+0.00) so this was effectively a chance to
+re-baseline the trader's quiet-day signature now that the audit
+re-ramp is in flight on the backtester.
+
+**Headline:** trader VM is operationally GREEN today. Two latent bugs
+surfaced from log analysis -- one in tests, one in the daemon
+supervisor. Both fixed in this commit, both NOT deployed (freeze
+slots already consumed by Phases 1-5 + misc OPEN bucket; trader
+continues to run commit `8f35593` which equals current `origin/main`
+on the host but is older than HEAD post-fix).
+
+### 23.1 Today's trader-VM signature (clean baseline)
+
+Pulled artefacts (via `tools/cloud/pull_logs.ps1`):
+
+* `logs/trading_agent_2026-05-29.log` — 4.6 MB, 26,500 lines
+* `logs/daemon_2026-05-29.log` — 4.6 KB supervisor log
+* `logs/audit/2026-05-29/` — 27 hourly+flapping checkpoints
+* `logs/signal_audit_2026-05-29.csv` — 33 rejected SELL signals
+* `logs/health.json`, `logs/trades.csv`
+
+| Signal | Count | Verdict |
+|---|---:|---|
+| ERROR / CRITICAL / Traceback / Exception | 0 / 0 / 0 / 0 | clean |
+| WARNING | 1 | benign (`Trading blocked: Past intraday exit time (15:15)`) |
+| HEARTBEAT lines | 143 | normal cadence |
+| Trades placed | 0 | expected — slot-1 (`allow_shorts:false`) blocked all 33 SELL signals |
+| EOD email sent | yes | Resend production API key works (4050 chars, 16:01:14 IST) |
+| Day P&L | ₹+0.00 | flat day, equity ₹120,990, drawdown 1.63% |
+| Daemon-supervisor restart at 15:00:15 IST | 1 | confirmed by operator — not a crash |
+| Cycles 09:00–15:30 IST | 18 | one continuous process, healthy |
+| Cycles 15:30–16:01 IST | 22 × Cycle=1 | **Bug N flap (see below)** |
+
+The slot-1 freeze is doing exactly what was designed: 33 SELL signals
+audited, 0 reached the broker. 5 rejected by `opening_lockout`
+(pre-09:30), 28 rejected by `allow_shorts:false`. Phase-C monitor
+day 4.
+
+### 23.2 Bug M — test invocations leak into production failed-alerts spool
+
+**File:** `packages/monitoring/alerts.py:72`
+
+**The smell:** `logs/failed_alerts/` had ~150 files dated 2026-05-19
+through 2026-05-29, each 173 bytes, every one with the exact same
+fingerprint:
+
+```json
+{"provider":"resend","subject":"Test","body":"boom","level":"critical",
+ "reason":"http_401: invalid api key"}
+```
+
+**Initial suspicion:** Resend production API key broken, alerts not
+delivering, ops missing critical signals. **Real diagnosis:** the
+`reason: "http_401: invalid api key"` is a **mocked** response from
+`tests/unit/test_alert_html_rendering.py::test_resend_spool_payload_persists_level`,
+not a real production failure. Production EOD email sent successfully
+at 16:01:14 IST today. **Resend key is healthy.**
+
+**Root cause:** `_FAILED_ALERTS_DIR = Path("logs") / "failed_alerts"`
+was a module-level CWD-relative constant. The test patches
+`_spool_failed_alert` with `side_effect=_capture` that calls into the
+real `original_spool(...)`, which writes to `_FAILED_ALERTS_DIR`. The
+test passes a `tmp_path`-based config to `AlertManager`, but the
+spool helper completely ignores it — it resolves the module-level
+constant directly. Result: every `pytest` run on a machine with cwd
+inside `/opt/trading-agent` (or any local dev tree) leaves one
+"Test/boom/critical" spool file behind.
+
+**Live impact at the time of discovery:** zero. Trader VM
+`logs/failed_alerts/` was already empty (verified over SSH: `find
+logs/failed_alerts -maxdepth 1 -name '*_Test_*.json' | wc -l` = 0).
+All 72 leaked files were on the **local dev machine** from this saga's
+many test-run iterations. The 24 files dated 2026-05-29 in the local
+tree came from local pytest runs during today's investigation, not
+from the trader.
+
+**Latent risk if undetected:** if pollution had reached the trader,
+the next healthy `drain_failed_alerts()` would push every `Test/boom`
+through to `_send_email_resend(spool_on_fail=False, level="critical")`
+using the live config — meaning 150+ CRITICAL emails to ops within
+one drain cycle.
+
+**Fix (3 layers):**
+
+1. **Path config-driven.** Added `monitoring.alerts.failed_alerts_dir`
+   config field. `AlertManager.__init__` reads it into
+   `self._failed_alerts_dir`, defaulting to `_FAILED_ALERTS_DIR` for
+   back-compat. `_spool_failed_alert` accepts an optional `spool_dir`
+   kwarg; both `_send_email_smtp` and `_send_email_resend` now pass
+   `spool_dir=self._failed_alerts_dir`. `drain_failed_alerts` reads
+   from `self._failed_alerts_dir`.
+
+2. **Defense-in-depth purge guard.** Added
+   `_TEST_POLLUTION_FINGERPRINTS = frozenset({("Test", "boom")})` and a
+   guard at the top of `drain_failed_alerts`'s replay loop: if
+   `(payload["subject"], payload["body"])` matches the fingerprint,
+   `path.unlink()` it and increment a new `purged_test` counter
+   (added to the return dict). Real production alerts never have
+   `subject="Test"` with `body="boom"`. Even if some pollution
+   survives the manual purge AND the path fix, drain will silently
+   delete it instead of replaying.
+
+3. **Test fixture.** `_resend_cfg(tmp_path)` now sets
+   `failed_alerts_dir: str(tmp_path / "failed_alerts")`. The existing
+   `test_resend_spool_payload_persists_level` had to update its
+   `_capture` wrapper to `**kwargs`-forward the new `spool_dir` kwarg.
+
+**New regression tests (`tests/unit/test_alert_html_rendering.py`):**
+
+* `test_spool_lands_in_config_dir_not_cwd_bug_m` — `monkeypatch.chdir(tmp_path)`,
+  configure a separate `cfg_dir`, trigger a 401 send-failure, assert
+  spool lands in `cfg_dir` and the legacy `tmp_path/logs/failed_alerts`
+  is empty.
+* `test_drain_purges_test_pollution_payloads_bug_m` — seed two
+  `Test/boom` files + one legitimate `Daily Report` spool file, run
+  `drain_failed_alerts`, assert `purged_test == 2`, `sent == 1`,
+  spool dir empty.
+
+**Cleanup actions:**
+
+* Local: `Remove-Item logs\failed_alerts\*_Test_*.json -Force` →
+  72 files removed.
+* Trader VM: 0 files to remove (already clean).
+
+**Severity:** MEDIUM — latent ops-spam risk, no current
+capital/safety impact.
+
+### 23.3 Bug N — supervisor flap-loop between 15:30 and 16:00 IST
+
+**File:** `run_daemon.py:86`
+
+**The smell (from `audit/2026-05-29/`):**
+
+```
+09:00  10:01  11:02  12:01  13:02  14:00  15:02   ← hourly, correct
+15:31  15:32  15:34  15:36  15:37  15:39  15:40
+15:42  15:44  15:45  15:47  15:48  15:50  15:51
+15:53  15:55  15:56  15:58  15:59  16:01            ← 22 writes in 30 min
+```
+
+The daemon's `_maybe_audit_checkpoint` has a correct hour-mismatch gate:
+
+```python
+if self._last_audit_hour == now.hour:
+    return
+```
+
+Verified via `docker exec trader sh -c 'grep -n -A 25 _maybe_audit_checkpoint /app/trading_agent.py'` — container code is byte-identical to local HEAD. So the gate IS in place; yet 22 writes fired in one hour. Why?
+
+**Cycle counter pinpoints the answer:**
+
+```
+15:01:35  [CONC-10] heartbeat thread started
+15:02:22  [HEARTBEAT] Cycle=1
+15:08:07  [HEARTBEAT] Cycle=4
+15:13:48  [HEARTBEAT] Cycle=7
+15:18:25  [HEARTBEAT] Cycle=10
+15:23:53  [HEARTBEAT] Cycle=14
+15:29:06  [HEARTBEAT] Cycle=18           ← single process, 18 cycles
+15:30:06  [CONC-10] heartbeat thread exiting
+15:31:19  [CONC-10] heartbeat thread started   ← ★ NEW process
+15:31:28  [HEARTBEAT] Cycle=1                  ← Cycle counter reset!
+15:31:37  [CONC-10] heartbeat thread exiting   ← exits 18s later
+15:32:50  [CONC-10] heartbeat thread started   ← ★ NEW process
+...repeats every ~90s for 30 minutes...
+```
+
+**The agent self-exits at 15:30 IST and the daemon supervisor immediately re-launches it.** Each fresh process initialises with `_last_audit_hour = None`, runs one cycle that fires `_maybe_audit_checkpoint` (gate misses on first cycle of any new process), exits at the next loop iteration ("Market closed `>= 15:30:00`"), and the supervisor re-spawns. ~22 spurious launches in 30 minutes.
+
+**Root cause traced two layers up to `is_market_window()`:**
+
+```python
+# pre-fix
+def is_market_window() -> bool:
+    """Returns True if within 08:30-16:00 IST on a weekday..."""
+    ...
+    return 8 <= hour < 16     # ← upper bound 15:59:59 IST
+```
+
+The 2026-05-13 patch in `run_daemon.main()` added a `past_close`
+branch that calls `continue` after a clean exit, intending to route
+the next outer-loop iteration into `sleep_until_market`. But the next
+iteration's gate is:
+
+```python
+if args.market_hours_only and not is_market_window():
+    sleep_until_market(args.config)
+```
+
+At 15:31 IST `is_market_window()=True`, so the sleep is **skipped**
+and we fall straight into `start_agent()` again. The 2026-05-13
+patch only fixed the surface symptom (11 EOD emails); the underlying
+restart-loop has been running every trading day since, masked by
+alert-dedup ("11 EOD emails" → "0 EOD emails, 36 SUPPRESSED").
+
+**Why the symptom never escalated:**
+
+| Symptom | Why it didn't escalate |
+|---|---|
+| 22 spurious EOD email attempts | Persistent dedup state file blocks all duplicates within the 60-min TTL — visible as 36 `[ALERT-SUPPRESSED] 'EOD Summary' / 'Scanner Update'` lines today |
+| 22 spurious post-mortem subprocess spawns | Each terminates in `<1s` because the post-mortem script is also idempotent (checks if `logs/postmortem/<date>.md` exists) |
+| 22 spurious profit-diagnostic subprocess spawns | Same — idempotent skip |
+| 22 spurious scanner runs | Each picks up roughly the same watchlist; dedup'd at alert layer |
+| 22 audit checkpoint files | No de-dup at this layer; 22 nearly-identical files written every trading day |
+
+**Cost:** ~30 min/day of redundant boot + scan + DB ops, plus audit
+signal-to-noise dilution. No capital risk, no safety risk.
+
+**Fix (2 layers):**
+
+1. **Tighten `is_market_window()` to match the agent's 15:30 IST self-exit.**
+   Switched from hour-resolution `8 <= hour < 16` to time-resolution
+   `dt_time(8, 0) <= t < dt_time(15, 30)`. Imported `time as dt_time`
+   from `datetime`. Now `is_market_window()` returns False the
+   instant the agent self-exits, so the supervisor's outer-loop gate
+   correctly routes to `sleep_until_market`.
+
+2. **Defense-in-depth: explicit `sleep_until_market` call in the `past_close` branch.**
+   Even if a future operator widens `is_market_window()` again, the
+   supervisor will still hit the off-hours sleep branch immediately
+   instead of falling through to another `start_agent()` round-trip.
+
+**New regression tests (`tests/unit/test_run_daemon_post_close_loop.py`):**
+
+* `test_bug_n_is_market_window_closes_at_1530_ist` — 9 hand-picked
+  `(hour, minute)` cases covering 07:59–16:00 IST. The pre-fix code
+  would fail on 15:31 / 15:45 / 15:59. The post-fix code passes all.
+* `test_bug_n_post_close_loop_does_not_relaunch_agent` — drives
+  `main()` with `is_market_window` returning True 10 times in a row
+  (mimicking the pre-fix behaviour). Asserts `run_once` was called
+  exactly **once** and `sleep_until_market` exactly **once**. A
+  regression that re-introduces the flap would call `run_once` 5+
+  times.
+
+**Severity:** MEDIUM — operational waste + audit-noise, no
+capital/safety impact. NOT deployed (freeze policy).
+
+### 23.4 CRLF noise from rsync (trivial)
+
+The rsync-from-trader pulled five files into the Windows working tree
+that Git's `core.autocrlf` then re-rewrote on the way out: `config.yaml`,
+`packages/core/database.py`, `packages/core/portfolio.py`,
+`packages/research/backtest_ensemble.py`, `trading_agent.py`. `git
+diff -w` returns empty for every one — pure line-ending noise, zero
+content drift. Reverted via `git checkout -- <files>`.
+
+### 23.5 Test counts after both fixes
+
+| Suite | Before (HEAD) | After Bug M + N | Δ |
+|---|---:|---:|---:|
+| `tests/unit` | 1,713 | 1,717 | +4 (2 Bug M + 2 Bug N) |
+| `tests/integration` | 248 (assumed unchanged) | (not re-run; Bug M+N are unit-scope) | 0 |
+| Pass rate | 100% | 100% | — |
+
+Local suite green: `1,717 passed in 34.05s`.
+
+### 23.6 What does NOT need fixing
+
+For the record (so future audits don't re-investigate):
+
+* **Resend API key.** Healthy. Today's EOD email at 16:01:14 IST sent
+  in 4050 chars. The 401 errors in `failed_alerts/` are mocked test
+  artefacts (Bug M).
+* **Daemon-supervisor restart at 15:00:15 IST.** Operator-initiated,
+  not a crash.
+* **The 36 `[ALERT-SUPPRESSED]` lines.** Functioning dedup, not a
+  bug. They're a downstream symptom of Bug N — once Bug N is
+  deployed they should drop to 1-2/day.
+* **The 33 REJECTED SELL signals in signal_audit.** FREEZE_v2.1 slot-1
+  working as designed. Phase-C monitor day 4.
+
+### 23.7 Backlog
+
+| Item | Action | Notes |
+|---|---|---|
+| Bug M | Deployed at next trader rebuild (after `post_retrain_xgb_focus_60d` results land) | Local pollution already purged; trader VM was clean. Defense-in-depth guard means no urgency. |
+| Bug N | Deployed at next trader rebuild | Pure operational improvement; no symptom visible to ops thanks to dedup. |
+| Audit-checkpoint flap | Auto-resolves once Bug N deploys | The flap is pure consequence of Bug N. |
+| Tighten further: separate "agent run window" from "daemon idle window" | Backlog | Pre-market (08:00-09:15) is not really a "trading" window — it's preflight time. A future refactor could split these. Not urgent. |
+
+### 23.8 Commit
+
+* `packages/monitoring/alerts.py` — Bug M code fix (path config-driven + defense-in-depth purge guard).
+* `tests/unit/test_alert_html_rendering.py` — Bug M test fixture update + 2 new regression tests.
+* `run_daemon.py` — Bug N code fix (tighten `is_market_window` + defense-in-depth `sleep_until_market` call).
+* `tests/unit/test_run_daemon_post_close_loop.py` — 2 new Bug N regression tests.
+* `docs/findings_log_2026-05-27.md` — this section (§23).
 

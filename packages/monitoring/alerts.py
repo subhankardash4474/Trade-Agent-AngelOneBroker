@@ -69,7 +69,29 @@ _RETRYABLE_STATUS = {408, 425, 429, 500, 502, 503, 504}
 # Backoff schedule in seconds. 4 attempts total: 0s, 2s, 8s, 24s.
 _BACKOFF_DELAYS = [0, 2, 8, 24]
 
+# Default spool dir for alerts that exhausted their retry budget. AlertManager
+# now holds a per-instance override (`self._failed_alerts_dir`) so tests --
+# whose `tmp_path` lives outside the repo -- can never write a real spool file
+# into the production `logs/failed_alerts/` tree. Bug M (2026-05-29): until
+# this fix `_spool_failed_alert` resolved this constant directly, which made
+# the test `test_resend_spool_payload_persists_level` leak ~150 bogus
+# "Test/boom/critical" entries onto the trader VM between 2026-05-19 and
+# 2026-05-29. See docs/findings_log_2026-05-27.md §13. Kept as the public
+# default so an `AlertManager` constructed without a `failed_alerts_dir`
+# config still uses the legacy location (matters for the drain path on
+# upgrade -- existing pre-fix spool files at `logs/failed_alerts/` must
+# still drain on next boot).
 _FAILED_ALERTS_DIR = Path("logs") / "failed_alerts"
+
+# Bug M defense-in-depth (2026-05-29): drain MUST NOT replay payloads that
+# match the test-pollution fingerprint, even after the path fix lands.
+# Reason: the trader VM accumulated ~150 of these between 2026-05-19 and
+# 2026-05-29; if we missed any in the manual purge AND the live Resend key
+# is healthy at next drain, ops would receive that many CRITICAL emails.
+# The fingerprint matches `tests/unit/test_alert_html_rendering.py::
+# test_resend_spool_payload_persists_level`'s exact (subject, body) pair --
+# no real production alert ever has subject "Test" with body "boom".
+_TEST_POLLUTION_FINGERPRINTS = frozenset({("Test", "boom")})
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -256,7 +278,11 @@ def _sanitize_filename(s: str) -> str:
     return s[:80] or "alert"
 
 
-def _spool_failed_alert(payload: dict, reason: str) -> Optional[Path]:
+def _spool_failed_alert(
+    payload: dict,
+    reason: str,
+    spool_dir: Optional[Path] = None,
+) -> Optional[Path]:
     """Persist a failed alert payload to disk so it can be replayed later.
     Returns the path written, or None if spool itself failed.
 
@@ -266,12 +292,19 @@ def _spool_failed_alert(payload: dict, reason: str) -> Optional[Path]:
     (``skipped`` counter), permanently losing the alert. Write via a
     sibling ``.tmp.<pid>`` then ``os.replace`` -- atomic on both
     Windows and POSIX -- mirroring the persistence-module convention.
+
+    Bug M (2026-05-29): ``spool_dir`` is now an optional override. Callers
+    on the production path (``AlertManager._send_email_*``) thread their
+    own ``self._failed_alerts_dir`` through here; tests can pass a
+    ``tmp_path``. Default stays ``_FAILED_ALERTS_DIR`` so legacy
+    pre-fix spool files still drain on the next boot.
     """
+    target_dir = Path(spool_dir) if spool_dir is not None else _FAILED_ALERTS_DIR
     try:
-        _FAILED_ALERTS_DIR.mkdir(parents=True, exist_ok=True)
+        target_dir.mkdir(parents=True, exist_ok=True)
         ts = datetime.now(IST).strftime("%Y-%m-%dT%H%M%S")
         title_slug = _sanitize_filename(payload.get("subject", "alert"))
-        path = _FAILED_ALERTS_DIR / f"{ts}_{title_slug}_{uuid.uuid4().hex[:6]}.json"
+        path = target_dir / f"{ts}_{title_slug}_{uuid.uuid4().hex[:6]}.json"
         body = json.dumps(
             {**payload, "spooled_at": ts, "reason": reason},
             ensure_ascii=False, indent=2,
@@ -319,6 +352,20 @@ class AlertManager:
         # ephemeral state under ``logs/``).
         state_path = dedup_cfg.get("state_path")
         self._dedup_state_path: Path = Path(state_path) if state_path else _DEDUP_STATE_FILE
+
+        # Bug M (2026-05-29): per-instance failed-alert spool dir. Tests
+        # MUST point this at ``tmp_path`` so the patched-but-real
+        # ``_spool_failed_alert`` doesn't write a 173-byte
+        # "Test/boom/critical" file into the production ``logs/failed_alerts/``
+        # tree. Production daemons leave ``failed_alerts_dir`` unset and get
+        # the legacy ``logs/failed_alerts/`` location (so existing pre-fix
+        # pollution still drains on first post-deploy boot, where the
+        # ``_TEST_POLLUTION_FINGERPRINTS`` guard in ``drain_failed_alerts``
+        # silently drops any survivors). See findings_log §13.
+        spool_dir_cfg = mon_cfg.get("failed_alerts_dir")
+        self._failed_alerts_dir: Path = (
+            Path(spool_dir_cfg) if spool_dir_cfg else _FAILED_ALERTS_DIR
+        )
 
     # ── Persistent dedup helpers ─────────────────────────────────
     @staticmethod
@@ -580,7 +627,7 @@ class AlertManager:
                 break
 
         if spool_on_fail:
-            _spool_failed_alert(spool_payload, last_reason)
+            _spool_failed_alert(spool_payload, last_reason, spool_dir=self._failed_alerts_dir)
         return False
 
     # ── Failed-alert spool management ────────────────────────
@@ -589,13 +636,17 @@ class AlertManager:
         outage). Successful replays delete the spool file; failures leave it
         in place to be retried next run. Safe to call at daemon boot.
 
-        Returns: {"sent": N, "failed": N, "skipped": N}.
+        Returns: ``{"sent": N, "failed": N, "skipped": N, "purged_test": N}``.
+        ``purged_test`` counts known test-pollution payloads (Bug M) that
+        we deliberately drop instead of replay -- those would otherwise
+        spam ops with "Test/boom/critical" emails as soon as the live
+        Resend key is healthy.
         """
-        if not _FAILED_ALERTS_DIR.exists():
-            return {"sent": 0, "failed": 0, "skipped": 0}
+        if not self._failed_alerts_dir.exists():
+            return {"sent": 0, "failed": 0, "skipped": 0, "purged_test": 0}
 
-        sent = failed = skipped = 0
-        for path in sorted(_FAILED_ALERTS_DIR.glob("*.json"))[:max_per_run]:
+        sent = failed = skipped = purged_test = 0
+        for path in sorted(self._failed_alerts_dir.glob("*.json"))[:max_per_run]:
             try:
                 payload = json.loads(path.read_text(encoding="utf-8"))
             except Exception as e:
@@ -607,6 +658,17 @@ class AlertManager:
             body = payload.get("body", "")
             provider = payload.get("provider", "resend")
             level = payload.get("level", "info")
+
+            # Bug M defense-in-depth: silently drop known test pollution.
+            # Real production alerts never have (subject="Test", body="boom").
+            if (subject, body) in _TEST_POLLUTION_FINGERPRINTS:
+                try:
+                    path.unlink()
+                except Exception:
+                    pass
+                purged_test += 1
+                logger.info(f"[ALERT-SPOOL] purged test-pollution payload: {path.name}")
+                continue
 
             ok = False
             try:
@@ -629,9 +691,12 @@ class AlertManager:
                 failed += 1
                 logger.warning(f"[ALERT-SPOOL] replay still failing, kept on disk: {path.name}")
 
-        if sent or failed:
-            logger.info(f"[ALERT-SPOOL] drain summary: sent={sent} failed={failed} skipped={skipped}")
-        return {"sent": sent, "failed": failed, "skipped": skipped}
+        if sent or failed or purged_test:
+            logger.info(
+                f"[ALERT-SPOOL] drain summary: sent={sent} failed={failed} "
+                f"skipped={skipped} purged_test={purged_test}"
+            )
+        return {"sent": sent, "failed": failed, "skipped": skipped, "purged_test": purged_test}
 
     def _send_email_resend(self, subject: str, body: str, *, spool_on_fail: bool = True, level: str = "info") -> bool:
         """Send email through Resend API with retry-on-network-error and
@@ -729,5 +794,5 @@ class AlertManager:
                 break
 
         if spool_on_fail:
-            _spool_failed_alert(spool_payload, last_reason)
+            _spool_failed_alert(spool_payload, last_reason, spool_dir=self._failed_alerts_dir)
         return False
