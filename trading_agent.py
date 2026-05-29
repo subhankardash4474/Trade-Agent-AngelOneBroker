@@ -834,6 +834,22 @@ class TradingAgent:
         self._historical_cache_hits: int = 0
         self._historical_cache_misses: int = 0
 
+        # PERF-07 (audit 2026-05-28): per-cycle tick-history memo.
+        # ``tick_aggregator.get_candle_history(symbol, timeframe)``
+        # allocates a fresh DataFrame on every call. With 300 symbols
+        # x 4 active strategies that's ~1,200 DataFrame allocations
+        # per cycle on the WS hot path -- short-lived churn that
+        # triggers gen-1/gen-2 GC pauses (10-50 ms) which directly
+        # stall the WS thread. Many strategies on the same symbol
+        # share the same timeframe (most live on 5min), so dedup by
+        # (symbol, interval) per cycle collapses the alloc count
+        # roughly 3-5x without changing any strategy output. Cleared
+        # at the start of every ``_trading_cycle`` so we never serve
+        # stale candles into a fresh cycle.
+        self._tick_history_cache: Dict[Tuple[str, str], "pd.DataFrame"] = {}
+        self._tick_history_cache_hits: int = 0
+        self._tick_history_cache_misses: int = 0
+
         # Concentration / safety limits from risk config
         risk_cfg_raw = self.config.get("risk", {})
         self._max_sector_exposure_pct: float = risk_cfg_raw.get("max_sector_exposure_pct", 40.0)
@@ -4006,14 +4022,63 @@ class TradingAgent:
         self.ensemble.set_runtime_threshold(target)
 
     def _clear_historical_cache(self) -> None:
-        """PERF-02: drop the per-cycle historical memo at cycle start.
+        """PERF-02 + PERF-07: drop the per-cycle data memos at cycle
+        start.
 
         Resets hit/miss tallies as well so the next digest reflects a
-        single cycle, not a running total.
+        single cycle, not a running total. Both caches are cleared
+        together because they're conceptually the same cycle-bound
+        deduplication primitive applied to two different data
+        sources (REST historical vs WS tick aggregator).
         """
         self._historical_cache.clear()
         self._historical_cache_hits = 0
         self._historical_cache_misses = 0
+        self._tick_history_cache.clear()
+        self._tick_history_cache_hits = 0
+        self._tick_history_cache_misses = 0
+
+    def _get_tick_history_cached(
+        self,
+        symbol: str,
+        timeframe: str,
+        limit: int = 200,
+    ) -> "pd.DataFrame":
+        """PERF-07 (audit 2026-05-28): per-cycle memo around
+        ``tick_aggregator.get_candle_history``.
+
+        Pre-fix, the aggregator built a fresh DataFrame on every
+        call; with 300 symbols x 4 strategies that was ~1,200
+        DataFrame allocations per cycle. Most strategies on the
+        same symbol share the same timeframe (5min), so memoising
+        by ``(symbol, timeframe)`` for the duration of a single
+        cycle eliminates 60-80% of those allocations and removes
+        the gen-1/gen-2 GC pauses that previously stalled the WS
+        thread.
+
+        Cache invariants:
+          * Keyed by ``(symbol, timeframe)`` only; ``limit`` is
+            ignored after the first writer (consistent with PERF-02).
+            Every in-cycle caller through ``_evaluate_strategy``
+            currently passes ``limit=200``; if a future caller
+            needs a different limit it can call
+            ``self.tick_aggregator.get_candle_history`` directly.
+          * Empty results are NOT cached so the REST-fallback path
+            in ``_evaluate_strategy`` keeps working: a tick stream
+            that just woke up part-way through a cycle should be
+            picked up on the next strategy eval, not deferred to
+            the next cycle.
+        """
+        key = (symbol, timeframe)
+        cached = self._tick_history_cache.get(key)
+        if cached is not None:
+            self._tick_history_cache_hits += 1
+            return cached
+        self._tick_history_cache_misses += 1
+        data = self.tick_aggregator.get_candle_history(symbol, timeframe, limit=limit)
+        if data is not None and not data.empty:
+            self._tick_history_cache[key] = data
+        return data
 
     def _get_historical_cached(
         self,
@@ -4119,8 +4184,12 @@ class TradingAgent:
         try:
             timeframe = strategy.params.get("timeframe", "5min")
 
-            # Try tick-aggregated data first (fresher)
-            data = self.tick_aggregator.get_candle_history(symbol, timeframe, limit=200)
+            # Try tick-aggregated data first (fresher).
+            # PERF-07 (audit 2026-05-28): route through the per-cycle
+            # cache so 4 strategies asking for the same (symbol,
+            # timeframe) on the WS hot path only allocate one
+            # DataFrame per cycle instead of four.
+            data = self._get_tick_history_cached(symbol, timeframe, limit=200)
 
             # Fall back to REST API if no tick data. For intraday bars we ALWAYS
             # ask for at least 7 calendar days of history so early-in-session

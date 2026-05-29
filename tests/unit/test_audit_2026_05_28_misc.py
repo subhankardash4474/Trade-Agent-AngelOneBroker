@@ -51,6 +51,22 @@ Findings covered in this file:
   ``total_commission - entry_commission`` so float subtraction
   drift no longer biases reported P&L over long-running portfolios
   (Group F).
+* **PERF-07** (Medium)  -- per-cycle tick-history cache.
+  ``tick_aggregator.get_candle_history`` allocates a fresh
+  DataFrame per call. New ``_get_tick_history_cached`` on
+  TradingAgent dedup'd the calls within a single
+  ``_trading_cycle``, eliminating ~60-80% of the DataFrame
+  allocations on the WS hot path. Cleared at cycle start; empty
+  results are never cached so the REST-fallback path keeps working
+  (Group G).
+* **PERF-13** (Medium)  -- battery cache sidecar SHA256.
+  ``_save_market_data_cache`` now writes a companion
+  ``market_data.pkl.sha256`` sidecar file, and
+  ``_load_market_data_cache`` reuses the sidecar instead of
+  re-hashing 300 MB on every worker. Saves ~1-2 s per variant
+  (20-40 s per 20-variant battery). Mtime-gated fallback to
+  live hashing keeps the OBS-20 audit log identical when the
+  sidecar is missing or stale (Group G).
 """
 
 from __future__ import annotations
@@ -1665,3 +1681,619 @@ class TestNUM10DecimalCharges:
         assert "from decimal import" in src
         assert "_PAISA = Decimal" in src
         assert "ROUND_HALF_EVEN" in src
+
+
+# ============================================================
+# PERF-07 -- per-cycle tick-history allocation cache (Group G)
+# ============================================================
+
+class TestPERF07TickHistoryCache:
+    """Pin the new tick-history cache helper on TradingAgent.
+
+    Why this matters
+    ----------------
+    Pre-fix every strategy on every symbol called
+    ``tick_aggregator.get_candle_history(...)`` directly, which
+    builds a fresh DataFrame on every call. With ~300 symbols x
+    ~4 strategies that's ~1,200 DataFrame allocations per
+    cycle and was visible as gen-1/gen-2 GC pauses on the WS
+    thread.
+
+    The fix introduces a per-cycle dict on ``TradingAgent``
+    (``_tick_history_cache``) keyed by ``(symbol, timeframe)``
+    and a thin wrapper ``_get_tick_history_cached`` that the
+    ``_evaluate_strategy`` hot path now calls. The cache is
+    cleared at the top of each cycle by
+    ``_clear_historical_cache``.
+
+    These tests work directly on the helper to keep the test
+    runtime O(ms) -- spawning a real TradingAgent here would
+    pull in the whole world (broker, DB, scheduler, ...). We
+    instead build a minimal stand-in that mimics only the
+    fields the helper touches, using ``types.SimpleNamespace``.
+    """
+
+    def _make_stub(self):
+        """Construct the minimum surface area the cache helper
+        needs: a tick_aggregator with ``get_candle_history`` and
+        the three cache attributes.
+        """
+        from types import SimpleNamespace
+        from unittest.mock import MagicMock
+
+        agent = SimpleNamespace()
+        agent._tick_history_cache = {}
+        agent._tick_history_cache_hits = 0
+        agent._tick_history_cache_misses = 0
+
+        agent.tick_aggregator = SimpleNamespace()
+        agent.tick_aggregator.get_candle_history = MagicMock()
+        return agent
+
+    def _bound_helper(self, agent):
+        """Bind ``TradingAgent._get_tick_history_cached`` onto
+        the stub so we exercise the real implementation.
+        """
+        from trading_agent import TradingAgent
+        return TradingAgent._get_tick_history_cached.__get__(agent)
+
+    def _bound_clear(self, agent):
+        from trading_agent import TradingAgent
+        return TradingAgent._clear_historical_cache.__get__(agent)
+
+    def test_first_call_misses_and_invokes_aggregator(self):
+        import pandas as pd
+
+        agent = self._make_stub()
+        df = pd.DataFrame({"close": [1.0, 2.0, 3.0]})
+        agent.tick_aggregator.get_candle_history.return_value = df
+
+        helper = self._bound_helper(agent)
+        out = helper("HDFCBANK", "5min", limit=200)
+
+        assert out is df
+        assert agent._tick_history_cache_hits == 0
+        assert agent._tick_history_cache_misses == 1
+        agent.tick_aggregator.get_candle_history.assert_called_once_with(
+            "HDFCBANK", "5min", limit=200
+        )
+
+    def test_second_call_same_key_hits_cache(self):
+        import pandas as pd
+
+        agent = self._make_stub()
+        df = pd.DataFrame({"close": [1.0, 2.0, 3.0]})
+        agent.tick_aggregator.get_candle_history.return_value = df
+
+        helper = self._bound_helper(agent)
+        a = helper("HDFCBANK", "5min", limit=200)
+        b = helper("HDFCBANK", "5min", limit=200)
+
+        assert a is b
+        assert agent._tick_history_cache_hits == 1
+        assert agent._tick_history_cache_misses == 1
+        # Aggregator only called on the first miss.
+        assert agent.tick_aggregator.get_candle_history.call_count == 1
+
+    def test_different_symbol_misses_separately(self):
+        import pandas as pd
+
+        agent = self._make_stub()
+        agent.tick_aggregator.get_candle_history.side_effect = [
+            pd.DataFrame({"close": [1.0]}),
+            pd.DataFrame({"close": [2.0]}),
+        ]
+        helper = self._bound_helper(agent)
+        helper("HDFCBANK", "5min", limit=200)
+        helper("RELIANCE", "5min", limit=200)
+        assert agent._tick_history_cache_misses == 2
+        assert agent._tick_history_cache_hits == 0
+        assert len(agent._tick_history_cache) == 2
+
+    def test_different_timeframe_misses_separately(self):
+        import pandas as pd
+
+        agent = self._make_stub()
+        agent.tick_aggregator.get_candle_history.side_effect = [
+            pd.DataFrame({"close": [1.0]}),
+            pd.DataFrame({"close": [2.0]}),
+        ]
+        helper = self._bound_helper(agent)
+        helper("HDFCBANK", "5min", limit=200)
+        helper("HDFCBANK", "15min", limit=200)
+        assert agent._tick_history_cache_misses == 2
+        assert agent._tick_history_cache_hits == 0
+        assert ("HDFCBANK", "5min") in agent._tick_history_cache
+        assert ("HDFCBANK", "15min") in agent._tick_history_cache
+
+    def test_empty_dataframe_is_not_cached(self):
+        """If the tick aggregator hasn't aggregated this symbol yet
+        it returns an empty frame. Caching the empty frame would
+        wedge the symbol for the rest of the cycle and starve the
+        REST-fallback path inside ``_evaluate_strategy``. Therefore
+        empty frames must NOT be cached.
+        """
+        import pandas as pd
+
+        agent = self._make_stub()
+        empty = pd.DataFrame()
+        agent.tick_aggregator.get_candle_history.return_value = empty
+        helper = self._bound_helper(agent)
+        out1 = helper("ZEEL", "5min", limit=200)
+        out2 = helper("ZEEL", "5min", limit=200)
+        assert out1 is empty and out2 is empty
+        # Both calls were misses -- nothing got cached.
+        assert agent._tick_history_cache_misses == 2
+        assert agent._tick_history_cache_hits == 0
+        assert agent._tick_history_cache == {}
+        assert agent.tick_aggregator.get_candle_history.call_count == 2
+
+    def test_none_result_is_not_cached(self):
+        """Some aggregator paths return ``None`` instead of empty.
+        Same reasoning -- don't cache or we starve the fallback.
+        """
+        agent = self._make_stub()
+        agent.tick_aggregator.get_candle_history.return_value = None
+        helper = self._bound_helper(agent)
+        out1 = helper("ZEEL", "5min", limit=200)
+        out2 = helper("ZEEL", "5min", limit=200)
+        assert out1 is None and out2 is None
+        assert agent._tick_history_cache_misses == 2
+        assert agent._tick_history_cache_hits == 0
+        assert agent._tick_history_cache == {}
+
+    def test_clear_resets_cache_and_counters(self):
+        import pandas as pd
+
+        agent = self._make_stub()
+        agent.tick_aggregator.get_candle_history.return_value = (
+            pd.DataFrame({"close": [1.0, 2.0, 3.0]})
+        )
+        helper = self._bound_helper(agent)
+        clear = self._bound_clear(agent)
+
+        # Need _historical_cache too because _clear_historical_cache
+        # touches both sets of attributes.
+        agent._historical_cache = {}
+        agent._historical_cache_hits = 0
+        agent._historical_cache_misses = 0
+
+        helper("HDFCBANK", "5min", limit=200)
+        helper("HDFCBANK", "5min", limit=200)
+        assert agent._tick_history_cache_hits == 1
+        assert agent._tick_history_cache_misses == 1
+        assert len(agent._tick_history_cache) == 1
+
+        clear()
+        assert agent._tick_history_cache == {}
+        assert agent._tick_history_cache_hits == 0
+        assert agent._tick_history_cache_misses == 0
+
+    def test_evaluate_strategy_uses_cached_helper(self):
+        """Source-level pin: ``_evaluate_strategy`` must route the
+        tick-aggregator call through ``_get_tick_history_cached``.
+        A future refactor that goes back to calling
+        ``self.tick_aggregator.get_candle_history`` directly from
+        the hot path would silently re-introduce the alloc churn
+        and would not be caught by behavioural tests.
+        """
+        import re
+        path = os.path.join(PROJECT_ROOT, "trading_agent.py")
+        with open(path, "r", encoding="utf-8") as fh:
+            src = fh.read()
+        idx = src.find("def _evaluate_strategy(")
+        assert idx >= 0
+        next_def = src.find("\n    def ", idx + 1)
+        body = src[idx:next_def]
+
+        # Positive: helper is invoked from inside _evaluate_strategy.
+        assert re.search(r"self\._get_tick_history_cached\s*\(", body), (
+            "PERF-07 regression: _evaluate_strategy no longer routes "
+            "through _get_tick_history_cached. The WS hot path will "
+            "re-allocate ~1k DataFrames per cycle and the GC pauses "
+            "will return."
+        )
+
+        # Negative: must NOT call the aggregator directly inside
+        # _evaluate_strategy. Strip comments + docstrings before
+        # scanning (so the explanatory annotation doesn't trip the
+        # regex).
+        body_no_comments = re.sub(r"#[^\n]*", "", body)
+        body_no_comments = re.sub(r'"""[\s\S]*?"""', "", body_no_comments)
+        bad = re.search(
+            r"self\.tick_aggregator\.get_candle_history\s*\(",
+            body_no_comments,
+        )
+        assert bad is None, (
+            "PERF-07 regression: _evaluate_strategy is calling "
+            "self.tick_aggregator.get_candle_history directly; route "
+            "through self._get_tick_history_cached(...) instead so "
+            "multi-strategy multi-symbol cycles stay alloc-bounded."
+        )
+
+    def test_clear_historical_cache_clears_tick_cache_too(self):
+        """Source-level pin: ``_clear_historical_cache`` must
+        clear *both* the historical (PERF-02) cache and the new
+        tick (PERF-07) cache. Otherwise stale tick-history rows
+        would survive into the next cycle and the cache would
+        no longer be cycle-bounded.
+        """
+        path = os.path.join(PROJECT_ROOT, "trading_agent.py")
+        with open(path, "r", encoding="utf-8") as fh:
+            src = fh.read()
+        idx = src.find("def _clear_historical_cache(")
+        assert idx >= 0
+        next_def = src.find("\n    def ", idx + 1)
+        body = src[idx:next_def]
+
+        assert "_tick_history_cache.clear()" in body, (
+            "PERF-07 regression: _clear_historical_cache no longer "
+            "clears _tick_history_cache. The cache must be reset at "
+            "cycle start so it stays cycle-bounded."
+        )
+        assert "_tick_history_cache_hits = 0" in body
+        assert "_tick_history_cache_misses = 0" in body
+
+    def test_init_seeds_tick_cache_attributes(self):
+        """Source-level pin: TradingAgent.__init__ must seed the
+        three cache attributes before any cycle runs. Forgetting
+        this would AttributeError on the first
+        _get_tick_history_cached call.
+        """
+        path = os.path.join(PROJECT_ROOT, "trading_agent.py")
+        with open(path, "r", encoding="utf-8") as fh:
+            src = fh.read()
+        idx = src.find("class TradingAgent")
+        init_idx = src.find("def __init__(", idx)
+        assert init_idx >= 0
+        # The cap of the init body is wherever the next def starts
+        # at 4-space indentation.
+        next_def = src.find("\n    def ", init_idx + 1)
+        body = src[init_idx:next_def]
+        assert "self._tick_history_cache" in body, (
+            "PERF-07 regression: TradingAgent.__init__ no longer "
+            "initialises self._tick_history_cache. The first "
+            "_get_tick_history_cached call will AttributeError."
+        )
+        assert "self._tick_history_cache_hits" in body
+        assert "self._tick_history_cache_misses" in body
+
+
+# ============================================================
+# PERF-13 -- battery cache sidecar SHA256 (Group G)
+# ============================================================
+
+class TestPERF13BatteryCacheSidecar:
+    """Pin the sidecar-hash optimisation for the battery cache load.
+
+    Why this matters
+    ----------------
+    The 20-variant battery used to re-hash a 300 MB
+    ``market_data.pkl`` once per worker (max_tasks_per_child=1
+    forces a fresh worker per variant). At ~1-2 s per hash that
+    was 20-40 s of pure redundant work per battery — the parent
+    process already knew the digest at cache-write time.
+
+    The fix: write a sidecar ``market_data.pkl.sha256`` next to
+    the cache. Loaders parse the sidecar (mtime-gated) and skip
+    rehashing. If the sidecar is missing or stale we fall back
+    to live hashing so the OBS-20 audit log remains intact.
+
+    These tests work directly on
+    ``_save_market_data_cache`` / ``_load_market_data_cache``
+    using a tiny synthetic dict so the test runtime is sub-second
+    (300 MB end-to-end would be too slow + brittle for unit
+    tests).
+    """
+
+    def _import_battery(self):
+        # battery.py pulls in pandas/yfinance/etc; importing on
+        # demand keeps the import cost out of the rest of the
+        # suite.
+        from research import battery
+        return battery
+
+    def _make_market_data(self):
+        import pandas as pd
+        idx = pd.date_range("2026-05-01", periods=4, freq="5min")
+        return {
+            "HDFCBANK": pd.DataFrame(
+                {"close": [1.0, 2.0, 3.0, 4.0]}, index=idx
+            ),
+            "RELIANCE": pd.DataFrame(
+                {"close": [10.0, 20.0, 30.0, 40.0]}, index=idx
+            ),
+        }
+
+    def test_save_writes_sidecar_with_full_64char_hash(self, tmp_path):
+        battery = self._import_battery()
+        battery._save_market_data_cache(tmp_path, self._make_market_data())
+
+        pkl = tmp_path / "market_data.pkl"
+        sidecar = tmp_path / "market_data.pkl.sha256"
+        assert pkl.exists()
+        assert sidecar.exists(), (
+            "PERF-13 regression: _save_market_data_cache no longer "
+            "writes the .sha256 sidecar; workers will fall back to "
+            "rehashing 300 MB per variant."
+        )
+
+        text = sidecar.read_text(encoding="utf-8").strip()
+        first_line = text.splitlines()[0]
+        parts = first_line.split()
+        digest = parts[0]
+        assert len(digest) == 64
+        assert all(c in "0123456789abcdef" for c in digest)
+
+        # Sanity: the sidecar's hash is the actual SHA256 of the .pkl.
+        live = battery._sha256_file(pkl)
+        assert digest == live
+
+    def test_save_sidecar_includes_mtime_field(self, tmp_path):
+        battery = self._import_battery()
+        battery._save_market_data_cache(tmp_path, self._make_market_data())
+        sidecar = tmp_path / "market_data.pkl.sha256"
+        text = sidecar.read_text(encoding="utf-8")
+        # Mtime gate is the safety net against stale-sidecar
+        # corruption — it must be present.
+        assert "mtime=" in text, (
+            "PERF-13 regression: sidecar missing mtime field; the "
+            "load path can no longer detect stale sidecars and may "
+            "log incorrect SHAs."
+        )
+
+    def test_load_uses_sidecar_when_fresh(self, tmp_path, caplog):
+        import logging
+        battery = self._import_battery()
+        battery._save_market_data_cache(tmp_path, self._make_market_data())
+
+        # Patch _sha256_file with a tripwire so we can prove the
+        # load path skipped it.
+        called = {"n": 0}
+        original = battery._sha256_file
+
+        def tripwire(path, *a, **kw):
+            called["n"] += 1
+            return original(path, *a, **kw)
+        battery._sha256_file = tripwire
+        try:
+            with caplog.at_level(logging.INFO):
+                md = battery._load_market_data_cache(tmp_path)
+        finally:
+            battery._sha256_file = original
+
+        assert md is not None
+        assert called["n"] == 0, (
+            "PERF-13 regression: load path is still re-hashing the "
+            "300 MB pickle even though a fresh sidecar exists. The "
+            "20-40 s per-battery overhead is back."
+        )
+
+    def test_load_falls_back_to_live_hash_when_sidecar_missing(
+        self, tmp_path, caplog
+    ):
+        import logging
+        battery = self._import_battery()
+        battery._save_market_data_cache(tmp_path, self._make_market_data())
+
+        sidecar = tmp_path / "market_data.pkl.sha256"
+        sidecar.unlink()
+
+        called = {"n": 0}
+        original = battery._sha256_file
+
+        def tripwire(path, *a, **kw):
+            called["n"] += 1
+            return original(path, *a, **kw)
+        battery._sha256_file = tripwire
+        try:
+            with caplog.at_level(logging.INFO):
+                md = battery._load_market_data_cache(tmp_path)
+        finally:
+            battery._sha256_file = original
+
+        assert md is not None
+        assert called["n"] >= 1, (
+            "PERF-13 regression: sidecar removed but load path didn't "
+            "fall back to live hashing — OBS-20 audit log will lose "
+            "its sha256[:16] field."
+        )
+
+    def test_load_falls_back_when_sidecar_mtime_stale(self, tmp_path):
+        import os as _os
+        import time
+        battery = self._import_battery()
+        battery._save_market_data_cache(tmp_path, self._make_market_data())
+
+        sidecar = tmp_path / "market_data.pkl.sha256"
+        original_text = sidecar.read_text(encoding="utf-8").strip()
+        parts = original_text.splitlines()[0].split()
+        digest = parts[0]
+        # Force a known-bad mtime (1 hour off) in the sidecar so the
+        # gate must fail.
+        pkl = tmp_path / "market_data.pkl"
+        pkl_mtime = pkl.stat().st_mtime
+        bad_mtime = pkl_mtime - 3600
+        sidecar.write_text(
+            f"{digest}  {pkl.name}  mtime={bad_mtime:.0f}\n",
+            encoding="utf-8",
+        )
+
+        # Re-touch pickle so its mtime stays ahead of the bad sidecar.
+        # (On fast filesystems write+stat timing can be subsecond
+        # which the helper rounds away.)
+        time.sleep(0.05)
+
+        live_called = {"n": 0}
+        original = battery._sha256_file
+
+        def tripwire(path, *a, **kw):
+            live_called["n"] += 1
+            return original(path, *a, **kw)
+        battery._sha256_file = tripwire
+        try:
+            md = battery._load_market_data_cache(tmp_path)
+        finally:
+            battery._sha256_file = original
+
+        assert md is not None
+        assert live_called["n"] >= 1, (
+            "PERF-13 regression: stale sidecar mtime should disqualify "
+            "the sidecar but the load path used it anyway."
+        )
+
+    def test_read_sidecar_hash_rejects_corrupt_digest(self, tmp_path):
+        battery = self._import_battery()
+        battery._save_market_data_cache(tmp_path, self._make_market_data())
+        sidecar = tmp_path / "market_data.pkl.sha256"
+        pkl = tmp_path / "market_data.pkl"
+        # Length-correct but non-hex digest.
+        sidecar.write_text(
+            "Z" * 64
+            + f"  {pkl.name}  mtime={pkl.stat().st_mtime:.0f}\n",
+            encoding="utf-8",
+        )
+        assert battery._read_sidecar_hash(pkl) is None
+
+    def test_read_sidecar_hash_rejects_wrong_length_digest(self, tmp_path):
+        battery = self._import_battery()
+        battery._save_market_data_cache(tmp_path, self._make_market_data())
+        sidecar = tmp_path / "market_data.pkl.sha256"
+        pkl = tmp_path / "market_data.pkl"
+        # 32-char hex (truncated SHA) — must be rejected.
+        sidecar.write_text(
+            "deadbeef" * 4 + f"  {pkl.name}  mtime={pkl.stat().st_mtime:.0f}\n",
+            encoding="utf-8",
+        )
+        assert battery._read_sidecar_hash(pkl) is None
+
+    def test_read_sidecar_hash_rejects_missing_mtime_field(self, tmp_path):
+        battery = self._import_battery()
+        battery._save_market_data_cache(tmp_path, self._make_market_data())
+        sidecar = tmp_path / "market_data.pkl.sha256"
+        pkl = tmp_path / "market_data.pkl"
+        digest = battery._sha256_file(pkl)
+        sidecar.write_text(f"{digest}  {pkl.name}\n", encoding="utf-8")
+        # No mtime token => can't gate => must reject.
+        assert battery._read_sidecar_hash(pkl) is None
+
+    def test_read_sidecar_hash_returns_full_digest_on_fresh_pair(
+        self, tmp_path
+    ):
+        battery = self._import_battery()
+        battery._save_market_data_cache(tmp_path, self._make_market_data())
+        pkl = tmp_path / "market_data.pkl"
+        digest = battery._read_sidecar_hash(pkl)
+        assert digest is not None
+        assert digest == battery._sha256_file(pkl)
+        assert len(digest) == 64
+
+    def test_load_log_line_marks_hash_source(self, tmp_path, caplog):
+        """OBS-20 / PERF-13 audit hygiene: the load log line now
+        reports ``hash_source=sidecar`` vs ``hash_source=live`` so
+        operators inspecting a battery log can tell at a glance
+        whether the worker spent the rehash budget or skipped it.
+        """
+        import logging
+        battery = self._import_battery()
+        battery._save_market_data_cache(tmp_path, self._make_market_data())
+
+        # Loguru -> caplog plumbing: the load function logs through
+        # loguru; intercept by reading the log file via a patched
+        # logger sink. Easier: just check the log message via
+        # loguru's record callback.
+        from loguru import logger as _lg
+        records = []
+        sink_id = _lg.add(
+            lambda msg: records.append(str(msg)),
+            level="INFO",
+        )
+        try:
+            md = battery._load_market_data_cache(tmp_path)
+        finally:
+            _lg.remove(sink_id)
+
+        assert md is not None
+        joined = "\n".join(records)
+        assert "hash_source=sidecar" in joined, (
+            "PERF-13 regression: the load log line no longer marks "
+            "which hash path was taken. Operator visibility into the "
+            "20-40 s/battery rehash cost is gone."
+        )
+
+    def test_load_log_line_marks_live_source_when_sidecar_missing(
+        self, tmp_path
+    ):
+        battery = self._import_battery()
+        battery._save_market_data_cache(tmp_path, self._make_market_data())
+        sidecar = tmp_path / "market_data.pkl.sha256"
+        sidecar.unlink()
+
+        from loguru import logger as _lg
+        records = []
+        sink_id = _lg.add(
+            lambda msg: records.append(str(msg)),
+            level="INFO",
+        )
+        try:
+            md = battery._load_market_data_cache(tmp_path)
+        finally:
+            _lg.remove(sink_id)
+
+        assert md is not None
+        joined = "\n".join(records)
+        assert "hash_source=live" in joined, (
+            "PERF-13 regression: when the sidecar is missing the "
+            "loader must still log hash_source=live so the audit "
+            "trail records that the slow path was taken."
+        )
+
+    def test_save_failure_to_write_sidecar_does_not_fail_save(
+        self, tmp_path, monkeypatch
+    ):
+        """The sidecar is best-effort: a sidecar I/O error must
+        not corrupt the .pkl write. Workers will fall back to
+        live hashing.
+        """
+        import pathlib
+        battery = self._import_battery()
+
+        # Force Path.write_text on the sidecar to raise; the .pkl
+        # write must still succeed and the function must return
+        # without raising.
+        original_write_text = pathlib.Path.write_text
+
+        def patched_write_text(self, *a, **kw):
+            if str(self).endswith(".sha256"):
+                raise OSError("simulated sidecar write failure")
+            return original_write_text(self, *a, **kw)
+
+        monkeypatch.setattr(pathlib.Path, "write_text", patched_write_text)
+        battery._save_market_data_cache(tmp_path, self._make_market_data())
+
+        pkl = tmp_path / "market_data.pkl"
+        sidecar = tmp_path / "market_data.pkl.sha256"
+        assert pkl.exists(), (
+            "PERF-13 regression: a sidecar write failure took down "
+            "the .pkl write itself. The sidecar is supposed to be "
+            "best-effort."
+        )
+        assert not sidecar.exists()
+        # And subsequent load must still work via live hashing.
+        md = battery._load_market_data_cache(tmp_path)
+        assert md is not None
+
+    def test_source_pins_perf13(self):
+        """Anchor the audit ID + helper symbols in the source."""
+        path = os.path.join(PROJECT_ROOT, "packages", "research", "battery.py")
+        with open(path, "r", encoding="utf-8") as fh:
+            src = fh.read()
+        assert "PERF-13" in src, (
+            "PERF-13 regression: audit anchor missing from "
+            "battery.py; refactor probably reverted the sidecar "
+            "optimisation."
+        )
+        assert "def _sha256_file(" in src
+        assert "def _read_sidecar_hash(" in src
+        assert ".sha256" in src
+

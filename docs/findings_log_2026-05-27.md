@@ -2898,3 +2898,248 @@ can be picked up opportunistically alongside the next perf
 sprint.
 
 
+## 20. Misc-OPEN bucket — Group G: WS hot-path + battery boot perf (PERF-07, PERF-13)
+
+**Audit IDs:** PERF-07, PERF-13.
+**Severity:** both Medium (perf, not correctness).
+**Date:** 2026-05-30.
+**Files touched:** `trading_agent.py` (PERF-07),
+`packages/research/battery.py` (PERF-13),
+`tests/unit/test_audit_2026_05_28_misc.py` (new tests),
+`tests/unit/test_audit_2026_05_28_phase1.py`
+(PERF-02 + OBS-20 pins updated to follow the helper extraction
+in PERF-13 and the second cache in PERF-07).
+
+### 20.1 What was broken
+
+**PERF-07 — DataFrame allocation churn on the WS hot path.**
+Every strategy on every symbol calls
+`tick_aggregator.get_candle_history(symbol, timeframe, limit=200)`
+through `_evaluate_strategy`. The aggregator builds a fresh
+DataFrame on every call. With ~300 symbols × ~4 strategies on a
+shared 5min timeframe that's ~1,200 DataFrame allocations per
+trading cycle. The allocations are short-lived (one cycle) and
+identical per `(symbol, timeframe)` key, so most of that work is
+duplicate. The follow-on cost is gen-1/gen-2 GC pauses on the
+WS thread of 10-50 ms each, which compete with tick processing
+and noticeably stretch the digest line. The `_get_historical_cached`
+PERF-02 cache already proves this pattern works for the REST
+historical path; the WS aggregator path was just the other half
+that hadn't been wired yet.
+
+**PERF-13 — battery cache rehash redundancy.**
+The OBS-20 phase-1 fix added a SHA256 to the
+`_load_market_data_cache` log line for research reproducibility
+(any worker's cache load can be cross-referenced against the
+parent's cache write). The implementation re-hashed the
+`~300 MB market_data.pkl` *inside every worker*. With
+`max_tasks_per_child=1` (Bug F isolation) and ~20 variants per
+battery that's ~20 × 1-2 s = 20-40 s of pure redundant work per
+battery — the parent process already knew the digest at
+cache-write time. The rehash also pages 300 MB through the
+worker's read buffer (in addition to the unpickle), doubling
+the I/O for no audit benefit.
+
+### 20.2 Fix
+
+**PERF-07 design.**
+*Mirror PERF-02's per-cycle memo for the tick-aggregator path.*
+
+* New attributes on `TradingAgent.__init__`:
+  `_tick_history_cache: Dict[(symbol, timeframe), DataFrame]`,
+  `_tick_history_cache_hits`, `_tick_history_cache_misses`.
+* New helper `_get_tick_history_cached(symbol, timeframe, limit=200)`:
+  * keyed by `(symbol, timeframe)` only — first writer wins,
+    subsequent callers in the same cycle get the cached frame
+    even if their requested `limit` differs (consistent with
+    PERF-02's window semantics).
+  * Empty/None results are **not** cached. Reasoning: an empty
+    return is a "tick stream not warmed up yet" signal; if we
+    cached it we'd starve the REST-fallback path inside
+    `_evaluate_strategy` for the rest of the cycle. Letting it
+    miss again on the next strategy eval gives the aggregator a
+    chance to publish data that arrived part-way through the
+    cycle.
+* `_evaluate_strategy` now calls
+  `self._get_tick_history_cached(symbol, timeframe, limit=200)`
+  instead of `self.tick_aggregator.get_candle_history(...)`
+  directly.
+* `_clear_historical_cache` (renamed-but-actually-same; called at
+  cycle start) clears both caches plus their counters together.
+
+Expected impact at 300 symbols × 4 strategies on a shared
+5min timeframe: ~75% miss rate (one miss per symbol-timeframe,
+three hits per symbol-timeframe) → ~3-4× alloc reduction on
+the eval micro-phase. The strategies are still doing their own
+internal copies, so the wall-time win is dominated by the GC
+pauses we no longer take.
+
+**PERF-13 design.**
+*Move the SHA256 from the worker boot to the parent's cache
+write — one hash per battery instead of one hash per worker.*
+
+* New helper `_sha256_file(path, chunk_bytes=1<<20)` factored
+  out of the prior inline hashing so writer and reader share a
+  single implementation (a drift between them would silently
+  invalidate every cache and undo the whole optimisation).
+* `_save_market_data_cache` now writes a sidecar
+  `market_data.pkl.sha256` next to the cache:
+  `<64-hex>  market_data.pkl  mtime=<float>\n`. The format is
+  intentionally compatible with `sha256sum -c` style consumers
+  and human readers.
+* `_read_sidecar_hash(cache_path)` parses the sidecar, returns
+  the 64-char digest only when:
+  * the sidecar exists,
+  * the digest is exactly 64 chars of lowercase hex,
+  * an `mtime=<float>` token is present, **and**
+  * the sidecar's mtime is within 1 second of the .pkl's
+    current mtime.
+  Otherwise returns `None` and the load path falls back to live
+  hashing (== identical to the OBS-20 implementation).
+* `_load_market_data_cache` log line now tags the source:
+  `hash_source=sidecar` vs `hash_source=live`. Operators
+  inspecting a battery log can tell at a glance which workers
+  paid the rehash budget.
+* Sidecar writes are **best-effort**: a `monkeypatch` test
+  forces `Path.write_text` to raise on the .sha256 file and
+  asserts the .pkl write itself still succeeds. Workers fall
+  back to live hashing in that scenario — no audit regression.
+
+Expected impact: ~1-2 s/variant × ~20 variants =
+**20-40 s saved per 20-variant battery**. Process-isolation
+(Bug F) is fully preserved (`max_tasks_per_child=1` unchanged).
+
+### 20.3 Test coverage
+
+23 new regression tests added to
+`tests/unit/test_audit_2026_05_28_misc.py`:
+
+`TestPERF07TickHistoryCache` (10):
+
+* `test_first_call_misses_and_invokes_aggregator` — initial
+  call records a miss and invokes the aggregator.
+* `test_second_call_same_key_hits_cache` — the second call
+  doesn't touch the aggregator at all and records a hit.
+* `test_different_symbol_misses_separately` — keys are
+  per-symbol.
+* `test_different_timeframe_misses_separately` — keys are
+  per-timeframe (so 5min and 15min both cache).
+* `test_empty_dataframe_is_not_cached` — empty frames must NOT
+  be cached (REST-fallback would starve otherwise).
+* `test_none_result_is_not_cached` — None results must NOT be
+  cached either.
+* `test_clear_resets_cache_and_counters` — `_clear_historical_cache`
+  drops both caches and their counters in one shot.
+* `test_evaluate_strategy_uses_cached_helper` — source-level
+  pin that `_evaluate_strategy` routes through
+  `_get_tick_history_cached` and does NOT call the aggregator
+  directly (negative + positive form, with comments stripped so
+  documentation can't trip the regex).
+* `test_clear_historical_cache_clears_tick_cache_too` —
+  source-level pin that the clear helper resets both caches.
+* `test_init_seeds_tick_cache_attributes` — source-level pin
+  that `TradingAgent.__init__` initialises the three cache
+  attributes (skipping this would AttributeError on first
+  call).
+
+`TestPERF13BatteryCacheSidecar` (13):
+
+* `test_save_writes_sidecar_with_full_64char_hash` — the
+  saved sidecar's digest matches `_sha256_file(pkl)` exactly.
+* `test_save_sidecar_includes_mtime_field` — mtime is the
+  staleness-detection mechanism; it must be present.
+* `test_load_uses_sidecar_when_fresh` — patches `_sha256_file`
+  with a tripwire and asserts the load path doesn't call it
+  when the sidecar is fresh (this is the actual perf win).
+* `test_load_falls_back_to_live_hash_when_sidecar_missing` —
+  delete sidecar, prove the load path lives-hashes.
+* `test_load_falls_back_when_sidecar_mtime_stale` — write a
+  bad mtime in the sidecar, prove the gate rejects it and
+  the loader falls back.
+* `test_read_sidecar_hash_rejects_corrupt_digest` — non-hex
+  in the digest field → reject.
+* `test_read_sidecar_hash_rejects_wrong_length_digest` — 32
+  chars instead of 64 → reject.
+* `test_read_sidecar_hash_rejects_missing_mtime_field` —
+  no mtime token → reject.
+* `test_read_sidecar_hash_returns_full_digest_on_fresh_pair` —
+  positive case round-trip.
+* `test_load_log_line_marks_hash_source` — the load log
+  contains `hash_source=sidecar` on the fast path.
+* `test_load_log_line_marks_live_source_when_sidecar_missing` —
+  the load log contains `hash_source=live` on the fallback
+  path.
+* `test_save_failure_to_write_sidecar_does_not_fail_save` —
+  monkeypatch sidecar write to raise; .pkl write still
+  succeeds; subsequent load works via live hashing.
+* `test_source_pins_perf13` — anchor the audit ID + helper
+  symbols (`_sha256_file`, `_read_sidecar_hash`) in the
+  source so a future refactor can't silently drop them.
+
+Two phase-1 tests updated to follow the helper extraction:
+
+* `test_perf02_clear_resets_cache_and_tallies` — now seeds
+  the new tick cache attributes too and asserts they're
+  cleared (fails closed if `_clear_historical_cache` ever
+  forgets the second cache).
+* `test_obs20_battery_cache_load_logs_sha256` — pin relaxed
+  to accept either `hashlib`, `_sha256_file`, or
+  `_read_sidecar_hash` as the path through which the load
+  reaches a SHA256 implementation. The `sha256[:16]` log
+  field check is unchanged, so the OBS-20 audit contract is
+  enforced exactly as before.
+
+### 20.4 Suite results
+
+* `tests/unit/test_audit_2026_05_28_misc.py::TestPERF07TickHistoryCache` — 10/10 PASS.
+* `tests/unit/test_audit_2026_05_28_misc.py::TestPERF13BatteryCacheSidecar` — 13/13 PASS.
+* Full unit suite — **1,648/1,648 PASS** (39.91s).
+* Full integration suite — **248/248 PASS** (29.60s).
+
+### 20.5 Honest caveats
+
+* PERF-07's caching layer is keyed by `(symbol, timeframe)`
+  and doesn't honour `limit`. Every existing in-cycle caller
+  passes `limit=200`, so this is fine today; if a future
+  caller needs a different limit the comment in
+  `_get_tick_history_cached` documents the bypass route
+  (call `self.tick_aggregator.get_candle_history` directly).
+  This trade-off is identical to the PERF-02 cache.
+* PERF-13's mtime gate is 1-second granular. On a fast
+  filesystem with sub-second .pkl rewrites the sidecar could
+  theoretically be accepted on the very next read after a
+  rewrite. We accept this because (a) the actual payload
+  hashes are still consistent (`_sha256_file` over the new
+  bytes would yield a different digest, and the next
+  re-saving would regenerate the sidecar), and (b) the
+  battery harness only writes the cache once per
+  battery-creation, never re-writing during a battery.
+* The PERF-07 win is observed via gen-1/gen-2 GC pause
+  reduction more than via the per-call wall-time. The unit
+  tests verify the contract (hits, misses, no double-call
+  to the aggregator); the actual perf delta will surface on
+  the next live-mode `[CYCLE-DIGEST]`.
+* The PERF-13 win is observed in the per-variant boot phase
+  before `bt.run()` begins. The unit tests verify the
+  sidecar logic; the actual perf delta will surface on the
+  next 20-variant battery as a 20-40 s drop in the
+  cumulative `[WORKER] starting variant ... market_data
+  loaded ...` interval.
+
+### 20.6 What's left in the misc-OPEN bucket
+
+Done in this commit: PERF-07, PERF-13.
+Done in `3d2e962`: NUM-10 (Group F).
+Done in `1518b24`: ORD-10 (Group E).
+Done in `f7d90cc`: NUM-11, ORD-11 (Group D).
+Done in `d578ff1`: ORD-05, ORD-07, ORD-08, ORD-09 (Group C).
+Done in `da7ab69`: NUM-06, NUM-07 (Group B).
+Done in `03ba66d`: NUM-01 (Group A).
+
+**All 13 misc-OPEN findings now closed.** Combined with the
+five named phases (1-5), the 2026-05-28 audit is now fully
+landed: **86 of 86 findings closed**, with regression coverage
+attached to every fix. Next move is the deploy decision (still
+gated on the Friday morning V15 verdict; see `friday_review_2026-05-29.md`).
+
+

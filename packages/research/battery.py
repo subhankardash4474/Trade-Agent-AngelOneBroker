@@ -515,35 +515,154 @@ def _summary_row(name: str, result) -> dict:
     }
 
 
+def _sha256_file(path: Path, *, chunk_bytes: int = 1 << 20) -> str:
+    """Stream a SHA256 over ``path`` in 1 MiB chunks.
+
+    Factored out so PERF-13's sidecar writer and the load-time
+    fallback both call exactly the same hashing routine — a drift
+    between writer and reader would silently invalidate every
+    cache on every worker and regress straight back to the
+    pre-fix per-worker rehash cost.
+    """
+    import hashlib
+    sha = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(chunk_bytes), b""):
+            sha.update(chunk)
+    return sha.hexdigest()
+
+
 def _save_market_data_cache(out_root: Path, market_data: dict) -> None:
-    """Pickle the pre-downloaded + feature-enriched market_data for resume."""
+    """Pickle the pre-downloaded + feature-enriched market_data for resume.
+
+    PERF-13 (audit 2026-05-28): also writes a sidecar
+    ``market_data.pkl.sha256`` next to the cache. The hash is the
+    full 64-char SHA256 of the .pkl bytes. Workers reuse this
+    sidecar on load instead of re-hashing 300 MB themselves —
+    that re-hash was costing ~1-2 s per variant (20-40 s wall
+    over a 20-variant battery) for an audit log line we already
+    knew the value of at write time.
+
+    The sidecar is best-effort. If the sidecar write fails we
+    still keep the .pkl; workers will fall back to recomputing
+    the hash, exactly as in the OBS-20 implementation. We do
+    NOT delete a stale sidecar from a previous run because the
+    load path verifies sidecar mtime against pkl mtime before
+    trusting it.
+    """
     cache_path = out_root / "market_data.pkl"
     try:
         with cache_path.open("wb") as f:
             pickle.dump(market_data, f, protocol=pickle.HIGHEST_PROTOCOL)
         size_mb = cache_path.stat().st_size / (1024 * 1024)
-        logger.info(f"[BATTERY] market_data cached ({size_mb:.1f} MB) -> {cache_path}")
+        # PERF-13: hash + write sidecar before the success log so
+        # we never report success on a cache that has no
+        # companion hash.
+        try:
+            full_hash = _sha256_file(cache_path)
+            sidecar = cache_path.with_suffix(cache_path.suffix + ".sha256")
+            mtime = cache_path.stat().st_mtime
+            # Format: "<hex>  <basename>  mtime=<float>" — robust to
+            # `sha256sum -c` style consumers and human readers.
+            sidecar.write_text(
+                f"{full_hash}  {cache_path.name}  mtime={mtime:.0f}\n",
+                encoding="utf-8",
+            )
+            logger.info(
+                f"[BATTERY] market_data cached ({size_mb:.1f} MB, "
+                f"sha256[:16]={full_hash[:16]}) -> {cache_path}"
+            )
+        except Exception as e:
+            # Sidecar is best-effort; never fail the cache write
+            # because we couldn't write the companion hash.
+            logger.warning(
+                f"[BATTERY] market_data cached ({size_mb:.1f} MB) -> "
+                f"{cache_path} (sidecar hash write failed: {e}; "
+                f"workers will fall back to recomputing the hash)"
+            )
     except Exception as e:
         logger.warning(f"[BATTERY] failed to cache market_data: {e}")
 
 
+def _read_sidecar_hash(cache_path: Path) -> str | None:
+    """PERF-13: parse the sidecar SHA256 file written by
+    ``_save_market_data_cache``.
+
+    Returns the 64-char lowercase hex digest if the sidecar
+    exists, has the same mtime stamp as the .pkl, and parses;
+    otherwise ``None`` so the caller falls back to live hashing.
+
+    Mtime gating is the safety net: if someone mutates the
+    .pkl in-place (resume, rsync, manual repro) the sidecar
+    will lag and we *must* fall back to live hashing rather
+    than emit a stale audit log.
+    """
+    sidecar = cache_path.with_suffix(cache_path.suffix + ".sha256")
+    if not sidecar.exists():
+        return None
+    try:
+        text = sidecar.read_text(encoding="utf-8").strip()
+        if not text:
+            return None
+        first_line = text.splitlines()[0]
+        parts = first_line.split()
+        if not parts:
+            return None
+        digest = parts[0]
+        # Defence: must be a 64-char lowercase hex string.
+        if len(digest) != 64 or not all(c in "0123456789abcdef" for c in digest):
+            return None
+        # Mtime gate: sidecar's "mtime=<float>" field must match the
+        # current .pkl mtime within 1 second.
+        sidecar_mtime: float | None = None
+        for tok in parts[1:]:
+            if tok.startswith("mtime="):
+                try:
+                    sidecar_mtime = float(tok.split("=", 1)[1])
+                except ValueError:
+                    return None
+                break
+        if sidecar_mtime is None:
+            return None
+        pkl_mtime = cache_path.stat().st_mtime
+        if abs(pkl_mtime - sidecar_mtime) > 1.0:
+            return None
+        return digest
+    except Exception:
+        return None
+
+
 def _load_market_data_cache(out_root: Path) -> dict | None:
-    """Return cached market_data dict if present and valid, else None."""
+    """Return cached market_data dict if present and valid, else None.
+
+    OBS-20 + PERF-13: the audit log includes size + symbol count
+    + sha256[:16] + mtime + absolute path so any worker's cache
+    load can be cross-referenced against the main process's
+    cache write in the same out_root.
+
+    PERF-13 (audit 2026-05-28): the SHA256 is now taken from a
+    sidecar file written by ``_save_market_data_cache`` whenever
+    the sidecar exists and its mtime matches the .pkl's.
+    Pre-fix every worker re-hashed 300 MB on its own (~1-2 s);
+    over a 20-variant battery that was 20-40 s of pure
+    redundant work because the parent process already knew the
+    hash at cache-write time. If the sidecar is missing or
+    stale (manual edits, rsync, resume) we fall back to live
+    hashing — the on-disk audit log remains identical.
+    """
     cache_path = out_root / "market_data.pkl"
     if not cache_path.exists():
         return None
     try:
-        # OBS-20 (audit 2026-05-28): pre-fix this logged only the size
-        # + symbol count. For research reproducibility we want absolute
-        # path + size + mtime + SHA256 so any worker's cache load can
-        # be cross-referenced against the main process's cache write
-        # in the same out_root. Research-only path; no live impact.
-        import hashlib
-        sha = hashlib.sha256()
-        with cache_path.open("rb") as f:
-            for chunk in iter(lambda: f.read(1 << 20), b""):
-                sha.update(chunk)
-        digest = sha.hexdigest()[:16]
+        sidecar_digest = _read_sidecar_hash(cache_path)
+        if sidecar_digest is not None:
+            digest_full = sidecar_digest
+            digest = digest_full[:16]
+            hash_source = "sidecar"
+        else:
+            digest_full = _sha256_file(cache_path)
+            digest = digest_full[:16]
+            hash_source = "live"
         mtime = cache_path.stat().st_mtime
         with cache_path.open("rb") as f:
             md = pickle.load(f)
@@ -551,7 +670,8 @@ def _load_market_data_cache(out_root: Path) -> dict | None:
         logger.info(
             f"[BATTERY] reusing cached market_data ({size_mb:.1f} MB, "
             f"{len(md)} symbols, sha256[:16]={digest}, mtime={mtime:.0f}, "
-            f"path={cache_path.resolve()}) — skipping yfinance fetch"
+            f"path={cache_path.resolve()}, hash_source={hash_source}) — "
+            f"skipping yfinance fetch"
         )
         return md
     except Exception as e:

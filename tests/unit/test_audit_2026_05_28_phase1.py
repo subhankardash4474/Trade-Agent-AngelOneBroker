@@ -233,10 +233,19 @@ def test_perf02_clear_resets_cache_and_tallies():
     agent._historical_cache = {("S", "5min"): pd.DataFrame()}
     agent._historical_cache_hits = 42
     agent._historical_cache_misses = 7
+    # PERF-07 (audit 2026-05-28): _clear_historical_cache also clears
+    # the per-cycle tick-history cache, so seed those attributes too
+    # or the helper will AttributeError.
+    agent._tick_history_cache = {("S", "5min"): pd.DataFrame()}
+    agent._tick_history_cache_hits = 99
+    agent._tick_history_cache_misses = 11
     agent._clear_historical_cache()
     assert agent._historical_cache == {}
     assert agent._historical_cache_hits == 0
     assert agent._historical_cache_misses == 0
+    assert agent._tick_history_cache == {}
+    assert agent._tick_history_cache_hits == 0
+    assert agent._tick_history_cache_misses == 0
 
 
 # ───────────────────────── NUM-13 ─────────────────────────────
@@ -436,12 +445,24 @@ def test_obs16_order_ledger_persist_failure_is_warning():
 
 def test_obs20_battery_cache_load_logs_sha256():
     src = (PACKAGES / "research" / "battery.py").read_text(encoding="utf-8")
+    # OBS-20 contract: every worker that loads market_data.pkl
+    # must surface the hash in its log so the worker's view can
+    # be cross-referenced against the parent's cache write.
+    # PERF-13 (2026-05-28) factored the hashing routine out to
+    # ``_sha256_file`` and added a sidecar fast path via
+    # ``_read_sidecar_hash``; either route still emits the same
+    # log fields, so the contract is now: the loader either
+    # hashes inline OR reuses a sidecar/helper, and the resulting
+    # log line still carries ``sha256[:16]``.
     needle = "_load_market_data_cache"
     pos = src.find("def " + needle)
     assert pos != -1
-    block = src[pos:pos + 1500]
-    assert "hashlib" in block, (
-        "OBS-20 regression: sha256 import missing"
+    block = src[pos:pos + 2500]
+    assert ("hashlib" in block) or ("_sha256_file" in block) or ("_read_sidecar_hash" in block), (
+        "OBS-20 regression: load path no longer reaches a sha256 "
+        "implementation (neither inline hashlib nor _sha256_file "
+        "nor _read_sidecar_hash). The audit log line will lose "
+        "the sha256[:16] field."
     )
     assert "sha256[:16]" in block, (
         "OBS-20 regression: sha256 must appear in the log line"
