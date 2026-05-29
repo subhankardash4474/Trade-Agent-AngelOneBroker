@@ -240,7 +240,7 @@ Always run, even on green:
       `slippage_bps` config to match reality.
 - [ ] Compare our SQLite `trades` count to broker `getTradeBook` count
       for the same window. Any mismatch is a P0.
-- [ ] Write a 5-line summary to `docs/e2e_broker_test_log.md` (append-
+- [ ] Write a 5-line summary to `docs/e2e/e2e_broker_test_log.md` (append-
       only journal, started fresh for this exercise).
 
 ---
@@ -290,4 +290,4 @@ risking more capital. That's the whole point of the scaffolding.
 ---
 
 *Updated: 2026-05-10. Next review: at start of each stage; record
-outcomes in `docs/e2e_broker_test_log.md` (to be created).*
+outcomes in `docs/e2e/e2e_broker_test_log.md` (to be created).*

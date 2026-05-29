@@ -270,7 +270,7 @@ docker compose logs --tail=20 trader   # confirm "PAPER" in the boot banner
 
 ### 4.5 Append to journal
 
-Write a 5-line summary to `docs/e2e_broker_test_log.md`:
+Write a 5-line summary to `docs/e2e/e2e_broker_test_log.md`:
 ```markdown
 ## 2026-05-18 Stage 3 -- 5-stock basket
 - Trades: N entries / M exits
