@@ -104,8 +104,37 @@ class BaseStrategy(ABC):
                 (data["low"] - data["close"].shift()).abs(),
             ], axis=1).max(axis=1)
             val = tr.ewm(span=period, adjust=False).mean().iloc[-1]
-            return float(val) if not pd.isna(val) else 0.0
-        except Exception:
+            if pd.isna(val):
+                # OBS-10 (audit 2026-05-28): pre-fix this returned 0.0
+                # silently when the EWM result was NaN (e.g. <14 bars,
+                # all-zero-range data). Strategies sized SLs off
+                # zero-ATR -> stops were sub-noise -> whipsaw exits.
+                # Log at WARNING so the data gap is visible, then
+                # surface 0.0 so the caller's existing guards
+                # (atr > 0 checks throughout RiskManager) trigger.
+                from loguru import logger as _logger
+                _logger.warning(
+                    f"[base_strategy._atr] EWM produced NaN for "
+                    f"period={period} on {len(data)} bars -- caller "
+                    f"will receive 0.0 and is expected to short-circuit "
+                    f"on the zero-ATR guard."
+                )
+                return 0.0
+            return float(val)
+        except Exception as exc:
+            # OBS-10 (audit 2026-05-28): pre-fix this swallowed every
+            # exception silently and returned 0.0 -- the caller saw a
+            # plausible "no volatility" reading and built a wrong SL.
+            # Now log repr(exc) at WARNING so a malformed DataFrame
+            # surfaces in the daemon log instead of corrupting the SL
+            # math invisibly.
+            from loguru import logger as _logger
+            _logger.warning(
+                f"[base_strategy._atr] computation RAISED for "
+                f"period={period} on {len(data) if data is not None else 'None'} "
+                f"bars: {type(exc).__name__}: {exc!r}. Returning 0.0; "
+                f"caller's zero-ATR guard MUST short-circuit."
+            )
             return 0.0
 
     def _make_signal(

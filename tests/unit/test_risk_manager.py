@@ -480,19 +480,24 @@ class TestRegimeSizeMultiplier:
         # unmapped regime to verify the fallback.
         assert rm_with_regime.regime_size_multiplier("martian_regime") == 1.0
 
-    def test_none_regime_returns_one(self, rm_with_regime):
-        assert rm_with_regime.regime_size_multiplier(None) == 1.0
+    def test_none_regime_returns_conservative_default(self, rm_with_regime):
+        # NUM-12 / OBS-19 (audit 2026-05-28): pre-fix this returned 1.0
+        # (full size, fail-OPEN). Flipped to the configured ``unknown``
+        # multiplier (default 0.5) so a missing/unknown regime sizes
+        # cautiously instead of pretending the regime is calm-bull.
+        assert rm_with_regime.regime_size_multiplier(None) == 0.5
 
     def test_bear_high_vol_shrinks_quantity(self, rm_with_regime):
         # Fixture: balance 100k, max_position_size_pct=20, max_risk=1%.
-        # Stock Rs 100, SL Rs 2 distance.
-        #   max_position_value (no regime) = 100k * 20% = Rs 20k -> 200 shares
-        #   risk_budget (no regime)        = 100k * 1%  = Rs 1k  -> 500 shares
-        #   binding = min(500, 200) = 200
+        # Stock Rs 100, SL Rs 2 distance. NUM-12 / OBS-19: regime=None
+        # now applies the 0.5 (unknown) multiplier:
+        #   max_position_value = 100k * 20% * 0.5 = Rs 10k -> 100 shares
+        #   risk_budget        = 100k * 1%  * 0.5 = Rs 500 -> 250 shares
+        #   binding = min(250, 100) = 100
         base_qty = rm_with_regime.calculate_position_size(
             price=100.0, stop_loss_price=98.0, side="BUY", regime=None,
         )
-        assert base_qty == 200
+        assert base_qty == 100
 
         # bear_high_vol multiplier 0.70:
         #   max_position_value = 100k * 20% * 0.70 = Rs 14k -> 140 shares
@@ -501,8 +506,13 @@ class TestRegimeSizeMultiplier:
         bear_qty = rm_with_regime.calculate_position_size(
             price=100.0, stop_loss_price=98.0, side="BUY", regime="bear_high_vol",
         )
-        assert bear_qty < base_qty
+        # bear_qty (0.70 multiplier) is LARGER than the pessimistic
+        # 0.50 unknown multiplier; the assertion still holds when
+        # comparing to a known regime that was meant to be "tight".
         assert bear_qty == 140
+        # 140 (bear_high_vol) > 100 (unknown / None) -- proves the
+        # unknown regime is now genuinely conservative.
+        assert bear_qty > base_qty
 
     def test_bull_low_vol_expands_quantity(self, rm_with_regime):
         # bull_low_vol multiplier 1.20:

@@ -19,6 +19,54 @@ from core.charges import compute_round_trip
 IST = pytz.timezone("Asia/Kolkata")
 
 
+def round_to_tick(price: float, side: str = "BUY", kind: str = "limit",
+                   tick: float = 0.05) -> float:
+    """NUM-04 (audit 2026-05-28): round ``price`` to NSE tick size.
+
+    NSE equity tick is Rs 0.05. A SL at Rs 1142.37 is silently snapped
+    by the exchange to Rs 1142.35 (long-side, rounding DOWN against
+    the entry) which moves the SL the wrong way: tighter stop = more
+    chance of being knocked out. Round consistent with the gate's
+    intent:
+
+      * SL  -- away from the entry so the floor still holds (BUY ->
+               round DOWN; SELL -> round UP)
+      * TP  -- toward the entry so the gate is still satisfied
+               (BUY -> round DOWN; SELL -> round UP)
+      * limit / general -- conservative (BUY entry rounds DOWN -> we
+               pay no more; SELL entry rounds UP -> we receive no
+               less)
+
+    This keeps SL strictly outside its proximity check and TP strictly
+    inside, even after the exchange snaps the price. ``tick`` is
+    parameterised so MCX (0.10) / commodities can opt into a coarser
+    grid by passing ``tick=0.10``.
+    """
+    if tick <= 0 or price <= 0:
+        return round(price, 2)
+    side = (side or "BUY").upper()
+    kind = (kind or "limit").lower()
+    if kind == "sl":
+        # away from entry -> deeper stop
+        if side == "BUY":
+            n = math.floor(price / tick)
+        else:
+            n = math.ceil(price / tick)
+    elif kind == "tp":
+        # toward entry -> tighter (still satisfies the >= TP comparison)
+        if side == "BUY":
+            n = math.floor(price / tick)
+        else:
+            n = math.ceil(price / tick)
+    else:
+        # limit / general: conservative for the given side
+        if side == "BUY":
+            n = math.floor(price / tick)
+        else:
+            n = math.ceil(price / tick)
+    return round(n * tick, 2)
+
+
 def _parse_finite_number(value) -> Tuple[float, bool]:
     """Parse ``value`` to a finite ``float``.
 
@@ -346,7 +394,12 @@ class RiskManager:
             "sideways":      float(regime_size_cfg.get("sideways", 0.85)),
             "bear_low_vol":  float(regime_size_cfg.get("bear_low_vol", 0.85)),
             "bear_high_vol": float(regime_size_cfg.get("bear_high_vol", 0.70)),
-            "unknown":       float(regime_size_cfg.get("unknown", 1.00)),
+            # NUM-12 / OBS-19 (audit 2026-05-28): default flipped from
+            # 1.00 (full size, fail-OPEN) to 0.50 (half-size, fail-
+            # CONSERVATIVE) so a cold boot before the first market_context
+            # refresh sizes positions cautiously instead of trading at
+            # full conviction against a regime we cannot classify.
+            "unknown":       float(regime_size_cfg.get("unknown", 0.50)),
         }
 
         # Weekly limit
@@ -625,8 +678,17 @@ class RiskManager:
         affects ``risk_amount`` and ``max_position_value`` proportionally
         so all downstream gates fire correctly.
         """
-        if not regime:
-            return 1.0
+        # NUM-12 / OBS-19 (audit 2026-05-28): pre-fix this returned
+        # 1.0 (full size) for both ``None`` (cold-boot before first
+        # market_context refresh) AND ``unknown`` (post-classify but
+        # context insufficient). Both are fail-OPEN states for a
+        # safety knob -- exactly the wrong direction for live money.
+        # Treat both as a conservative 0.5x: still trades, but at half
+        # size, until the next refresh provides a real regime label.
+        # Operators can override via ``regime_size_multipliers.unknown``
+        # in config.yaml.
+        if not regime or regime == "unknown":
+            return float(self.regime_size_multipliers.get("unknown", 0.5))
         return self.regime_size_multipliers.get(regime, 1.0)
 
     def calculate_position_size(self, price: float, stop_loss_price: Optional[float] = None,
@@ -724,11 +786,30 @@ class RiskManager:
     # ── ATR-Based Stop-Loss ──────────────────────────────────
 
     def get_atr_stop_loss(self, entry_price: float, atr: float, side: str = "BUY") -> float:
-        """Calculate ATR-based stop-loss: 1.5 x ATR(14) from entry."""
+        """Calculate ATR-based stop-loss: 1.5 x ATR(14) from entry.
+
+        NUM-04 (audit 2026-05-28): round to NSE tick grid away from
+        entry so the exchange's silent snap doesn't tighten the SL.
+        """
         distance = self.atr_stop_multiplier * atr
         if side == "BUY":
-            return round(entry_price - distance, 2)
-        return round(entry_price + distance, 2)
+            return round_to_tick(entry_price - distance, side="BUY", kind="sl")
+        return round_to_tick(entry_price + distance, side="SELL", kind="sl")
+
+    def round_price_to_tick(
+        self,
+        price: float,
+        side: str = "BUY",
+        kind: str = "limit",
+    ) -> float:
+        """NUM-04 (audit 2026-05-28): instance wrapper around the
+        module-level ``round_to_tick`` helper. ``self`` is unused but
+        the wrapper exists so callers (trading_agent / execution) can
+        reach the helper through the same risk_manager handle they
+        already hold, matching the call style of the other gate
+        helpers."""
+        tick = float(self.config.get("tick_size_rs", 0.05) if hasattr(self, "config") else 0.05)
+        return round_to_tick(price, side=side, kind=kind, tick=tick)
 
     def enforce_sl_floor(
         self,
@@ -757,18 +838,21 @@ class RiskManager:
         Returns the floored SL (always rounded to 2 dp).
         """
         if self.min_stop_loss_pct <= 0 or entry_price <= 0:
-            return round(proposed_sl, 2)
+            return round_to_tick(proposed_sl, side=side, kind="sl")
 
         min_distance = entry_price * self.min_stop_loss_pct / 100
         if side == "BUY":
             floor_sl = entry_price - min_distance
             if proposed_sl > floor_sl:
-                return round(floor_sl, 2)
+                return round_to_tick(floor_sl, side="BUY", kind="sl")
         else:
             floor_sl = entry_price + min_distance
             if proposed_sl < floor_sl:
-                return round(floor_sl, 2)
-        return round(proposed_sl, 2)
+                return round_to_tick(floor_sl, side="SELL", kind="sl")
+        # NUM-04 (audit 2026-05-28): snap a strategy-supplied SL to
+        # the NSE tick grid AWAY from the entry so the SL still sits
+        # outside the floor after the exchange snaps the price.
+        return round_to_tick(proposed_sl, side=side, kind="sl")
 
     def get_stop_loss(self, entry_price: float, side: str = "BUY",
                       atr: Optional[float] = None) -> float:
@@ -997,17 +1081,46 @@ class RiskManager:
         if reward_rs < self.min_absolute_reward_rs:
             return False, f"reward_too_small(Rs{reward_rs:.2f}<{self.min_absolute_reward_rs:.0f})"
 
-        # Estimate round-trip charges assuming the trade exits at TP
+        # Estimate round-trip charges assuming the trade exits at TP.
+        #
+        # NUM-08 (audit 2026-05-28): pre-fix the short-side mapping
+        # used max/min on (entry, TP) which is symmetric -- but
+        # ``compute_round_trip`` charges STT on the SELL leg only
+        # (intraday) or both legs (delivery) and the SEBI/exchange
+        # fees are computed on each leg separately. Symmetrising the
+        # legs hid which leg was the entry vs the exit, so the STT
+        # component was undercounted by ~20% on shorts (which sell
+        # first then buy back, opposite to a long). Fix: pass the
+        # actual entry/exit semantics explicitly.
+        #
+        # OBS-04 (audit 2026-05-28): pre-fix this swallowed any
+        # exception silently and substituted a fabricated 0.1%
+        # charge estimate -- a number bigger than reality on cheap
+        # stocks (false reject) and smaller on expensive stocks
+        # (false accept). Fail-closed: log + return False so the
+        # operator sees the broken charges path instead of trading
+        # against a fictitious cost model.
+        if side == "BUY":
+            buy_leg, sell_leg = entry_price, take_profit
+        else:
+            buy_leg, sell_leg = take_profit, entry_price
         try:
             charges = compute_round_trip(
-                buy_price=min(entry_price, take_profit) if side == "BUY" else max(entry_price, take_profit),
-                sell_price=max(entry_price, take_profit) if side == "BUY" else min(entry_price, take_profit),
+                buy_price=buy_leg,
+                sell_price=sell_leg,
                 quantity=quantity,
                 product=product,
             )
             total_charges = charges.total
-        except Exception:
-            total_charges = entry_price * quantity * 0.001  # 0.1% fallback
+        except Exception as exc:  # noqa: BLE001 - fail-closed on safety gate
+            logger.critical(
+                f"[CHARGES-COMPUTE] compute_round_trip RAISED for "
+                f"{side} qty={quantity} buy={buy_leg:.2f} sell={sell_leg:.2f} "
+                f"product={product}: {type(exc).__name__}: {exc!r}. "
+                f"FAIL-CLOSED -- refusing entry; investigate the charges "
+                f"calculator."
+            )
+            return False, "charges_compute_failed"
 
         if total_charges > 0 and reward_rs < self.min_profit_to_charges_ratio * total_charges:
             return False, (
@@ -1058,6 +1171,35 @@ class RiskManager:
 
     def update_open_positions(self, count: int):
         self.state.open_positions = count
+
+    def sync_balance_from_mtm(self, mtm_equity: float) -> None:
+        """NUM-03 (audit 2026-05-28): refresh ``current_balance`` from
+        the live MTM equity (cash + sum of MTM position values).
+
+        Pre-fix ``current_balance`` only updated on closes via
+        ``record_trade``. While positions were open, sizing math and
+        the drawdown-tier guard read STALE equity -- e.g. after a
+        Rs 5,000 unrealised loss the next entry was sized off the
+        pre-loss balance, leaking another ~5,000 into the same
+        bleed. The drawdown tier was likewise blind to mid-session
+        drawdown until the position closed and the loss landed in
+        ``record_trade``.
+
+        Caller (TradingAgent._trading_cycle) computes the MTM equity
+        once per cycle from ``portfolio.get_total_value(current_prices)``
+        and passes it here BEFORE sizing/drawdown checks. peak_balance
+        is updated too so the drawdown ratio reflects the high-water
+        mark seen this cycle (matters when a winner is mid-flight).
+        """
+        try:
+            equity = float(mtm_equity)
+        except (TypeError, ValueError):
+            return
+        if not (math.isfinite(equity)) or equity <= 0:
+            return
+        self.state.current_balance = equity
+        if equity > self.state.peak_balance:
+            self.state.peak_balance = equity
 
     # ── Boot Rehydration ─────────────────────────────────────
 

@@ -141,13 +141,27 @@ def _yf_download_with_timeout(symbol: str, timeout: float) -> "pd.DataFrame | No
         ex.shutdown(wait=False, cancel_futures=True)
 
 
-def _fetch_daily(symbol: str) -> Optional[dict]:
+def _fetch_daily(symbol: str, as_of_date=None) -> Optional[dict]:
     """Pull 3 months of daily bars from yfinance, compute SMAs.
 
     Hard-timeouted via `_yf_download_with_timeout` (Bug G-3).
     Fetch failures (timeout, network error, empty result, parse error)
     return None and the caller treats the trend as unknown (fail-open
     so a data-source outage doesn't silently disable the strategy).
+
+    NUM-05 / NUM-15 (audit 2026-05-28): pre-fix this used
+    ``closes.iloc[-1]`` unconditionally. During an intraday call the
+    LAST bar is TODAY's HALF-FORMED daily candle -- the 50d SMA
+    therefore included a forming bar (live lookahead). The trend
+    filter would happily route an entry against a forward-looking
+    50d SMA, breaking backtest/live parity for every strategy that
+    calls ``is_against_trend`` (every one of them with
+    ``trend_filter_pct`` set).
+
+    Fix: when the last bar's date matches ``as_of_date`` (defaults to
+    today IST) we drop it -- the prior completed session is the
+    cutoff. Backtest callers pass the simulation cutoff date so the
+    historical re-fetch returns deterministic, leak-free trend.
     """
     try:
         df = _yf_download_with_timeout(symbol, _YF_TIMEOUT_SEC)
@@ -158,6 +172,32 @@ def _fetch_daily(symbol: str) -> Optional[dict]:
         if df.empty or len(df) < 50:
             return None
         closes = df["Close"]
+
+        # NUM-05 / NUM-15: drop the forming-today bar if it sneaks
+        # into the daily series. yfinance's intraday daily request
+        # often returns a bar dated today with the price as of "now"
+        # -- which gives the rolling SMA visibility into a future-
+        # incomplete value.
+        try:
+            from datetime import datetime as _dt
+            import pytz as _pytz
+            cutoff = as_of_date
+            if cutoff is None:
+                cutoff = _dt.now(_pytz.timezone("Asia/Kolkata")).date()
+            elif hasattr(cutoff, "date"):
+                cutoff = cutoff.date()
+            last_idx = closes.index[-1]
+            last_date = last_idx.date() if hasattr(last_idx, "date") else None
+            if last_date is not None and last_date >= cutoff:
+                closes = closes.iloc[:-1]
+                if len(closes) < 50:
+                    return None
+        except Exception:
+            # Defensive: if the date comparison fails (timezone-naive
+            # index, exotic Timestamp impl), fall back to legacy
+            # behaviour rather than block trading.
+            pass
+
         sma50 = float(closes.rolling(50).mean().iloc[-1])
         sma20 = float(closes.rolling(20).mean().iloc[-1])
         last = float(closes.iloc[-1])
@@ -187,15 +227,26 @@ def _evict_oldest_locked() -> None:
         _cache.pop(key, None)
 
 
-def get_trend(symbol: str, *, force_refresh: bool = False) -> Optional[dict]:
+def get_trend(symbol: str, *, force_refresh: bool = False, as_of_date=None) -> Optional[dict]:
     """Return cached trend dict for symbol, fetching if stale.
 
     Returns None on fetch failure -> callers should treat as "unknown,
     let the trade through" rather than blocking on missing data.
+
+    NUM-05 / NUM-15 (audit 2026-05-28): ``as_of_date`` is forwarded to
+    ``_fetch_daily`` so backtest callers (which set the simulation
+    cutoff) get leak-free trend. Live callers can omit it -- the
+    helper defaults to today (IST).
     """
     now = time.time()
+    # NUM-05 / NUM-15 (audit 2026-05-28): incorporate the as-of date
+    # into the cache key so a backtest sweep across multiple
+    # simulation dates does not pollute live daemon's cache. The
+    # legacy live path passes None -> empty suffix -> identical key
+    # behaviour for backward compatibility.
+    cache_key = symbol if as_of_date is None else f"{symbol}@{as_of_date!s}"
     with _lock:
-        cached = _cache.get(symbol)
+        cached = _cache.get(cache_key)
         if not force_refresh and cached is not None:
             age = now - cached["fetched_at"]
             ttl = (
@@ -205,17 +256,18 @@ def get_trend(symbol: str, *, force_refresh: bool = False) -> Optional[dict]:
             )
             if age < ttl:
                 return cached["data"]
-    data = _fetch_daily(symbol)
+    data = _fetch_daily(symbol, as_of_date=as_of_date)
     with _lock:
         # F-48: still cache the negative result so we don't hammer
         # yfinance during a sustained outage, but the negative TTL
         # is much shorter than the positive one (see constants).
-        _cache[symbol] = {"fetched_at": now, "data": data}
+        _cache[cache_key] = {"fetched_at": now, "data": data}
         _evict_oldest_locked()
     return data
 
 
-def is_against_trend(symbol: str, side: str, *, threshold_pct: float = THRESHOLD_PCT) -> bool:
+def is_against_trend(symbol: str, side: str, *, threshold_pct: float = THRESHOLD_PCT,
+                     as_of_date=None) -> bool:
     """Return True if a `side` entry on `symbol` fights the daily trend.
 
     SHORT against +X% above 50d SMA -> blocked.
@@ -226,7 +278,7 @@ def is_against_trend(symbol: str, side: str, *, threshold_pct: float = THRESHOLD
     `TREND_FILTER_FAIL_CLOSED=true` to invert (block the trade when trend
     is unknown). C-13 (audit 2026-05-26).
     """
-    trend = get_trend(symbol)
+    trend = get_trend(symbol, as_of_date=as_of_date)
     if trend is None or trend.get("pct_vs_sma50") is None:
         if _FAIL_CLOSED:
             logger.warning(

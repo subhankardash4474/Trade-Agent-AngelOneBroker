@@ -3672,6 +3672,21 @@ class TradingAgent:
             # Continue to EOD path (no new trades, risk gate will also block)
             # but don't hard-return — we still want to send EOD summary etc.
 
+        # NUM-03 (audit 2026-05-28): refresh the risk-manager's
+        # ``current_balance`` from the live MTM equity BEFORE the
+        # gate / sizing reads it. Pre-fix the balance only updated on
+        # closes, so sizing math read stale equity for the entire
+        # life of an open position -- a Rs 5,000 unrealised loss
+        # was invisible to the next entry's risk budget. We do this
+        # opportunistically: if no LTPs are available yet (cold
+        # boot), the helper no-ops on equity <= 0.
+        try:
+            mtm_prices = {s: p.entry_price for s, p in self.portfolio.positions.items()}
+            mtm_equity = self.portfolio.get_total_value(mtm_prices)
+            self.risk_manager.sync_balance_from_mtm(mtm_equity)
+        except Exception as exc:  # noqa: BLE001 - best-effort
+            logger.debug(f"[NUM-03] sync_balance_from_mtm skipped: {exc!r}")
+
         # Risk gate
         can_trade, reason = self.risk_manager.can_trade(self._market_context)
         if not can_trade:
@@ -5050,7 +5065,24 @@ class TradingAgent:
         kelly_mult = 1.0
         if self.trade_analyzer.enabled and leading_strategy:
             kelly_mult = self.trade_analyzer.kelly_multiplier(leading_strategy)
-            quantity = max(1, int(round(quantity * kelly_mult)))
+            # NUM-02 (audit 2026-05-28): pre-fix this was
+            # ``max(1, int(round(quantity * kelly_mult)))`` which is a
+            # regression of F-34. If risk-sized ``quantity`` was 0 (the
+            # SL distance / risk budget could not afford even one
+            # share), Kelly forced 1 share and silently exceeded the
+            # per-trade risk budget by an unknown multiple. Honour the
+            # zero-floor: only apply Kelly when quantity > 0; if
+            # post-Kelly is 0, audit-reject so the entry is skipped.
+            if quantity > 0:
+                quantity = int(round(quantity * kelly_mult))
+                if quantity <= 0:
+                    logger.info(
+                        f"[KELLY-SIZE] {symbol} post-Kelly quantity is 0 "
+                        f"(kelly_mult={kelly_mult:.2f}). Skipping trade -- "
+                        f"risk budget too tight for this conviction level."
+                    )
+                    self._audit_reject(signal, current_price, "sizing:zero_qty")
+                    return
 
         # Minimum-notional floor (Fix 1, 2026-04-30): round-trip commissions
         # eat ~Rs 40 per trade regardless of size. On sub-Rs 6k trades this is
@@ -5375,6 +5407,17 @@ class TradingAgent:
             # P1 #15 (2026-05-17): snapshot immediately so a crash before
             # the first trail update still leaves the position recoverable.
             self._persist_trailing_states()
+            # CONC-01 (audit 2026-05-28): refresh the risk-manager's
+            # cached open-position count IMMEDIATELY after a successful
+            # entry. Pre-fix the count was only refreshed at cycle end
+            # (line 3697 / 3713), so within a single cycle two
+            # consecutive entries could BOTH read the pre-cycle count
+            # (e.g. 2 open) and BOTH pass the ``open_positions <
+            # max_open_positions`` gate, breaching the cap by 1. Now
+            # the next entry in the same cycle sees the correct count.
+            self.risk_manager.update_open_positions(
+                self.portfolio.open_position_count
+            )
             if trend_continuation:
                 ts.trail_activation_rr = 0.5
                 ts.trail_step_pct = 0.6

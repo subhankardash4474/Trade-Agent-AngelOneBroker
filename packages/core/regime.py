@@ -15,9 +15,32 @@ Regimes are computed cheaply from two pieces of context: India VIX and Nifty's
 trend vs its 200 EMA (provided by trading_agent._market_context).
 """
 
+import math
 from typing import Dict, Optional
 
 from loguru import logger
+
+
+def _is_finite_number(value) -> bool:
+    """NUM-09 (audit 2026-05-28): pre-fix ``classify_regime`` only
+    checked ``value is None`` -- a NaN VIX from a transient
+    upstream feed glitch (Yahoo returning a non-finite ``ltp``)
+    sailed past the gate. ``vix is None`` was False, ``vix >= 16.0``
+    is silently False for NaN, and the regime fell through to
+    ``bull_low_vol`` with full multipliers WHILE ``can_trade``
+    elsewhere correctly refused the cycle on the same NaN. Result:
+    sizing math read a fully permissive multiplier, the trade was
+    blocked at the gate, but if a future code path skipped the
+    gate and went straight to sizing, it would size as if the
+    regime were calm.
+    """
+    if value is None:
+        return False
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return False
+    return not (math.isnan(parsed) or math.isinf(parsed))
 
 
 # Coarse regime → which strategy categories do well in it.
@@ -205,13 +228,19 @@ def classify_regime(market_context: Optional[Dict]) -> str:
     else:
         trend = market_context.get("nifty_trend")
         vix = market_context.get("india_vix")
-        if trend is None or vix is None:
+        # NUM-09 (audit 2026-05-28): treat NaN / inf / non-numeric the
+        # same as None. Pre-fix a NaN VIX bypassed this guard because
+        # ``vix is None`` was False; the ``vix >= 16.0`` comparison
+        # silently returned False for NaN and the regime fell through
+        # to ``bull_low_vol`` with full multipliers.
+        if not _is_finite_number(trend) or not _is_finite_number(vix):
             regime = "unknown"
         else:
-            high_vol = vix >= 16.0
-            if trend == 1:
+            high_vol = float(vix) >= 16.0
+            trend_int = int(float(trend))
+            if trend_int == 1:
                 regime = "bull_high_vol" if high_vol else "bull_low_vol"
-            elif trend == -1:
+            elif trend_int == -1:
                 regime = "bear_high_vol" if high_vol else "bear_low_vol"
             else:
                 regime = "sideways"
