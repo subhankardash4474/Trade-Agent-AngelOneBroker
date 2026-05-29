@@ -558,7 +558,81 @@ big universe):**
 | Item | Expected by | Effect on §10.1 verdict |
 |------|------|------|
 | ~~V18 result lands~~ | **DONE 15:25 IST 2026-05-29** | V18 = 229 trades, PF 0.85, -₹473 — **almost identical to V4** (229 trades, PF 0.84, -₹489). The slot-#2 V18=V2 anomaly was a one-off (stale config snapshot at slot-#2 startup, NOT a universe-specific override-merge bug). §6.2 hypothesis (b) ruled out; §6 RCA priority drops to LOW. |
-| V19 result lands | ~17:40 IST tonight (52.3% as of 15:57 IST) | Should be V19=V2 by symmetry (long-only-filters-off ≡ all-filters-off when shorts are already disabled live). Confirmation only. |
+| ~~V19 result lands~~ | **DONE 17:34 IST 2026-05-29** | V19 = 266 trades, PF 0.69, -₹981 — **byte-identical to V2 / V3 / V7** as predicted by symmetry (long-only ≡ all-filters-off when `allow_shorts: false` is already live). Confirmation only; no impact on §10.1. |
+
+### 10.5 Retrain LANDED with operator override — 2026-05-29 18:05 IST
+
+User: "Train the XGB with latest data so that the next battery run
+will be with proper setup. And we have actually good or bad data
+by end of the next week maybe."
+
+This **overrode the §10.1 "defer retrain indefinitely" call** on the
+practical argument that a properly-trained baseline pkl is strictly
+better than the broken pipeline pkl AND the next battery gives
+end-of-next-week real evidence — backtester-only, no freeze slot.
+
+**Pre-flight A-E** ran locally in ~30 min (see findings_log §5.10.1).
+All 7 known training-pipeline fixes pinned in
+`tests/unit/test_training_pipeline_preflight.py` (33 tests; full
+unit **1,713/1,713**).
+
+**Phase 2 training** ran on backtester VM at 17:59 IST:
+
+| Metric | Value | Verdict |
+|---|---|---|
+| Total samples | 271,979 | ✅ Healthy |
+| Train/Test rows | 217,544 / 54,435 (P1 #7 timestamp split @ 2026-05-12 09:35 IST) | ✅ |
+| Label balance | UP 49.9% / DOWN 50.1% | ✅ Far from broken-pkl 95/5 |
+| Best iteration | 30 / 500 (early-stop) | ✅ F-22 carve fired |
+| **Raw test AUC** | **0.4705** | ❌ ~Random; no edge at model layer |
+| **Calibrated AUC** | 0.4908 (raw_eval 0.5166) | C-23 collapse safety fired → ships raw booster |
+| **Prediction distribution** | **BUY 32.0% / SELL 68.0%** | ⚠️ Mild SELL bias; **nowhere near broken 95/5** |
+| Top features | dow_sin, tod_cos, india_vix, dow_cos, tod_sin | Session-time + VIX dominate (no real signal pattern) |
+
+**Hard-stop fired**: `AUC=0.4908 < 0.55` → script refused the swap.
+**Operator override**: backtester pkl manually swapped (NOT trader);
+broken pkl backed up at
+`models/xgboost_model_pre_override_20260529T1233Z.pkl`. Hash-verified
+(see findings_log §5.10.2). Hard-stop in the script unchanged — the
+override is a one-time deliberate action with full audit trail.
+
+**Updated decision (overrides §10.1):**
+
+* **Backtester pkl**: swapped to retrained (160 KB, 32/68 prediction
+  distribution, AUC 0.47).
+* **Trader pkl**: untouched. `xgboost_classifier` remains disabled in
+  `strategies.active` live. **No capital exposure to the new pkl.**
+* **Slot #4 queued**: `post_retrain_xgb_focus_60d` (V1 + V3 + V10 +
+  V11 + V15 on 232 stocks × 60d, ETA ~12h). Provides apples-to-apples
+  comparison vs slot-3 with only the pkl changed.
+* **Slot #5 deferred**: `post_retrain_v2_holdout_30d` (~36h) is left
+  commented-out, gated on focus result. Activate iff focus V15
+  PF ≥ 0.95.
+* **No promotion to live**: even if focus V15 PF > 1.0, do NOT
+  consume bypass slot 3 of 3 yet — first run H3 entry-lag forensic
+  to confirm whether broker fill timing (not the model) is the
+  primary loss driver.
+
+**What the AUC=0.49 result means for §10.1:**
+
+The retrain was not a magic bullet, as predicted by §10.1. The 271k
+samples on the proper pipeline (all 7 known fixes confirmed firing)
+still produce no edge at the model layer. This **strengthens** the
+"defer XGBoost-deploy indefinitely" call: H3 (entry-lag forensic)
+and H1 (regime classifier diagnostic) are even more clearly the
+right next moves. The focus battery exists only to confirm the
+predicted "no PF improvement at strategy layer" outcome (which would
+fully isolate model layer from execution layer as loss drivers).
+
+**Wall-clock ahead:**
+
+| Item | Expected by |
+|---|---|
+| Slot #4 focus result | Saturday 2026-05-30 ~05-08 IST |
+| H3 entry-lag forensic | Sunday 2026-05-31 → Tuesday 2026-06-02 |
+| H1 regime classifier | Tuesday 2026-06-02 → Wednesday 2026-06-03 |
+| Slot #5 holdout (if enabled) | Wednesday early morning |
+| **Friday 2026-06-05 verdict** | Synthesis: focus PF + H3 histogram + H1 per-regime PnL |
 
 ### 10.5 Recommended next moves
 

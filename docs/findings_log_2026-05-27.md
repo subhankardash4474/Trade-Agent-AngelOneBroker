@@ -171,13 +171,34 @@ landed during the holiday window while the trader VM idled:
     AUC < 0.55 / label or prediction split > 85/15). Phase 4 queue
     diff drafted (`data/battery_queue_post_retrain.yaml`, 2 jobs:
     xgb-focus 5-variant ~12h + 19-variant 30d-holdout ~36-46h).
-    Full unit **1,713/1,713** green. **Phase 2 (training run on
-    backtester VM) waits for slot-#3 V19 to finish ~17:00 IST
-    tonight; expected Phase 4 queue restart ~18:00 IST; Friday
-    2026-06-05 verdict has 2 days analysis buffer.** Honest signal:
-    10-stock AUC was 0.49 (~random) but that's noise floor, not a
-    verdict; 232-stock training has the structural §5.9 step-3 AUC
-    > 0.55 hard-stop baked into the trigger script.
+    Full unit **1,713/1,713** green.
+
+**Update 2026-05-29 18:05 IST (Friday evening, retrain LANDED with override).**
+
+16. **§5.10.2 Retrain Phase 2 EXECUTED + AUC < 0.55 hard-stop fired
+    + operator override applied.** Full pipeline ran end-to-end on
+    232 stocks × 60d × 5m × 271,979 samples (3 fix iterations:
+    container-uid permission, host-python pandas, awk float compare
+    — see §5.10.2 for the full sequence). Training metrics:
+    label balance UP 49.9% / DOWN 50.1% ✅, prediction distribution
+    BUY 32.0% / SELL 68.0% (mild bias, **nowhere near 95/5 broken
+    mode**), test AUC = **0.4705 raw / 0.4908 calibrated** ❌ —
+    no edge at model layer. Calibration-collapse safety fired →
+    raw booster ships. Hard-stop AUC < 0.55 refused to swap pkl;
+    fresh pkl preserved at
+    `models/xgboost_model_retrain_20260529T1225Z.pkl`. Operator
+    override (with explicit user "go ahead"): swapped manually on
+    backtester ONLY (broken pkl backed up at
+    `xgboost_model_pre_override_20260529T1233Z.pkl`; trader VM
+    untouched; xgb-classifier disabled live so no capital exposure).
+    Slot #4 `post_retrain_xgb_focus_60d` (5 variants ETA ~12h)
+    queued; slot #5 holdout-30d deferred-pending-focus-result.
+    **The script's safety gate is unchanged** — this is a one-time
+    deliberate operator action with full audit trail. Honest verdict:
+    AUC=0.49 on 271k samples *strengthens* the friday_review §10
+    "defer indefinitely" call. Top priority remains H3 entry-lag
+    forensic + H1 regime classifier; the focus battery just gives
+    us the V15-PF delta to confirm or surprise.
 
 ---
 
@@ -906,6 +927,134 @@ keep capital paused and pivot to H3 entry-lag forensic).
 * `tools/cloud/run_retrain_on_backtester.sh` (Phase 2+3 trigger; idempotent + fail-closed).
 * `data/v2_universe_232.txt` (the 232-stock symbols file; matches `tests/fixtures/battery_v2_universe.json`).
 * `data/battery_queue_post_retrain.yaml` (Phase 4 queue addendum draft).
+
+### 5.10.2 Phase 2 EXECUTED + AUC < 0.55 hard-stop fired — 2026-05-29 18:00 IST
+
+**Sequence of events:**
+
+1. **17:25 IST** — V19 finished (266 trades, PF 0.69 = V2 by symmetry,
+   confirms long-only ≡ all-filters-off when shorts already disabled).
+   Slot-3 fully done.
+2. **17:35 IST** — `wait_then_retrain.sh` detected no battery container
+   running, auto-fired `run_retrain_on_backtester.sh` (commit
+   `561a728`). Run failed at `os.makedirs(data/retrain_<TS>)` with
+   `PermissionError` because container runs as uid 1001 (trader)
+   while `/opt/trading-agent/data` is opc-owned 0775 — trader has
+   r-x but not w. Logged to `retrain_20260529T1205Z.log`.
+3. **17:43 IST** — Fix landed (commit `6385ee6`): pre-create the
+   output dir with `chown 1001:1001` before invoking docker.
+4. **17:47 IST** — Re-fired script, `prepare_dataset.py` succeeded
+   on full 232 stocks. Crashed at the host-python label-balance
+   check with `ModuleNotFoundError: No module named 'pandas'` —
+   Oracle Linux 8 ships system python3 without pandas; the trading-
+   agent ML stack is only inside the docker image. Fail-closed:
+   the empty `LABEL_BALANCE` was misinterpreted as ">85/15
+   one-sided" and the script exited 20 (correct behaviour, wrong
+   message). Logged to `retrain_20260529T1217Z.log`.
+5. **17:55 IST** — Fix landed (commit `9cb991e`): `docker_py()`
+   wrapper that routes all sanity-check python sub-shells through
+   another `docker run` so they have access to the ML stack.
+6. **17:59 IST** — Re-fired script, full pipeline ran end-to-end
+   in ~4 minutes. Logged to `retrain_20260529T1225Z.log`.
+
+**Training run output (HONEST, ALL METRICS):**
+
+| Metric | Value | Verdict |
+|---|---|---|
+| Total samples | 271,979 | ✅ Healthy density (60d × 5m × 232 stocks) |
+| Train rows | 217,544 (~80%) | ✅ |
+| Test rows | 54,435 (~20%) | ✅ Strictly post-broken-pkl-deploy |
+| **Label balance** | **UP 49.9% / DOWN 50.1%** | ✅ Far from 95/5 broken-pkl mode |
+| Best iteration | 30 / 500 (early-stop) | ✅ F-22 carve fired (32,631 val tail / 184,913 fit) |
+| Raw test AUC | 0.4705 | ❌ ~Random; no edge at model layer |
+| Calibrated AUC | 0.4908 (raw_eval 0.5166) | C-23 collapse safety fired → ships raw booster |
+| Brier (raw vs cal) | 0.2556 vs 0.2515 | Slight calibration improvement |
+| **Prediction distribution** | **BUY 32.0% / SELL 68.0%** | ⚠️ Mild SELL bias but **nowhere near 95/5** |
+| Top features | dow_sin (0.122), tod_cos (0.088), india_vix (0.086), dow_cos (0.086), tod_sin (0.085) | Session-time + VIX dominate (classic "no real signal" pattern; technical features rank lower) |
+| DOWN precision/recall | 0.48 / 0.66 | Predicts DOWN well; biased toward this class |
+| UP precision/recall | 0.48 / 0.30 | Misses UP samples → source of 32/68 directional skew |
+
+**Hard-stop fired — `AUC=0.4908 < 0.55` — script exit 22, existing
+pkl NOT replaced. Fresh pkl preserved at
+`models/xgboost_model_retrain_20260529T1225Z.pkl` for forensic
+inspection. The script worked as designed.**
+
+**Operator override decision — 2026-05-29 18:05 IST.**
+
+After reviewing the full output, I (the agent, with explicit user
+"go ahead for the decision") decided to deliberately override the
+hard-stop and ship the new pkl on the **backtester only**. Audit
+trail of the decision-making:
+
+**Why override is safe:**
+
+* Trader VM is untouched. `xgboost_classifier` is disabled in
+  `strategies.active` live (commit `f32009c`, 2026-05-27), so the
+  trader's pkl is unused. No live capital impact.
+* The broken pkl is preserved as
+  `models/xgboost_model_pre_override_20260529T1233Z.pkl`. Reversal
+  is one `cp + chown + mv` away.
+* The new pkl is structurally healthier than what it replaces: 50/50
+  labels (vs broken pkl's 95/5), 32/68 predictions (vs broken pkl's
+  95/5), calibration safety fallback engaged (raw booster ships, not
+  a leaky calibrator). It's the canonical artifact of "all known
+  training-pipeline bugs fixed."
+* The hard-stop in `run_retrain_on_backtester.sh` is **unchanged** —
+  the safety stays in place for future automated runs. This override
+  is a one-time deliberate operator action with this audit trail.
+
+**Why override is informative:**
+
+* The data point we want is the *delta* between broken-pkl V15
+  (95/5 → PF 0.94) and new-pkl V15 (32/68 → PF ?) on the SAME
+  backtest config. With AUC=0.49 already strongly suggesting
+  no-edge-at-model-layer, the battery either:
+  - Confirms that hypothesis (V15 PF ~ 0.85-0.95 with new pkl
+    too) → strengthens H3 entry-lag forensic priority;
+  - Surprises (V15 PF ≥ 1.0 with new pkl) → hardens the case
+    that the broken pkl was actively destroying P&L beyond what
+    AUC alone would predict.
+
+**Hash verification of the swap:**
+
+```
+md5sum models/xgboost_model.pkl models/xgboost_model_retrain_20260529T1225Z.pkl
+a6008e2c3ba5ea833c93b81f39b7792b  models/xgboost_model.pkl
+a6008e2c3ba5ea833c93b81f39b7792b  models/xgboost_model_retrain_20260529T1225Z.pkl
+```
+
+**Queue change.** Appended one job to `data/battery_queue.yaml`
+(slot #4 `post_retrain_xgb_focus_60d`, 5 variants × 232 stocks ×
+60d, ETA ~12h). The 36h `post_retrain_v2_holdout_30d` job is left
+**deferred** in the file as a commented-out placeholder, gated on
+focus result:
+
+* Focus V15 PF ≥ 0.95 → uncomment the holdout block, restart
+  scheduler.
+* Focus V15 PF < 0.90 → leave the holdout commented, pivot fully
+  to H3 entry-lag forensic.
+
+**Wall-clock from here:**
+
+* 18:10 IST: scheduler restarted, focus run begins (V1+V3+V10+V11+V15).
+* Saturday morning ~05-08 IST: focus run completes, V15-with-new-pkl
+  PF lands.
+* Saturday/Sunday: H3 entry-lag forensic (broker_fill_ts vs
+  strategy_emit_ts histogram from last 30d trader logs).
+* Friday 2026-06-05: verdict synthesis (focus + H3 + maybe holdout).
+
+**Files changed in this commit:**
+
+* `tools/cloud/run_retrain_on_backtester.sh` (3 patches: trader-UID
+  pre-create + docker_py wrapper + AUC awk-comparison).
+* `data/battery_queue.yaml` (slot #4 added; slot #5 deferred).
+* `docs/findings_log_2026-05-27.md` §5.10.2 (this section).
+* `docs/friday_review_2026-05-29.md` §10.5 (override decision +
+  retrain metrics).
+
+**ZERO trader-VM impact + ZERO freeze-bypass slot consumed** (this
+is a backtester-only research artifact; live freeze-v2.1 is
+unaffected).
 
 ---
 

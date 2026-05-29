@@ -122,3 +122,59 @@ jobs:
     workers: 2
     universe-file: tests/fixtures/battery_v2_universe.json
     holdout-window-days: 30
+
+  # ── 4. POST-RETRAIN focus run — added 2026-05-29 18:05 IST ─────────
+  # Operator-deliberate override of the AUC<0.55 hard-stop in
+  # tools/cloud/run_retrain_on_backtester.sh. The retrained pkl
+  # (xgboost_model_retrain_20260529T1225Z.pkl) had AUC 0.47 on the
+  # 271k-sample 232-stock × 60d × 5m training run; the safety gate
+  # therefore refused to swap it. We swapped manually on backtester
+  # ONLY (trader VM untouched, xgboost_classifier disabled live; old
+  # pkl backed up at xgboost_model_pre_override_20260529T1233Z.pkl).
+  # Rationale + audit trail: docs/findings_log_2026-05-27.md §5.10.2.
+  #
+  # This job runs the 5 variants whose behaviour depends on the pkl:
+  #   * V1_baseline_current_shipped — control, NOT pkl-dependent. If
+  #     V1's PnL / trade-count / PF on this run differs from slot-#3
+  #     V1 by more than determinism noise, something else changed and
+  #     the V3/V10/V11/V15 deltas can't be cleanly attributed to the
+  #     retrain.
+  #   * V3_only_xgb_mr_filtered_yday — XGB filters MR signals using
+  #     yesterday's regime tag.
+  #   * V10_confidence_060 — XGB confidence threshold 0.60 (tighter).
+  #   * V11_confidence_050 — XGB confidence threshold 0.50 (looser).
+  #   * V15_mr_xgb_only — pure MR-with-XGB-filter; the diagnostic-
+  #     decisive variant from friday_review §10.
+  #
+  # Apples-to-apples vs slot-#3 (same universe, same window, only the
+  # pkl changed). ETA ~12h on workers=2; signal Saturday morning.
+  # Gating for the holdout follow-on (see commented entry below):
+  #   * Focus V15 PF ≥ 0.95 → queue holdout-30d follow-on (~36h)
+  #   * Focus V15 PF < 0.90 → confirm "no edge at model layer"; skip
+  #     holdout, pivot fully to H3 entry-lag forensic.
+  - name: post_retrain_xgb_focus_60d
+    days: 60
+    interval: 5m
+    workers: 2
+    universe-file: tests/fixtures/battery_v2_universe.json
+    variants:
+      - V1_baseline_current_shipped
+      - V3_only_xgb_mr_filtered_yday
+      - V10_confidence_060
+      - V11_confidence_050
+      - V15_mr_xgb_only
+
+  # ── 5. POST-RETRAIN holdout-30d — DEFERRED 2026-05-29 18:05 IST ─────
+  # Walk-forward holdout (Bug K commit 357b60d means workers will
+  # actually see the slice this time). Deferred behind slot #4 focus
+  # gating because (a) AUC=0.47 makes a 36h walk-forward unlikely to
+  # surface edge, (b) we'd rather spend that compute on H3 entry-lag
+  # forensic if the focus run confirms no model-layer edge. To activate
+  # after focus result lands: uncomment + restart scheduler.
+  #
+  # - name: post_retrain_v2_holdout_30d
+  #   days: 90
+  #   interval: 5m
+  #   workers: 2
+  #   universe-file: tests/fixtures/battery_v2_universe.json
+  #   holdout-window-days: 30
