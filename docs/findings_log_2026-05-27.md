@@ -205,7 +205,8 @@ landed during the holiday window while the trader VM idled:
 17. **§23 Trader VM 2026-05-29 audit + Bug M (alert spool path leak)
     + Bug N (post-close restart loop).** Operator pulled today's
     trader logs after market close and asked for an "any issues / any
-    fix needed" review. Day was operationally GREEN: 0 trades, ₹+0
+    fix needed" review. (See §24 below for the 19:10 IST follow-up
+    that produced Bug O + the freeze-exit pre-commitment.) Day was operationally GREEN: 0 trades, ₹+0
     PnL, 0 errors / 0 criticals / 0 tracebacks, 1 benign warning,
     Resend EOD email delivered cleanly. Two latent bugs surfaced:
     **Bug M** — `_FAILED_ALERTS_DIR = Path("logs") / "failed_alerts"`
@@ -230,6 +231,40 @@ landed during the holiday window while the trader VM idled:
     **1,717/1,717** green. Both fixes NOT deployed to trader VM
     today (freeze policy; trader continues to run commit `8f35593`).
     Severity MEDIUM each; no capital/safety impact today.
+
+**Update 2026-05-29 19:30 IST (Friday evening, project review + Bug O + freeze-exit pre-commitment).**
+
+18. **§24 Project review accepted + Bug O (Portfolio test \u2192 prod
+    `trades.csv` leak) + freeze-exit kill-criteria pre-committed.**
+    Operator delivered a thorough project review identifying three
+    independent negative signals (no-edge in any 232-stock variant;
+    single Nifty-50 winner doesn\u2019t transfer cross-universe; AUC=0.49
+    on clean retrain) and asked for in-writing pre-commitment to
+    kill thresholds before any next-week work begins, to prevent
+    "extend the freeze, run more variants, hope for surprise edge"
+    drift. Three thresholds pre-committed in
+    `docs/freeze_v2.1_exit_criteria_2026-06-05.md`: H3-prime
+    entry-lag forensic (Wed 2026-06-03), Slot #4 V15-PF readout
+    (Sat 2026-05-30), wind-down kill criterion (Fri 2026-06-08).
+    Friday 2026-06-05 decision is constrained to 3 explicit options
+    (1.A wind-down, 1.B single-knob deploy under hard rupee kill
+    floor, 1.C architectural pivot under a new charter); the
+    implicit 4th option ("more battery variants") is explicitly
+    ruled out. Bug O surfaced during the review: `Portfolio.__init__`
+    has `log_dir: str = "logs"` default, so the persistence test
+    `test_close_position_persists_trade_to_db` writes a real
+    `ZZTEST/manual_test` row into the production `logs/trades.csv`
+    on every pytest invocation \u2014 same class as Bug M. Fixed by
+    passing `log_dir=str(tmp_path)` in the offending test plus a
+    new `TestBugOTradesCsvIsolation` regression class. Existing 4
+    stale `manual_test` rows archived to
+    `logs/trades_pre_bug_o_purge_2026-05-29.csv` and purged from
+    `logs/trades.csv`. Audit-only classification refined to a
+    three-way scheme (trader-behaviour-changing /
+    audit-only-semantically-neutral /
+    audit-only-baseline-shifting); the third class now requires
+    explicit baseline-reset notice in findings_log to prevent the
+    "what the data says" drift the review flagged.
 
 ---
 
@@ -4197,4 +4232,240 @@ For the record (so future audits don't re-investigate):
 * `run_daemon.py` — Bug N code fix (tighten `is_market_window` + defense-in-depth `sleep_until_market` call).
 * `tests/unit/test_run_daemon_post_close_loop.py` — 2 new Bug N regression tests.
 * `docs/findings_log_2026-05-27.md` — this section (§23).
+
+Landed as commit `f74547a` on `main`, not pushed.
+
+
+
+## 24. Project review 2026-05-29 + Bug O (Portfolio test → prod `trades.csv` leak) + freeze-exit kill-criteria pre-committed
+
+### 24.1 The review
+
+At 2026-05-29 ~19:10 IST the operator delivered a thorough,
+adversarial project review of the entire freeze-v2.1 effort. The
+review's anchor finding was a brutal-but-correct synthesis of the
+diagnostic-sprint data:
+
+> Three independent negative signals: (1) the 4-strategy ensemble has
+> no edge in any variant on the 232-stock production universe (best
+> variant V4 PF=0.84, all 19 net-negative); (2) the only positive
+> Nifty-50 variant (V15 PF=1.02) does not transfer cross-universe
+> (V15 on 232 stocks: PF=0.94, -₹326); (3) the retrained XGBoost has
+> no edge at the model layer (AUC=0.49 on 271,979 samples with all 7
+> known pipeline bugs fixed; top features are calendar/VIX, not TA).
+> The hypothesis "XGBoost on TA features can predict 15-min
+> directional return on Indian equities at 5-min bars" is REFUTED on
+> out-of-sample data.
+
+The review also flagged six concerns that needed to be on the table
+before next-week work begins — every one of which is either
+actionable now or pre-committed in the new exit-criteria document:
+
+| Review concern | Resolution |
+|---|---|
+| (A) Retrain operator-override sets a slippery precedent | Pre-committed in `freeze_v2.1_exit_criteria_2026-06-05.md` §0.2 + §4: V15 PF ≥ 1.05 is "surprising — investigate", NOT "ship to live". V15 is forensic, not exploratory. |
+| (B) Top features are session-time + VIX is a finding, not a footnote | Acknowledged in §24.4 below. Calendar features dominating is the canonical signature of label-noise-dominated learning; the rule-based strategies' implicit hypothesis is the same hypothesis as XGBoost's. |
+| (C) Slot 3 of 3 consumed; next move requires unfreeze | Codified in `freeze_v2.1_exit_criteria_2026-06-05.md` §2: hard end date 2026-06-08 with three options (A/B/C); 4th option ("run more variants") explicitly ruled out. |
+| (D) "Audit-only" reclassification is being used as a release valve | New three-way classification in `freeze_v2.1_exit_criteria_2026-06-05.md` §3: trader-behaviour-changing / audit-only-semantically-neutral / audit-only-baseline-shifting. The third class now requires explicit baseline-reset notice. |
+| (E) `manual_test` pollution in raw `trades.csv` | **Bug O — fixed in this commit** (see §24.3 below). Existing 4 rows archived to `logs/trades_pre_bug_o_purge_2026-05-29.csv` and purged. |
+| (F) Wind-down question hasn't been asked aloud | Threshold 3 in `freeze_v2.1_exit_criteria_2026-06-05.md` §0.3 is the kill criterion. Wind-down decision pre-committed for 2026-06-08 if both clauses satisfy. |
+
+### 24.2 The pre-commitment document
+
+`docs/freeze_v2.1_exit_criteria_2026-06-05.md` is the operating
+contract from 2026-05-29 forward. Three pre-committed thresholds:
+
+* **T1.** H3-prime entry-lag forensic (Wed 2026-06-03). Median
+  `broker_fill_ts - strategy_emit_ts` < 30 s / 30–120 s / > 120 s
+  drives the lead conclusion.
+* **T2.** Slot #4 focus run V15 PF (Sat 2026-05-30 morning). PF
+  ≥ 1.05 / 0.90–1.05 / < 0.90 drives the model-layer verdict.
+* **T3.** Wind-down kill criterion (Fri 2026-06-08). If no PERF fix
+  produces a 5-day paper window with PF ≥ 1.20 AND no H3/H1 finding
+  identifies a single-bug remediation that could move PF above 1.0
+  → wind-down.
+
+Friday 2026-06-05 decision is constrained to exactly three options:
+**1.A** wind-down, **1.B** single-knob deploy (PERF-01 + V4-thresh-3%
+on Nifty 50 only, max-concurrent-positions=5, hard rupee kill floor
+-₹500, paper-only for first 5 days), **1.C** architectural pivot
+(higher TF, event-driven features, formal v2.1 close-out + v3
+charter). The implicit 4th option ("more battery variants") is
+explicitly ruled out.
+
+### 24.3 Bug O — `Portfolio.__init__` `log_dir` default leaks test trades into prod CSV
+
+**File:** `packages/core/portfolio.py:120-121`
+
+**The smell:**
+
+```
+$ Select-String -LiteralPath logs\trades.csv -Pattern 'manual_test'
+ZZTEST,SELL,...,2026-05-29T18:47:36.824810+05:30,...,manual_test,1.05
+ZZTEST2,SELL,...,2026-05-29T18:58:07.779616+05:30,...,manual_test,1.05
+ZZTEST,SELL,...,2026-05-29T19:01:32.115201+05:30,...,manual_test,1.05
+ZZTEST2,SELL,...,2026-05-29T19:01:32.144872+05:30,...,manual_test,1.05
+```
+
+Four `manual_test` rows in the production `logs/trades.csv` -- timestamps
+literally during this evening's Bug M / Bug N investigation. Same
+fingerprint as the historical 38 rows the operator flagged in the
+review §3.E.
+
+**Root cause:** `Portfolio.__init__` defaults `log_dir: str = "logs"`
+(CWD-relative), then computes
+`self._trade_log_path = os.path.join(log_dir, "trades.csv")`. The
+unit test `tests/unit/test_trend_filter_and_tp_realism.py::
+TestPersistTradeIdempotent::test_close_position_persists_trade_to_db`
+constructs `Portfolio(initial_balance=50000, database=db,
+reset_balance=True)` -- DB is correctly isolated to
+`tmp_path/test.db`, but `log_dir` falls through to the default
+`"logs"`. Every run of this test appends a real `ZZTEST` row to
+`<cwd>/logs/trades.csv`. Same exact pattern as Bug M (alert spool
+path leak).
+
+**Latent risk:** `logs/trades.csv` is consumed by `tools/eod_*.py`,
+the dashboard, and any operator running raw analysis with
+`pd.read_csv("logs/trades.csv")`. The EOD analyser already filters
+on `exit_reason != "manual_test"` (verified: today's
+`eod_2026-05-29.md` correctly shows 3 trades from May 26 with no
+pollution), but ad-hoc analysis does not. The 38 historical rows in
+the operator's review §3.E pre-date this saga; they were a constant
+source of small "wait, why does it say 42 trades?" confusion in raw
+data sweeps.
+
+**Fix.** Two-line scope:
+
+* `tests/unit/test_trend_filter_and_tp_realism.py:304, 334` --
+  pass `log_dir=str(tmp_path)` to both `Portfolio(...)` calls.
+* New regression test `TestBugOTradesCsvIsolation::
+  test_close_position_writes_to_log_dir_not_cwd` -- pin the
+  contract: `monkeypatch.chdir(tmp_path)`, configure separate
+  `cfg_log_dir`, write a `ZZTEST_BUG_O` trade, assert it lands in
+  `cfg_log_dir/trades.csv` and the legacy
+  `tmp_path/logs/trades.csv` does NOT contain `ZZTEST_BUG_O`.
+
+The source code (`packages/core/portfolio.py`) is NOT touched.
+Production callers (`trading_agent.py:238`,
+`backtest_ensemble.py:260`, etc.) all pass `log_dir` explicitly via
+config, so the default value is essentially test-fixture syntactic
+sugar -- and that's the leak surface. Tightening the default to
+something like `log_dir: Optional[str] = None` and raising on None
+would force every caller to think, but it's a freeze-relevant code
+change that we intentionally skip on 2026-05-29.
+
+**Cleanup actions.**
+
+* `logs/trades.csv` -- 4 stale `manual_test` rows archived to
+  `logs/trades_pre_bug_o_purge_2026-05-29.csv` (5,110 bytes,
+  preserved as audit trail); CSV is now 32 lines = 1 header + 31
+  real trades, 0 `manual_test`.
+* No trader-VM action needed; trader VM never ran pytest in
+  production CWD (Docker container has its own filesystem and CWD
+  is `/app`, not `/opt/trading-agent`).
+
+**Severity:** LOW (cosmetic test-pollution; EOD already filters);
+elevated to MEDIUM by class (same root cause as Bug M, suggests a
+broader hardcoded-path audit may be warranted post-freeze).
+
+### 24.4 The "top features are calendar + VIX" finding (response to review §3.B)
+
+This deserves its own subsection because the review is right that
+it's not a footnote. Today's retrain feature-importance ranking
+(top 5 of ~30 features):
+
+```
+dow_sin    0.0427   day-of-week, sin component
+tod_cos    0.0411   time-of-day, cos component
+india_vix  0.0394   market volatility regime
+dow_cos    0.0385   day-of-week, cos component
+tod_sin    0.0379   time-of-day, sin component
+                        --- ---
+rsi_14     0.0241   first technical feature, rank #11
+volume_ratio 0.0224 rank #14
+macd_hist  0.0211   rank #17
+bb_width   0.0203   rank #19
+```
+
+Four of the top five features are cyclic time encodings. The fifth
+is regime context (India VIX). The first technical-analysis feature
+(`rsi_14`) ranks #11 with importance ~57% of the top calendar feature.
+
+**What this means:**
+
+1. **The TA features are uninformative on the chosen horizon
+   (15-min directional return at 5-min bars on Indian equities).**
+   The model is essentially saying "I have nothing better to grab
+   onto than calendar effects." This explains the V1-V19 results on
+   232 stocks: the rule-based strategies are using the same TA
+   features (RSI, MACD, BBands, momentum, volume profile, VWAP
+   distance, ATR-pct), expressed as discrete rules. If those
+   features carry no information for an XGBoost model trained on
+   271k samples, they're unlikely to carry edge when expressed as
+   `if rsi < 30 then BUY`.
+
+2. **Calendar features dominating is the canonical signature of
+   label-noise-dominated learning.** The model couldn't find
+   structure, so it latched onto cyclic features as a weak prior
+   (e.g., "Mondays are slightly different from Wednesdays in this
+   training window"). This is consistent with the 50/50 label
+   distribution and AUC near 0.5.
+
+3. **This is the deepest finding of the entire diagnostic sprint.**
+   The earlier story was "the broken pkl was bad; retrain on a
+   clean pipeline and we'll get a real signal." The pipeline IS
+   clean now (verified: 7 known bugs fixed, 33 regression tests
+   green, label balance healthy at UP 49.9% / DOWN 50.1%, time-
+   based train/test split, out-of-sample calibration, fail-hard on
+   any pipeline-correctness exception). The data still produces
+   AUC=0.49. The hypothesis fails on out-of-sample data on this
+   feature set.
+
+This is now the dominant prior on every Threshold-2 readout: V15
+PF < 0.90 is the predicted outcome. ≥ 1.05 would be genuinely
+surprising and would need to be reconciled against this finding
+before any deploy decision.
+
+### 24.5 Freeze contract end date is now in writing
+
+Per `freeze_v2.1_exit_criteria_2026-06-05.md` §2:
+
+* No further behaviour-changing edits to trader-VM-deployable code
+  until 2026-06-05 decision lands. Bug fixes that surface between
+  now and then are documented (Bug-Q, Bug-R, ...) but not
+  deployed.
+* "Audit-only" is no longer a release valve for behaviour change.
+* Hard end date 2026-06-08, exactly three terminal options:
+  wind-down (1.A), single-knob deploy (1.B with constraints), or
+  architectural pivot to v3 (1.C with formal charter close-out).
+
+This explicitly forecloses the "extend the freeze, run more
+battery variants, hope for surprise edge" path that got us from
+week 1 to week 2.
+
+### 24.6 Test counts after Bug O
+
+| Suite | After Bug M+N (commit f74547a) | After Bug O | Δ |
+|---|---:|---:|---:|
+| `tests/unit/test_trend_filter_and_tp_realism.py` | 17 | 18 | +1 (Bug O regression) |
+| `tests/unit` total | 1,717 | 1,718 (verified)  | +1 |
+| Pass rate | 100% | 100% | — |
+
+### 24.7 Commit
+
+* `docs/freeze_v2.1_exit_criteria_2026-06-05.md` — new file (~9 KB), the operating contract.
+* `tests/unit/test_trend_filter_and_tp_realism.py` — Bug O fix + new regression class.
+* `logs/trades.csv` — 4 `manual_test` rows purged (gitignored, no track impact).
+* `logs/trades_pre_bug_o_purge_2026-05-29.csv` — pre-purge backup (gitignored).
+* `docs/findings_log_2026-05-27.md` — this section (§24) + executive summary entry 18.
+* `docs/friday_review_2026-05-29.md` — link to the new exit-criteria doc.
+
+Honest framing: the review's data-side conclusions are accepted as
+correct. The agent is not arguing for "one more iteration" of the
+existing engine. The work between now and 2026-06-05 is the H3-prime
+entry-lag forensic + slot-#4 V15 readout + H1 per-regime PnL slice;
+the work on 2026-06-05 is picking option A, B, or C against the
+pre-committed thresholds.
+
+
 

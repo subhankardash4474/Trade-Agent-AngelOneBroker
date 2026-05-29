@@ -694,3 +694,51 @@ strong steer toward H1+H3 as the next-sprint focus. That's a
 successful sprint outcome even though the headline answer is
 "nothing to ship today."
 
+---
+
+## 11. Project review 2026-05-29 19:10 IST + freeze-exit pre-commitment
+
+The operator delivered a thorough adversarial review at 19:10 IST
+that synthesised the diagnostic-sprint data into a brutal-but-correct
+three-part finding (no-edge in any 232-stock variant; single Nifty-50
+winner doesn't transfer; AUC=0.49 on clean retrain) and asked for
+in-writing pre-commitment to kill thresholds before any next-week
+work begins.
+
+The pre-commitment landed in:
+
+**[`docs/freeze_v2.1_exit_criteria_2026-06-05.md`](freeze_v2.1_exit_criteria_2026-06-05.md)**
+
+That document is the operating contract from 2026-05-29 forward.
+Three pre-committed thresholds:
+
+| Threshold | When | What |
+|---|---|---|
+| **T1** | Wed 2026-06-03 | H3-prime entry-lag forensic. Median `broker_fill_ts - strategy_emit_ts`: < 30 s → wind-down candidate; 30–120 s → single-knob pilot under hard kill floor; > 120 s → deploy PERF-01/02/14 + 5-day paper window. |
+| **T2** | Sat 2026-05-30 morning | Slot #4 focus run V15 PF: ≥ 1.05 surprising (do **NOT** ship); 0.90–1.05 net-zero model; < 0.90 retire `xgboost_classifier` permanently. |
+| **T3** | Fri 2026-06-08 | Wind-down kill criterion. If no PERF fix produces a 5-day paper window with PF ≥ 1.20 AND no H3/H1 finding identifies a single-bug remediation that could move PF above 1.0 → wind-down. |
+
+Friday 2026-06-05 decision is constrained to exactly three options
+(see exit-criteria doc §1):
+
+* **1.A** Wind-down (recommended absent surprise data).
+* **1.B** Single-knob deploy: PERF-01 + V4-thresh-3% on Nifty 50
+  only, max-concurrent-positions=5, hard rupee kill floor -₹500,
+  paper-only for first 5 days. Live trading requires a second
+  explicit unfreeze decision.
+* **1.C** Architectural pivot: higher TF, event-driven features,
+  formal v2.1 close-out + new v3 charter.
+
+The implicit fourth option ("extend the freeze, run more battery
+variants, hope for surprise edge") is explicitly ruled out. See
+exit-criteria doc §1.D.
+
+Bug O (test → prod `trades.csv` leak) and the audit-only
+reclassification refinement also landed in this review window. Full
+RCA in `docs/findings_log_2026-05-27.md` §24.
+
+The review's data-side conclusions are accepted. This file is
+preserved as the snapshot of what we believed and how we framed it
+on Friday morning before the review; the exit-criteria document is
+what we operate under for the next 10 days.
+

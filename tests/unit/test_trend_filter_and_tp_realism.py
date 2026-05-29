@@ -301,7 +301,16 @@ class TestPortfolioIdempotentPersist:
         from core.portfolio import Portfolio
 
         db = Database(str(tmp_path / "test.db"))
-        port = Portfolio(initial_balance=50000, database=db, reset_balance=True)
+        # Bug O (2026-05-29): pass log_dir=str(tmp_path) so the trade
+        # CSV-write inside close_position lands in tmp_path, not the
+        # repo's logs/trades.csv. Until this fix, every run of this
+        # test appended a ZZTEST row to the production trades.csv on
+        # whatever host happened to run pytest. Same class of bug as
+        # Bug M (logs/failed_alerts pollution). See findings_log §24.
+        port = Portfolio(
+            initial_balance=50000, database=db, reset_balance=True,
+            log_dir=str(tmp_path),
+        )
         port.open_position(
             symbol="ZZTEST", side="SELL", quantity=10,
             price=100.0, strategy="mean_reversion",
@@ -331,7 +340,12 @@ class TestPortfolioIdempotentPersist:
         from core.portfolio import Portfolio
 
         db = Database(str(tmp_path / "test.db"))
-        port = Portfolio(initial_balance=50000, database=db, reset_balance=True)
+        # Bug O (2026-05-29): same fix as the prior test -- route
+        # the CSV write through tmp_path. See findings_log §24.
+        port = Portfolio(
+            initial_balance=50000, database=db, reset_balance=True,
+            log_dir=str(tmp_path),
+        )
         port.open_position(
             symbol="ZZTEST2", side="SELL", quantity=10,
             price=100.0, strategy="mean_reversion",
@@ -354,3 +368,65 @@ class TestPortfolioIdempotentPersist:
             conn.close()
 
         assert count == 1, f"Expected idempotent, got {count} rows"
+
+
+class TestBugOTradesCsvIsolation:
+    """Bug O (2026-05-29): regression tests for the
+    `Portfolio(log_dir=...)` test-isolation contract.
+
+    Until the 2026-05-29 fix, every run of the persistence tests
+    above appended a real ``ZZTEST`` / ``ZZTEST2`` row to whatever
+    ``logs/trades.csv`` lived in the test process's CWD -- the
+    repo's production trade log on the dev machine, the trader VM's
+    production trade log on the trader VM. Same class of bug as
+    Bug M (alert spool path leak). The DB was correctly isolated to
+    ``tmp_path/test.db``; the CSV path defaulted to ``"logs"``.
+    See ``docs/findings_log_2026-05-27.md`` §24.
+    """
+
+    def test_close_position_writes_to_log_dir_not_cwd(self, tmp_path, monkeypatch):
+        """When ``log_dir=str(tmp_path)`` is supplied, the trade CSV
+        MUST land inside ``tmp_path`` and the CWD-relative
+        ``logs/trades.csv`` MUST stay untouched.
+        """
+        from core.database import Database
+        from core.portfolio import Portfolio
+
+        # CD into a clean tmp dir so the legacy ``logs/trades.csv``
+        # ALSO lands inside tmp_path. Belt + suspenders: the test
+        # then asserts the configured log_dir got the row AND the
+        # legacy ``./logs/trades.csv`` is empty / nonexistent.
+        monkeypatch.chdir(tmp_path)
+        cfg_log_dir = tmp_path / "isolated_logs"
+
+        db = Database(str(tmp_path / "test.db"))
+        port = Portfolio(
+            initial_balance=50000, database=db, reset_balance=True,
+            log_dir=str(cfg_log_dir),
+        )
+        port.open_position(
+            symbol="ZZTEST_BUG_O", side="SELL", quantity=10,
+            price=100.0, strategy="mean_reversion",
+            stop_loss=105.0, take_profit=95.0,
+        )
+        rec = port.close_position(
+            "ZZTEST_BUG_O", exit_price=95.5, exit_reason="manual_test"
+        )
+        assert rec is not None
+
+        configured_csv = cfg_log_dir / "trades.csv"
+        assert configured_csv.exists(), (
+            f"Expected trades.csv at configured log_dir {configured_csv!s}, "
+            f"but it doesn't exist."
+        )
+        assert "ZZTEST_BUG_O" in configured_csv.read_text(encoding="utf-8"), (
+            f"Expected ZZTEST_BUG_O row in {configured_csv!s}."
+        )
+
+        legacy_csv = tmp_path / "logs" / "trades.csv"
+        legacy_text = legacy_csv.read_text(encoding="utf-8") if legacy_csv.exists() else ""
+        assert "ZZTEST_BUG_O" not in legacy_text, (
+            f"Bug O regression: trade CSV write leaked into "
+            f"CWD-relative {legacy_csv!s} despite log_dir override. "
+            f"Verify Portfolio.__init__ honours the log_dir kwarg."
+        )
