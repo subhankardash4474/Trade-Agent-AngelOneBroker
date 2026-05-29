@@ -196,6 +196,32 @@ class ExecutionEngine:
         self.boot_reconcile_failed_live: bool = False
         self.boot_reconcile_failure_reason: Optional[str] = None
 
+        # ── NUM-11 / ORD-11 (audit 2026-05-28) ────────────────────────
+        # Live slippage tolerance circuit breaker. Pre-fix:
+        #   * Paper applied an *adverse* slippage draw of [0,
+        #     slippage_tolerance_pct]% (so backtests systematically
+        #     under-reported headline P&L vs live).
+        #   * Live recorded ``slippage`` as the absolute Rs delta
+        #     between fill and requested price, but never validated
+        #     it against ``slippage_tolerance_pct`` -- so a runaway
+        #     fill (illiquid name, RMS lifting protection) was
+        #     invisible to ops until the next P&L review.
+        # Post-fix:
+        #   * Both paper and live results carry ``slippage_pct`` (a
+        #     percent, comparable across modes) AND ``slippage_breach``
+        #     (bool, set when slippage_pct exceeds the tolerance).
+        #   * Live breaches log CRITICAL ``[ORD-11-SLIPPAGE]`` with
+        #     full context.
+        #   * If ``execution.halt_symbol_on_slippage_breach`` is true
+        #     (default False -- conservative; ops opts in), the
+        #     breached symbol is added to ``_slippage_breached_symbols``
+        #     and ``is_symbol_slippage_blocked`` returns True so the
+        #     caller gates new entries.
+        self.halt_symbol_on_slippage_breach: bool = bool(
+            exec_cfg.get("halt_symbol_on_slippage_breach", False)
+        )
+        self._slippage_breached_symbols: set[str] = set()
+
     def place_order(
         self,
         symbol: str,
@@ -492,6 +518,11 @@ class ExecutionEngine:
             "slippage": slippage,
             "bracket": False,
         }
+        # NUM-11 (audit 2026-05-28): paper + live now emit the same
+        # ``slippage_pct`` / ``slippage_breach`` shape so the backtester
+        # and the live broker are comparable. ``slippage`` (Rs absolute)
+        # is preserved for back-compat.
+        self._record_slippage(result, price)
         self._order_log.append(result)
         self._pending_orders[order_id] = result
         self._persist_order(result)
@@ -928,6 +959,14 @@ class ExecutionEngine:
                             result["slippage"] = round(
                                 abs(result["filled_price"] - price), 4
                             )
+                        # NUM-11 / ORD-11 (audit 2026-05-28): unified
+                        # slippage-pct accounting + breach circuit
+                        # breaker. Paper, live, and the cancel-race
+                        # path all flow through ``_record_slippage``
+                        # so backtester and live emit the same shape
+                        # AND a runaway live fill surfaces a CRITICAL
+                        # ``[ORD-11-SLIPPAGE]`` log immediately.
+                        self._record_slippage(result, price)
                         # Reflect updated state on the pending-orders cache
                         # so downstream order-status queries see the truth.
                         self._pending_orders[response] = result
@@ -1009,6 +1048,9 @@ class ExecutionEngine:
                                         abs(result["filled_price"] - price),
                                         4,
                                     )
+                                # NUM-11 / ORD-11 -- race-filled path
+                                # also emits slippage_pct + breach alert.
+                                self._record_slippage(result, price)
                                 self._pending_orders[response] = result
                                 logger.warning(
                                     f"[ORD-09-RACE] {symbol}: order "
@@ -1024,6 +1066,9 @@ class ExecutionEngine:
                                     race_filled_price or price
                                 )
                                 result["filled_quantity"] = race_filled_qty
+                                # NUM-11 / ORD-11 -- partial fills also emit
+                                # slippage_pct + breach alert.
+                                self._record_slippage(result, price)
                                 self._pending_orders[response] = result
                                 logger.warning(
                                     f"[ORD-09-RACE] {symbol}: order "
@@ -1402,6 +1447,115 @@ class ExecutionEngine:
         to flag any SL we believe is active on the broker."""
         return dict(self._sl_orders_by_symbol)
 
+    # ── NUM-11 / ORD-11 (audit 2026-05-28) ─────────────────────────────
+    #
+    # Live slippage tolerance circuit breaker. See ``__init__`` for the
+    # full background; the helpers below are the single source of truth
+    # for slippage-pct accounting (used by paper, shadow, AND live) and
+    # for the per-symbol block consulted by the entry path.
+
+    def _record_slippage(
+        self,
+        result: dict,
+        requested_price: Optional[float],
+    ) -> None:
+        """Compute ``slippage_pct`` and (optionally) flag a breach.
+
+        Always populates ``result["slippage_pct"]`` and
+        ``result["slippage_breach"]``. The legacy absolute ``slippage``
+        field (Rs) is left untouched if already set so existing
+        callers / persisted rows keep their semantics.
+
+        On breach (live only) emits a CRITICAL ``[ORD-11-SLIPPAGE]``
+        log with side, mode, fill / requested / pct, and the
+        operator-relevant remediation hint. Adds the symbol to
+        ``_slippage_breached_symbols`` only when
+        ``halt_symbol_on_slippage_breach`` is true so the default
+        "log-only" mode is non-disruptive.
+        """
+        try:
+            fp_raw = result.get("filled_price")
+            fp = float(fp_raw) if fp_raw is not None else None
+        except (TypeError, ValueError):
+            fp = None
+        try:
+            req = float(requested_price) if requested_price is not None else None
+        except (TypeError, ValueError):
+            req = None
+
+        if fp is None or req is None or req <= 0 or fp <= 0:
+            result.setdefault("slippage_pct", None)
+            result.setdefault("slippage_breach", False)
+            return
+
+        slip_pct = abs(fp - req) / req * 100.0
+        result["slippage_pct"] = round(slip_pct, 4)
+
+        # Float epsilon so a fill exactly at the tolerance does not
+        # trip a spurious breach (e.g. 0.10000000001 vs 0.10).
+        breached = slip_pct > (self.slippage_tolerance + 1e-9)
+        result["slippage_breach"] = bool(breached)
+
+        if not breached:
+            return
+
+        sym = result.get("symbol", "?")
+        side = result.get("transaction_type", "?")
+        mode = result.get("mode", "?")
+        oid = result.get("order_id", "?")
+
+        # Paper / shadow breaches are informational (the paper RNG can
+        # draw the upper-tolerance corner exactly); live breaches are
+        # the alert-worthy ones.
+        if mode == "live":
+            logger.critical(
+                f"[ORD-11-SLIPPAGE] {sym} {side} live={oid}: "
+                f"fill=Rs {fp:.2f} requested=Rs {req:.2f} "
+                f"slip_pct={slip_pct:.4f}% > tolerance="
+                f"{self.slippage_tolerance:.4f}%. "
+                + (
+                    "Blocking new entries on this symbol "
+                    "until clear_slippage_block() is called."
+                    if self.halt_symbol_on_slippage_breach
+                    else
+                    "halt_symbol_on_slippage_breach disabled "
+                    "-- alert is informational; ops should review."
+                )
+            )
+            if self.halt_symbol_on_slippage_breach:
+                self._slippage_breached_symbols.add(sym)
+        else:
+            logger.warning(
+                f"[ORD-11-SLIPPAGE] {sym} {side} {mode}={oid}: "
+                f"slip_pct={slip_pct:.4f}% > tolerance="
+                f"{self.slippage_tolerance:.4f}% (expected for "
+                f"paper adverse-draw worst case)."
+            )
+
+    def is_symbol_slippage_blocked(self, symbol: str) -> bool:
+        """ORD-11: True iff the symbol is currently blocked because a
+        previous live fill exceeded ``slippage_tolerance_pct`` AND
+        ``halt_symbol_on_slippage_breach`` is enabled.
+        """
+        return symbol in self._slippage_breached_symbols
+
+    def clear_slippage_block(self, symbol: str) -> bool:
+        """Operator hook: lift the slippage-breach block on ``symbol``.
+        Returns True if the symbol was previously blocked.
+        """
+        if symbol in self._slippage_breached_symbols:
+            self._slippage_breached_symbols.discard(symbol)
+            logger.warning(
+                f"[ORD-11-SLIPPAGE-CLEAR] {symbol}: slippage block "
+                f"lifted by operator."
+            )
+            return True
+        return False
+
+    def get_slippage_breached_symbols(self) -> set:
+        """Snapshot of the current slippage-breach blocklist."""
+        return set(self._slippage_breached_symbols)
+
     # P0 #4 (2026-05-15) — LIVE-MODE SAFETY: restart reconciliation.
     #
     # When the daemon restarts mid-session with open positions, the portfolio
@@ -1640,6 +1794,11 @@ class ExecutionEngine:
                         if filled_price > 0 and requested > 0:
                             pending["filled_price"] = filled_price
                             pending["slippage"] = round(abs(filled_price - requested), 2)
+                            # NUM-11 / ORD-11: keep slippage_pct +
+                            # breach flag in sync on the passive
+                            # observation path so cycle-end snapshots
+                            # also see the breach.
+                            self._record_slippage(pending, requested)
                         return order
         except Exception as e:
             logger.error(f"Failed to fetch order status: {e}")

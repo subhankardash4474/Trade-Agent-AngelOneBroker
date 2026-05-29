@@ -2347,4 +2347,169 @@ Remaining (4 groups, 6 findings):
 The Critical-tagged finding NUM-01 is already CLOSED (commit
 `03ba66d`); ORD-* remaining are all Medium-tagged.
 
+---
+
+## 17. Misc-OPEN bucket — Group D: live slippage parity + tolerance circuit breaker (NUM-11/ORD-11)
+
+**Date:** 2026-05-29 (night IST)
+**Commit:** PENDING (this section is being written before the commit)
+**Status:** 2 findings FIXED, NOT deployed.
+
+### 17.1 What was broken
+
+**NUM-11** — Paper applied an *adverse* slippage draw of [0,
+slippage_tolerance_pct]% on every fill, so the backtester
+systematically under-reported headline P&L vs live.
+
+**ORD-11** — Live fills recorded `slippage` as the absolute Rs
+delta between fill and requested price, but never validated it
+against `slippage_tolerance_pct`. A runaway fill (illiquid name,
+RMS lifting the protective gate, MARKET order on a wide quote)
+was invisible to ops until the next manual P&L review.
+
+The combination meant the backtester and the live broker were
+emitting non-comparable shapes and the live-side guardrail was
+absent.
+
+### 17.2 Fixes
+
+**Single source of truth: `ExecutionEngine._record_slippage(result, requested_price)`.**
+
+```
+def _record_slippage(self, result, requested_price):
+    fp = float(result.get("filled_price"))
+    if fp is None or requested_price <= 0 or fp <= 0:
+        result["slippage_pct"] = None
+        result["slippage_breach"] = False
+        return
+    slip_pct = abs(fp - requested_price) / requested_price * 100.0
+    result["slippage_pct"] = round(slip_pct, 4)
+    result["slippage_breach"] = slip_pct > (slippage_tolerance + 1e-9)
+    if result["slippage_breach"] and result["mode"] == "live":
+        logger.critical("[ORD-11-SLIPPAGE] ...")
+        if halt_symbol_on_slippage_breach:
+            self._slippage_breached_symbols.add(symbol)
+```
+
+Wired into every result-emission path:
+
+* `_paper_order` — paper fills (replaces the inline `slippage`
+  computation; the legacy `slippage` Rs absolute field is preserved
+  for back-compat).
+* `_live_order_with_retry` — live FILLED + PARTIALLY_FILLED branch.
+* `_live_order_with_retry` — ORD-09 race-FILLED + race-PARTIAL
+  branches (so a fill that lands in the cancel window also gets
+  the breach check).
+* `get_order_status` — passive observation path, so cycle-end
+  snapshots also see breach state.
+
+**Trading-agent gate (entry path only).**
+
+`TradingAgent._open_new_position` now consults
+`execution.is_symbol_slippage_blocked(symbol)` immediately after the
+`ROLLBACK-BLOCK` check. If True it logs `[SLIPPAGE-BLOCK]`, calls
+`_audit_reject(signal, current_price, "slippage_block:breach")`, and
+returns. Exits / square-off / SL trail paths route through
+`execution.place_order` directly and are NOT gated -- this matters
+because the operator might WANT to flatten a position whose entry
+slippage breached.
+
+**Configuration knobs.**
+
+* `execution.slippage_tolerance_pct` — already existed (default
+  0.10%); now also used as the live breach threshold.
+* `execution.halt_symbol_on_slippage_breach` — new (default False).
+  Conservative default: ops opts in. When True, breaches add to the
+  in-memory blocklist and gate new entries until cleared.
+
+**Public ops API.**
+
+* `ExecutionEngine.is_symbol_slippage_blocked(symbol) -> bool`
+* `ExecutionEngine.clear_slippage_block(symbol) -> bool`
+* `ExecutionEngine.get_slippage_breached_symbols() -> set` (returns
+  a copy so callers can't mutate state).
+
+### 17.3 Test coverage
+
+**New `TestNUM11SlippageParity`** (5 tests):
+
+* `test_paper_result_carries_slippage_pct_and_breach_flag` -- paper
+  result dict has both new keys; paper draws stay within the
+  tolerance band.
+* `test_live_filled_result_carries_slippage_pct` -- live FILLED
+  result has slippage_pct + breach=False for a 0.05% slip vs 0.10%
+  tolerance.
+* `test_slippage_pct_is_zero_when_fill_matches_request` -- exact
+  fill = 0% slip, no breach.
+* `test_record_slippage_returns_none_when_inputs_invalid` --
+  defensive: missing fill_price OR requested_price=0 yields
+  slippage_pct=None and breach=False without raising.
+* `test_get_order_status_path_also_records_slippage_pct` -- the
+  passive observer keeps the pending-orders cache in sync.
+
+**New `TestORD11SlippageCircuitBreaker`** (7 tests):
+
+* `test_breach_on_live_fill_logs_critical_anchor` -- 1.0% slip vs
+  0.10% tolerance → result["slippage_breach"] is True; halt
+  disabled so symbol NOT blocked.
+* `test_breach_with_halt_flag_blocks_symbol` -- with halt enabled,
+  breached symbol is in the blocklist; snapshot is a copy.
+* `test_clear_slippage_block_lifts_gate` -- explicit clear lifts
+  the gate; clearing an unknown symbol returns False without
+  raising (idempotent).
+* `test_within_tolerance_does_not_block` -- 0.10% slip == 0.10%
+  tolerance: epsilon-aware → NOT a breach.
+* `test_partial_fill_also_records_slippage_pct` -- paper partial
+  fills also emit slippage_pct + breach.
+* `test_open_new_position_consults_slippage_block` -- source-level
+  pin so a future refactor can't silently drop the entry-path
+  gate. Also pins the audit_reject reason string so ops dashboards
+  remain stable.
+* `test_anchor_in_execution_source` -- pins `_record_slippage`,
+  `is_symbol_slippage_blocked`, `clear_slippage_block`,
+  `[ORD-11-SLIPPAGE]`, and `halt_symbol_on_slippage_breach` so
+  greppable audit IDs survive future refactors.
+
+**Suite results:**
+
+* Unit: **1,600 / 1,600** PASSED.
+* Integration: **248 / 248** PASSED.
+
+### 17.4 Files touched
+
+* `packages/core/execution.py` -- `_record_slippage` helper +
+  `_slippage_breached_symbols` state + 3 public methods +
+  wiring into 4 result-emission paths.
+* `trading_agent.py` -- `_open_new_position` slippage block gate.
+* `tests/unit/test_audit_2026_05_28_misc.py` -- 12 new tests
+  (TestNUM11SlippageParity + TestORD11SlippageCircuitBreaker).
+
+### 17.5 Honest caveat
+
+The default is `halt_symbol_on_slippage_breach=False` so the
+log-level alert fires but no auto-halt happens. This is deliberate:
+NSE has plenty of legitimate ~0.30% spreads on illiquid mid-caps
+right at open, and a hair-trigger circuit breaker would block more
+real entries than runaway fills. Ops should review the
+`[ORD-11-SLIPPAGE]` log entries for a few days, calibrate
+`slippage_tolerance_pct` per universe, and then flip
+`halt_symbol_on_slippage_breach` to True once the false-positive
+rate is acceptable.
+
+### 17.6 What's left in the misc-OPEN bucket
+
+Done in this commit: NUM-11, ORD-11.
+Done in `d578ff1`: ORD-05, ORD-07, ORD-08, ORD-09.
+Done in `da7ab69`: NUM-06, NUM-07.
+Done in `03ba66d`: NUM-01.
+
+Remaining (3 groups, 4 findings):
+
+* **Group E** — ORD-10 (reactive re-auth on `401` / `AB*` error
+  classes; the 7-hour proactive timer is too coarse).
+* **Group F** — NUM-10 (decimal arithmetic for charges; touches
+  `charges.py` + `portfolio.py`).
+* **Group G** — PERF-07 (DataFrame allocation cache) +
+  PERF-13 (battery worker pickle); deferrable, backtester-only.
+
 

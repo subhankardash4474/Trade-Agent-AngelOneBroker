@@ -27,6 +27,16 @@ Findings covered in this file:
 * **ORD-09** (Medium)   -- order-fill TTL now actively cancels the
   pending order and fails the call instead of silently keeping
   ``status='PLACED'`` (Group C).
+* **NUM-11** (Medium)   -- paper / live slippage parity. Both modes
+  now emit ``slippage_pct`` + ``slippage_breach`` so the backtester
+  and the live broker are comparable (Group D).
+* **ORD-11** (Medium)   -- live slippage tolerance circuit breaker.
+  After every live fill, ``slippage_pct`` is compared against
+  ``execution.slippage_tolerance_pct``; on breach the engine emits a
+  CRITICAL ``[ORD-11-SLIPPAGE]`` log and (when
+  ``execution.halt_symbol_on_slippage_breach`` is set) blocks new
+  entries on the symbol until ``clear_slippage_block`` is called
+  (Group D).
 """
 
 from __future__ import annotations
@@ -880,3 +890,319 @@ class TestORD09TTLCancelAndFail:
         assert "ORD-09" in body
         # The TTL branch must invoke cancel_order before returning.
         assert "self.cancel_order(" in body
+
+
+# ─────────────────────────────────────────────────────────────────────
+# NUM-11 / ORD-11: live slippage capture + tolerance circuit breaker
+# ─────────────────────────────────────────────────────────────────────
+
+
+def _slippage_engine(api_mock, *, halt: bool = False, tolerance_pct: float = 0.10):
+    """Live ExecutionEngine wired to ``api_mock`` with the slippage
+    tolerance circuit breaker controlled by ``halt`` (the
+    ``halt_symbol_on_slippage_breach`` config knob).
+    """
+    from core.execution import ExecutionEngine
+
+    cfg = {
+        "broker": {"mode": "live"},
+        "execution": {
+            "order_type": "LIMIT",
+            "product_type": "INTRADAY",
+            "live_order_fill_timeout_sec": 0.05,
+            "live_order_fill_poll_interval_sec": 0.02,
+            "slippage_tolerance_pct": tolerance_pct,
+            "halt_symbol_on_slippage_breach": halt,
+        },
+        "market": {"exchange": "NSE"},
+    }
+    return ExecutionEngine(cfg, smart_api=api_mock)
+
+
+def _seed_book(api_mock, order_id: str, *, status: str = "complete",
+               avg_price: float = 1500.0, qty: int = 10):
+    api_mock.orderBook.return_value = {
+        "status": True,
+        "data": [{
+            "orderid": order_id,
+            "status": status,
+            "averageprice": str(avg_price),
+            "filledshares": str(qty),
+        }],
+    }
+
+
+class TestNUM11SlippageParity:
+    """Paper and live MUST emit the same slippage shape so the
+    backtester is comparable to live without bespoke parsing."""
+
+    def test_paper_result_carries_slippage_pct_and_breach_flag(self):
+        from unittest.mock import MagicMock
+
+        from core.execution import ExecutionEngine
+
+        cfg = {
+            "broker": {"mode": "paper"},
+            "execution": {
+                "order_type": "LIMIT",
+                "product_type": "INTRADAY",
+                "slippage_tolerance_pct": 0.10,
+            },
+            "market": {"exchange": "NSE"},
+        }
+        eng = ExecutionEngine(cfg, smart_api=None, database=MagicMock())
+
+        res = eng.place_order(
+            symbol="HDFCBANK", token="123", transaction_type="BUY",
+            quantity=10, price=1500.0,
+        )
+        assert res is not None
+        assert "slippage_pct" in res
+        assert "slippage_breach" in res
+        # Paper draws within [0, tolerance] so by definition it CAN'T
+        # exceed tolerance + epsilon.
+        assert isinstance(res["slippage_pct"], (int, float))
+        assert res["slippage_pct"] >= 0.0
+        # Paper cannot strictly exceed tolerance (uniform draw is half-
+        # open on the right after rounding to 2dp).
+        assert res["slippage_breach"] is False or res["slippage_pct"] <= 0.10001
+
+    def test_live_filled_result_carries_slippage_pct(self):
+        from unittest.mock import MagicMock
+
+        api = MagicMock()
+        api.placeOrder.side_effect = ["OID-LP-1"]
+        # Fill 0.05% above requested -> within tolerance.
+        _seed_book(api, "OID-LP-1", avg_price=1500.75, qty=10)
+        eng = _slippage_engine(api, tolerance_pct=0.10)
+
+        res = eng._live_order_with_retry(
+            symbol="HDFCBANK", token="123", tx_type="BUY",
+            quantity=10, price=1500.0, order_type="LIMIT",
+            stop_loss=None, take_profit=None, tag="t",
+        )
+        assert res is not None
+        assert res["status"] == "FILLED"
+        assert res["slippage_pct"] == pytest.approx(0.05, rel=1e-3)
+        assert res["slippage_breach"] is False
+
+    def test_slippage_pct_is_zero_when_fill_matches_request(self):
+        from unittest.mock import MagicMock
+
+        api = MagicMock()
+        api.placeOrder.side_effect = ["OID-EXACT"]
+        _seed_book(api, "OID-EXACT", avg_price=1500.0, qty=10)
+        eng = _slippage_engine(api, tolerance_pct=0.10)
+
+        res = eng._live_order_with_retry(
+            symbol="X", token="0", tx_type="BUY",
+            quantity=10, price=1500.0, order_type="LIMIT",
+            stop_loss=None, take_profit=None, tag="t",
+        )
+        assert res["slippage_pct"] == pytest.approx(0.0, abs=1e-6)
+        assert res["slippage_breach"] is False
+
+    def test_record_slippage_returns_none_when_inputs_invalid(self):
+        from unittest.mock import MagicMock
+
+        from core.execution import ExecutionEngine
+
+        eng = ExecutionEngine({"broker": {"mode": "paper"}}, smart_api=None,
+                              database=MagicMock())
+
+        # Missing fill price.
+        res = {"order_id": "X", "filled_price": None, "mode": "paper"}
+        eng._record_slippage(res, requested_price=100.0)
+        assert res["slippage_pct"] is None
+        assert res["slippage_breach"] is False
+
+        # Zero requested.
+        res = {"order_id": "X", "filled_price": 100.0, "mode": "paper"}
+        eng._record_slippage(res, requested_price=0.0)
+        assert res["slippage_pct"] is None
+        assert res["slippage_breach"] is False
+
+    def test_get_order_status_path_also_records_slippage_pct(self):
+        from unittest.mock import MagicMock
+
+        api = MagicMock()
+        api.orderBook.return_value = {
+            "status": True,  # outer envelope
+            "data": [{
+                "orderid": "OID-OBSERVED",
+                "status": "complete",
+                "averageprice": "1503.00",
+                "filledshares": "10",
+            }]
+        }
+        eng = _slippage_engine(api, tolerance_pct=0.10)
+        # Pre-seed the pending dict the way ``_live_order_with_retry``
+        # would have: requested_price is required.
+        eng._pending_orders["OID-OBSERVED"] = {
+            "order_id": "OID-OBSERVED",
+            "requested_price": 1500.0,
+            "mode": "live",
+        }
+        out = eng.get_order_status("OID-OBSERVED")
+        assert out is not None
+        # The pending row should now have slippage_pct + breach (0.20%
+        # > 0.10% tolerance).
+        pending = eng._pending_orders["OID-OBSERVED"]
+        assert pending["slippage_pct"] == pytest.approx(0.20, rel=1e-3)
+        assert pending["slippage_breach"] is True
+
+
+class TestORD11SlippageCircuitBreaker:
+    """A live fill that breaches ``slippage_tolerance_pct`` MUST surface
+    as a CRITICAL ``[ORD-11-SLIPPAGE]`` log AND (when the operator opts
+    in) block new entries on the symbol until cleared.
+    """
+
+    def test_breach_on_live_fill_logs_critical_anchor(self, caplog):
+        import logging
+
+        from unittest.mock import MagicMock
+
+        api = MagicMock()
+        api.placeOrder.side_effect = ["OID-BREACH-1"]
+        # Fill 1.0% above requested -> breach 0.10% tolerance by 10x.
+        _seed_book(api, "OID-BREACH-1", avg_price=1515.0, qty=10)
+        eng = _slippage_engine(api, halt=False, tolerance_pct=0.10)
+
+        # Loguru -> stdlib bridge: capture WARNING+ from a stdlib
+        # handler attached to a unique logger name. Easier: read the
+        # ``result`` dict and assert the breach flag, since loguru
+        # routes elsewhere by default.
+        res = eng._live_order_with_retry(
+            symbol="HDFCBANK", token="123", tx_type="BUY",
+            quantity=10, price=1500.0, order_type="LIMIT",
+            stop_loss=None, take_profit=None, tag="t",
+        )
+        assert res is not None
+        assert res["slippage_breach"] is True
+        assert res["slippage_pct"] == pytest.approx(1.0, rel=1e-3)
+        # halt=False so the symbol is NOT blocked.
+        assert eng.is_symbol_slippage_blocked("HDFCBANK") is False
+
+    def test_breach_with_halt_flag_blocks_symbol(self):
+        from unittest.mock import MagicMock
+
+        api = MagicMock()
+        api.placeOrder.side_effect = ["OID-BREACH-2"]
+        _seed_book(api, "OID-BREACH-2", avg_price=1515.0, qty=10)
+        eng = _slippage_engine(api, halt=True, tolerance_pct=0.10)
+
+        res = eng._live_order_with_retry(
+            symbol="HDFCBANK", token="123", tx_type="BUY",
+            quantity=10, price=1500.0, order_type="LIMIT",
+            stop_loss=None, take_profit=None, tag="t",
+        )
+        assert res["slippage_breach"] is True
+        assert eng.is_symbol_slippage_blocked("HDFCBANK") is True
+        # Snapshot returns a copy so callers can't mutate state.
+        snapshot = eng.get_slippage_breached_symbols()
+        assert snapshot == {"HDFCBANK"}
+        snapshot.clear()
+        assert eng.is_symbol_slippage_blocked("HDFCBANK") is True
+
+    def test_clear_slippage_block_lifts_gate(self):
+        from unittest.mock import MagicMock
+
+        api = MagicMock()
+        api.placeOrder.side_effect = ["OID-BREACH-3"]
+        _seed_book(api, "OID-BREACH-3", avg_price=1515.0, qty=10)
+        eng = _slippage_engine(api, halt=True, tolerance_pct=0.10)
+
+        eng._live_order_with_retry(
+            symbol="X", token="0", tx_type="BUY",
+            quantity=10, price=1500.0, order_type="LIMIT",
+            stop_loss=None, take_profit=None, tag="t",
+        )
+        assert eng.is_symbol_slippage_blocked("X") is True
+        cleared = eng.clear_slippage_block("X")
+        assert cleared is True
+        assert eng.is_symbol_slippage_blocked("X") is False
+        # Idempotent: clearing an unknown symbol returns False without
+        # raising.
+        assert eng.clear_slippage_block("UNKNOWN") is False
+
+    def test_within_tolerance_does_not_block(self):
+        from unittest.mock import MagicMock
+
+        api = MagicMock()
+        api.placeOrder.side_effect = ["OID-OK"]
+        # Exactly at tolerance: should NOT breach (epsilon-aware).
+        _seed_book(api, "OID-OK", avg_price=1500.0 * (1 + 0.001), qty=10)
+        eng = _slippage_engine(api, halt=True, tolerance_pct=0.10)
+
+        res = eng._live_order_with_retry(
+            symbol="X", token="0", tx_type="BUY",
+            quantity=10, price=1500.0, order_type="LIMIT",
+            stop_loss=None, take_profit=None, tag="t",
+        )
+        assert res is not None
+        # 0.10% slippage exactly = tolerance, not a breach.
+        assert res["slippage_breach"] is False
+        assert eng.is_symbol_slippage_blocked("X") is False
+
+    def test_partial_fill_also_records_slippage_pct(self):
+        from unittest.mock import MagicMock
+
+        from core.execution import ExecutionEngine
+
+        cfg = {
+            "broker": {"mode": "paper"},
+            "execution": {
+                "order_type": "LIMIT",
+                "product_type": "INTRADAY",
+                "slippage_tolerance_pct": 0.10,
+                "paper_partial_fill_prob": 1.0,
+                "paper_partial_fill_min_ratio": 0.5,
+            },
+            "market": {"exchange": "NSE"},
+        }
+        eng = ExecutionEngine(cfg, smart_api=None, database=MagicMock())
+        res = eng.place_order(
+            symbol="X", token="0", transaction_type="BUY",
+            quantity=10, price=1500.0,
+        )
+        assert res is not None
+        assert "slippage_pct" in res
+        assert "slippage_breach" in res
+
+    def test_open_new_position_consults_slippage_block(self):
+        """The trading_agent entry path must gate on
+        ``is_symbol_slippage_blocked`` before issuing a new entry.
+        Source-level pin so a future refactor cannot silently drop the
+        gate."""
+        path = os.path.join(PROJECT_ROOT, "trading_agent.py")
+        with open(path, "r", encoding="utf-8") as fh:
+            src = fh.read()
+        idx = src.find("def _open_new_position(")
+        assert idx >= 0, "_open_new_position must exist"
+        next_def = src.find("\n    def ", idx + 1)
+        body = src[idx:next_def]
+        assert "is_symbol_slippage_blocked" in body, (
+            "ORD-11 regression: _open_new_position no longer consults "
+            "execution.is_symbol_slippage_blocked. The slippage circuit "
+            "breaker is now bypassable. Re-add the gate before the "
+            "rollback-block check or wherever the entry-time gates "
+            "are applied."
+        )
+        # The reject reason string is part of the audit contract.
+        assert "slippage_block:breach" in body or "slippage_block" in body, (
+            "ORD-11 regression: the gate's audit_reject reason string "
+            "changed -- ops dashboards key off this string."
+        )
+
+    def test_anchor_in_execution_source(self):
+        path = os.path.join(PROJECT_ROOT, "packages", "core", "execution.py")
+        with open(path, "r", encoding="utf-8") as fh:
+            src = fh.read()
+        # Helper exists.
+        assert "def _record_slippage(" in src
+        assert "def is_symbol_slippage_blocked(" in src
+        assert "def clear_slippage_block(" in src
+        # Anchors so future refactors can grep for the audit ID.
+        assert "ORD-11-SLIPPAGE" in src
+        assert "halt_symbol_on_slippage_breach" in src

@@ -5018,6 +5018,30 @@ class TradingAgent:
             self._audit_reject(signal, current_price, "rollback_block:incomplete")
             return
 
+        # ORD-11 (audit 2026-05-28): slippage circuit-breaker gate. If
+        # a prior live fill on this symbol exceeded
+        # ``execution.slippage_tolerance_pct`` AND ops opted into
+        # ``execution.halt_symbol_on_slippage_breach``, refuse new
+        # entries until ``ExecutionEngine.clear_slippage_block(symbol)``
+        # is called. Exits / SL trail / square-off paths are NOT
+        # gated -- they go through ``execution.place_order`` directly.
+        try:
+            if self.execution.is_symbol_slippage_blocked(symbol):
+                logger.warning(
+                    f"[SLIPPAGE-BLOCK] Refusing new {direction_label} on "
+                    f"{symbol}: prior live fill breached "
+                    f"slippage_tolerance_pct. Operator must call "
+                    f"ExecutionEngine.clear_slippage_block({symbol!r}) "
+                    f"to lift the gate."
+                )
+                self._audit_reject(
+                    signal, current_price, "slippage_block:breach"
+                )
+                return
+        except AttributeError:
+            # Older ExecutionEngine on a hot-reload path; ignore.
+            pass
+
         # STATE-09 (audit 2026-05-28): cooldown / blacklist persistence
         # was corrupt at boot. The loader returned blank counters which
         # would otherwise let a previously-blacklisted stock trade
