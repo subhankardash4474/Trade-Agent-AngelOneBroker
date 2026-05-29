@@ -33,9 +33,16 @@ set -euo pipefail
 
 REPO=/opt/trading-agent
 TS=$(date -u +%Y%m%dT%H%MZ)
-LOG="$REPO/logs/wait_then_retrain_${TS}.log"
-
-mkdir -p "$REPO/logs"
+# Log to /home/opc/retrain_logs not $REPO/logs because the latter is
+# daemon-user-owned (uid 1001) under Bug J's three-way ownership split
+# (see findings_log_2026-05-27.md §1.5). HARDCODED to /home/opc because
+# the inner run_retrain_on_backtester.sh is invoked under sudo (so its
+# $HOME would become /root); we want both wrapper + inner logs to
+# co-locate in opc's home tree for operator inspection.
+OPC_HOME=/home/opc
+LOG_DIR="$OPC_HOME/retrain_logs"
+mkdir -p "$LOG_DIR"
+LOG="$LOG_DIR/wait_then_retrain_${TS}.log"
 exec > >(tee -a "$LOG") 2>&1
 
 echo "============================================================"
@@ -64,6 +71,9 @@ while true; do
 done
 
 echo
-echo "Triggering: bash $REPO/tools/cloud/run_retrain_on_backtester.sh"
+echo "Triggering: sudo -n bash $REPO/tools/cloud/run_retrain_on_backtester.sh"
 echo
-exec sudo bash "$REPO/tools/cloud/run_retrain_on_backtester.sh"
+# `sudo -n` because we run under nohup with no TTY; opc has NOPASSWD
+# pre-configured for the docker/systemctl operations the inner script
+# performs (verified at retrain-prep time on 2026-05-29).
+exec sudo -n bash "$REPO/tools/cloud/run_retrain_on_backtester.sh"

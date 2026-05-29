@@ -52,11 +52,20 @@ set -euo pipefail
 
 REPO=/opt/trading-agent
 TS=$(date -u +%Y%m%dT%H%MZ)
-RUN_LOG="$REPO/logs/retrain_${TS}.log"
+# Log to /home/opc/retrain_logs not $REPO/logs because daemon-user owns
+# the latter under Bug J's three-way ownership split — see findings_log
+# §1.5). HARDCODED to /home/opc (not $HOME) because this script may be
+# invoked via `sudo bash ...` from the wait wrapper, in which case $HOME
+# would become /root and the logs would land in the wrong tree. /home/opc
+# is the operator's natural look-up location and is opc-owned.
+OPC_HOME=/home/opc
+LOG_DIR="$OPC_HOME/retrain_logs"
+mkdir -p "$LOG_DIR"
+chown opc:opc "$LOG_DIR" 2>/dev/null || true
+RUN_LOG="$LOG_DIR/retrain_${TS}.log"
 PKL_OUT="$REPO/models/xgboost_model_retrain_${TS}.pkl"
 PKL_LIVE="$REPO/models/xgboost_model.pkl"
 
-mkdir -p "$REPO/logs"
 exec > >(tee -a "$RUN_LOG") 2>&1
 
 banner() { echo; echo "============================================================"; echo " $1"; echo "============================================================"; echo; }
@@ -128,6 +137,11 @@ if [ ! -f "$TRAIN_CSV" ] || [ ! -f "$TEST_CSV" ]; then
     echo "[FATAL] prepare_dataset did not produce train/test CSVs" >&2
     exit 13
 fi
+# Docker writes output as root (uid 0) inside the container, which lands
+# as root-owned files on the host bind-mount. Subsequent python sub-shells
+# in this script run as opc, so they can't read root-owned CSVs without
+# sudo. chown back to opc so the rest of the pipeline reads cleanly.
+sudo chown -R opc:opc "$DATASET_DIR"
 TRAIN_ROWS=$(($(wc -l < "$TRAIN_CSV") - 1))
 TEST_ROWS=$(($(wc -l < "$TEST_CSV") - 1))
 echo "Train: $TRAIN_ROWS rows  | Test: $TEST_ROWS rows"
@@ -175,6 +189,9 @@ if [ ! -f "$PKL_OUT" ]; then
     echo "[FATAL] train_xgboost did not produce $PKL_OUT" >&2
     exit 14
 fi
+# Same chown rationale as for the dataset CSVs: docker wrote the pkl as
+# root, but Step 7's python sub-shell needs to pickle.load it as opc.
+sudo chown opc:opc "$PKL_OUT"
 echo "Model written: $PKL_OUT"
 
 # ── Step 6: extract metrics from the run log (parsed from training output) ─
