@@ -163,11 +163,30 @@ TEST_ROWS=$(($(wc -l < "$TEST_CSV") - 1))
 echo "Train: $TRAIN_ROWS rows  | Test: $TEST_ROWS rows"
 
 # Hard-stop A: label balance must be sane.
-PYTHONBIN=$(command -v python3 || command -v python)
-LABEL_BALANCE=$($PYTHONBIN -c "
+# We can't use the host python here — Oracle Linux 8 ships /usr/bin/python3
+# without pandas. The trading-agent:latest image has the full ML stack
+# baked in, so we route the sanity checks through a thin docker run too.
+# The previous version of this script (commit 6385ee6) tried the host
+# python and crashed at `ModuleNotFoundError: No module named 'pandas'`
+# (see /home/opc/retrain_logs/retrain_20260529T1217Z.log) — which the
+# fail-closed `LABEL_RC != 0` branch correctly interpreted as "abort,
+# don't replace pkl", but it surfaced as a misleading "label balance >
+# 85/15" message. Fixed now.
+docker_py() {
+    sudo docker run --rm \
+        -v "$REPO":/app \
+        -v "$REPO/data":/app/data \
+        -v "$REPO/models":/app/models \
+        -w /app \
+        -e PYTHONPATH=/app \
+        trading-agent:latest \
+        python "$@"
+}
+
+LABEL_BALANCE=$(docker_py -c "
 import pandas as pd
 import sys
-df = pd.read_csv('$TRAIN_CSV')
+df = pd.read_csv('data/retrain_${TS}/train_dataset.csv')
 total = len(df)
 up = int((df['label'] == 1).sum())
 down = int((df['label'] == 0).sum())
@@ -221,13 +240,13 @@ echo "Brier : ${BRIER:-<missing>}"
 
 # ── Step 7: BUY/SELL prediction distribution check on test set ───────────
 banner "Step 7: prediction distribution check"
-PRED_BALANCE=$($PYTHONBIN -c "
+PRED_BALANCE=$(docker_py -c "
 import pandas as pd
 import pickle
 import sys
-with open('$PKL_OUT', 'rb') as f:
+with open('models/xgboost_model_retrain_${TS}.pkl', 'rb') as f:
     model = pickle.load(f)
-df = pd.read_csv('$TEST_CSV', index_col=0)
+df = pd.read_csv('data/retrain_${TS}/test_dataset.csv', index_col=0)
 feature_cols = [c for c in df.columns if c not in ('label', 'symbol')]
 X = df[feature_cols].fillna(0)
 proba = model.predict_proba(X)[:, 1]
@@ -246,8 +265,10 @@ if [ $PRED_RC -ne 0 ]; then
 fi
 
 # ── Step 8: AUC hard-stop ────────────────────────────────────────────────
+# Bash float-compare via awk (no docker round-trip needed for a 1-line
+# arithmetic check; the host has awk).
 if [ -n "${AUC:-}" ]; then
-    AUC_OK=$($PYTHONBIN -c "print('OK' if float('$AUC') >= 0.55 else 'FAIL')")
+    AUC_OK=$(awk -v a="$AUC" 'BEGIN{print (a + 0 >= 0.55) ? "OK" : "FAIL"}')
     if [ "$AUC_OK" != "OK" ]; then
         echo "[FATAL] AUC=$AUC < 0.55 — model didn't find enough signal." >&2
         echo "        Existing pkl NOT replaced; new pkl preserved at $PKL_OUT" >&2
