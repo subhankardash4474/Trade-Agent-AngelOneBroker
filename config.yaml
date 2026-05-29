@@ -664,6 +664,18 @@ execution:
   retry_attempts: 3
   retry_delay_seconds: 2
   slippage_tolerance_pct: 0.1
+  # NUM-01 (audit 2026-05-28): MIS short-margin model. Live brokers
+  # post ~20% of notional as margin when you SHORT under MIS (the
+  # remaining 80% is the broker's intra-day extension of credit
+  # against the sell-proceeds). Pre-fix the backtester locked the
+  # FULL short notional (100%), so a Rs 100k cash budget could only
+  # sustain Rs 100k of short notional vs the Rs 500k a live broker
+  # would actually allow. Every short-side battery number was
+  # ~5x under-sized vs live capital efficiency. Set 1.0 to recover
+  # the legacy "full notional lock" behaviour. Range [0, 1] -- out-
+  # of-range values are clamped silently. LONG positions ignore
+  # this knob (they always lock full notional in the simulator).
+  mis_short_margin_pct: 0.20
   # C-27 (audit 2026-05-26): DEAD KNOB — kept for backwards compat with
   # callers that pass it to Portfolio(commission_pct=...) but charge math
   # exclusively uses `packages/core/charges.py` (compute_one_leg /

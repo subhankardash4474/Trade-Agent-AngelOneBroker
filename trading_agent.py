@@ -231,6 +231,9 @@ class TradingAgent:
             database=self.database,
             product_type=self.config.get("execution", {}).get("product_type", "INTRADAY"),
             reset_balance=reset_balance,
+            mis_short_margin_pct=float(
+                self.config.get("execution", {}).get("mis_short_margin_pct", 0.20)
+            ),
         )
 
         # P0 #2 (2026-05-15) — LIVE-MODE SAFETY: serialize exit checks.

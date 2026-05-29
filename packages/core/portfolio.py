@@ -39,6 +39,19 @@ class Position:
     # Per-strategy credit shares (sums to ~1.0). Used by the learner to
     # attribute PnL back to the strategies that voted for this trade.
     contributing_strategies: Optional[Dict[str, float]] = None
+    # NUM-01 (audit 2026-05-28): explicit cash actually locked when this
+    # position was opened. For LONG this is ``entry_price * quantity +
+    # entry_commission``. For SHORT under MIS this is
+    # ``entry_price * quantity * mis_short_margin_pct +
+    # entry_commission`` (margin model) -- pre-fix the backtester locked
+    # the FULL short notional, biasing every short-side P&L number ~5x
+    # vs live broker reality. Stored explicitly so ``close_position``
+    # can reverse the same number that was deducted on ``open_position``,
+    # even if config or default margin changes mid-session. ``0.0`` =
+    # legacy / restored row -- callers fall back to the implicit
+    # ``entry_value + entry_commission`` model so we never break a
+    # position that was opened before the migration shipped.
+    cash_locked: float = 0.0
 
     @property
     def value(self) -> float:
@@ -106,7 +119,7 @@ class Portfolio:
 
     def __init__(self, initial_balance: float, commission_pct: float = 0.03,
                  log_dir: str = "logs", database=None, product_type: str = "INTRADAY",
-                 reset_balance: bool = False):
+                 reset_balance: bool = False, mis_short_margin_pct: float = 1.0):
         """
         Args:
             initial_balance: Seed balance used on first ever run (or when
@@ -115,12 +128,32 @@ class Portfolio:
                 unless you explicitly opt out.
             reset_balance: If True, ignore DB history and start fresh from
                 `initial_balance`. Useful for debugging or after manual resets.
+            mis_short_margin_pct: NUM-01 (audit 2026-05-28). Fraction of
+                short notional locked as collateral when opening a SHORT
+                under INTRADAY (MIS) product type. The default ``1.0``
+                preserves the legacy "lock full notional" behaviour (so
+                test fixtures and existing call sites are byte-identical).
+                Production callers (trader + backtester) pass ``0.20``
+                from ``execution.mis_short_margin_pct`` in config, which
+                matches the ~20% MIS margin Indian brokers actually post
+                at the exchange. Pre-fix the backtester under-sized
+                shorts ~5x vs live broker reality. DELIVERY (CNC) shorts
+                always lock the full notional (CNC is a long-only
+                product anyway, so this is mostly defensive). For LONG
+                positions the value is ignored.
         """
         self.initial_balance = initial_balance
         self.cash = initial_balance
         self.commission_pct = commission_pct
         # INTRADAY (MIS) or DELIVERY (CNC) — drives realistic charges model
         self.product_type = product_type.upper()
+        # NUM-01: clamp into [0, 1] to neutralise misconfiguration. A
+        # negative or >1 value would silently break short-cash math.
+        try:
+            margin_pct = float(mis_short_margin_pct)
+        except (TypeError, ValueError):
+            margin_pct = 1.0
+        self.mis_short_margin_pct = max(0.0, min(1.0, margin_pct))
         self.positions: Dict[str, Position] = {}
         # CONC-11 (audit 2026-05-28): pre-fix this was an unbounded
         # ``List[TradeRecord]``. A daemon running for months
@@ -230,6 +263,18 @@ class Portfolio:
                 # uses to credit/debit per-strategy P&L on exit. The DB
                 # already persists them (see database.py:200-201, 433-462,
                 # 516-530) -- we just weren't using them.
+                # NUM-01 (audit 2026-05-28): preserve the cash_locked
+                # value that ``open_position`` deducted, so a daemon
+                # restart between open and close still releases the
+                # correct collateral. Legacy rows missing the column
+                # land as ``None`` from the DB driver -- map to 0.0
+                # which triggers the close_position legacy fallback
+                # ("full notional + entry commission" lock).
+                cash_locked_raw = row.get("cash_locked")
+                try:
+                    cash_locked_val = float(cash_locked_raw) if cash_locked_raw is not None else 0.0
+                except (TypeError, ValueError):
+                    cash_locked_val = 0.0
                 pos = Position(
                     symbol=row["symbol"],
                     side=row["side"],
@@ -242,6 +287,7 @@ class Portfolio:
                     order_id=row.get("order_id", ""),
                     regime=row.get("regime") or None,
                     contributing_strategies=row.get("contributing_strategies") or None,
+                    cash_locked=cash_locked_val,
                 )
                 self.positions[row["symbol"]] = pos
                 ca = row.get("cash_after")
@@ -406,16 +452,34 @@ class Portfolio:
             entry_side = "BUY" if side == "BUY" else "SELL"
             commission = compute_one_leg(price, quantity, side=entry_side, product=self.product_type)
 
-            # Cash/margin accounting:
-            #   * LONG: we pay `cost + commission` upfront.
-            #   * SHORT: with a real broker we'd receive the sell-proceeds
-            #     and post margin (≈20% of notional for MIS). For simplicity
-            #     and to prevent paper-mode over-leveraging, we lock the full
-            #     notional as collateral (same as a long). On close we
-            #     reverse the math so the net cash change equals realized PnL.
-            if cost + commission > self.cash:
+            # Cash/margin accounting -- NUM-01 (audit 2026-05-28).
+            #   * LONG: we pay ``cost + commission`` upfront. Backtest
+            #     and paper-mode lock the full notional (no MIS leverage
+            #     modelled on longs -- that's a separate, deferred
+            #     finding tracked in the misc-OPEN bucket).
+            #   * SHORT under INTRADAY: lock
+            #     ``cost * mis_short_margin_pct + commission``. The
+            #     default in production config is 0.20 which matches the
+            #     ~20% MIS margin brokers post at the exchange. On
+            #     ``close_position`` we release the SAME number we
+            #     deducted here (stored on the Position via
+            #     ``cash_locked``) and apply the realised PnL minus
+            #     the exit commission, so the net cash change equals
+            #     ``pnl`` regardless of margin %.
+            #   * SHORT under DELIVERY: locks the full notional. CNC
+            #     is effectively long-only on Indian retail brokers
+            #     (you cannot deliver shares you don't own), but if a
+            #     caller forces this we treat it conservatively.
+            if side == "BUY":
+                cash_locked = cost + commission
+            else:
+                if self.product_type == "INTRADAY":
+                    cash_locked = cost * self.mis_short_margin_pct + commission
+                else:
+                    cash_locked = cost + commission
+            if cash_locked > self.cash:
                 logger.warning(
-                    f"Insufficient cash for {symbol}: need {cost + commission:.2f}, "
+                    f"Insufficient cash for {symbol}: need {cash_locked:.2f}, "
                     f"have {self.cash:.2f}"
                 )
                 return False
@@ -440,9 +504,10 @@ class Portfolio:
                         quantity=quantity, entry_time=entry_time_iso,
                         stop_loss=stop_loss, take_profit=take_profit,
                         strategy=strategy, order_id=order_id,
-                        cash_after=self.cash - (cost + commission),
+                        cash_after=self.cash - cash_locked,
                         regime=regime,
                         contributing_strategies=contributing_strategies,
+                        cash_locked=cash_locked,
                     )
                 except Exception as e:
                     # If DB rejects, abort cleanly. The reason can be
@@ -461,7 +526,7 @@ class Portfolio:
                     )
                     return False
 
-            self.cash -= (cost + commission)
+            self.cash -= cash_locked
             self.positions[symbol] = Position(
                 symbol=symbol,
                 side=side,
@@ -478,10 +543,17 @@ class Portfolio:
                 market_trend=market_trend,
                 regime=regime,
                 contributing_strategies=contributing_strategies or {},
+                cash_locked=cash_locked,
             )
+            short_margin_note = ""
+            if side != "BUY" and self.product_type == "INTRADAY" and self.mis_short_margin_pct < 1.0:
+                short_margin_note = (
+                    f" | MIS short margin: {self.mis_short_margin_pct*100:.0f}% "
+                    f"of notional Rs {cost:.2f} -> locked Rs {cash_locked - commission:.2f}"
+                )
             logger.info(
                 f"Opened {side} position: {quantity} x {symbol} @ {price:.2f} "
-                f"(commission: {commission:.2f})"
+                f"(commission: {commission:.2f}){short_margin_note}"
             )
             # Persist cash + equity atomically (2026-05-04 fix). Without this,
             # a daemon kill between events would leave the DB with stale cash
@@ -590,18 +662,28 @@ class Portfolio:
             if pos.value > 0:
                 pnl_pct = pnl / pos.value * 100
 
-            # Cash reconciliation:
+            # Cash reconciliation -- NUM-01 (audit 2026-05-28).
             #   LONG: on open we deducted (entry_value + entry_commission).
             #         On close we receive sell proceeds (exit_value) minus the
             #         exit-side commission. Net = gross_pnl - total_commission.
-            #   SHORT: on open we deducted (entry_value + entry_commission) as
-            #         locked collateral. On close we release that collateral
-            #         and apply the realized gross_pnl (which is already signed
-            #         correctly by unrealized_pnl), minus exit commission.
+            #   SHORT: on open we locked ``pos.cash_locked`` (margin model
+            #         under INTRADAY, full notional under DELIVERY). On
+            #         close we release that exact number plus the realised
+            #         ``gross_pnl`` (signed correctly by unrealized_pnl)
+            #         minus the exit commission. Net cash change therefore
+            #         equals ``pnl`` (= gross_pnl - total_commission)
+            #         regardless of the margin % used. Legacy / restored
+            #         positions opened before this audit may have
+            #         ``cash_locked == 0`` -- fall back to the implicit
+            #         "full notional + entry commission" lock so we don't
+            #         under-release cash on those rows.
             if pos.side == "BUY":
                 self.cash += exit_value - exit_commission
             else:
-                self.cash += pos.entry_price * pos.quantity + gross_pnl - exit_commission
+                short_release = pos.cash_locked
+                if short_release <= 0:
+                    short_release = pos.entry_price * pos.quantity + entry_commission
+                self.cash += short_release + gross_pnl - exit_commission - entry_commission
 
             if exit_time is None:
                 exit_time = datetime.now(IST)

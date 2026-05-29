@@ -129,10 +129,17 @@ class TestMinStopLossDistance:
         assert sl == 97.0  # 2.0 * 1.5 = 3.0 → 97.0
 
     def test_floor_disabled_when_zero(self):
+        # NUM-04 (audit 2026-05-28): SL prices are now snapped to the
+        # 0.05 NSE tick AWAY from entry (BUY -> floor toward 0). Raw
+        # value here is ``100 - 1.5 * 0.3 = 99.55``; under IEEE-754
+        # ``99.55 / 0.05`` parses as ``1990.999...``, so the SL-aware
+        # ``floor`` lands on ``99.50``. Either way the post-NUM-04
+        # contract is "snapped to tick + AWAY from entry", so 99.50
+        # is the correct (and slightly safer / wider) stop.
         cfg = {"risk": {"min_stop_loss_pct": 0.0, "atr_stop_multiplier": 1.5}}
         rm = RiskManager(cfg, 10_000.0)
         sl = rm.get_stop_loss(entry_price=100.0, side="BUY", atr=0.3)
-        assert sl == 99.55  # 100 - 0.45
+        assert sl == 99.50
 
 
 # ─────────────────────────────────────────────────────────────────────────

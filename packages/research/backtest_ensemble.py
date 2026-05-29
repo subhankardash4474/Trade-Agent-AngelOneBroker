@@ -81,6 +81,13 @@ class BacktestConfig:
     apply_expected_profit_gate: bool = True
     apply_regime_filter: bool = True
     product_type: str = "INTRADAY"
+    # NUM-01 (audit 2026-05-28): MIS short margin %. Pre-fix the
+    # backtester locked the FULL short notional, which under-sized
+    # shorts ~5x vs live broker reality and biased every short-side
+    # battery number. 0.20 matches the exchange MIS margin schedule.
+    # Override via battery variant config when stress-testing the
+    # capital model.
+    mis_short_margin_pct: float = 0.20
     # B-7 / C-21 (audit 2026-05-26): seed the paper-order RNG so
     # repeated runs of the same variant produce byte-identical fill
     # ledgers. Leave as None for legacy stochastic behaviour. Battery
@@ -256,6 +263,7 @@ class EnsembleBacktester:
             log_dir=os.path.join("logs", "backtest_ensemble"),
             database=None,
             product_type=self.bt.product_type,
+            mis_short_margin_pct=self.bt.mis_short_margin_pct,
         )
         risk_cfg = dict(self.config)
         risk_cfg.setdefault("risk", {})

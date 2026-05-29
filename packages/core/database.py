@@ -254,6 +254,14 @@ class Database:
             self._ensure_column(conn, "trade_patterns", "regime", "TEXT")
             self._ensure_column(conn, "open_positions", "regime", "TEXT")
             self._ensure_column(conn, "open_positions", "contributing_strategies", "TEXT")
+            # NUM-01 (audit 2026-05-28): explicit per-position cash lock
+            # so close_position can release exactly what open_position
+            # deducted, even after a restart that crosses the migration
+            # boundary or a config change to mis_short_margin_pct.
+            # NULL on legacy rows -- Portfolio.close_position falls back
+            # to the implicit "full notional + entry commission" lock so
+            # we never under-release cash on a pre-migration row.
+            self._ensure_column(conn, "open_positions", "cash_locked", "REAL")
             self._ensure_column(conn, "trades", "regime", "TEXT")
             self._ensure_column(conn, "trades", "holding_minutes", "REAL")
 
@@ -468,7 +476,8 @@ class Database:
                            take_profit: float = None, strategy: str = "",
                            order_id: str = "", cash_after: float = 0,
                            regime: str = None,
-                           contributing_strategies: Optional[dict] = None):
+                           contributing_strategies: Optional[dict] = None,
+                           cash_locked: Optional[float] = None):
         """
         Persist an open position. Uses plain INSERT (not INSERT OR REPLACE)
         so concurrent duplicate opens are rejected by the PRIMARY KEY
@@ -492,11 +501,11 @@ class Database:
                 """INSERT INTO open_positions
                    (symbol, side, entry_price, quantity, entry_time,
                     stop_loss, take_profit, strategy, order_id, cash_after,
-                    regime, contributing_strategies)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    regime, contributing_strategies, cash_locked)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (symbol, side, entry_price, quantity, entry_time,
                  stop_loss, take_profit, strategy, order_id, cash_after,
-                 regime, contrib_json),
+                 regime, contrib_json, cash_locked),
             )
         logger.debug(f"Saved open position: {quantity}x {symbol} @ {entry_price}")
 
