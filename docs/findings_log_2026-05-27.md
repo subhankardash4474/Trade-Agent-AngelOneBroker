@@ -154,6 +154,31 @@ landed during the holiday window while the trader VM idled:
     no freeze slot consumed. Re-queue of a real holdout job
     waits until slot-#3 (V18+V19) finishes tonight.
 
+**Update 2026-05-29 15:30 IST (Friday afternoon, retrain pre-flight EXECUTED).**
+
+15. **§5.10.1 Retrain pre-flight steps A-E DONE locally.** Operator
+    overrode the §7 V15-defer call on the practical argument that a
+    properly-trained baseline pkl is strictly better than the broken
+    pipeline pkl AND the next battery gives end-of-next-week real
+    evidence (without consuming any freeze slot). Pre-flight A
+    (prepare_dataset code-read), B (train_xgboost code-read), C
+    (window choice = 232 v4 universe / 60d / 5m), D (33 regression
+    tests in `tests/unit/test_training_pipeline_preflight.py`), and
+    E (10-stock smoke train: pipeline end-to-end clean, label
+    balance UP 49.8% / DOWN 50.2% — far from the 95%-one-sided
+    broken-pkl failure mode). Phase 2 trigger script written
+    (`tools/cloud/run_retrain_on_backtester.sh`, fail-closed on
+    AUC < 0.55 / label or prediction split > 85/15). Phase 4 queue
+    diff drafted (`data/battery_queue_post_retrain.yaml`, 2 jobs:
+    xgb-focus 5-variant ~12h + 19-variant 30d-holdout ~36-46h).
+    Full unit **1,713/1,713** green. **Phase 2 (training run on
+    backtester VM) waits for slot-#3 V19 to finish ~17:00 IST
+    tonight; expected Phase 4 queue restart ~18:00 IST; Friday
+    2026-06-05 verdict has 2 days analysis buffer.** Honest signal:
+    10-stock AUC was 0.49 (~random) but that's noise floor, not a
+    verdict; 232-stock training has the structural §5.9 step-3 AUC
+    > 0.55 hard-stop baked into the trigger script.
+
 ---
 
 ## 1. Bug J — `tools/cloud/bootstrap_backtester.sh` chowns to container UID, breaking host-side scheduler
@@ -803,6 +828,84 @@ fresh VM into the operational surface during freeze-v2.1.
 
 **Owner of the GO/NO-GO call on Friday morning:** operator + advisor
 review using the §7 decision matrix in friday_review_2026-05-29.md.
+
+### 5.10.1 Pre-flight EXECUTED — 2026-05-29 15:30 IST (Friday afternoon)
+
+**Decision override.** The §7 V15-transfer matrix said "defer retrain
+indefinitely" because slot-#3 V15 PF=0.94 (small-universe noise on
+slot-#1). The operator overrode this on the practical argument: even
+if V15 doesn't transfer, having a properly-trained model is strictly
+better than the current broken-pipeline pkl, AND the next battery
+gives end-of-next-week real evidence on whether retrain is sufficient
+(without committing the live freeze-bypass slot — backtester-only).
+
+**Pre-flight steps A–E executed locally, ~30 min total:**
+
+| Step | What | Result |
+|------|------|--------|
+| A | Code-read `prepare_dataset.py` | ✅ F-24 lookahead-shift (line 205), P1 #8 neutral default (lines 112-115, 207-215), P1 #7 calendar-time split (lines 265-310) all CONFIRMED. Bonus: F-70 fail-hard on time-split exception (288-305), P1 #9 interval-mismatch hard-block (413-430) also confirmed. |
+| B | Code-read `train_xgboost.py` | ✅ F-22 chronological-tail validation (99-118), C-23 OOS calibration split (180-228) CONFIRMED. Bonus: F-100 docstring honesty fix (5-10), AUC-collapse safety fallback (221-228) confirmed. |
+| C | Pick training/holdout windows | Universe = 232-stock v4 (`tests/fixtures/battery_v2_universe.json`); Interval = 5m (P1 #9); Period = 60d (yfinance hard cap); Horizon = 3 bars / 15 min; Threshold = 0.3%. Train ≈ 2026-03-30 → 2026-05-11; Test ≈ 2026-05-11 → 2026-05-29 (**18 days post-broken-pkl-deploy = strictly held-out fresh data**). |
+| D | Write `tests/unit/test_training_pipeline_preflight.py` | 33 tests, all green. AST + text guards for F-22 / F-24 / F-70 / C-23 / P1 #7 / P1 #8 / P1 #9 + signature/CLI-flag pins. Full unit 1,713/1,713. |
+| E | Smoke-test `prepare_dataset.py` on 10-stock slice + smoke-train | Pipeline runs end-to-end. **Label balance: UP 49.8% / DOWN 50.2% (perfectly balanced, far from the 95% one-sided broken-pkl failure mode).** Best iteration 19. F-22 / C-23 splits firing as designed. AUC-collapse safety check working (calibrated 0.4909 vs raw_eval 0.4931, within 2pp tolerance, calibrated model ships). |
+
+**Honest Step-E signal.** AUC = 0.4943 on the 10-stock smoke set (~
+random). Top features are session-time (`dow_cos`, `tod_cos`,
+`india_vix`) rather than technical (`rsi`, `macd`). This is a HINT,
+not a verdict — 232 stocks with 23× more data may surface real signal
+the 10-stock noise floor can't. The smoke test's only purpose was to
+prove the pipeline runs; that gate is met. The §5.9 step 3 hard-stop
+of AUC > 0.55 will be applied during the actual VM training.
+
+**Phase 2 trigger script written:** `tools/cloud/run_retrain_on_backtester.sh`.
+Self-contained, idempotent, fail-closed. Refuses to run if any
+`battery_*` container is still active (avoids racing slot-#3
+workers). Refuses to swap `models/xgboost_model.pkl` if AUC < 0.55,
+label balance > 85/15, or BUY/SELL prediction split > 85/15
+(re-introduces the broken-pkl failure mode). Backs up the existing
+pkl before the swap; logs the full session to
+`/opt/trading-agent/logs/retrain_<UTC_TS>.log`.
+
+**Phase 4 queue diff drafted:** `data/battery_queue_post_retrain.yaml`.
+Two new jobs:
+
+* `post_retrain_xgb_focus_60d` — V1 baseline + the 4 xgb-using
+  variants (V3, V10, V11, V15) on 232 stocks × 60d × 5m. Same
+  setup as slot-#3 with the only changing variable being the pkl.
+  ETA ~12h, signal by Saturday morning.
+* `post_retrain_v2_holdout_30d` — all 19 variants × 232 stocks ×
+  90 source days × 30-day holdout slice. **First production-grade
+  walk-forward evidence ever produced by this repo** (Bug K commit
+  357b60d landed today; previously the slice was silently dropped
+  by workers — see §9). ETA ~36-46h, completes Wed early morning.
+
+**Combined Phase 2+3+4 wall-clock from slot-#3 finish:**
+
+* Slot-#3 V19 ETA: ~17:00 IST tonight 2026-05-29 (Friday)
+* Phase 2 retrain: ~17:30-17:45 IST (auto-fail-stops if anything
+  off; backups guaranteed)
+* Phase 3 validation reads off the training run's AUC/Brier/label-balance/
+  prediction-distribution gates inside `run_retrain_on_backtester.sh`
+  (no separate compute).
+* Phase 4 queue restart: ~18:00 IST tonight (operator decision after
+  reviewing GO line)
+* Job A (xgb-focus) completes: Saturday ~05-08 IST
+* Job B (holdout-30d) completes: Wednesday next week ~05-08 IST
+* **Friday 2026-06-05 verdict: 2 days analysis buffer.**
+
+**Trader-VM impact: zero.** `xgboost_classifier` is currently disabled
+in `strategies.active` live; the trader's pkl is unused. The retrain
+ships the new pkl to the BACKTESTER VM only. Re-enable on trader is
+a separate decision gated on the post-retrain V15 transfer result
+(if PF > 1.0 on 232 stocks → consume bypass slot 3 of 3; otherwise
+keep capital paused and pivot to H3 entry-lag forensic).
+
+**Files added in this commit:**
+
+* `tests/unit/test_training_pipeline_preflight.py` (33 tests; pins all 7 known training-pipeline fixes).
+* `tools/cloud/run_retrain_on_backtester.sh` (Phase 2+3 trigger; idempotent + fail-closed).
+* `data/v2_universe_232.txt` (the 232-stock symbols file; matches `tests/fixtures/battery_v2_universe.json`).
+* `data/battery_queue_post_retrain.yaml` (Phase 4 queue addendum draft).
 
 ---
 
