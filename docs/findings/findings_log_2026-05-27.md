@@ -4756,3 +4756,130 @@ Things explicitly out-of-scope for A1 by charter:
 
 **Phase A1 ? A2 hand-off ready.** A2 can begin with A2-1 (next-day-open fill mode) immediately if the operator wishes; or wait for Sat afternoon / Sun per charter timeline.
 
+---
+
+## 28. Phase A2-A4 deliverables landed (2026-05-30 ~10:30 IST)
+
+**Cross-ref:** `docs/freeze/freeze_v3.0_charter_2026-05-30.md` §6 (A2-A4 plan), `docs/diagnoses/v3_backtester_gap_analysis_2026-05-30.md` §10 (deliverable list).
+
+The user response "Start A2 and all next steps" kicked off contiguous execution of Phase A2 (engine + helpers), Phase A3 (strategies), and Phase A4 (variants + queue). Trader VM untouched throughout per §6.1 museum mode. All work landed on backtester-side code paths only.
+
+### 28.1 Commit ledger
+
+| Commit | Phase | Scope |
+|---|---|---|
+| 33d197b | A2-1 + A2-2 + A2-5 | engine: fill_mode + holding_days + charges docstring + 13 tests |
+| 2bf5ccd | A2-3 | data/v3_universe_top30.json + tools/build_v3_universe_snapshot.py |
+| 16ed43b | A3 | trend_pullback.py + breakout_20d.py + registry/ensemble + 16 tests |
+| 12c30ba | A4 | V20-V24 in battery.py + slot #6 in battery_queue.yaml |
+
+### 28.2 A2 engine changes
+
+**A2-1 fill_mode** (`packages/research/backtest_ensemble.py`): added `BacktestConfig.fill_mode: "close_plus_slippage" | "next_bar_open"`. The default preserves v2.1 byte-identical behaviour. v3 swing variants set `next_bar_open` so daily-bar signal at day N close fills at day N+1 open + slippage.
+
+Implementation note: the per-symbol bar index is rebuilt in the consumer loop via a `Dict[str, int]` counter that increments on every event. This avoids changing `_merge_bars`'s 4-tuple yield contract (which has 6 existing test sites pinning the shape across `test_backtester_perf_2026_05_27.py` and `test_strategy_history_window.py`). Trade-off: ~0.5 µs per event for the dict lookup; on a 600-day × 30-stock × 1-d run that's ~9 ms total ? negligible.
+
+Final-bar signals under `next_bar_open` are dropped with a new `GateStats.no_next_bar` counter visible in `as_dict()`. NaN / non-positive opens are absorbed under the same counter as a defensive data-quality guard.
+
+**A2-2 holding_days** on every trade dict, computed via `(exit_time.date() - entry_time.date()).days`. Cosmetic readability; doesn't replace `holding_minutes`. Returns `None` (not 0) when timestamps are missing, so downstream code can distinguish unknown from same-day.
+
+**A2-5 charges docstring**: added a paragraph clarifying that `DP_CHARGE_CDSL` is per-SELL-order on delivery, NOT per-day-per-ISIN as the advisor charter loosely phrased. The annual demat AMC (~?300/yr flat) is intentionally not modelled.
+
+### 28.3 A2-3 universe snapshot
+
+`data/v3_universe_top30.json` initial commit uses the first 30 of `tests/fixtures/nifty50_universe.json` (market-cap ordered) as a proxy for ADTV-top-30. Spearman correlation > 0.95 for Nifty 50 names so the proxy is sound for week-1 validation.
+
+`tools/build_v3_universe_snapshot.py` is the refresh tool. Computes ADTV (close × volume) over a configurable trailing window via yfinance, picks top-N, writes the JSON with full provenance. Supports `--as-of` for back-dated snapshots (reduces survivorship bias on a specific backtest start), `--dry-run` for preview, and configurable `--window-days` / `--top-n`.
+
+Operator runs this on the backtester VM where yfinance is reachable. Output is deterministic given fixed inputs.
+
+### 28.4 A3 strategies
+
+**Rule 1 ? `trend_pullback.py`** (~250 lines): BUY when close > 200-DMA AND > 50-DMA AND within 2% of 20-DMA AND RSI(14) ? [40, 55] AND volume >= 80% of 20d avg. SL = entry × 0.97, TP = entry × 1.08. Separately emits SELL when close < 50-DMA so the engine's existing opposite-signal exit path closes any held long; pair with `risk.allow_shorts: false` so SELL never opens a short.
+
+**Rule 2 ? `breakout_20d.py`** (~280 lines): BUY when close > prior 20-day rolling-max-high AND close > 50-DMA AND volume >= 1.5× 20d avg AND ADX(14) > 20. SL = max(entry × 0.96, breakout_day_low) ? "tighter" SL = higher value (less downside) for a long. TP = entry × 1.12. ADX uses Wilder smoothing (alpha = 1/period RMA), matching standard implementations.
+
+**Charter simplification accepted**: trail-stop is NOT implemented in v3 Phase A. Charter §2 calls for "lock 50% of unrealised once +5%/+6%" but this requires per-position peak tracking with dynamic SL updates (engine change). Deferred to Phase B per Phase A1 §10 risk discussion. The 3%/8% (Rule 1) and 4%/12% (Rule 2) binary SL/TP remain in force; the trail would only IMPROVE expectancy on winners, not unlock new edge.
+
+Both strategies registered in `STRATEGY_REGISTRY` and added to `DEFAULT_WEIGHTS` (1.0 each).
+
+### 28.5 A4 variants
+
+`packages/research/battery.py` gains a `_v3_swing_base()` helper that centralises the 12 common config overrides every swing variant needs (long-only, CNC delivery, fill_mode, disabled-for-daily-bars gates, charter §3 sizing). Variants differentiate via `strategies.active` and per-strategy parameter overrides only.
+
+| Variant | Strategies | Differentiator |
+|---|---|---|
+| V20_swing_pullback_only | trend_pullback | ? |
+| V21_swing_breakout_only | breakout_20d | ? |
+| V22_swing_combined | both | charter default |
+| V23_swing_combined_loose | both | RSI 35-60, vol_floor 0.70, ADX 15 |
+| V24_swing_combined_tight | both | RSI 42-50, vol_mult 2.0, ADX 25 |
+
+**Battery queue slot #6** (`v3_swing_a5_180d_eff`):
+* `days: 600` (calendar) ? ~430 trading days. After 220-bar warmup for trend_pullback's 200-DMA ? ~210 effective signal-emission days, comfortably exceeding charter §6.5 "180-day" spec.
+* `interval: 1d`, `workers: 2`, `universe-file: data/v3_universe_top30.json`
+* All 5 variants
+* Estimated runtime ~60-120 min on workers=2.
+
+The 600-day window is critical. A naive `days: 180` would leave trend_pullback in HOLD-for-insufficient-data state for the entire run, producing zero trades ? a silent failure that would look like "v3 has no edge". The yaml comment block explains the math so future maintainers don't shrink the window.
+
+### 28.6 Test additions
+
+| File | Tests | Scope |
+|---|---:|---|
+| `test_backtester_fill_mode_2026_05_30.py` | 13 | A2-1 (fill_mode) + A2-2 (holding_days) |
+| `test_v3_strategies_2026_05_30.py` | 16 | A3 strategies (entry conditions + SL/TP/registry) |
+
+Full unit suite: **1749 passed** (was 1729 before A3 ? +20 from A3, was 1713 before A2 ? +16 from A2). Zero regressions across all phases.
+
+### 28.7 Phase A5 handoff
+
+**Operator action required.** Phase A5 is a backtester-VM job; the agent has produced and committed all code/config but cannot itself launch the run.
+
+Steps for operator on backtester VM (80.225.197.125):
+1. `git pull` to pick up commits 33d197b ? 12c30ba.
+2. (Optional but recommended) Refresh the universe snapshot with live ADTV data:
+   ```
+   ssh opc@80.225.197.125
+   cd /opt/trading-agent
+   python tools/build_v3_universe_snapshot.py --as-of $(date -I) --dry-run
+   # If the dry-run output looks sensible:
+   python tools/build_v3_universe_snapshot.py --as-of $(date -I)
+   git add data/v3_universe_top30.json
+   git commit -m "v3 universe snapshot refresh on $(date -I)"
+   ```
+3. Restart the battery scheduler so it picks up the new queue slot:
+   ```
+   sudo systemctl restart battery-scheduler
+   ```
+4. Monitor via the existing `tools/battery_status_remote.ps1` from local, or:
+   ```
+   tail -f logs/backtests/battery_v3_swing_a5_180d_eff_*/run.log
+   ```
+5. When complete (~60-120 min), pull results local:
+   ```
+   .\tools\cloud\pull_battery_results.ps1 -RunId battery_v3_swing_a5_180d_eff_<utc_ts>
+   ```
+
+### 28.8 Phase A5 read-out (mechanical, no re-interpretation)
+
+Per charter §6.5:
+
+* **All 5 variants PF >= 1.5 with >= 30 trades each** ? strong evidence; queue walk-forward holdout (separate slot, deferred).
+* **V22 PF 1.0-1.5 but V20 or V21 alone PF >= 1.5** ? one rule is dragging the other; ship the better single rule, drop the worse. Still proceed.
+* **All variants PF < 1.0** ? SURPRISE. Per charter §10.5 R1, budget for 1-2 surprise backtester bugs at the daily-bar path not previously exercised. Read once, sleep on it, decide whether to try a different rule set or pivot the pivot. Do NOT debug into oblivion.
+
+If Phase A5 passes, the next gate is the 6-condition Phase B hard gate per charter §7.1. Trader VM remains untouched until ALL six conditions hold.
+
+### 28.9 What's NOT in Phase A2-A4
+
+Per charter §6.1 (museum mode) and §10.5 R1:
+
+* **No trader VM changes.** Anything that touches the trader is a Phase B+ item.
+* **No live data refresh** beyond the universe snapshot tool; that's an operator step.
+* **No engine changes beyond fill_mode.** A2 was scoped tightly per A1 gap analysis.
+* **No new ML models.** v3 is rule-based by charter §2 design.
+* **No retroactive v2.1 variant changes.** The DEFAULT for `fill_mode` preserves v2.1 byte-identical behaviour.
+
+**Phase A1 ? A4 deliverables complete. Phase A5 awaits operator backtest run.**
+
