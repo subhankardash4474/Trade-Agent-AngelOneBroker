@@ -494,6 +494,15 @@ def _bt_config(cfg: dict) -> BacktestConfig:
         # gives reproducible runs whose slippage now samples from the
         # same U(0, slippage_pct) distribution the paper executor uses.
         paper_seed=cfg.get("backtest", {}).get("paper_seed"),
+        # A2-1 (v3 charter Phase A2, 2026-05-30): plumb
+        # ``backtest.fill_mode`` through. Default ``close_plus_slippage``
+        # preserves v2.1 byte-identical behaviour. v3 swing variants
+        # (V20+) set ``backtest.fill_mode: next_bar_open`` so daily-bar
+        # signals fill at next session's open instead of signal-day's
+        # close. See BacktestConfig.fill_mode docstring for semantics.
+        fill_mode=str(
+            cfg.get("backtest", {}).get("fill_mode", "close_plus_slippage")
+        ),
     )
 
 

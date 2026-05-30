@@ -9,6 +9,16 @@ Computes realistic per-trade costs for:
 All values are fractions unless stated otherwise.
 Rates are as of 2026-04-28.
 
+DP charge clarification (A2-5, v3 charter, 2026-05-30): the CDSL DP
+charge modelled below (``DP_CHARGE_CDSL`` + GST) is **per SELL ORDER on
+delivery, not per day and not per holding day**. The advisor charter
+phrase "₹13.5 / ISIN / day" was loose terminology; the actual broker
+schedule is a one-time fee charged on the sell leg of any CNC trade,
+regardless of how long the position was held. There is a separate
+annual demat-account maintenance charge (~₹300/year flat) that is
+NOT modelled here because it is a fixed infrastructure cost, not a
+trade-attributable cost.
+
 P3 polish (2026-05-17): rates can now be overridden at runtime via env vars
 without a rebuild. Useful when SEBI / the broker bumps a rate mid-deployment
 and we need a hot patch. Example:

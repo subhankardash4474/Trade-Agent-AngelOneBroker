@@ -121,6 +121,28 @@ class BacktestConfig:
     # Configurable so a future strategy with a longer lookback can
     # opt-up without code change.
     strategy_history_window: int = 300
+    # A2-1 (v3 charter Phase A2, 2026-05-30): how to price entry fills
+    # relative to the bar that produced the signal.
+    #
+    # ``"close_plus_slippage"`` — legacy v2.1 behaviour. The entry fills
+    # at the SIGNAL BAR's close + slippage. Realistic on 5-min bars where
+    # the next bar is 5 min later and the close-vs-next-open delta is
+    # sub-perceptible.
+    #
+    # ``"next_bar_open"`` — v3 swing behaviour. The entry fills at the
+    # NEXT BAR's open + slippage. Required for daily candles where signal
+    # generation happens at end-of-day (15:30 IST) but the order actually
+    # fills at next session's open (09:15 IST). Without this, a daily
+    # backtest would over-state entry-side timing edge by one full bar.
+    #
+    # When ``next_bar_open`` is set and the signal arrives on the FINAL
+    # bar of the symbol's series (no next bar exists), the engine drops
+    # the signal silently and increments ``GateStats.no_next_bar``. That
+    # boundary case is rare in production runs but must be visible.
+    #
+    # Default preserves v2.1 behaviour byte-for-byte. v3 swing variants
+    # (V20+) explicitly opt in via the ``backtest.fill_mode`` config key.
+    fill_mode: str = "close_plus_slippage"
 
 
 @dataclass
@@ -148,6 +170,13 @@ class GateStats:
     # been rejected by an explicit rule. Surfacing it makes regime-
     # fragile ensembles (low consensus) visible in the diagnostic.
     ensemble_hold: int = 0
+    # A2-1 (v3 charter Phase A2, 2026-05-30): signals dropped because
+    # ``BacktestConfig.fill_mode == "next_bar_open"`` AND the signal
+    # arrived on the FINAL bar of the symbol's series — there is no
+    # next bar to fill on. Surfaced as a gate so a 180d swing battery
+    # can quickly tell if an end-of-window edge effect is silently
+    # eating signals (rare; should be < 1 per symbol per run).
+    no_next_bar: int = 0
 
     def as_dict(self) -> Dict[str, int]:
         return {k: getattr(self, k) for k in self.__dataclass_fields__}
@@ -338,6 +367,17 @@ class EnsembleBacktester:
         total_events = sum(len(df) for df in market_data.values())
         events = self._merge_bars(market_data)
 
+        # A2-1 (v3 charter Phase A2, 2026-05-30): per-symbol bar index
+        # counter. Required for ``fill_mode == "next_bar_open"`` to look
+        # up ``market_data[symbol].iloc[i + 1]`` without changing the
+        # ``_merge_bars`` yield signature (which has six existing test
+        # sites pinning the 4-tuple shape; see the gap analysis doc
+        # §10 risk discussion). Per-symbol streams are sorted, and
+        # ``heapq.merge`` preserves per-stream order, so simply
+        # incrementing on every event for that symbol re-derives the
+        # bar index ``i`` that ``_merge_bars`` used internally.
+        per_symbol_bar_idx: Dict[str, int] = {}
+
         run_t0 = time.time()
         next_progress_at = PROGRESS_LOG_INTERVAL_EVENTS
         last_progress_wall_t = run_t0
@@ -357,6 +397,14 @@ class EnsembleBacktester:
         last_progress_event_idx = 0
 
         for event_idx, (ts, symbol, bar, df_slice) in enumerate(events, start=1):
+            # A2-1: re-derive the per-symbol bar index. ``_merge_bars`` has
+            # already iterated this symbol ``per_symbol_bar_idx[symbol]``
+            # times before the current event, so the current bar's
+            # zero-based index within ``market_data[symbol]`` is exactly
+            # this counter (post-increment). Cheap O(1) per event; no
+            # ``df.index.get_loc`` lookup required.
+            per_symbol_bar_idx[symbol] = per_symbol_bar_idx.get(symbol, -1) + 1
+
             # Periodic progress log. Without this, the worker emits only
             # strategy-signal lines and there is no way (short of reading
             # source) to tell whether a multi-hour run is 10% or 90% done.
@@ -622,7 +670,46 @@ class EnsembleBacktester:
 
             # Sizing
             atr_val = self._latest_atr(df_slice)
-            entry_price = self._apply_slippage(close, agg.signal.name, exit=False)
+            # A2-1 (v3 charter Phase A2, 2026-05-30): fill-mode dispatch.
+            # ``close_plus_slippage`` (legacy v2.1) prices the entry at
+            # the SIGNAL BAR's close + slippage. ``next_bar_open`` (v3
+            # swing) prices the entry at the NEXT BAR's open + slippage,
+            # which is what an end-of-day decision actually fills against
+            # at next session's open. When the signal arrives on the
+            # FINAL bar of the symbol's series under next_bar_open, drop
+            # the signal silently and increment the visible gate counter
+            # (rare; bounded above by one per symbol per run).
+            if self.bt.fill_mode == "next_bar_open":
+                sym_df = market_data[symbol]
+                next_idx = per_symbol_bar_idx[symbol] + 1
+                if next_idx >= len(sym_df):
+                    gate_stats.no_next_bar += 1
+                    _bump_equity(ts, symbol, close)
+                    continue
+                next_bar_row = sym_df.iloc[next_idx]
+                fill_base_raw = next_bar_row["open"]
+                # Defensive: if the next bar's open is NaN / inf / <=0
+                # (data-quality glitch — yfinance has produced empty bars
+                # on rare exchange-feed hiccups), absorb under no_next_bar
+                # rather than feed the bad value through to slippage and
+                # silently corrupt the trade record. Data-quality drop
+                # should also be visible in the gate table for debugging.
+                if pd.isna(fill_base_raw) or float(fill_base_raw) <= 0:
+                    gate_stats.no_next_bar += 1
+                    _bump_equity(ts, symbol, close)
+                    continue
+                fill_base = float(fill_base_raw)
+                # Use next bar's timestamp as the trade's entry_time so
+                # holding_minutes / holding_days reflect the actual fill
+                # session, not the signal-emit session. The two diverge
+                # by exactly one bar (~5 min on intraday, ~1 trading day
+                # on daily); the swing-trade time accounting depends on
+                # the fill session, not the decision session.
+                fill_ts = next_bar_row.name
+            else:
+                fill_base = close
+                fill_ts = ts
+            entry_price = self._apply_slippage(fill_base, agg.signal.name, exit=False)
             sl = agg.stop_loss or rm.get_stop_loss(entry_price, agg.signal.name, atr_val)
             tp = agg.take_profit or rm.get_take_profit(
                 entry_price, agg.signal.name, atr_val, regime=regime
@@ -672,9 +759,13 @@ class EnsembleBacktester:
                 take_profit=tp,
                 regime=regime,
                 contributing_strategies=agg.contributing_strategies,
-                # Stamp entry with simulated bar timestamp so trade
-                # records and holding_minutes reflect market time.
-                entry_time=self._ts_to_datetime(ts),
+                # Stamp entry with the simulated FILL timestamp (not the
+                # signal-emit timestamp). For ``close_plus_slippage`` mode
+                # these are identical; for ``next_bar_open`` the fill
+                # timestamp is the next bar's index. Trade records and
+                # holding_minutes / holding_days then reflect the actual
+                # fill session.
+                entry_time=self._ts_to_datetime(fill_ts),
             )
             gate_stats.executed += 1
             _bump_equity(ts, symbol, close)
@@ -974,6 +1065,29 @@ class EnsembleBacktester:
         return None if pd.isna(v) else float(v)
 
     def _trade_to_dict(self, record, exit_reason: str) -> dict:
+        # A2-2 (v3 charter Phase A2, 2026-05-30): expose `holding_days`
+        # for swing-trade readability. v2.1 reports `holding_minutes` on
+        # TradeRecord, which is fine for 5-min intraday but unwieldy for
+        # 3-10-day CNC delivery (a 5-day hold becomes 7,200 minutes —
+        # technically correct but operationally opaque). Computed from
+        # the same entry/exit timestamps as holding_minutes; rounded to
+        # whole calendar days using ``.date()``-difference so weekends
+        # and holidays count toward the hold (the operator's capital
+        # IS deployed across them under CNC). When either timestamp is
+        # missing (legacy / partial trade record), the field is None
+        # rather than 0 so downstream readers can distinguish "unknown"
+        # from "same-day".
+        entry_t = getattr(record, "entry_time", None)
+        exit_t = getattr(record, "exit_time", None)
+        holding_days: Optional[int] = None
+        if entry_t is not None and exit_t is not None:
+            try:
+                holding_days = int((exit_t.date() - entry_t.date()).days)
+            except Exception:
+                # Defensive: tz-naive vs tz-aware mismatch, weird
+                # subclass, etc. Better to surface None than to crash
+                # the whole result write.
+                holding_days = None
         return {
             "symbol": record.symbol,
             "side": record.side,
@@ -985,10 +1099,9 @@ class EnsembleBacktester:
             "strategy": record.strategy,
             "exit_reason": exit_reason,
             "regime": getattr(record, "regime", None),
-            "entry_time": getattr(record, "entry_time", None).isoformat()
-                if getattr(record, "entry_time", None) else None,
-            "exit_time": getattr(record, "exit_time", None).isoformat()
-                if getattr(record, "exit_time", None) else None,
+            "entry_time": entry_t.isoformat() if entry_t else None,
+            "exit_time": exit_t.isoformat() if exit_t else None,
+            "holding_days": holding_days,
         }
 
     def _build_result(
