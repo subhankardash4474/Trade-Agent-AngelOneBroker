@@ -932,3 +932,355 @@ remains RED, escalating to RED-WITH-NEW-BUGS.**
   the xgboost-zombie and runtime-persist bugs surfaced this morning.
 * `git log --since="2026-05-30 01:00"` — the 13-commit delta since
   session 1.
+
+---
+
+## Session @ 14:47 IST
+
+**BRUTAL REVIEW — 2026-05-30 (Session 3)**
+Scope: review of the new V25 finding and the three closure commits
+landed between Session 2 (11:07 IST) and now.
+Persona: Expert algo trader + adviser. Verdict is unsentimental.
+
+This is a **scoped** brutal review — not a full sweep — focused on the
+operator's question: "is the V25 finding honest enough that the
+2026-06-05 wind-down trigger can fire on it without re-opening the
+'incomplete data' objection?" Session 2's mandate produced five P0/P1
+items; this session checks what landed and whether the V25 verdict
+that drove the V25 commit is robust.
+
+**New artefacts under review:**
+
+| Commit | Time IST | What it claims to close |
+|---|---|---|
+| `7b4723d` | 14:11 | Session 2 §2 Bugs A (xgboost zombie) + B (`_persist_runtime_state` AttributeError) |
+| `f50e9ee` | 14:12 | Session 2 §1 — adds V25_swing_combined_shorts variant |
+| `2837b45` | 14:13 | Session 2 §3 — supervisor restart loop (Session 1 Finding 6) |
+| `6f13234` | 14:14 | docs: brutal-review Session 2 + findings_log §30 audit closure |
+| `f1670d4` | 14:45 | V25 verdict: PF 0.23 → wind-down trigger on complete data |
+
+Five session-2 P0/P1 items: closed = 4 (§1 V25, §2 bugs A+B, §3
+supervisor, §5 source-of-truth divergence partially via findings
+log). Open = 1 (the EOD self_sufficiency==checkpoint assertion was
+not landed; see Things-That-Look-Suspect §3 below).
+
+---
+
+### Verdict (one line)
+
+**The V25 finding is honest.** The wind-down trigger CAN now fire on
+2026-06-05 without re-opening the long-only-veto objection — but with
+three named caveats below that the operator's own write-up did not
+surface and which the verdict meeting deserves to see.
+
+Status moves from **RED-WITH-NEW-BUGS** (session 2, 11:07) to
+**RED, evidence-complete** (now). Verdict colour unchanged; the
+adverb changes from "escalating" to "complete-enough".
+
+---
+
+### Bottom-line numbers (independently re-derived from V25 raw JSON)
+
+Source: `logs/backtests/battery_v3_swing_a5_v25_shorts_20260530T090709/results/V25_swing_combined_shorts.json`.
+
+| Metric | Claimed (commit `f1670d4`) | Re-derived | Match? |
+|---|---|---|---|
+| Trades | 189 | `summary.trades = 189` (`:63`) | ✅ |
+| Win rate | 27.5% | `summary.win_rate = 27.5` (`:66`) | ✅ |
+| PnL | -₹3,764 | `summary.pnl = -3763.63` (`:67`) | ✅ |
+| Profit Factor | 0.23 | `summary.profit_factor = 0.23` (`:68`) | ✅ |
+| R:R | 1:0.61 | `summary.rr = 0.61` (`:69`) | ✅ |
+| Sharpe (annualised) | -5.53 | `summary.sharpe = -5.53` (`:71`) | ✅ |
+| Max drawdown | 37.84% | `summary.max_dd_pct = 37.84` (`:72`) | ✅ |
+| Charges drag | -₹3,408 | `summary.charges = 3408.11` (`:74`) | ✅ |
+| Shorts blocked | 0 | `gate_stats.shorts_blocked = 0` (`:85`) | ✅ |
+| Executed / Total signals | 189 / 2,636 = 7.2% | `executed=189`, `total_signals=2636` (`:77,84`) | ✅ |
+| Override resolution | `allow_shorts: True` wins | `overrides[]:55-58` shows `allow_shorts:true` is the LAST entry; later overrides win in the loader | ✅ (also pinned by `test_v25_resolves_allow_shorts_true`) |
+
+All headline numbers match the commit message and the forensic
+§8 update. The V25 result is internally consistent with the artefact
+on disk.
+
+---
+
+### Top suspicions, ranked by ₹ impact
+
+#### 1. The backtester does NOT apply the live drawdown halt — every V20-V25 PF reading lets the strategy bleed past `drawdown_halt_pct: 20.0`
+
+**Evidence.** V25's MaxDD is 37.84% (`results/V25_swing_combined_shorts.json:72`).
+`config.yaml:319` block has `drawdown_halt_pct: 20.0` and
+`max_drawdown_pct: 10.0` (daily). A grep of
+`packages/research/backtest_ensemble.py` for `drawdown_halt|max_drawdown_pct`
+returns **4 hits, all of them reporting metrics (lines 199, 1147, 1203,
+1225) — none of them gating execution**. The halt config keys exist on
+the dataclass; nothing in the event loop consults them.
+
+```
+packages/research/backtest_ensemble.py:1147
+            r.max_drawdown_pct = (
+                mdd_val / final_peak * 100.0 if final_peak else 0.0
+            )
+```
+
+This is the **only** consumer. The backtester reports drawdown — it
+does not stop the strategy when drawdown exceeds 20%.
+
+**Business interpretation.** V25 ran to -37.84% drawdown in backtest;
+the live engine would have halted at -20% (potentially earlier if the
+daily 10% gate fires first). So V25's PnL of -₹3,764 over the full
+600-day window is an over-statement of the loss the live engine would
+have realised — the real live loss would have been bounded by the halt
+threshold, then the strategy would have been *suspended*, not deleted.
+
+This does **not** rescue the verdict — PF 0.23 over the surviving
+sub-window would still be < 1.0, and the strategy would still be a
+losing strategy that the operator should not run. **But it does mean
+every PF figure across V20-V25 is computed without the most important
+protective gate the live engine actually has.** Any future v3.1
+backtest will have the same issue. If at some point a candidate
+strategy lands at PF 0.95-1.05, the backtester is mis-reporting the
+live outcome by *more* than the wind-down margin.
+
+**Estimated ₹ impact / day.** Zero in the wind-down context (V25
+verdict not threatened). Bounded above by **the misclassification
+risk on a future borderline strategy** — if such a candidate emerges
+in v3.1 or later, this gap could either falsely accept a strategy
+(backtest looks decent because losses kept compounding into a recovery
+phase) or falsely reject one (backtest looks bad because losses ran
+past the live halt). Likely a one-line `if r.max_drawdown_pct >
+drawdown_halt_pct: break` in the event loop. ~30 min fix.
+
+**Recommended action.** **Not blocking the 2026-06-05 wind-down
+decision.** File as a v3.1-prerequisite if any future strategy push
+happens. Document in `docs/findings/findings_log_2026-05-27.md` so
+the gap is on the record for the verdict meeting.
+
+#### 2. 71.8% of V25 signals dropped at the 5-position cap — V25 tested "what does V22+shorts look like with this position cap" and not "is there short edge"
+
+**Evidence.** `V25 gate_stats: max_positions_reached = 1,893 / 2,636 = 71.8%`.
+Only 7.2% of generated signals actually opened a position. The
+forensic §8.3 acknowledges this and asserts "Even at higher caps the
+additional fills would be marginal-quality shorts further diluting
+the book" — but that assertion is **uncited**. There is no V25-with-
+higher-cap data point to support it.
+
+The asymmetric-short caveat compounds this: trend_pullback's SELL has
+1 gate vs BUY's 5 gates; the strategy should emit SELL roughly 10x as
+often as BUY in a directional regime. V25's SELL/BUY trade ratio is
+143/46 = 3.1:1 — **much less than the underlying signal ratio**. The
+gap (10:1 emission, 3:1 execution) is being absorbed by the position
+cap, not by any signal-quality filter.
+
+**Business interpretation.** V25 *as designed* answers the exact
+question Session 2 asked ("does adding shorts to V22 turn it
+profitable?" — answer: no). But V25 does **not** answer the closely
+related question "is the short side of trend_pullback profitable when
+not capital-constrained?" The position-cap dilution means the V25 PF
+of 0.23 is a verdict on a *capital-throttled subset* of the short
+signal set, not on the short signal set itself.
+
+For the **wind-down decision specifically** this does not matter —
+the live engine WILL be capital-constrained, and at the live
+`max_positions: 5` value V25 reproduces the live behaviour faithfully.
+For any **v3.1 follow-up that proposes a higher position cap**, V25 is
+not informative about what would happen.
+
+**Estimated ₹ impact / day.** Zero in the wind-down context. The
+operator's forensic §8.3 framing is correct in practice; the
+adversarial point is just that the supporting evidence isn't on disk.
+
+**Recommended action.** **Optional pre-verdict insurance run:** a
+V26_swing_combined_shorts_loose_cap = V25 with `risk.max_positions:
+15`. If V26 PF is still < 1.0, the operator's §8.3 assertion is
+confirmed; if V26 PF ≥ 1.0, the wind-down verdict is on shaky ground
+and v3.1 is owed a proper short-side strategy. Cost: one battery slot
+(~25 min); deferrable. If skipped, the verdict meeting should note
+this as a known sub-question that was not tested.
+
+#### 3. The "source-of-truth divergence" item from Session 2 §5 was NOT closed by today's commits
+
+**Evidence.** Session 2 §5 recommended a one-line EOD assertion:
+`self_sufficiency.cumulative == checkpoint.cumulative ± 0.01`. Today's
+commits (5 of them, all 14:11–14:45) touched: `strategies` (Bug A),
+`trading_agent._persist_runtime_state` (Bug B),
+`packages/research/battery.py` (V25 variant),
+`tools/run_daemon_resilient.ps1` (supervisor fix), and
+`docs/reviews/brutal_review_2026-05-30.md` + `docs/findings/...`
+(audit closure). **No commit modified the EOD pipeline.**
+
+`data/self_sufficiency.json` is still stale (mtime 2026-05-14, content
+`cumulative_realised_inr: 0.0`). The 2026-06-05 verdict meeting will
+still read three different cash figures from three different files
+unless one of them is explicitly chosen as canonical.
+
+**Business interpretation.** Bug B's fix (preserve the disk snapshot
+when in-memory state is incomplete) *reduces* the risk of a stale
+`self_sufficiency.json` getting silently clobbered with an empty
+state. So the worst-case scenario from Session 1 Finding 4 is less
+likely than it was at 01:24 IST. But the **positive** assertion that
+the three sources agree is still absent. If, between now and 2026-06-05,
+the trader VM restarts and reads `self_sufficiency.json` as canonical,
+the operator sees `cumulative=0` and over-counts the project's
+profitability by ₹1,212.
+
+**Estimated ₹ impact / day.** Zero direct; bounded by the wrong
+decision risk at the verdict meeting. Worth 15 min between now and
+the meeting.
+
+**Recommended action.** Add the assertion before 2026-06-04 EOD.
+Trivial.
+
+---
+
+### Things that look fine
+
+This section is **larger than usual on purpose** — the operator
+shipped a lot in 3 hours and most of it is correct.
+
+* **V25 variant is config-correct.** Override list (`results/V25_*.json:3-58`)
+  ends with `["risk.allow_shorts", true]`. Loader applies overrides in
+  order, later wins. Behaviour pinned by
+  `test_v25_resolves_allow_shorts_true`. The base-config `allow_shorts:
+  false` is correctly overridden by the V25-specific true. No bug.
+* **V25 verdict-tree pre-commit was honoured mechanically.** The
+  commit `f50e9ee` documented the two-branch verdict tree in the
+  variant docstring BEFORE the run; commit `f1670d4` shows the V25
+  PF=0.23 falls in the first branch ("forensic verdict honest, wind-down
+  on complete-enough data"). Charter §10.5 R1 ("do NOT debug into
+  oblivion") explicitly NOT triggered: no parameter sweep, no "let me
+  also try V26 with wider SL", no retry on a different universe. This
+  is exemplary discipline.
+* **Forensic §8 (the V25 update) self-flags the asymmetric-short
+  caveat.** §8.5 names what V25 rules out AND what it doesn't, including
+  "A truly symmetric short strategy (`trend_pullback_short` with mirror
+  gates) … V25 doesn't prove it doesn't [have edge]". The operator's
+  framing is one degree more honest than the commit-message headline.
+  The brutal review's primary objection from session 2 is closed; the
+  remaining v3.1 hypothesis is parked correctly.
+* **Bug A fix (xgboost zombie) is defence-in-depth.** Module-level
+  `DEPRECATED_STRATEGIES = {"xgboost_classifier"}` with a CRITICAL log
+  when a stale config tries to load a retired name. The right
+  semantics: "config can be stale, denylist cannot". To revive: must
+  remove from the set in the same commit that overturns the verdict.
+  6 tests, including `test_load_strategies_denylist_logs_critical`.
+* **Bug B fix (`_persist_runtime_state`) chose the right failure
+  semantics.** The commit explicitly rejects `getattr(..., {})` (which
+  would clobber the disk snapshot) in favour of skip-and-CRITICAL-log
+  (which preserves the snapshot). This is the correct choice for a
+  persistence layer protecting protective runtime state — silent
+  clobber would be worse than the swallow. 3 tests covering both the
+  skip path and the success path.
+* **Supervisor fix is targeted.** `tools/run_daemon_resilient.ps1`
+  diff: only the post-exit branch changed. `if $exitCode -eq 0` logs
+  `[SUPERVISOR-CLEAN-EXIT]` and `exit 0`. Non-zero still cooldowns and
+  retries — transient broker / OOM failures still self-heal. The
+  opt-out env var `SUPERVISOR_RESTART_ON_CLEAN_EXIT=1` is documented
+  in the supervisor's own log so an operator restoring legacy
+  behaviour can grep-find the knob. 4 structural tests pin the
+  PowerShell source against future regressions.
+* **All 1,765 unit tests pass.** Bug A+B commit message documents zero
+  regressions. The session-2 fixes did not break anything.
+
+---
+
+### What I refused to conclude (insufficient evidence)
+
+* **Whether V26 (V25 + higher max_positions) would change the verdict.**
+  Not run. The operator's §8.3 assertion ("higher caps would dilute")
+  is plausible but uncited. See Suspicion §2.
+* **Whether the trader-VM (cloud) currently has the Bug A/B fixes
+  deployed.** The fixes are on `main`; the trader VM's deploy
+  status is not visible from this local checkout. If the freeze
+  contract forbids re-deploys during the freeze window, the fixes are
+  *correct on disk but not in production*, which means the next live
+  session could still emit the zombie xgboost signals and the
+  AttributeError. Operator action: explicit confirmation that either
+  (a) the trader-VM was redeployed, or (b) the trader-VM never had
+  these bugs because the prod config was already clean.
+* **Whether the 03:45 IST timestamps on V25 trade entries
+  (`results/V25_*.json:107-108`) reflect a Yahoo-data timezone offset
+  or a genuine engine bug.** Trade 1: entry `2025-01-20T03:45:00+05:30`,
+  exit `2025-01-21T03:45:00+05:30`. 03:45 IST is well before market open;
+  the daily bar should be stamped 09:15 (open) or 15:30 (close). Most
+  likely Yahoo Finance returns UTC-aligned 22:15 timestamps for daily
+  bars that the data_handler converts to IST → 03:45 IST next day. Not
+  material to PF / WR / DD / verdict (those are computed on prices,
+  not timestamps), but the timestamps will look wrong to anyone
+  reviewing trade-by-trade later. Worth a 1-line clarification in the
+  variant block.
+* **Whether the BUY-arm PF drift (V20: 0.41 → V25 BUY: 0.31) is
+  signal or noise.** N=46 and N=55 at sub-1 PF, no confidence interval
+  reported. Operator's "explained by short positions consuming
+  position cap" is the most parsimonious explanation. Not material to
+  the wind-down.
+
+---
+
+### Next 24h checklist (operator actions, ranked)
+
+1. **(P1, ~15 min, before 2026-06-04 EOD)** Add the EOD assertion
+   `self_sufficiency.cumulative_realised_inr ==
+   checkpoint.cumulative_realised_inr ± 0.01`. Closes the last open
+   Session 2 item. The verdict meeting deserves to read one cumulative
+   number, not three.
+2. **(P1, ~25 min, OPTIONAL pre-verdict insurance)** Run V26 =
+   V25 + `risk.max_positions: 15`. If V26 PF < 1.0, the wind-down
+   verdict is confirmed against the position-cap-dilution objection.
+   If V26 PF ≥ 1.0, defer the wind-down — the short side may have
+   edge that was capital-throttled. Skipping is defensible if the
+   operator commits in the verdict-meeting minutes that "V25's
+   position-cap dilution was an accepted caveat".
+3. **(P1, before 2026-06-04 EOD)** Confirm that the trader-VM has
+   either (a) been redeployed with the Bug A+B fixes (denylist +
+   persist guard) OR (b) never had those bugs in prod (the bugs were
+   local-checkout-only). Either is fine; not knowing which is not.
+4. **(P2, ~30 min, post-decision)** Wire the `drawdown_halt_pct` and
+   `max_drawdown_pct` config values into the backtester event loop.
+   Currently they are read-only metrics; in live they are protective
+   gates. Any v3.1 backtest would benefit. Not blocking the wind-down.
+5. **(P2, ~1 line)** Footnote on the V25 trade timestamps — either
+   convert to 09:15 IST or document the Yahoo 22:15 UTC → 03:45 IST
+   conversion in the variant block. Cosmetic.
+
+---
+
+### One-paragraph summary for the 2026-06-05 verdict meeting
+
+V25 is honest. The wind-down trigger can fire on it without re-opening
+the long-only-veto objection — the BUY arm of V25 reproduces V20's
+edge profile (PF 0.31 vs 0.41) and the SELL arm at PF 0.19 closes
+the cheap "what about the obvious short emissions we were vetoing"
+question. The operator's forensic §8 correctly self-flags that V25's
+short side used the strategy's long-exit signal as a short-entry (the
+"asymmetric short" caveat) and parks a properly-symmetric
+`trend_pullback_short` as a separate v3.1 hypothesis — that
+discipline is exactly right. Three new sub-findings remain for the
+verdict meeting record: (a) the backtester does not apply the live
+`drawdown_halt_pct: 20.0` gate, so every PF reading lets losses run
+past where the live engine would halt; (b) 71.8% of V25's signals were
+dropped at `max_positions: 5`, so V25 tested a capital-throttled
+subset rather than the underlying signal quality, with the operator's
+"higher caps would dilute" assertion plausible but uncited (V26 would
+close this in 25 min); (c) the EOD-assertion against
+source-of-truth divergence (Session 2 §5) is still unshipped. None of
+these threaten the wind-down verdict; all three deserve mention in
+the meeting minutes. **Verdict: RED, evidence-complete. Operator is
+free to make the 2026-06-05 call.**
+
+---
+
+### Cross-references (delta only — session 1 and 2's full lists still apply)
+
+* `logs/backtests/battery_v3_swing_a5_v25_shorts_20260530T090709/results/V25_swing_combined_shorts.json`
+  — the raw artefact this session re-derives from.
+* `docs/diagnoses/v3_phase_a5_forensic_2026-05-30.md` §8 — the
+  operator's V25 update; this session contests three of its implicit
+  framings (drawdown halt, position-cap dilution, source-of-truth
+  closure status).
+* `commit f1670d4` — V25 verdict commit; numbers all match.
+* `commit f50e9ee` — V25 variant + pre-committed verdict tree; clean.
+* `commit 7b4723d` — Bug A+B fix; correct failure semantics.
+* `commit 2837b45` — supervisor fix; targeted, opt-out documented.
+* `packages/research/backtest_ensemble.py:199, 1147, 1203, 1225` — the
+  four hits for `drawdown_halt|max_drawdown_pct`, all reporting and
+  none gating.

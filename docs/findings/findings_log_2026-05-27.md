@@ -5089,3 +5089,92 @@ The T3 hypothesis (per `docs/freeze/wind_down_criteria_2026-06-05.md`) was "v3.0
 * `packages/research/battery.py:V25_swing_combined_shorts` (variant + verdict tree docstring)
 * `docs/freeze/wind_down_criteria_2026-06-05.md` (T3 trigger definition)
 
+## 32. Brutal review (Session 3) follow-on: backtester drawdown halt + V26 disambiguation + EOD source-of-truth assertion (2026-05-30 ~15:30 IST)
+
+The Session 3 brutal-review pass at ~14:50 IST confirmed the V25 finding is honest and the wind-down trigger can fire on 2026-06-05 without re-opening the long-only-veto objection. Verdict colour unchanged (RED), adverb changed from "escalating" to "evidence-complete". Three new sub-findings landed for the verdict-meeting record:
+
+1. **§1 ? Backtester does not apply the live `drawdown_halt_pct: 20.0` gate.** V25's MaxDD=37.84% in backtest; the live engine would have halted at -20%. Not material to the wind-down (PF 0.23 << 1.0 even with halt active), but bias-optimistic for any future v3.1 candidate that has period-segregated bleed.
+2. **§2 ? V25 dropped 71.8% of signals at `risk.max_positions: 5`.** V25's PF 0.23 is on a capital-throttled subset, not the strategy's signal-quality ceiling. Forensic §8.3 asserted "higher caps would dilute" without citing data.
+3. **§3 ? Session 2 §5 EOD source-of-truth assertion was not shipped in the prior batch.** `data/self_sufficiency.json` was 16d stale (cumulative=0.0) while DB-summed showed -?1,212.26.
+
+Operator decision (this section): ship all three. P1 EOD assertion + V26 variant before the verdict meeting; P2 drawdown-halt knob shipped now (default OFF) so any v3.1 backtest can opt in. Trader-VM deploy state confirmation remains an operator action (separate ssh task).
+
+### 32.1 What landed in this batch (4 commits to land)
+
+| # | Change | File(s) | Default behaviour | Tests added |
+|---|---|---|---|---|
+| 1 | V25 timestamp footnote | `packages/research/battery.py` (V25 variant docstring) | Documentation only | 1 (`test_v25_docstring_documents_timestamp_footnote`) |
+| 2 | Backtester drawdown halt (opt-in) | `packages/research/backtest_ensemble.py`, `packages/research/battery.py` | OFF ? `drawdown_halt_pct=None`, `drawdown_pause_pct=None` defaults | 5 structural + config tests |
+| 3 | V26 variant + queue entry | `packages/research/battery.py`, `data/battery_queue.yaml` | New variant, opt-in via queue scheduler | 6 (existence, resolution, V25-vs-V26 diff, queue, verdict-tree docstring) |
+| 4 | EOD source-of-truth assertion | `trading_agent.py` (helper + EOD report wiring) | Always-on when `risk.self_sufficiency.enabled=True`; otherwise skipped | 9 (helper exists, disabled case, OK case, fp tolerance, DRIFT case + CRITICAL log, DB error case + WARNING log, empty DB, EOD invocation, EOD body rendering) |
+
+Total: 21 new unit tests. Full suite: **1,786 passed** (was 1,765, zero regressions).
+
+### 32.2 Why drawdown halt defaults OFF
+
+Reading `risk.drawdown_halt_pct: 20.0` (which exists in `config.yaml` for the live engine) directly into the backtester would silently retroactively change every V1-V25 PF figure ever published. That's exactly the failure mode the v3 charter §6.1 ("museum mode") forbids. The plumbing reads from a NEW config key ? `backtest.drawdown_halt_pct` ? which is unset in `config.yaml`, so:
+
+* V1-V25 reproduce byte-identically (no halt applied).
+* V26 also reproduces byte-identically (does NOT opt in; the docstring explicitly notes conflating cap-lift AND halt would make a borderline V26 PF un-attributable).
+* Any future v3.1 swing variant CAN opt in by adding `("backtest.drawdown_halt_pct", 20.0)` to its override list.
+
+`GateStats.drawdown_halted` was added so post-run analysis can spot opt-in runs at a glance: it is 0 on every legacy variant and non-zero only when the gate fires.
+
+### 32.3 V26 verdict tree (pre-committed before run)
+
+Per charter §10.5 R1 the verdict tree was committed to the V26 variant docstring BEFORE any data was generated. Two branches:
+
+| Branch | Condition | Implication |
+|---|---|---|
+| V26 PF < 1.0 | Cap-dilution objection refuted | V25's PF 0.23 is the strategy's ACTUAL ceiling, not a throttling artefact. Strongest possible "no edge" verdict the existing strategy code can produce. Wind-down on data that closes both Session 2's long-only-veto objection AND Session 3's capital-throttle objection. |
+| V26 PF >= 1.0 | MATERIAL FINDING | Latent edge that the live 5-position cap was hiding. Wind-down deferred until either (a) operator commits to running live with `max_positions: 15` (separate risk-policy decision), or (b) a properly-symmetric `trend_pullback_short` v3.1 strategy is built so the higher-cap result can be reproduced with mirror-gated shorts (cleaner edge attribution). |
+
+V26 variant: `V26_swing_combined_shorts_high_cap` in `packages/research/battery.py`. Identical to V25 except `risk.max_positions: 15`. Confirmed by `test_v26_matches_v25_except_max_positions`.
+
+V26 queue job: `v3_swing_a5_v26_high_cap` in `data/battery_queue.yaml`. Same Nifty-30 universe, same 600d window, same 1d interval as V25. Operator activation: same as V25 (push, ssh-restart battery-scheduler on backtester VM, pull results local).
+
+### 32.4 EOD source-of-truth assertion: how it works
+
+Helper: `TradingAgent._eod_source_of_truth_assertion()` (returns `(status, ledger_cum, db_cum, diff)` or None). Called from `_maybe_send_eod_summary` once per EOD cycle.
+
+Compares:
+* **Source A:** `self_sufficiency.cumulative_realised_inr` (lifetime ledger, written on every close via `record_realised_pnl`).
+* **Source B:** `SUM(pnl) FROM trades WHERE entry_time >= deployed_on` (re-computed from the DB).
+
+Tolerance: ±?0.01. On DRIFT (i.e. `|A ? B| > 0.01`):
+* Emits a CRITICAL log line `[EOD-ASSERT] SOURCE-OF-TRUTH DRIFT:` with both numbers and the suggested rebuild action.
+* Surfaces a `Source-of-truth: DRIFT ? ledger Rs ... vs DB Rs ... (diff Rs ...)` line in the EOD email body so the operator sees disagreement on every EOD without checking the daemon log.
+
+On OK: a quieter `Source-of-truth: ledger == DB == Rs ...  [OK]` line in the email body + an INFO log.
+
+On DB-error: a WARNING log (NOT critical) and a `Source-of-truth: check ERROR` line. Different severity from DRIFT because "can't run the check" is a different failure class from "the check ran and found drift" ? flooding CRITICAL on a transient DB hiccup teaches operators to ignore the alert.
+
+Tracker disabled in config: skipped silently (returns None). Email omits the source-of-truth section entirely.
+
+### 32.5 Things this batch deliberately does NOT do
+
+To preserve charter discipline:
+
+1. **No retroactive recomputation of V20-V25 with drawdown halt enabled.** Historic results stay as they are; the audit trail in `logs/backtests/` is a museum exhibit.
+2. **No automatic DB-to-ledger rebuild on DRIFT.** The CRITICAL log surfaces the drift and points at the rebuild action; the operator runs the rebuild manually so a transient DB hiccup can't silently overwrite a correct ledger.
+3. **V26 does not enable drawdown halt.** Conflating cap-lift and halt would make a borderline V26 PF un-attributable; the cap-lift question is answered cleanly by the single-knob change.
+4. **No timestamp conversion of V25 trade records.** The 03:45 IST stamps are documented as a yfinance daily-bar UTC-midnight rendering artefact in the V25 docstring; the actual fill semantics (next-bar-open) are unchanged. Conversion is parked as a v3.1 cosmetic.
+
+### 32.6 Operator follow-up (post-2026-06-05)
+
+Items that did NOT land in this batch and require operator action:
+
+1. **Trader-VM deploy state of Session 2 fixes** (Bug A xgboost denylist, Bug B `_persist_runtime_state`). The fixes are on `main`; the trader VM's deploy status is not visible from this local checkout. Required confirmation: either (a) trader-VM was redeployed, or (b) trader-VM never had these bugs because prod config was already clean. The freeze charter §6.1 forbids re-deploys during the window unless triggered by a verdict-meeting decision.
+2. **V26 actual run + verdict-tree application.** Push + ssh-restart + pull results. ~25-40 min wall-clock on the backtester VM.
+3. **Wind-down decision (2026-06-05 verdict meeting).** The audit log records evidence; it does not recommend a path. Per the charter, the operator owns the call.
+
+### 32.7 Cross-references
+
+* `docs/reviews/brutal_review_2026-05-30.md` Session 3 (full review with the three suspicions).
+* `packages/research/backtest_ensemble.py` ? `BacktestConfig.drawdown_halt_pct` docstring (knob contract), `_bump_equity` closure (peak tracking + arming), drawdown-halt entry-gate ladder.
+* `packages/research/battery.py` ? V25 timestamp footnote in variant docstring, `V26_swing_combined_shorts_high_cap` variant + verdict tree, `_bt_config` plumbing for the new knobs.
+* `data/battery_queue.yaml` ? `v3_swing_a5_v26_high_cap` job.
+* `trading_agent.py` ? `_eod_source_of_truth_assertion` helper + `_maybe_send_eod_summary` integration.
+* `tests/unit/test_brutal_review_2026_05_30_session3_followon.py` ? drawdown halt + V26 + timestamp footnote tests (12).
+* `tests/unit/test_eod_source_of_truth_assertion_2026_05_30.py` ? EOD assertion tests (9).
+
