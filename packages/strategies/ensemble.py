@@ -16,6 +16,13 @@ from strategies.base_strategy import BaseStrategy, Signal, TradeSignal
 
 # Default weights reflecting trust hierarchy:
 #   ML models get higher base weight; rule-based act as confirmation.
+#
+# v3.0 (charter §2) adds two daily-bar swing rules: trend_pullback +
+# breakout_20d. They get weight 1.0 — equal-ish to v2.1's mid-pack
+# rules. v3 swing variants run with min_strategies_agree=1 (single rule
+# is sufficient to fire) and override these via ensemble.weights as
+# needed; the default 1.0 makes them fire cleanly through the default
+# 0.55 confidence threshold given the strategy emits confidence=0.80.
 DEFAULT_WEIGHTS = {
     "xgboost_classifier": 2.0,
     "lstm_price_model": 1.8,
@@ -24,6 +31,8 @@ DEFAULT_WEIGHTS = {
     "vwap_bounce": 1.2,
     "moving_average_crossover": 1.0,
     "rsi_momentum": 1.0,
+    "trend_pullback": 1.0,
+    "breakout_20d": 1.0,
     "mean_reversion": 0.8,
 }
 
