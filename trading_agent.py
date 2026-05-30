@@ -60,6 +60,26 @@ IST = pytz.timezone("Asia/Kolkata")
 # Full strategy registry (rule-based + ML)
 STRATEGY_REGISTRY = {}
 
+# Strategies that have been formally retired and must NEVER be loaded into a
+# live daemon, even if a stale config.yaml still lists them in
+# ``strategies.active``. This is a defence-in-depth backstop -- the canonical
+# source of truth is the comment-out in ``config.yaml`` -- but the
+# 2026-05-30 brutal review (Session 2) caught a local-laptop daemon loading
+# ``xgboost_classifier`` 36 minutes after the T1 retirement commit landed,
+# producing AAPL/MSFT BUYs on a Saturday market against an unvalidated
+# universe. Any name in this set causes ``_load_strategies`` to log a
+# CRITICAL and skip the entry; the daemon continues with the remaining
+# strategies. To revive a retired strategy, REMOVE it from this set in
+# the SAME commit that documents why the verdict that retired it has been
+# overturned (e.g. clean retrain + held-out PF >= 0.90 backtest).
+#
+# Per-name retirement evidence:
+#   * xgboost_classifier: T1 verdict 2026-05-30 (V15 PF=0.77 < 0.90 floor),
+#     commit c9d3936. See docs/findings/findings_log_2026-05-27.md §28.
+DEPRECATED_STRATEGIES: set = {
+    "xgboost_classifier",
+}
+
 
 def _load_registry():
     global STRATEGY_REGISTRY
@@ -1455,6 +1475,19 @@ class TradingAgent:
         active = strat_cfg.get("active", [])
         strategies = []
         for name in active:
+            # Defence-in-depth retirement gate (2026-05-30 brutal review §2).
+            # A stale config.yaml that still lists a retired strategy must NOT
+            # silently revive it. The denylist is module-level so the
+            # decision is visible alongside the registry.
+            if name in DEPRECATED_STRATEGIES:
+                logger.critical(
+                    f"[STRATEGY-DEPRECATED] '{name}' is in DEPRECATED_STRATEGIES "
+                    f"and will NOT be loaded, even though config.yaml lists it "
+                    f"in strategies.active. Update config.yaml to remove this "
+                    f"entry, or revive the strategy via the documented path "
+                    f"(see DEPRECATED_STRATEGIES docstring in trading_agent.py)."
+                )
+                continue
             cls = STRATEGY_REGISTRY.get(name)
             if cls is None:
                 logger.warning(f"Strategy '{name}' not in registry, skipping")
@@ -2332,7 +2365,52 @@ class TradingAgent:
         """P2 restart-cluster (2026-05-17): atomically snapshot the three
         intraday runtime maps to data/runtime_state.json. Called from every
         mutation point (strategy outcome record, open-window append, TP
-        streak bump, daily reset). Failure is logged and swallowed."""
+        streak bump, daily reset). Failure is logged and swallowed.
+
+        2026-05-30 brutal review §2 (Bug B): the local-laptop daemon
+        produced ``[RUNTIME-PERSIST] save failed: AttributeError("'TradingAgent'
+        object has no attribute '_strategy_state'")`` every cycle. The
+        2026-05-18 audit fix at line ~1090 ensures ``_strategy_state`` is
+        initialised BEFORE ``load_runtime_state`` is called, so the only
+        path that can produce this AttributeError is a save invoked on a
+        partially-constructed object (e.g. an exception during
+        ``__init__`` between the disk-IO step that sets
+        ``_strategy_state`` and a downstream step that calls
+        ``_persist_runtime_state`` indirectly via reconcile / position
+        restore). Defensive check below converts the silent
+        AttributeError swallow into:
+
+          * A loud CRITICAL log (operator sees the bug instead of
+            silent ledger drift).
+          * Skipping the save (preserves the existing on-disk
+            snapshot rather than over-writing it with empty state,
+            which would silently zero suspended-strategy / open-rate
+            / TP-streak counters on the next load).
+
+        The deeper init-ordering question is tracked separately; this
+        guard converts a silent ledger corruption into a loud, no-op
+        warning so the disk snapshot survives until the operator can
+        investigate.
+        """
+        # Guard against a partially-constructed object: any of the three
+        # required attributes missing -> log loud, skip save (preserve
+        # the on-disk snapshot rather than clobber it with empty state).
+        missing = [
+            n for n in ("_strategy_state", "_recent_opens", "_consec_tp_today")
+            if not hasattr(self, n)
+        ]
+        if missing:
+            logger.critical(
+                f"[RUNTIME-PERSIST] save SKIPPED (preserving on-disk snapshot): "
+                f"required attribute(s) {missing} not initialised yet on this "
+                f"TradingAgent instance. Likely root cause: __init__ raised "
+                f"before the runtime-state init block at line ~1090, and a "
+                f"reconcile / restore step is calling _persist_runtime_state "
+                f"on the partially-constructed object. Investigate __init__ "
+                f"order; do NOT delete data/runtime_state.json without "
+                f"reading it first."
+            )
+            return
         try:
             save_runtime_state(
                 self._strategy_state,
