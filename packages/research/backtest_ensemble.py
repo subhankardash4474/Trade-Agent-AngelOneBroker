@@ -143,6 +143,43 @@ class BacktestConfig:
     # Default preserves v2.1 behaviour byte-for-byte. v3 swing variants
     # (V20+) explicitly opt in via the ``backtest.fill_mode`` config key.
     fill_mode: str = "close_plus_slippage"
+    # 2026-05-30 brutal review (Session 3 §1): drawdown halt parity with the
+    # live engine. The live RiskManager.can_enter (packages/core/risk_manager.py:559-573)
+    # has TWO drawdown gates against all-time-high-water-mark equity:
+    #
+    #   * ``drawdown_halt_pct`` — HARD halt. Once equity drawdown crosses
+    #     this threshold, the engine refuses new entries for the rest of
+    #     the run ("manual restart required" semantics in live; in
+    #     backtest, "rest of the simulation"). Existing positions still
+    #     close out via SL/TP/opposite-signal — the halt is on entries,
+    #     not exits.
+    #   * ``drawdown_pause_pct`` — SOFT pause. Blocks new entries WHILE
+    #     drawdown is >= threshold; auto-recovers if equity climbs back.
+    #     In the live config this corresponds to ``risk.max_drawdown_pct``
+    #     (we rename to ``drawdown_pause_pct`` here so the
+    #     ``BacktestResult.max_drawdown_pct`` REPORTING field — which has
+    #     existed for ages and means "the worst drawdown the run hit" —
+    #     stays unambiguous).
+    #
+    # BOTH default to None == "OFF". This preserves v2.1 byte-identical
+    # behaviour for V1-V25 (computed under the "no halt" assumption) AND
+    # keeps any apples-to-apples comparison between adjacent variants
+    # honest (V25 vs V26 must not differ on this knob unless we want to
+    # vary it deliberately).
+    #
+    # PLUMBING: the battery harness reads these from the
+    # ``backtest.drawdown_halt_pct`` / ``backtest.drawdown_pause_pct``
+    # config keys (NOT ``risk.*``). The live ``risk.drawdown_halt_pct``
+    # already exists in config.yaml at 20.0; reading from there would
+    # have silently applied the gate retroactively to V1-V25 and broken
+    # historic reproduction. Variants opt in by setting the
+    # ``backtest.*`` keys in their override list.
+    #
+    # GateStats.drawdown_halted counts entry attempts dropped by EITHER
+    # gate so a future variant comparison can quickly spot if a candidate
+    # would have been gated by drawdown in addition to the other gates.
+    drawdown_halt_pct: Optional[float] = None
+    drawdown_pause_pct: Optional[float] = None
 
 
 @dataclass
@@ -177,6 +214,14 @@ class GateStats:
     # can quickly tell if an end-of-window edge effect is silently
     # eating signals (rare; should be < 1 per symbol per run).
     no_next_bar: int = 0
+    # 2026-05-30 brutal review (Session 3 §1): drawdown halt parity gate.
+    # Counts entry attempts dropped because either ``drawdown_halt_pct``
+    # (hard, once-tripped-stays-tripped) OR ``drawdown_pause_pct`` (soft,
+    # auto-recover) was active at signal evaluation. Both default OFF so
+    # this counter is 0 unless a variant deliberately opts in. See
+    # ``BacktestConfig.drawdown_halt_pct`` and the entry-gate ladder in
+    # ``run`` for the contract.
+    drawdown_halted: int = 0
 
     def as_dict(self) -> Dict[str, int]:
         return {k: getattr(self, k) for k in self.__dataclass_fields__}
@@ -303,6 +348,17 @@ class EnsembleBacktester:
         gate_stats = GateStats()
         trades: List[dict] = []
         equity_curve: List[float] = [self.bt.initial_capital]
+        # 2026-05-30 brutal review (Session 3 §1): drawdown-halt mirrors
+        # the live engine's risk_manager.can_enter contract. We track the
+        # all-time-high-water-mark equity so the drawdown gate can fire
+        # on the same anchor as live (RiskManager.high_water_mark).
+        # Both knobs default to None which means "OFF" — the closure
+        # never enters the gate branch in that case, preserving v2.1
+        # byte-identical behaviour for every V1-V25 variant.
+        # Mutable single-element lists (not nonlocal) so the
+        # ``_bump_equity`` closure can update them without a rebinding.
+        _peak_holder: List[float] = [self.bt.initial_capital]
+        _hard_halted: List[bool] = [False]
         # 2026-05-25 senior-dev scan, Bug D fix: track end-of-day equity
         # by IST date so Sharpe is computed on DAILY returns (not per-event
         # returns × sqrt(252) which is nonsensical when there are 220k
@@ -357,6 +413,29 @@ class EnsembleBacktester:
                     day = None
             if day is not None:
                 last_equity_per_day[day] = eq
+            # 2026-05-30 brutal review (Session 3 §1): track the all-time
+            # peak and arm the hard-halt flag the moment drawdown crosses
+            # the configured threshold. We log the trip event ONCE — the
+            # entry-gate ladder will then drop every subsequent signal
+            # against gate_stats.drawdown_halted. The check is gated by
+            # ``drawdown_halt_pct is not None`` so the legacy "OFF" path
+            # adds no measurable overhead (one None check per equity bump).
+            if eq > _peak_holder[0]:
+                _peak_holder[0] = eq
+            if (self.bt.drawdown_halt_pct is not None
+                    and not _hard_halted[0]
+                    and _peak_holder[0] > 0):
+                cur_dd_pct = (_peak_holder[0] - eq) / _peak_holder[0] * 100.0
+                if cur_dd_pct >= self.bt.drawdown_halt_pct:
+                    _hard_halted[0] = True
+                    logger.info(
+                        f"[BACKTEST-HALT] hard drawdown halt tripped at "
+                        f"{cur_dd_pct:.2f}% >= {self.bt.drawdown_halt_pct}% "
+                        f"(peak Rs {_peak_holder[0]:.2f}, equity Rs {eq:.2f}) "
+                        f"at sim ts {_ts}; new entries blocked for the rest "
+                        f"of the run. Existing positions still close out via "
+                        f"SL/TP/opposite-signal, mirroring live."
+                    )
             return eq
 
         # Build a unified, time-ordered event stream across symbols so
@@ -642,6 +721,38 @@ class EnsembleBacktester:
                 gate_stats.shorts_blocked += 1
                 _bump_equity(ts, symbol, close)
                 continue
+
+            # 2026-05-30 brutal review (Session 3 §1): drawdown halt gate.
+            # Mirrors the live RiskManager.can_enter check at
+            # packages/core/risk_manager.py:559-573. Two failure modes
+            # rolled into one gate counter:
+            #   * Hard halt: ``_hard_halted[0]`` was tripped earlier in
+            #     ``_bump_equity`` when drawdown crossed
+            #     ``self.bt.drawdown_halt_pct``. Stays tripped for the rest
+            #     of the run (live: "manual restart required").
+            #   * Soft pause: drawdown is currently >= ``drawdown_pause_pct``.
+            #     Auto-recovers once equity climbs back. Re-evaluated each
+            #     bar against the current equity / running peak.
+            # Existing positions still close out via SL/TP/opposite-signal
+            # (those branches run BEFORE the entry-gate ladder), matching
+            # the live contract that drawdown halt blocks NEW entries only.
+            if _hard_halted[0]:
+                gate_stats.drawdown_halted += 1
+                _bump_equity(ts, symbol, close)
+                continue
+            if (self.bt.drawdown_pause_pct is not None
+                    and _peak_holder[0] > 0):
+                _cur_eq_for_dd = (
+                    equity_curve[-1] if equity_curve
+                    else self.bt.initial_capital
+                )
+                _cur_dd = (
+                    (_peak_holder[0] - _cur_eq_for_dd) / _peak_holder[0] * 100.0
+                )
+                if _cur_dd >= self.bt.drawdown_pause_pct:
+                    gate_stats.drawdown_halted += 1
+                    _bump_equity(ts, symbol, close)
+                    continue
 
             # Gate: dead-hour
             if self.bt.apply_dead_hour and self._in_dead_hour(ts):

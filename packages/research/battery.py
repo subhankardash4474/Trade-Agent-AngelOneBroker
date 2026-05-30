@@ -609,7 +609,70 @@ VARIANTS = [
         # is the entire purpose of V25 — every other swing variant is
         # long-only by charter §2; V25 explicitly tests the side that
         # was vetoed.
+        #
+        # Trade-record timestamps note (2026-05-30 brutal review §3 cosmetic):
+        # V25's trade JSONs show entry/exit timestamps like
+        # ``2025-01-20T03:45:00+05:30``. This is the data_handler's IST
+        # rendering of Yahoo Finance's daily-bar UTC-midnight (00:00 UTC =
+        # 05:30 IST) shifted by the symbol's exchange-session adjustment;
+        # the actual fill semantics are still "next-bar open", just stamped
+        # with the bar index timestamp. PF/WR/MaxDD numbers are unaffected.
+        # Reviewer parking the cosmetic mismatch as v3.1-only.
         ("risk.allow_shorts", True),
+    ]),
+
+    # ── Tier 10: V25 capital-throttling disambiguation (2026-05-30 brutal review §2) ─
+    # The Session 3 brutal review caught that V25 dropped 71.8% of its
+    # signals (1,893 / 2,636) at `risk.max_positions: 5`. V25 therefore
+    # tests what V22+shorts looks like at the LIVE 5-position cap, not
+    # whether the underlying short signal has edge when not capital-
+    # constrained. Forensic §8.3 asserted "Even at higher caps the
+    # additional fills would be marginal-quality shorts further diluting
+    # the book" — but that assertion was uncited. V26 closes that gap.
+    #
+    # V26 = V25 + ``risk.max_positions: 15`` (3x the live cap). One
+    # variant, single override on top of V25.
+    #
+    # WHY 15 AND NOT (e.g.) 30: at cap=15 the position-cap-blocked
+    # fraction should drop from 71.8% to roughly 15-30% (the order-of-
+    # magnitude estimate from V25's data: short emissions ~0.7/day across
+    # 30 stocks = ~20 simultaneous candidates; cap=15 absorbs most of
+    # them). That's enough headroom to surface latent edge if it exists,
+    # without going so high that the run becomes unrealistic vs any
+    # reasonable live cap. cap=30 would also work but adds ~no signal.
+    #
+    # WHAT V26 DOES NOT TEST: drawdown_halt. The companion commit (this
+    # batch) adds drawdown_halt as an opt-in BacktestConfig knob, default
+    # OFF to preserve v2.1 byte-identical behaviour AND keep V26 apples-
+    # to-apples with V25. Conflating two changes (cap=15 AND halt=20)
+    # would make a V26 PF >= 1.0 result un-attributable.
+    #
+    # Verdict tree for V26 (operator decision 2026-06-05 with V26 in hand):
+    #   * V26 PF < 1.0 → cap-dilution objection refuted. V25's PF 0.23 is
+    #     the strategy's ACTUAL ceiling, not a throttling artefact. The
+    #     wind-down call is on data that closes both Session 2's long-
+    #     only-veto objection AND Session 3's capital-throttle objection.
+    #     Strongest possible "no edge" verdict the existing strategy code
+    #     can produce.
+    #   * V26 PF >= 1.0 → MATERIAL FINDING. The short side has latent
+    #     edge that the live 5-position cap was hiding. Wind-down deferred
+    #     until either (a) the operator commits to running live with
+    #     max_positions: 15 (separate risk-policy decision), or (b) a
+    #     properly-symmetric trend_pullback_short v3.1 strategy is built
+    #     so the higher-cap result can be reproduced with mirror-gated
+    #     shorts (cleaner edge attribution).
+    #
+    # Operator activation: same as V25 (commit + push, ssh-restart
+    # battery-scheduler on backtester VM, pull results local).
+    ("V26_swing_combined_shorts_high_cap", [
+        *_v3_swing_base(),
+        ("strategies.active", ["trend_pullback", "breakout_20d"]),
+        # V25's allow_shorts:True override (the bidirectional read).
+        ("risk.allow_shorts", True),
+        # V26's differentiator: lift max_positions from the v3 base of 5
+        # to 15 to absorb the short-emission flood without the cap-
+        # dilution artefact §8.3 asserted but didn't test.
+        ("risk.max_positions", 15),
     ]),
 ]
 
@@ -666,6 +729,18 @@ def _bt_config(cfg: dict) -> BacktestConfig:
         fill_mode=str(
             cfg.get("backtest", {}).get("fill_mode", "close_plus_slippage")
         ),
+        # 2026-05-30 brutal review (Session 3 §1): plumb
+        # ``backtest.drawdown_halt_pct`` and ``backtest.drawdown_pause_pct``
+        # so battery variants can opt in to live-engine drawdown gating.
+        # Read from the ``backtest`` section (NOT ``risk``) so the live
+        # ``risk.drawdown_halt_pct: 20.0`` sitting in config.yaml does
+        # NOT silently apply retroactively to V1-V25 runs. Historic
+        # results for V1-V25 were computed without halt; preserving
+        # byte-identical reproduction requires this isolation.
+        # New variants opt in by setting ``backtest.drawdown_halt_pct: 20.0``
+        # in their override list. Both default None == OFF.
+        drawdown_halt_pct=cfg.get("backtest", {}).get("drawdown_halt_pct"),
+        drawdown_pause_pct=cfg.get("backtest", {}).get("drawdown_pause_pct"),
     )
 
 

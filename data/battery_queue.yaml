@@ -267,3 +267,41 @@ jobs:
     universe-file: data/v3_universe_top30.json
     variants:
       - V25_swing_combined_shorts
+
+  # ── 8. v3.0 capital-throttle disambiguation — V26 (2026-05-30 Session 3) ──
+  # Single-variant follow-on that addresses brutal-review Session 3 §2:
+  # V25 dropped 71.8% of its signals (1,893 / 2,636) at the live
+  # ``risk.max_positions: 5`` cap, so V25's PF 0.23 reading is on a
+  # capital-throttled subset rather than the underlying signal quality.
+  # The forensic §8.3 assertion "Even at higher caps the additional fills
+  # would be marginal-quality shorts further diluting the book" was
+  # uncited; V26 closes that gap.
+  #
+  # V26 = V25 + ``risk.max_positions: 15`` (3x the live cap). Same universe,
+  # same window, same fill_mode, same warmup, allow_shorts: True
+  # (inherited from V25). The ONLY difference vs V25 is the position cap
+  # is lifted from 5 to 15. Drawdown halt remains OFF (default) so V26 is
+  # apples-to-apples with V25 on every other dimension.
+  #
+  # Charter §6.1 (trader VM untouched) preserved: backtester-only run.
+  #
+  # Verdict tree (operator decision 2026-06-05 with V26 in hand):
+  #   * V26 PF < 1.0 → cap-dilution objection refuted. V25's PF 0.23 is
+  #     the strategy's ACTUAL ceiling. Wind-down on data that closes both
+  #     Session 2's long-only-veto objection AND Session 3's capital-
+  #     throttle objection. Strongest possible "no edge" reading.
+  #   * V26 PF >= 1.0 → MATERIAL FINDING. Latent edge that the live
+  #     5-position cap was hiding. Wind-down deferred until either (a) a
+  #     risk-policy decision to run live with max_positions: 15, or (b) a
+  #     properly-symmetric trend_pullback_short v3.1 strategy is built so
+  #     the higher-cap result can be reproduced with mirror-gated shorts.
+  #
+  # Estimated runtime: ~25-40 min (single variant, more fills than V25
+  # due to higher cap absorbing more signals).
+  - name: v3_swing_a5_v26_high_cap
+    days: 600
+    interval: 1d
+    workers: 2
+    universe-file: data/v3_universe_top30.json
+    variants:
+      - V26_swing_combined_shorts_high_cap
