@@ -178,3 +178,63 @@ jobs:
   #   workers: 2
   #   universe-file: tests/fixtures/battery_v2_universe.json
   #   holdout-window-days: 30
+
+  # ── 6. v3.0 swing CNC battery — Phase A5 (2026-05-30) ───────────────
+  # First v3.0 battery run. Per
+  # docs/freeze/freeze_v3.0_charter_2026-05-30.md §6 Phase A5.
+  # Five swing variants × 30 stocks × 1d bars. Universe:
+  # data/v3_universe_top30.json (top 30 Nifty 50 by liquidity).
+  #
+  # Calendar-day window vs effective signal window:
+  # ─────────────────────────────────────────────────
+  # We download `days: 600` calendar days = ~430 trading days. The first
+  # ~220 trading days are strategy warmup (trend_pullback's 200-DMA
+  # filter needs 200+ bars before it can produce non-NaN values; the
+  # ``required_history_bars=220`` guard short-circuits to HOLD
+  # otherwise). Net effective signal-emission window is ~210 trading
+  # days, which comfortably exceeds the charter §6.5 "180-day"
+  # spec. Without this padding the 180d window would be ENTIRELY
+  # consumed by warmup and zero trades would fire — a silent failure
+  # mode that would look like "v3 has no signal".
+  #
+  # Estimated runtime on workers=2: ~60-120 min for ~430 trading days
+  # × 30 stocks × 5 variants. Still 7-14x faster than the 5-min
+  # equivalent (where 600 calendar days × 75 bars/day = 32k bars/symbol
+  # = ~14h+ on workers=2).
+  #
+  # Variant set:
+  #   * V20_swing_pullback_only      — Rule 1 alone
+  #   * V21_swing_breakout_only      — Rule 2 alone
+  #   * V22_swing_combined           — both rules (charter default)
+  #   * V23_swing_combined_loose     — both rules, loosened thresholds
+  #   * V24_swing_combined_tight     — both rules, tightened thresholds
+  #
+  # Phase A5 read-out (per charter §6.5):
+  #   * All 5 variants PF >= 1.5 with >= 30 trades        → strong;
+  #     proceed to walk-forward holdout (separate slot, deferred).
+  #   * V22 PF 1.0-1.5 but V20 or V21 alone PF >= 1.5     → ship the
+  #     better single rule, drop the worse.
+  #   * All variants PF < 1.0                              → SURPRISE.
+  #     Either swing CNC isn't the answer or there's a backtester
+  #     bug. Read once, sleep, decide whether to try a different
+  #     rule set or pivot the pivot. Per charter §10.5 R1 we should
+  #     budget for 1-2 surprise backtester bugs at the daily-bar path
+  #     not previously exercised; do NOT debug into oblivion.
+  #
+  # Phase B gate is HARD (charter §7.1): ALL six conditions must hold
+  # before the trader VM is touched. This slot satisfies condition (1)
+  # and contributes evidence toward (2). Conditions (3)-(6) are
+  # separate work items.
+  #
+  # Trader VM remains untouched throughout this run (charter §6.1).
+  - name: v3_swing_a5_180d_eff
+    days: 600
+    interval: 1d
+    workers: 2
+    universe-file: data/v3_universe_top30.json
+    variants:
+      - V20_swing_pullback_only
+      - V21_swing_breakout_only
+      - V22_swing_combined
+      - V23_swing_combined_loose
+      - V24_swing_combined_tight

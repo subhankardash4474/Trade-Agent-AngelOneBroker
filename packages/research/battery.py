@@ -327,6 +327,54 @@ def _trend_all(pct):
     return [(f"strategies.{k}.trend_filter_pct", pct) for k in keys]
 
 
+def _v3_swing_base() -> list:
+    """Common config overrides shared by every v3 swing variant (V20+).
+
+    Per ``docs/freeze/freeze_v3.0_charter_2026-05-30.md`` §2 + §6.
+    Each V20-V24 variant prepends these and adds only its
+    differentiator (active strategies, RSI bounds, etc.). Centralising
+    here means any future common change (e.g. new fill_mode option) is
+    applied to all swing variants in one edit.
+    """
+    return [
+        # Single-strategy fires alone (no consensus required).
+        ("ensemble.min_strategies_agree", 1),
+        # Long-only: charter §2 rules emit BUY only; SELL is an exit
+        # signal for trend_pullback. allow_shorts=False drops SELL
+        # before order placement so SELL can never open a short.
+        ("risk.allow_shorts", False),
+        # CNC delivery: no 15:15 intraday flat-out, multi-day holds OK.
+        ("execution.product_type", "DELIVERY"),
+        # Daily decision -> next-day-open fill (A2-1).
+        ("backtest.fill_mode", "next_bar_open"),
+        # Trail-stop is a Phase B item; the engine-side peak_giveback
+        # is the closest pre-existing knob and we explicitly disable it
+        # so v3 results aren't influenced by a v2.1 mechanism the
+        # charter doesn't include.
+        ("risk.peak_giveback_enabled", False),
+        # Daily bars don't have an opening-lockout concept.
+        ("risk.opening_lockout_minutes", 0),
+        # Daily bars don't have a dead-hour concept.
+        ("backtest_gates.apply_dead_hour", False),
+        # ATR floor is a 5-min-bar protection for whipsaw entries; on
+        # daily bars the strategy's RSI/ADX gates do the equivalent
+        # job. Disable so we don't double-gate.
+        ("robustness.min_entry_atr_pct", 0.0),
+        # Reward floor was tuned for 5-min trades (~Rs 20). Daily swing
+        # SL/TP are far wider; disable to avoid silently dropping
+        # otherwise-valid signals.
+        ("risk.min_absolute_reward_rs", 0.0),
+        # Charges-ratio gate is computed against intraday-style
+        # commission. CNC delivery has zero brokerage at Zerodha so
+        # the ratio math degenerates (charges = 0 -> infinite ratio
+        # OR 0/0). Disable; charter accepts charges as a per-trade
+        # cost rather than an entry gate.
+        ("risk.min_profit_to_charges_ratio", 0.0),
+        # Per charter §3 sizing: 5 concurrent positions max.
+        ("risk.max_positions", 5),
+    ]
+
+
 VARIANTS = [
     # ── Tier 1: validate the May-8 trend-filter expansion ──
     # V1 is the *current shipped config*; V2 turns ALL filters off (the
@@ -447,6 +495,65 @@ VARIANTS = [
     ("V19_long_only_filters_off", [
         ("risk.allow_shorts", False),
         *_trend_all(None),
+    ]),
+
+    # ── Tier 8: v3.0 swing CNC variants (2026-05-30) ──
+    # Per docs/freeze/freeze_v3.0_charter_2026-05-30.md §2 + Phase A4 plan.
+    # Five variants test whether the two charter rules (trend_pullback,
+    # breakout_20d) have edge individually, combine without conflict,
+    # and are robust to sensible parameter perturbations.
+    #
+    # Common v3 overrides (applied to every V20-V24):
+    #   * strategies.active = ["trend_pullback", ...] (excludes v2.1 strats)
+    #   * ensemble.min_strategies_agree: 1   (single rule fires alone)
+    #   * ensemble.confidence_threshold: 0.55  (default is fine; 1 rule * conf 0.80 * weight 1.0 / total_weight passes)
+    #   * risk.allow_shorts: false  (long-only swing per charter)
+    #   * execution.product_type: DELIVERY  (CNC, no 15:15 flat-out)
+    #   * backtest.fill_mode: next_bar_open  (daily decision -> next-day fill)
+    #   * risk.peak_giveback_enabled: false  (engine-side trail not implemented)
+    #   * risk.opening_lockout_minutes: 0  (irrelevant for daily bars)
+    #   * backtest_gates.apply_dead_hour: false  (irrelevant for daily bars)
+    #
+    # The `_v3_swing_base` helper below collects these so each variant
+    # can express only its differentiator.
+    *(),  # empty unpack — placeholder so the next list comprehension renders cleanly
+    ("V20_swing_pullback_only", [
+        *_v3_swing_base(),
+        ("strategies.active", ["trend_pullback"]),
+    ]),
+    ("V21_swing_breakout_only", [
+        *_v3_swing_base(),
+        ("strategies.active", ["breakout_20d"]),
+    ]),
+    ("V22_swing_combined", [
+        *_v3_swing_base(),
+        ("strategies.active", ["trend_pullback", "breakout_20d"]),
+    ]),
+    ("V23_swing_combined_loose", [
+        *_v3_swing_base(),
+        ("strategies.active", ["trend_pullback", "breakout_20d"]),
+        # Looser RSI window for trend_pullback (35-60 instead of 40-55):
+        # fires on a wider band of pullbacks, accepts slightly less-cooled
+        # entries. Tests robustness — if V23 PF >> V22, the strict window
+        # is too tight; if V23 PF < V22, the strict window encodes real
+        # selection.
+        ("strategies.trend_pullback.rsi_lower", 35.0),
+        ("strategies.trend_pullback.rsi_upper", 60.0),
+        # Slightly lower volume floor on pullback (70% instead of 80%).
+        ("strategies.trend_pullback.volume_floor_ratio", 0.70),
+        # Slightly lower ADX threshold for breakout_20d (15 instead of 20).
+        ("strategies.breakout_20d.adx_threshold", 15.0),
+    ]),
+    ("V24_swing_combined_tight", [
+        *_v3_swing_base(),
+        ("strategies.active", ["trend_pullback", "breakout_20d"]),
+        # Tighter RSI window for trend_pullback (42-50 instead of 40-55).
+        ("strategies.trend_pullback.rsi_lower", 42.0),
+        ("strategies.trend_pullback.rsi_upper", 50.0),
+        # Tighter volume requirement for breakout_20d (2.0x instead of 1.5x).
+        ("strategies.breakout_20d.volume_multiplier", 2.0),
+        # Tighter ADX threshold for breakout_20d (25 instead of 20).
+        ("strategies.breakout_20d.adx_threshold", 25.0),
     ]),
 ]
 
