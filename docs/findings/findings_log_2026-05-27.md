@@ -4883,3 +4883,62 @@ Per charter §6.1 (museum mode) and §10.5 R1:
 
 **Phase A1 ? A4 deliverables complete. Phase A5 awaits operator backtest run.**
 
+---
+
+## 29. Phase A5 verdict: SURPRISE branch ? all variants PF<1.0 (2026-05-30 ~10:42 IST)
+
+**Cross-ref:** `docs/diagnoses/v3_phase_a5_forensic_2026-05-30.md` (full forensic).
+
+The operator launched the v3 swing battery on the backtester VM at 05:04 GMT (~10:34 IST). All five variants completed in ~21s of bt.run() time each (combined wall-clock 1m11s), exit=0, comparison.md generated cleanly. Results:
+
+| Variant | Trades | WR% | PnL Rs | PF | MaxDD% |
+|---|---:|---:|---:|---:|---:|
+| V20_swing_pullback_only | 55 | 20.0 | -1,137 | 0.41 | 13.0 |
+| V21_swing_breakout_only | 46 | 13.0 | -1,712 | 0.23 | 16.9 |
+| V22_swing_combined | 84 | 17.9 | -2,267 | 0.28 | 22.3 |
+| V23_swing_combined_loose | 103 | 19.4 | -2,750 | 0.29 | 26.9 |
+| V24_swing_combined_tight | 46 | 10.9 | -1,499 | 0.21 | 15.2 |
+
+### 29.1 Mechanical charter verdict
+
+Per charter §6.5 outcome tree (defined BEFORE this run): **all variants PF < 1.0 ? SURPRISE branch**. Per charter §10.5 R1: read once, do NOT debug into oblivion, sleep on it, decide next steps tomorrow morning.
+
+### 29.2 Bug-or-no-edge classification
+
+Diagnostic script ran a pre-defined verdict tree (BUG-A intra-bar SL on entry / BUG-B end-of-backtest flush / BUG-C stuck fills / NO-EDGE / MIXED). Outcome:
+
+* **Same-day SL: 1.8-15.2%** across variants ? NOT the ?50% that BUG-A would require.
+* **End-of-backtest exits: 0-2.4%** ? NOT the ?50% that BUG-B would require.
+* **Median holding: 5-6 days** ? squarely in charter §6.5 "3-10 day" target, NOT the 0-day signature of BUG-C.
+
+**Mechanics confirmed sane.** The strategies fired as designed, on charter-compliant conditions, hit realistic exits. The PF 0.21-0.41 / WR 10-20% result is a real "no edge" reading, not a bug.
+
+### 29.3 Two real signals from the data
+
+* **Rule 2 (breakout_20d) is anti-edge on Nifty 50 mega-caps.** V21 alone: 84.8% stop-out, PF 0.23. The 20-day high breakout is functioning as a *bear trap* ? institutional sells into momentum strength, retail buys, retail loses. Combined variants (V22-V24) are dragged by this.
+* **Tightening produced LOWER win rate, not higher.** V23 (loose) WR 19.4% > V22 (default) WR 17.9% > V24 (tight) WR 10.9%. If the rules captured real edge, tighter thresholds should pick cleaner setups (equal-or-higher WR). Getting *worse* on tighter selection is the textbook signature of rules fitting noise, not signal.
+
+### 29.4 What's NOT being done tonight
+
+Per charter discipline (§6.5 "read once" + §10.5 R1 "do NOT debug into oblivion"):
+
+* No re-runs with tweaked parameters (curve-fitting).
+* No "one more variant to confirm" runs.
+* No engine-side debugging (mechanics are sane).
+* No verdict on next steps ? operator's call after sleep.
+* No trader VM touch (museum mode per §6.1).
+
+### 29.5 Three options surfaced to operator (decision = tomorrow morning)
+
+A. **Wind-down.** v2.1 (no edge on 5-min intraday) + v3 (no edge on daily swing) covers the two most-tractable horizons for retail-without-leverage. Matches `wind_down_criteria_2026-06-05.md` T3 trigger.
+
+B. **Different rule set, same infra (v3.1 charter required).** Candidates: pure 50-DMA trend, mean-reversion with trend filter, Bollinger breakout, sector rotation. Cost: another 2-week cycle.
+
+C. **Same rules, wider SL/TP (cheapest).** 5% SL / 12% TP for Rule 1, 6% SL / 15% TP for Rule 2 as V25/V26. ~2h work. Risk: curve-fitting.
+
+### 29.6 Forensic preserved
+
+Full analysis at `docs/diagnoses/v3_phase_a5_forensic_2026-05-30.md`. Run artefacts at `logs/backtests/battery_v3_swing_a5_180d_eff_20260530T050422/` (configs, results JSONs, worker logs, comparison.md, market_data.pkl, all 5MB total).
+
+**Phase A5 closure: SURPRISE branch confirmed; mechanical charter discipline applied; operator decision deferred to tomorrow.**
+
