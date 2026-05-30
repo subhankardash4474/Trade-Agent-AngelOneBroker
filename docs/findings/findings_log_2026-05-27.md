@@ -4599,3 +4599,92 @@ v1.1 is still pre-slot-#4 (slot #4 finishes ~02:40 IST per the
 2026-05-30 01:42 IST status pull, not 05-08 IST as initially
 assumed). Pre-commit discipline is intact.
 
+
+
+---
+
+## Section 26 — T1 verdict applied (2026-05-30 ~08:58 IST)
+
+**Mechanical reading per wind_down_criteria_2026-06-05.md Threshold 1.**
+
+### 26.1 Slot #4 V15 readout
+
+Run completed 2026-05-30 ~02:38 IST (slot ran ~9h 30m wall-clock end-to-end, 5099.7s for V15 alone).
+
+| Variant | Trades | WR% | PnL (60d, INR) | PF | R:R | Expectancy | Sharpe | MaxDD% | Ret% |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| V1 baseline (control)  | 242 | 36.0 | -683 | 0.79 | 1:1.40 | -2.8 | -2.63 | 8.16 | -6.70 |
+| V3 xgb+mr filtered yday | 273 | 33.0 | -1002 | 0.69 | 1:1.40 | -3.7 | -4.46 | 10.81 | -9.89 |
+| V10 confidence 060      | 245 | 37.6 | -341 | 0.89 | 1:1.49 | -1.4 | -1.02 | 6.76 | -3.04 |
+| V11 confidence 050      | 243 | 35.8 | -710 | 0.78 | 1:1.40 | -2.9 | -2.73 | 8.29 | -6.96 |
+| **V15 mr+xgb only**     | **186** | **38.7** | **-527** | **0.77** | **1:1.21** | **-2.8** | **-3.26** | **6.02** | **-5.40** |
+
+Run ID: `battery_post_retrain_xgb_focus_60d_20260529T123814`.
+Local artefacts: `logs/backtests/battery_post_retrain_xgb_focus_60d_20260529T123814/`.
+
+### 26.2 Control sanity (Read B per advisor)
+
+Slot #4 V1 vs slot #3 V1 (same universe, same code, only the pkl swapped on backtester):
+
+| | Slot #3 V1 | Slot #4 V1 | Delta |
+|---|---:|---:|---:|
+| PF | 0.78 | 0.79 | +1.3% |
+| Trades | ~242 | 242 | ~0% |
+| PnL (INR, 60d) | -693 | -683 | +1.4% |
+
+Within 2% on every dimension. **Control passes.** V15 number is a clean attribution to "old broken pkl -> new clean-pipeline pkl, ceteris paribus".
+
+### 26.3 T1 verdict (mechanical)
+
+Wind-down doc Threshold 1:
+
+* PF >= 1.05 -> surprise; investigate before any action.
+* 0.90 <= PF < 1.05 -> as predicted; weak evidence of net-zero model contribution.
+* **PF < 0.90 -> permanently retire `xgboost_classifier` from `strategies.active`.**
+
+V15 PF = 0.77 < 0.90 -> **third branch fires.**
+
+**Verdict: `xgboost_classifier` is permanently retired from `strategies.active`.**
+
+### 26.4 Strength of evidence (above the bare verdict)
+
+The result is **stronger than the AUC=0.49 prior implied.** Predicted band was 0.85-0.95 per the AUC implication; actual landed at 0.77, **below** the prediction. The advisor's framing said: "If it lands lower, the case for permanent XGBoost retirement strengthens." It did, and it does.
+
+Two specific patterns in the V15 line that confirm the diagnosis:
+
+* **V15 has the highest WR (38.7%) of any variant.** The model is selective -- it fires on a tighter subset of signals than the unfiltered baseline.
+* **V15 has the lowest R:R (1:1.21) of any variant** and the second-worst PF (0.77, only V3 at 0.69 is worse).
+
+Translation: **selectivity without information.** The model picks fewer trades, but the trades it picks are smaller-winners-larger-losers than random. This is exactly what a near-random AUC produces at the trade level: trade-count restriction without quality improvement. Retraining with better hyperparameters does not fix this -- it is a feature-information problem, not a model-tuning problem.
+
+V15 vs slot #3 V15 comparison (same 232-stock universe, only the pkl differs):
+
+| | Slot #3 V15 (broken pkl) | Slot #4 V15 (retrained pkl) | Direction |
+|---|---:|---:|---|
+| PF | 0.94 | 0.77 | **WORSE** |
+| Trades | 444 | 186 | -58% |
+| PnL (INR, 60d) | -326 | -527 | **WORSE** |
+| MaxDD% | -- | 6.02 | -- |
+
+**The new (clean-pipeline AUC=0.49) pkl made V15 measurably worse than the broken pkl.** The new model is more restrictive (186 trades vs 444) but the restrictions don't filter bad trades any better than random -- they just leave good trades on the table. This is the strongest single piece of evidence that the feature set itself is uninformative for 5-min directional prediction on Indian equities.
+
+### 26.5 What T1 commits us to (operationally)
+
+* **Documentary retirement, immediate.** Update `strategies.active` design intent: `xgboost_classifier` is a closed chapter. The 1.0 weight in ensemble config is conceptually replaced by 0; the strategy file is in the v3 charter section 5 archive list.
+* **Code-level retirement, deferred to v3 Phase A2.** File archive (`packages/strategies/_archive/v2.1/xgboost_classifier.py`) and import removal happen as part of v3 Phase A2 backtester capability fixes. **Trader VM stays in museum mode** per charter v1.1 section 6.1; the strategy was already disabled live in slot-2 (commit f32009c, 2026-05-26), so this changes nothing operationally on trader VM today.
+* **No retrain attempts.** No "let me try different hyperparameters / longer history / different feature set" -- the wind-down doc section 4 anti-temptation table closed that door, and V15 0.77 confirms it should stay closed.
+* **No reintroduction in v3 or v4.** v3 charter section 9 explicitly says no ML; v4 conversation only after v3 has 6 months of live data.
+
+### 26.6 Status of the other thresholds
+
+T1 is **closed** with a definite verdict. T2 and T3 still pending:
+
+* **T2 (H3 entry-lag forensic, deliverable Wed 2026-06-03):** not started. Defers until after Phase A1 lands and the operator has a Sunday/Monday window to do the SCP + grep + cross-join work.
+* **T3 (Wind-down trigger, decision 2026-06-08):** still requires both (a) no PERF-fix paper window achieves rolling PF >= 1.20 AND (b) no H3/H1 finding names a single bug whose fix could plausibly move PF above 1.0. T1 = retire xgb does not on its own trigger T3 -- it is a sub-component.
+
+The 2026-06-05 verdict meeting still reads T1 + T2 + T3 mechanically. T1 is now in the bag with verdict "retire". T2 + T3 to follow.
+
+### 26.7 Forward read
+
+Slot #4 was the last v2.1 data point. **There is no slot #5 unless an unfreeze decision is rendered.** The next data this project consumes is from the v3 charter Phase A backtester run (V20-V24 swing variants, target Wed-Thu 2026-06-03/04 per charter v1.1 section 6).
+
