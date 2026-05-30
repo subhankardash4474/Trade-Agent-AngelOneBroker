@@ -3522,6 +3522,107 @@ class TradingAgent:
                 f"A daemon restart before midnight could resend EOD."
             )
 
+    def _eod_source_of_truth_assertion(self):
+        """Assert self_sufficiency ledger agrees with the DB on lifetime
+        cumulative realised P&L.
+
+        2026-05-30 brutal review (Session 2 §5 / Session 3 §3): the
+        review surfaced four disagreeing numbers across the cash-burn
+        sources. The data/self_sufficiency.json ledger was 16 days
+        stale on 2026-05-30 (cumulative=0.0) while the DB-summed total
+        showed -₹1,212.26. The wind-down decision hinges on which
+        number you read; reading the optimistic stale ledger leads to
+        the wrong call.
+
+        This assertion fires once per EOD cycle and compares:
+
+          A. ``self_sufficiency.cumulative_realised_inr`` (lifetime
+             ledger, written on every close via record_realised_pnl)
+          B. ``SUM(pnl) FROM trades WHERE entry_time >= deployed_on``
+             (re-computed from the DB)
+
+        On DRIFT (|A - B| > ₹0.01): emits a [EOD-ASSERT] CRITICAL log
+        and surfaces a one-line "DRIFT" notice into the EOD email body.
+        Does NOT block the EOD send — the operator must still see the
+        rest of the day's report — but the CRITICAL log is loud enough
+        to grep for and the email banner makes the disagreement visible
+        without having to read the daemon log.
+
+        Skipped (returns None) when:
+          * ``self_sufficiency`` is disabled in config (tracker .enabled is False).
+          * The DB or ledger is unreachable / un-parseable. We log a
+            WARNING in that case (NOT CRITICAL) because "can't run the
+            check" is a different failure class from "the check ran
+            and found drift".
+
+        Returns ``(status, ledger_cum, db_cum, diff)`` where
+        ``status`` ∈ ``{"OK", "DRIFT", "ERROR"}``, or None if skipped.
+        """
+        try:
+            if not getattr(self.self_sufficiency, "enabled", False):
+                return None
+            ledger = getattr(self.self_sufficiency, "_ledger", None) or {}
+            ledger_cum = float(ledger.get("cumulative_realised_inr", 0.0) or 0.0)
+            deployed_iso = ledger.get("deployed_on", "")
+            try:
+                rows_df = (
+                    self.database.load_trades(start=deployed_iso)
+                    if deployed_iso else self.database.load_trades()
+                )
+            except Exception as exc:
+                logger.warning(
+                    f"[EOD-ASSERT] DB load_trades failed ({exc!r}); "
+                    f"cannot reconcile ledger vs DB this cycle. "
+                    f"Re-run will retry tomorrow."
+                )
+                return ("ERROR", ledger_cum, 0.0, 0.0)
+            try:
+                db_cum = (
+                    float(rows_df["pnl"].sum())
+                    if rows_df is not None and not rows_df.empty
+                    and "pnl" in rows_df.columns
+                    else 0.0
+                )
+            except Exception as exc:
+                logger.warning(
+                    f"[EOD-ASSERT] DB pnl column sum failed ({exc!r}); "
+                    f"schema may have drifted. Skipping."
+                )
+                return ("ERROR", ledger_cum, 0.0, 0.0)
+            diff = ledger_cum - db_cum
+            if abs(diff) <= 0.01:
+                logger.info(
+                    f"[EOD-ASSERT] source-of-truth OK: ledger=DB="
+                    f"Rs {ledger_cum:+,.2f} (diff Rs {diff:+,.4f}, "
+                    f"tolerance Rs 0.01)."
+                )
+                return ("OK", ledger_cum, db_cum, diff)
+            logger.critical(
+                f"[EOD-ASSERT] SOURCE-OF-TRUTH DRIFT: "
+                f"self_sufficiency.cumulative_realised_inr="
+                f"Rs {ledger_cum:+,.2f} vs DB SUM(pnl since "
+                f"{deployed_iso or 'inception'})=Rs {db_cum:+,.2f}; "
+                f"diff=Rs {diff:+,.2f} > tolerance Rs 0.01. The in-process "
+                f"trader and the on-disk ledger no longer agree on "
+                f"lifetime realised P&L. Most likely cause: a write to "
+                f"data/self_sufficiency.json failed silently in a prior "
+                f"cycle (see SelfSufficiencyTracker.record_realised_pnl "
+                f"exception handler — it logs WARNING but the agent "
+                f"keeps trading). Operator action: rebuild the ledger "
+                f"from the DB (set ``cumulative_realised_inr`` = "
+                f"Rs {db_cum:+,.2f} in data/self_sufficiency.json) OR "
+                f"identify the missing close events from the daemon log."
+            )
+            return ("DRIFT", ledger_cum, db_cum, diff)
+        except Exception as exc:
+            logger.warning(
+                f"[EOD-ASSERT] source-of-truth check failed unexpectedly: "
+                f"{exc!r}. EOD email will still send. This is a missed "
+                f"observability window, not a trading correctness "
+                f"failure."
+            )
+            return ("ERROR", 0.0, 0.0, 0.0)
+
     def _maybe_send_eod_summary(self):
         """Auto-send end-of-day summary at the configured time."""
         if self._eod_summary_sent:
@@ -3563,6 +3664,37 @@ class TradingAgent:
             _peak = float(risk.get("peak_equity") or risk.get("peak", 0) or 0)
             _equity_now = float(summary.get("total_value", summary.get("cash", 0)) or 0)
 
+            # 2026-05-30 brutal review (Session 2 §5 / Session 3 §3):
+            # source-of-truth reconciliation. Compare the
+            # self_sufficiency ledger against the DB-summed lifetime
+            # realised P&L; surface the result in the EOD email so the
+            # operator always sees whether the cash-burn numbers agree.
+            # See ``_eod_source_of_truth_assertion`` docstring for the
+            # contract. ``sot`` is None when the tracker is disabled.
+            sot = self._eod_source_of_truth_assertion()
+            if sot is None:
+                sot_block = ""
+            else:
+                sot_status, sot_ledger, sot_db, sot_diff = sot
+                if sot_status == "OK":
+                    sot_block = (
+                        f"Source-of-truth: ledger == DB == "
+                        f"Rs {sot_ledger:+,.2f}  [OK]\n"
+                    )
+                elif sot_status == "DRIFT":
+                    sot_block = (
+                        f"Source-of-truth: DRIFT — ledger Rs "
+                        f"{sot_ledger:+,.2f} vs DB Rs {sot_db:+,.2f} "
+                        f"(diff Rs {sot_diff:+,.2f}). See [EOD-ASSERT] "
+                        f"CRITICAL in daemon log; rebuild ledger OR "
+                        f"identify missing closes.\n"
+                    )
+                else:
+                    sot_block = (
+                        f"Source-of-truth: check ERROR — see daemon "
+                        f"log for details.\n"
+                    )
+
             report = (
                 f"EOD Report {day_iso}\n"
                 f"Day PnL: Rs {risk['daily_pnl']:+,.2f}\n"
@@ -3578,7 +3710,8 @@ class TradingAgent:
                 # close to but NOT equal to the configured value during
                 # half the 2026 trading days. Render the configured value.
                 f"Drawdown: {risk['drawdown_pct']:.1f}%   "
-                f"[agent halts at {self.risk_manager.drawdown_halt_pct:.0f}%]"
+                f"[agent halts at {self.risk_manager.drawdown_halt_pct:.0f}%]\n"
+                f"{sot_block}"
                 f"{open_pos_block}"
                 f"{diag}"
                 f"{strategy_mix}"
