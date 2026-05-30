@@ -555,6 +555,62 @@ VARIANTS = [
         # Tighter ADX threshold for breakout_20d (25 instead of 20).
         ("strategies.breakout_20d.adx_threshold", 25.0),
     ]),
+
+    # ── Tier 9: v3.0 wind-down disambiguation (2026-05-30 brutal review §1) ─
+    # The Phase A5 forensic verdict (`docs/diagnoses/v3_phase_a5_forensic_2026-05-30.md`)
+    # called the v3 swing pivot "no edge" based on V20-V24 PF 0.21-0.41.
+    # The 2026-05-30 brutal review (Session 2 §1) caught that the verdict
+    # was computed on the LONG-ONLY 7-11% of the strategy's natural signal
+    # set, because `_v3_swing_base` sets `risk.allow_shorts: false` and
+    # 88-93% of trend_pullback's emissions are SELL signals (close < 50-DMA
+    # exit triggers, treated as short-entry candidates by the engine).
+    # V21_swing_breakout_only is a clean read (breakout_20d has no SELL
+    # emissions, so 0/119 shorts blocked); V20/V22/V23/V24 are not.
+    #
+    # V25 disambiguates: same as V22 (combined) but with allow_shorts=True
+    # and the long-only override scrubbed.
+    #
+    # IMPORTANT — KNOWN ASYMMETRY (read before interpreting V25 results):
+    # ───────────────────────────────────────────────────────────────────
+    # trend_pullback emits SELL on a single condition: `close < sma_50`
+    # (the charter "exit on breach below 50-DMA" rule). It does NOT mirror
+    # the long-side gates (pullback proximity, RSI 40-55, volume floor)
+    # for the short side. The long-side BUY signal requires FIVE gates;
+    # the short-side SELL signal requires ONE. With allow_shorts=True
+    # the engine opens a short on every "below trend" emission, with
+    # ATR-based fallback SL/TP (no strategy-provided SL/TP since the SELL
+    # was originally designed as a long-exit signal, not a short-entry).
+    #
+    # Consequence: V25 tests "long pullback + below-trend short", which
+    # is asymmetric. A meaningful PF >= 1.0 here would be a strong signal
+    # the short side has edge. A PF < 1.0 result is necessary-but-not-
+    # sufficient evidence for "the bidirectional version of trend_pullback
+    # has no edge" — a TRULY symmetric short would mirror the long's five
+    # gates, which is a separate strategy (`trend_pullback_short`) and
+    # out of scope for the wind-down decision window.
+    #
+    # Verdict tree for V25 (operator decision 2026-06-05):
+    #   * V25 PF < 1.0 → forensic verdict (Phase A5) is honest. The
+    #     short side as gated here also has no edge. Wind-down on
+    #     complete-enough data; the "what about shorts" objection is
+    #     addressed for the simpler short and a true symmetric short
+    #     remains a v3.1 hypothesis the operator can choose to pursue
+    #     separately if they want exhaustive coverage.
+    #   * V25 PF >= 1.0 → MATERIAL FINDING. The long arm has no edge,
+    #     but the simpler "below-trend short" does. Wind-down decision
+    #     should be deferred until a proper bidirectional version
+    #     (`trend_pullback_short`) is implemented and tested. Under no
+    #     circumstances should the asymmetric V25 alone be deployed
+    #     live.
+    ("V25_swing_combined_shorts", [
+        *_v3_swing_base(),
+        ("strategies.active", ["trend_pullback", "breakout_20d"]),
+        # OVERRIDE the _v3_swing_base allow_shorts:False to True. This
+        # is the entire purpose of V25 — every other swing variant is
+        # long-only by charter §2; V25 explicitly tests the side that
+        # was vetoed.
+        ("risk.allow_shorts", True),
+    ]),
 ]
 
 

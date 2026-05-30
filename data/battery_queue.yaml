@@ -238,3 +238,32 @@ jobs:
       - V22_swing_combined
       - V23_swing_combined_loose
       - V24_swing_combined_tight
+
+  # ── 7. v3.0 wind-down disambiguation — V25 (2026-05-30 brutal review) ──
+  # Single-variant follow-on that addresses the Session 2 §1 finding:
+  # the Phase A5 verdict was computed on the LONG-ONLY 7-11% of
+  # trend_pullback's natural signal set. V25 = V22 + risk.allow_shorts:
+  # true. Same universe, same window, same fill_mode, same warmup —
+  # the only difference is the long-only veto is dropped.
+  #
+  # Charter §6.1 (trader VM untouched) is preserved: this is a
+  # backtester-only run on the existing v3 swing engine. No live config
+  # changes, no deployment.
+  #
+  # See V25_swing_combined_shorts variant docstring in
+  # packages/research/battery.py for the asymmetric-short caveat. The
+  # verdict tree there controls the 2026-06-05 wind-down decision.
+  #
+  # Estimated runtime: ~12-25 min (single variant, ~60-120 min/5
+  # variants from slot #6 means ~12-25 min/variant on workers=2).
+  # Operator launches via:
+  #     sudo systemctl restart battery-scheduler
+  # then pulls results with tools/cloud/pull_battery_results.ps1 once
+  # comparison.md lands at logs/backtests/battery_v3_swing_a5_v25_shorts_*/.
+  - name: v3_swing_a5_v25_shorts
+    days: 600
+    interval: 1d
+    workers: 2
+    universe-file: data/v3_universe_top30.json
+    variants:
+      - V25_swing_combined_shorts
