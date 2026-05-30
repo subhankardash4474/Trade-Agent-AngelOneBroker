@@ -5010,3 +5010,82 @@ Per scope discipline:
 
 **Phase A5 closure stands; V25 disambiguation queued; two live bugs and one observability gap closed; full suite green.**
 
+---
+
+## 31. V25 verdict landed: PF 0.23 ? wind-down trigger now on complete data (2026-05-30 ~14:37 IST)
+
+The operator launched the v3 swing shorts-allowed disambiguation battery (`v3_swing_a5_v25_shorts`) on the backtester VM at 09:07 GMT (~14:37 IST). Single variant, one job, completed in 23.9s of `bt.run()` time, scheduler exit=0.
+
+### 31.1 Headline numbers
+
+| Metric | V22 (longs only) | V25 (shorts allowed) | ? |
+|---|---:|---:|---:|
+| Trades | 84 | 189 | +105 |
+| Win rate | 17.9% | 27.5% | +9.6 ppts |
+| PF | 0.28 | **0.23** | -0.05 worse |
+| PnL | -?2,267 | -?3,764 | -?1,497 worse |
+| Max drawdown | 22.3% | **37.84%** | nearly doubled |
+
+**V25 PF = 0.23 < 1.0** ? pre-committed verdict tree branch `V25 PF < 1.0` fires (defined in `packages/research/battery.py:V25_swing_combined_shorts` docstring before the run).
+
+### 31.2 BUY-arm vs SELL-arm split (V25 internal forensic)
+
+| Side | N | WR% | PnL | PF | avg_W | avg_L | Hold | TPs | Stops |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| BUY | 46 | 19.6 | -?1,185 | 0.31 | +?58.9 | -?46.4 | 18.8d | 7 | 27 |
+| SELL | 143 | 30.1 | -?2,579 | 0.19 | +?13.8 | -?31.7 | 4.2d | 43 | 97 |
+
+* Long arm reproduces V20's edge profile (PF 0.31 vs V20's 0.41; the ~25% drift is consistent with 5-position cap competition from shorts).
+* Short arm = high-frequency mediocre: WR up by 10 ppts but avg win drops 4.3x (?58.9 ? ?13.8), losses unchanged. Net: more trades, lower expectancy, doubled MaxDD.
+* 4.2-day short hold vs 18.8-day long hold = shorts squeezed fast in a generally up-trending Nifty-50 regime over the 600-day window.
+
+### 31.3 Why higher WR but worse PF: the asymmetric-short caveat in action
+
+Documented in advance in the V25 variant docstring: trend_pullback's SELL emission has ONE gate (`close < sma_50`) vs the BUY's FIVE gates. SELL on a flat book opens a SHORT with engine-fallback ATR-based SL/TP because the SELL was designed as a long-exit, not a short-entry. Consequence in the data:
+
+* ATR-based TP is much tighter than the strategy's 8% TP that the long path uses ? wins capture only small moves (?13.8 avg).
+* ATR-based SL is roughly the same magnitude as the long's 3% SL ? losses unchanged (?31.7 avg).
+* The simpler short-on-trend-loss signal is a tradeable signal but not an edge.
+
+### 31.4 Verdict tree closure
+
+| Branch | Condition | Fires? | Implication |
+|---|---|:---:|---|
+| V25 PF < 1.0 | "forensic verdict honest, simpler short ALSO no edge, wind-down on complete-enough data, truly symmetric short remains a v3.1 hypothesis the operator can pursue separately" | ? | Wind-down trigger now on complete data |
+| V25 PF ? 1.0 | "MATERIAL FINDING, wind-down deferred until proper bidirectional `trend_pullback_short` is implemented and tested" | ? | n/a |
+
+### 31.5 What V25 rules out
+
+* "The Phase A5 verdict was a long-only-veto artefact" ? refuted; adding shorts made every economic metric worse, not better.
+* "There's an obvious edge hiding in the SELL emissions we were vetoing" ? refuted; the simpler short side is tradeable but net-negative.
+* "Shorts are the cheap unlock for swing CNC on Nifty 50" ? refuted; the cheap simple short worsened the book.
+
+### 31.6 What V25 does NOT rule out (and why we are not testing them now)
+
+Per charter §10.5 R1 ("do NOT debug into oblivion") and §6.5 ("read once, sleep on it"):
+
+* **A truly symmetric short** (`trend_pullback_short` with mirror pullback / RSI / volume / volume gates) ? would require a new strategy file + tests, ~3-4 hours. Pre-commit required as a v3.1 hypothesis.
+* **A different rule family** (Bollinger breakout, mean-reversion-with-trend, sector rotation) ? fresh charter cycle, ~2 weeks.
+* **Wider SL/TP on the same rules** ? would be curve-fitting on a single battery result.
+
+These are options the operator can pursue post-decision; they are NOT triggered by V25's result.
+
+### 31.7 Status of the 2026-06-05 wind-down trigger
+
+The T3 hypothesis (per `docs/freeze/wind_down_criteria_2026-06-05.md`) was "v3.0 swing CNC produces PF >= 1.0 on the chartered universe / window / fill_mode." After today's run we have:
+
+* V20-V24 long-only: PF 0.21-0.41 (Phase A5, §29).
+* V25 shorts-allowed: PF 0.23 (this section, §31).
+* Mechanical sanity confirmed: no engine bugs, fills land at next-day open, exits hit at sensible reasons and holding periods.
+* The brutal review's primary objection (long-only-only data) is formally addressed.
+
+**The decision is now on complete-enough evidence. Operator owns the call.** This audit log records the verdict tree closure; it does not recommend a path. The 2026-06-05 verdict meeting has, as of 14:37 IST, all the data the pre-committed criteria require.
+
+### 31.8 Cross-references
+
+* `logs/backtests/battery_v3_swing_a5_v25_shorts_20260530T090709/results/V25_swing_combined_shorts.json` (raw trade tape + gate stats)
+* `docs/diagnoses/v3_phase_a5_forensic_2026-05-30.md` §8 (forensic update with full V25 analysis)
+* `docs/reviews/brutal_review_2026-05-30.md` Session 2 §1 (original objection that V25 disambiguates)
+* `packages/research/battery.py:V25_swing_combined_shorts` (variant + verdict tree docstring)
+* `docs/freeze/wind_down_criteria_2026-06-05.md` (T3 trigger definition)
+
