@@ -4688,3 +4688,71 @@ The 2026-06-05 verdict meeting still reads T1 + T2 + T3 mechanically. T1 is now 
 
 Slot #4 was the last v2.1 data point. **There is no slot #5 unless an unfreeze decision is rendered.** The next data this project consumes is from the v3 charter Phase A backtester run (V20-V24 swing variants, target Wed-Thu 2026-06-03/04 per charter v1.1 section 6).
 
+---
+
+## 27. Phase A1 deliverable ? backtester capability gap analysis (2026-05-30 ~09:10 IST)
+
+**Cross-ref:** `docs/diagnoses/v3_backtester_gap_analysis_2026-05-30.md`.
+
+Phase A1 of the v3.0 charter (per `freeze_v3.0_charter_2026-05-30.md` §6) is the read-only audit of the backtester against the 8 v3 requirements. Trader VM untouched per charter §6.1 (museum mode). Phase A1 output is a single doc; no code changes land here.
+
+### 27.1 Audit result summary
+
+| Req | Description | Status | A2 effort |
+|---|---|---|---:|
+| 1 | Daily candle frame as primary | SUPPORTED | 0h (config-only on variant side) |
+| 2 | CNC product, no 15:15 flat-out | SUPPORTED | 0h (config-only) |
+| 3 | Multi-day position holds | SUPPORTED | ~30min (cosmetic `holding_days` field) |
+| 4 | **Next-day-open entry fills** | **GAP** | **~3-4h** (largest A2 item) |
+| 5 | CNC charges (DP/STT/etc) | SUPPORTED | ~15min (doc footnote) |
+| 6 | 30-stock universe | PARTIAL | ~1h (snapshot path; per-day deferred) |
+| 7 | 180-day window with daily | SUPPORTED | 0h |
+| 8 | Walk-forward train/holdout | SUPPORTED | 0h (Bug K closed with regression tests) |
+
+**Total A2 engineering: ~5-6h, dominated by Req 4 (next-day-open fill mode).**
+
+### 27.2 Single key finding
+
+**The backtester is far closer to v3-ready than I expected going in.** Of 8 v3 requirements, 5 are zero-effort (already supported), 1 is cosmetic (~30min), 1 is config-shape work (~1h), and only 1 is a real engine-level change (~3-4h, the next-day-open fill mode).
+
+This is mostly a function of two things:
+
+* The audit hardening from 2026-05-25 onwards already plumbed `product_type` end-to-end (`BacktestConfig.product_type` ? `Portfolio` ? `core.charges`), and `compute_round_trip` / `compute_one_leg` correctly model DELIVERY with zero brokerage + 0.1% STT both legs + ?13.5 + 18% GST DP per SELL. NUM-10 (Decimal precision) and the unit tests in `tests/unit/test_audit_2026_05_28_misc.py:1554-1559` make this rock-solid.
+* The 15:15 flat-out logic lives entirely in `trading_agent.py` (10 hits at lines 1264, 3513, 3872, 3942, 3974, 6074, 6674), NOT in `packages/research/`. The backtester naturally allows multi-day holds because no per-day flush exists.
+
+### 27.3 Single real engine change for A2
+
+`BacktestConfig.fill_mode: "close_plus_slippage" | "next_bar_open"`. Today the engine fills every entry at the signal-bar's close + slippage (`backtest_ensemble.py:625`). On 5-min bars this is fine; on daily bars this means signal at day N close fills at day N close, which over-states entry-side timing edge for v3's "Entry: next day open" specs. A2 will:
+
+* Add the new config field (default preserves v2.1 behaviour).
+* Pass `market_data[symbol]` + index `i` into the event payload so the entry path can do `df.iloc[i+1]` lookahead WITHOUT mutating `_merge_bars`.
+* Drop the signal silently with a new `gate_stats.no_next_bar` counter when the signal bar is the symbol's final bar.
+* Apply slippage to the next bar's open price, not the signal bar's close.
+* Unit test: hand-built 3-bar synthetic with gap-up open, plus a byte-identical-legacy-v2.1 smoke.
+
+### 27.4 Two non-obvious risks logged
+
+Per advisor charter §10.5:
+
+* **R1 (daily-timeframe surprise bugs):** the daily path has been exercised much less than 5-min. Likely surface area: holding-period arithmetic, `losses_per_stock` reset semantics on daily bars, regime classification with no Nifty/VIX bars on daily resolution. **Mitigation:** A2 unit tests must use daily-bar fixtures, not borrow from 5-min ones. Budget 1-2 surprise bugs.
+* **R2 (survivorship bias in universe):** snapshot-at-window-start is bounded for Nifty 30 over 180d but non-zero. Logged as a v3.1+ follow-up (per-day universe lookup) if v3 ever reaches a live phase.
+
+### 27.5 What's NOT in this analysis
+
+Things explicitly out-of-scope for A1 by charter:
+
+* No code changes. Pure read-only audit.
+* No trader VM touch. Museum mode per §6.1.
+* No strategy implementations. Those are A3.
+* No variant config writing. That's A4.
+* No actual backtest runs. Those start at A5 once A2-A4 are done.
+
+### 27.6 Phase A1 closure
+
+* Read 5 source files (`backtest_ensemble.py`, `battery.py`, `charges.py`, `data_handler.py`, `backtest.py`) plus selected test files.
+* Pinned all gap locations at file:line so A2 implementers and reviewers don't have to re-derive.
+* Authored the gap-analysis doc with summary table, A2 deliverable list (5 items in dependency order), risks, and cross-references.
+* Logged this section in the findings log so the audit trail of v3 work is stitched to v2.1 work.
+
+**Phase A1 ? A2 hand-off ready.** A2 can begin with A2-1 (next-day-open fill mode) immediately if the operator wishes; or wait for Sat afternoon / Sun per charter timeline.
+
