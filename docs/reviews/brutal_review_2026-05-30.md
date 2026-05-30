@@ -487,3 +487,448 @@ absence is the reason this review was needed in the first place.
   Finding 2.
 * `logs/audit/2026-05-29/checkpoint_1601.json` — the most recent
   checkpoint cited throughout.
+
+---
+
+## Session @ 11:07 IST
+
+**BRUTAL REVIEW — 2026-05-30 (Session 2)**
+Window reviewed: 2026-05-29 16:01 IST → 2026-05-30 10:10 IST
+(the 18 hours since session 1; markets closed today, Saturday).
+Persona: Expert algo trader + adviser. Verdict is unsentimental.
+
+This session does NOT re-derive the 13-day window — session 1 above
+already did that and the numbers haven't moved (no live trades since
+2026-05-26). This session re-checks **what changed since 01:24 IST**
+and is therefore tightly scoped to: (a) the v3 swing battery that
+finished at 10:35 IST and the forensic verdict written at 10:42 IST,
+(b) the local-laptop daemon that was started at 09:38 IST today and
+is still running, (c) which of session 1's six findings the day's 13
+commits actually closed.
+
+---
+
+### Verdict (one line)
+
+**RED, escalating.** The v3 swing pivot (the project's single named
+T3 hypothesis) cleared the bug-vs-edge test honestly and produced no
+edge — but the verdict was computed on the **7–11% of signals that
+survived `allow_shorts:false`**, so the wind-down trigger is about to
+fire on a half-tested strategy; meanwhile the trader VM shipped two
+new live bugs in the same morning the freeze surface was supposed to
+be untouchable.
+
+---
+
+### Bottom-line numbers (independently derived, not from checkpoint)
+
+Sources for the new numbers below:
+`logs/backtests/battery_v3_swing_a5_180d_eff_20260530T050422/results/V*.json`,
+`logs/daemon_2026-05-30.log`,
+`data/self_sufficiency.json`, `logs/health.json`,
+`docs/diagnoses/v3_phase_a5_forensic_2026-05-30.md`,
+`git log --since="2026-05-30 01:00"`.
+
+| Metric | Value | Source / note |
+|---|---|---|
+| Live P&L delta since session 1 | **₹0** | Markets closed; daemon idle. Cumulative still -₹1,212.26 per checkpoint. |
+| Avg win / avg loss / R / WR (unchanged) | ₹68 / -₹128 / 0.53 / 36.7% | `logs/trades.csv` rows 2-32 — no new rows since 2026-05-26. |
+| **v3 swing battery — best variant** | V20 PF **0.41** / WR 20.0% / -₹1,137 | `results/V20_swing_pullback_only.json:62-66`, 55 trades over ~408 daily bars × 30 Nifty-30 stocks. |
+| v3 swing battery — worst variant | V24 PF 0.21 / WR 10.9% / -₹1,499 | `results/V24_swing_combined_tight.json`. Tightening produced WORSE WR than V23 (loose), per `v3_phase_a5_forensic_2026-05-30.md:79-93`. Signature of rules fitting noise. |
+| **v3 fill model verified honest** | `backtest.fill_mode: next_bar_open` in every V20-V24 config; engine path at `packages/research/backtest_ensemble.py:682` dispatches | `logs/backtests/.../configs/V20_swing_pullback_only.yaml:246`, `results/V20_*.json:16-19`. The "no edge" verdict is NOT an artefact of close-fill bias. |
+| **v3 shorts-blocked rate (V20)** | **2,623 / 2,831 = 92.7%** of raw signals stripped by `risk.allow_shorts:false` | `results/V20_swing_pullback_only.json:80` `"shorts_blocked": 2623`. The 55 executed trades = the surviving **7.3%**. |
+| v3 shorts-blocked rate (V22 combined) | **2,627 / 2,962 = 88.7%** stripped | `results/V22_swing_combined.json` gate_stats. PF=0.28 read on 11.3% of the strategy's natural signal set. |
+| v3 shorts-blocked rate (V21 breakout-only) | 0 / 119 — all 0 | V21's `breakout_20d` rule is inherently long-side; not affected by the veto. PF 0.23 is a clean read of that rule alone. |
+| **Trader runtime-persist** | **BROKEN** — `AttributeError("'TradingAgent' object has no attribute '_strategy_state'")` | `logs/daemon_2026-05-30.log:~1955` (2 hits this morning); direct evidence for session-1 Finding 4 hypothesis "writer path is dead". |
+| **xgboost zombie signals** | **30 hits** in today's daemon log for **AAPL / MSFT** (US tickers not in any prod universe) | `logs/daemon_2026-05-30.log:641-...`, starting 09:38:49 IST — 36 minutes AFTER commit `c9d3936` ("retire xgboost_classifier"). |
+| Supervisor restart loop today | **21 cycles** by 10:10 IST | `Select-String -Pattern "Agent exited cleanly\|Agent self-exited" \| Count`. Session-1 Finding 6 not closed; worse on a Saturday. |
+| WebSocket reconnect spam today | dozens of `Reconnection failed: down` | `logs/daemon_2026-05-30.log` tail — broker WS being hammered on a market-closed Saturday. |
+| self_sufficiency.json drift | **16 days stale**, `cumulative_realised_inr: 0.0`, `last_update: 2026-05-14` | `data/self_sufficiency.json`. Session-1 Finding 4 still wide open. |
+| health.json drift | cash 100,000 vs checkpoint 120,990; ts 2026-05-29 18:32 | `logs/health.json:12`. Third disagreeing source for "current cash". |
+| Commits since session 1 | **13** | `git log --since="2026-05-30 01:00"`. 7 v3 charter commits, 1 T1 verdict commit, 5 docs commits. **Zero commits addressing session-1 Findings 3, 4, 5, or 6.** |
+
+---
+
+### Top suspicions, ranked by ₹ impact
+
+#### 1. The v3 "no edge" verdict is a verdict on the LONG-ONLY 7–11% of signals — the wind-down trigger is about to fire on half-tested evidence
+
+**Evidence.** `results/V20_swing_pullback_only.json` gate_stats:
+
+```
+"total_signals":   2831,
+"shorts_blocked":  2623,   // 92.7% of raw signals vetoed
+"executed":          55,
+```
+
+`results/V22_swing_combined.json` gate_stats:
+`shorts_blocked: 2627 / 2962 = 88.7%`. `results/V21_*.json`: 0 / 119
+(Rule 2 is long-side by construction, unaffected). The forensic doc's
+verdict, "the trend-pullback-with-RSI-cooled setup does not have edge
+on this universe at this horizon"
+(`docs/diagnoses/v3_phase_a5_forensic_2026-05-30.md:117-121`), is
+overstated by one degree. The correct verdict is **"the long-only arm
+of trend-pullback does not have edge"**. The short arm — 88-93% of
+the strategy's natural signal set — has not been tested.
+
+**Business interpretation.** This is the same finding as session 1
+Finding 1, but now the v3 forensic *reproduces* it inside a clean
+backtest. The v3 swing was supposed to be the named, measurable T3
+hypothesis whose failure triggers wind-down (`wind_down_criteria_2026-06-05.md`,
+charter §6.5). Firing the wind-down on the long-only sub-set of v3's
+signals would close the project on a strawman. The most expensive
+mistake this project can still make is to call it dead before testing
+the other half of the strategy.
+
+**Estimated ₹ impact / day.** Not directly bleeding right now (capital
+paused), but: if the short side of trend_pullback has edge and we
+shut down without testing it, the opportunity cost is **the entire
+remaining option-value of the project**. Bounded above by the
+₹120k notional × ~10-15% annual swing-strategy expectation if real
+= **₹12-18k/year** of foregone PnL on a wrong-shutdown.
+
+**Recommended action.** Before 2026-06-05 verdict meeting, add one
+variant: **V25_swing_combined_shorts** — V22 settings, but with
+`risk.allow_shorts: true` and a hard daily-loss floor at ₹500 (≈ 0.4%
+of ₹120k capital). One battery slot, ≤2h. If V25 also shows PF<1.0
+across all directions, the wind-down verdict is honest. If V25 shows
+PF≥1.0, the wind-down verdict is wrong and the right move is a v3.1
+that keeps the strategy but lifts the long-only veto under a tight
+risk perimeter.
+
+#### 2. Two new live bugs landed on the supposedly-frozen trader VM in the same morning the v3 charter promised "museum mode"
+
+**Evidence — bug A (xgboost zombie).** `logs/daemon_2026-05-30.log:641-670`:
+
+```
+2026-05-30 09:38:49.617 | INFO | strategies.xgboost_classifier:generate_signal:339 -
+    [xgboost_classifier] BUY AAPL buffered (1/2) | prob_up=0.800
+2026-05-30 09:38:49.624 | INFO | strategies.xgboost_classifier:generate_signal:354 -
+    [xgboost_classifier] BUY AAPL | prob_up=0.800 | stability=2/2
+2026-05-30 09:38:49.630 | INFO | strategies.xgboost_classifier:generate_signal:378 -
+    [xgboost_classifier] SELL AAPL buffered (1/2) | prob_down=0.900
+```
+
+30 total AAPL/MSFT hits since 09:38:49 IST today. Neither symbol
+appears in `data/v2_universe_232.txt`, `data/v3_universe_top30.json`,
+`config.yaml`, or any `tests/fixtures/*` file. Commit `c9d3936`
+("T1 verdict applied: V15 PF=0.77 < 0.90 -> retire xgboost_classifier")
+landed at 09:02:07 IST — **36 minutes before** the classifier started
+firing BUYs on US tickers in this morning's daemon.
+
+**Evidence — bug B (runtime-persist AttributeError).** Same log,
+~10:10 IST:
+
+```
+2026-05-30 10:10:45.804 | WARNING | trading_agent:_persist_runtime_state:2343 -
+    [RUNTIME-PERSIST] save failed: AttributeError("'TradingAgent' object has no attribute '_strategy_state'")
+```
+
+Twice within 1 ms (two near-simultaneous persist attempts both
+crashed). This is the **direct evidence** for session 1 Finding 4's
+"writer path is dead" hypothesis. The agent cannot persist its
+strategy_state across restarts — every restart starts from zero, and
+the `self_sufficiency.json` file will never advance.
+
+**Business interpretation.** The freeze contract
+(`docs/freeze/FREEZE_v2.1.md`, expires 2026-06-05) and the v3 charter
+(`freeze_v3.0_charter_2026-05-30.md` §6.1, "museum mode") explicitly
+forbid trader-VM changes during the freeze window. The "retire
+xgboost_classifier" change at 09:02 was meant to be a backtest-side
+T1 verdict — but in this morning's local daemon it has either (a) not
+deactivated the strategy at all (still in `strategies.active`), or
+(b) deactivated only the V15 backtest variant and left the live config
+untouched. Either way, the operator cannot rely on the freeze
+discipline to mean "live behaviour is locked". And the runtime-persist
+break would silently corrupt the wind-down meeting's "cumulative
+realised" reading if the trader VM ever restarts.
+
+**Estimated ₹ impact / day.** If this were the actual trader VM
+(this morning's daemon is the local laptop, so the production impact
+is bounded), a zombie classifier firing BUYs on tickers not in
+`v3_universe_top30` could (a) place an order against a symbol the
+broker doesn't recognise → rejected, no loss, or (b) place an order
+against a symbol the broker DOES recognise → uncontrolled loss
+potential bounded only by `max_position_size_pct: 15.0`
+(`config.yaml:319`) = ≈₹18k of notional risk per position. **P0
+regardless of impact**, because the failure class is "strategy fires
+on symbols that were never validated".
+
+**Recommended action.** Two things, both today:
+
+1. **Kill the local laptop daemon now** — it has nothing useful to do
+   on a Saturday and it's polluting the production log with AAPL
+   signals that future EOD scripts will have to filter.
+2. **Run `code-bug-review`** on the trader-side
+   `strategies.xgboost_classifier` and `trading_agent._persist_runtime_state`.
+   File findings under `docs/bug_found_2026-05-30/`. The two bugs need
+   formal write-ups before the 2026-06-05 verdict.
+
+#### 3. Three of session 1's six findings are still open 10 hours later — every commit today went to v3, none to observability
+
+**Evidence.** `git log --since="2026-05-30 01:00" --pretty=oneline`
+shows 13 commits since session 1: 7 are v3 charter/phase commits
+(A1-A5), 1 is the T1 verdict, 5 are doc reorg / cross-reference
+sweeps. None mention:
+
+* Session 1 Finding 3: checkpoint acceptance-rate gate. The latest
+  checkpoint (`logs/audit/2026-05-29/checkpoint_1601.md:4`) still says
+  `Verdict: GREEN` despite cumulative -₹1,212 and 3 sessions of zero
+  trades.
+* Session 1 Finding 5: conftest isolation against test→prod CSV/log
+  leakage. `tests/conftest.py` was not touched today.
+* Session 1 Finding 6: supervisor restart loop. Today's log shows
+  **21 restart cycles** by 10:10 IST — the same loop, now firing on a
+  market-closed Saturday.
+
+**Business interpretation.** The v3 push is excellent engineering
+discipline (mechanical charter compliance, pre-committed verdict tree,
+honest forensic doc). But it is happening to the exclusion of the
+observability fixes that the same operator agreed to at 01:24 IST.
+The trade-off is real: if the v3 sweep proves the project's hypothesis
+dead, the observability fixes were never going to matter. **But if v3
+proves anything *short* of dead (Finding 1 above suggests it might),
+the operator will need acceptance-rate alerting and conftest isolation
+in the next live run — and they'll be writing them under pressure
+between 2026-06-05 (verdict) and 2026-06-08 (wind-down trigger
+window).**
+
+**Estimated ₹ impact / day.** Zero direct, but: the supervisor loop
+costs ~₹10/day of cloud CPU and 100% of forensic readability for any
+15:15-15:55 window. The acceptance-rate gate would have caught the
+"engine inert in bear" mode 3 days earlier than the operator did
+manually. The conftest isolation is the kind of thing that costs zero
+until the day it costs a P0 reconciliation incident.
+
+**Recommended action.** Pick ONE of these and ship before the next
+market open (2026-06-02 Monday):
+
+* Cheapest: the supervisor `--no-restart-after-self-exit` flag.
+  5 lines in `run_daemon.py`. ~10 min.
+* Highest leverage: the acceptance-rate `<5%` ⇒ YELLOW checkpoint
+  rule. ~20 min in the audit generator.
+* Most-needed: the `conftest.py` monkey-patch isolating the prod CSV
+  + logger paths. ~30 min, fixes Bug O properly.
+
+#### 4. The Saturday daemon is hammering AngelOne's websocket with reconnect attempts on a closed market
+
+**Evidence.** `logs/daemon_2026-05-30.log` tail:
+
+```
+2026-05-30 10:10:45.727 | ERROR | core.websocket_client:_reconnect_loop:779 - Reconnection failed: down
+2026-05-30 10:10:45.727 | INFO  | core.websocket_client:_reconnect_loop:765 - Reconnecting WebSocket in 32s...
+... (repeats with 60s, 60s, 60s, 60s, 60s, 2s backoff cycles)
+```
+
+Combined with 21 supervisor-induced daemon restarts in the same morning,
+the local laptop is generating ~30-50 connection attempts per hour to
+AngelOne's websocket endpoint **while the broker is closed for the
+weekend**. The reconnect-loop backoff caps at 60s but the supervisor
+restart resets it every ~75s, so the backoff never compounds.
+
+**Business interpretation.** AngelOne does not advertise a rate limit
+on websocket connection attempts but Indian retail brokers
+*do* track these and *do* throttle abusive clients. A weekend pattern
+of dozens of failed reconnects can quietly mark the client_id as
+suspicious; the consequence next live session is a delayed connection
+or a silent throttle. Either of those becomes a P0 if it happens on a
+trade-decision cycle.
+
+**Estimated ₹ impact / day.** Likely zero, possibly catastrophic.
+Cannot quantify without AngelOne's internal throttle policy.
+
+**Recommended action.** Either (a) kill the local daemon (it has no
+purpose on a Saturday), or (b) extend the
+`core.websocket_client._reconnect_loop` to detect `state ==
+idle_off_hours` and short-circuit the reconnect entirely. ~10 lines.
+
+#### 5. Source-of-truth drift now has FOUR disagreeing numbers for "are we paying for ourselves"
+
+**Evidence.**
+
+| Source | Cumulative realised | Cash | Last update |
+|---|---|---|---|
+| `data/self_sufficiency.json` | **0.0** | (n/a) | 2026-05-14 13:45 (16d stale) |
+| `logs/health.json:9-12` | (n/a) | **100,000.0** | 2026-05-29 18:32 (idle_off_hours) |
+| `logs/audit/2026-05-29/checkpoint_1601.json:120` | **-1,212.26** | **120,990.17** | 2026-05-29 16:01 |
+| `logs/diagnostics/eod_2026-05-29.md:2` | (per-strategy: 3 trades) | (n/a) | 2026-05-29 18:33 |
+
+Session 1 already flagged the first three. The fourth (eod_2026-05-29.md
+reporting only 3 trades when CSV has 7 post-5/21) confirms the DB
+analytics-pipeline blindspot is still active.
+
+**Business interpretation.** The wind-down decision on 2026-06-08 will
+hinge on `cumulative_realised vs cost-burn`. Today there are FOUR
+candidate sources and they disagree by **₹1,212 on realised** and
+**₹20,990 on cash**. If a fresh restart of the trader VM reads
+`self_sufficiency.json` as the canonical state, the verdict meeting
+sees `cumulative = 0`, which is **the most optimistic reading
+available**. Session-2 evidence (bug B above: `_persist_runtime_state`
+throwing AttributeError) makes this scenario more plausible, not less:
+the persistence file isn't getting rewritten because the writer
+crashes.
+
+**Estimated ₹ impact / day.** Zero direct, but the wind-down decision
+itself is the highest-stakes decision the project will make. Reading
+the wrong number = wrong decision. Bounded above by the same
+₹12-18k/year option-value as Finding 1.
+
+**Recommended action.** Before the 2026-06-05 verdict meeting, add ONE
+assertion to the EOD pipeline:
+
+```python
+assert self_sufficiency["cumulative_realised_inr"] == checkpoint["cumulative_realised_inr"], \
+    f"DRIFT: self_sufficiency={...}, checkpoint={...}"
+```
+
+Fail loud, do not silently fall back. ~15 min.
+
+---
+
+### Things the daemon is telling itself that are not true
+
+* **Commit `c9d3936` declares "retire xgboost_classifier", but xgboost
+  is still firing BUY/SELL signals 36 min later in the same daemon
+  process.** The retirement was at the V15-variant level
+  (`logs/backtests/...V15...`) and did not change the live config's
+  `strategies.active` list. The narrative says "retired"; the live log
+  says "still scoring AAPL/MSFT every cycle".
+* **`v3_phase_a5_forensic_2026-05-30.md` says "trend-pullback does not
+  have edge"**, but the gate_stats show the verdict was computed on
+  the **long-only 7.3% (V20) / 11.3% (V22)** of the strategy's natural
+  signal set. Correct framing: "trend-pullback's long-only arm does
+  not have edge on Nifty-30 daily."
+* **`comparison.md` headers say "Days: 600"**
+  (`logs/backtests/battery_v3_swing_a5_180d_eff_20260530T050422/comparison.md:7`)
+  but the run-id is `..._180d_eff_...`, the charter scopes 180 days,
+  and `log.txt:2` confirms `--days 600`. The "180d_eff" suffix and
+  the `Days: 600` cell can't both be right. (Not material to the
+  verdict — 600 days is a richer evidence base than 180, so if
+  anything the "no edge" reading is stronger than the charter spec
+  would suggest.)
+* **Checkpoint `1601.md:4` still says GREEN** despite the prior brutal
+  review documenting 3 sessions of zero trades and Finding 1
+  recommending the GREEN/YELLOW/RED gate be rewired. No change today.
+
+---
+
+### Things that look fine
+
+* **V3 charter discipline is exemplary.** Pre-committed verdict tree
+  (`freeze_v3.0_charter_2026-05-30.md §6.5`), mechanical application
+  ("SURPRISE branch"), single-day Phase A1→A5 execution with 7 commits,
+  no scope drift. This is the right way to operate. The forensic doc
+  even refuses to recommend next steps ("Sleep on it. Decide tomorrow.")
+  per charter §10.5 R1.
+* **V3 fill_mode is honest.** Confirmed `BacktestConfig.fill_mode:
+  "next_bar_open"` in every V20-V24 result file; engine path at
+  `packages/research/backtest_ensemble.py:682` dispatches correctly;
+  `no_next_bar` gate counter exists (`results/V22_*.json:gate_stats`)
+  and reported 3 dropped signals out of 2962 — bounded, transparent.
+  Phase A2-1 was the largest gap and it landed clean.
+* **Bug K (slice-after-cache-save) is fully closed** with three regression
+  test classes — verified during this morning's gap analysis
+  (`docs/diagnoses/v3_backtester_gap_analysis_2026-05-30.md:174-184`).
+  No new evidence to add or contest.
+* **DELIVERY charges path** is the correct STT-on-both-legs + DP-per-SELL
+  model (`packages/core/charges.py:150-218`); the only docstring drift
+  is the "per day" misnomer in the charter, scoped for a footnote.
+
+---
+
+### What I refused to conclude (insufficient evidence)
+
+* **Whether `trend_pullback` with `allow_shorts: true` is profitable.**
+  Cannot be answered without a V25 re-run. **This is the single most
+  important open question for the 2026-06-05 verdict.**
+* **Origin of the AAPL/MSFT xgboost signals.** Could be (a) a stale
+  paper-mode universe in this local laptop's `config.yaml`, (b) a
+  test fixture's symbol list leaking into the prod data_handler, or
+  (c) Yahoo Finance returning a fallback set when the requested
+  Nifty-30 symbols 404. Needs `code-bug-review` to trace from
+  `data_handler.download_historical_for_*` → `xgboost_classifier.generate_signal`.
+* **Whether the trader-VM `runtime_state.json` writer has been broken
+  since 2026-05-14.** The mtime suggests yes, the AttributeError
+  caught this morning suggests yes, but I cannot say *when* the bug
+  was introduced without a git-blame on `_persist_runtime_state` and a
+  diff against the last successful write. Out of brutal-review scope;
+  belongs in `code-bug-review`.
+* **Whether `allow_shorts:false` was a charter-level decision or a
+  risk-policy-veto that the v3 sweep inherited by accident.** The
+  veto is documented at `config.yaml:319` as "Higher-level kill switch
+  on the SHORT side (2026-05-25)" with no expiry, but the v3 swing
+  charter does not explicitly say "long-only". The default behaviour
+  may not match the charter's intent. Needs an operator decision before
+  V25 is queued.
+
+---
+
+### Next 24h checklist (operator actions, ranked)
+
+1. **(P0, ~10 min)** Kill the local laptop daemon NOW. It is on a
+   Saturday, emitting xgboost BUY signals for AAPL/MSFT, hammering
+   AngelOne's websocket, and producing zero useful output. (Closes the
+   ongoing damage from Findings 2 + 4.)
+2. **(P0, ~2 h)** Queue **V25_swing_combined_shorts** = V22 + `risk.allow_shorts: true` + hard daily-loss floor ₹500. Run before the
+   verdict meeting. If V25 ≥ PF 1.0 the wind-down trigger is wrong;
+   if V25 < PF 1.0 the wind-down trigger is honest. **Without this,
+   the verdict is on half the data.** (Closes Finding 1.)
+3. **(P0, ~30 min)** Confirm xgboost is actually deactivated in the
+   live config — open `config.yaml`, check `strategies.active`. If
+   `xgboost_classifier` is still in the list, that's the bug (the T1
+   verdict commit `c9d3936` only changed backtest variants). Either
+   way, file a `code-bug-review` write-up of the AAPL/MSFT signal
+   origin into `docs/bug_found_2026-05-30/`. (Closes Finding 2 bug A.)
+4. **(P0, ~30 min)** Fix `_persist_runtime_state` — the strategy_state
+   attribute reference is broken. Grep for `_strategy_state` vs
+   `strategy_state` vs `_strategies_state` and reconcile. Add a unit
+   test that asserts persistence succeeds on a freshly-constructed
+   `TradingAgent`. (Closes Finding 2 bug B.)
+5. **(P1, ~15 min)** Add the EOD assertion: `self_sufficiency.cumulative ==
+   checkpoint.cumulative ± 0.01`. Fail loud. (Closes Finding 5.)
+6. **(P1, ~10 min)** Ship at least ONE of session 1's three unfixed
+   observability items — the supervisor `--no-restart-after-self-exit`
+   flag is the cheapest. (Partially closes Finding 3.)
+7. **(P2, post-decision)** Resolve the "long-only veto vs charter
+   intent" question (last bullet of "refused to conclude"). Either
+   document `allow_shorts:false` as a permanent project-level
+   constraint, or scope a v3.1 that explicitly tests both directions.
+
+---
+
+### One-paragraph summary for the 2026-06-05 verdict meeting
+
+The v3 swing pivot executed end-to-end in a single day with charter
+discipline I'd happily ship to a real desk. The forensic verdict ("no
+edge, sleep on it") is honest *for what it tested* — but it tested the
+**long-only 7-11% of the strategy's natural signal set**. Triggering
+the wind-down on this evidence without first running a shorts-allowed
+variant (≤2h of work) is the most expensive call this project can
+still make. In parallel: two live bugs landed on the supposedly-frozen
+trader VM in the same morning (xgboost zombie firing for US tickers
+36 min after the retirement commit; runtime-persist throwing
+AttributeError every cycle), and the GREEN/YELLOW/RED gate, the
+acceptance-rate alarm, the conftest isolation, and the supervisor
+restart loop — all four cheap observability fixes the operator agreed
+to at 01:24 IST — are still untouched 10 hours later. **Verdict
+remains RED, escalating to RED-WITH-NEW-BUGS.**
+
+---
+
+### Cross-references (delta only — session 1's full list still applies)
+
+* `docs/diagnoses/v3_phase_a5_forensic_2026-05-30.md` — the morning's
+  honest "SURPRISE branch" verdict; this session contests one degree
+  of the framing (long-only sub-sample).
+* `docs/diagnoses/v3_backtester_gap_analysis_2026-05-30.md` — Phase A1
+  deliverable, confirms `next_bar_open` fill model is implemented.
+* `docs/freeze/freeze_v3.0_charter_2026-05-30.md` — the new operating
+  contract whose §10.5 R1 / §6.5 the morning's forensic correctly
+  honoured.
+* `logs/backtests/battery_v3_swing_a5_180d_eff_20260530T050422/results/*.json`
+  — the gate_stats this session re-reads to surface the shorts-blocked
+  rate the forensic doc didn't quote.
+* `logs/daemon_2026-05-30.log` — the local laptop daemon log where
+  the xgboost-zombie and runtime-persist bugs surfaced this morning.
+* `git log --since="2026-05-30 01:00"` — the 13-commit delta since
+  session 1.

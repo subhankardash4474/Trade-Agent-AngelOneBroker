@@ -4942,3 +4942,71 @@ Full analysis at `docs/diagnoses/v3_phase_a5_forensic_2026-05-30.md`. Run artefa
 
 **Phase A5 closure: SURPRISE branch confirmed; mechanical charter discipline applied; operator decision deferred to tomorrow.**
 
+---
+
+## 30. Brutal review (Session 2) follow-on: bug fixes + V25 disambiguation (2026-05-30 ~14:00 IST)
+
+**Trigger.** The Session 2 brutal review (`docs/reviews/brutal_review_2026-05-30.md` Session 2) caught:
+
+* **§1** the Phase A5 verdict was computed on the LONG-ONLY 7-11% of trend_pullback's natural signal set. 88-93% of SELL emissions (close < 50-DMA exits) were dropped by `_v3_swing_base`'s `allow_shorts: false`. Recommended: V25 = V22 + `allow_shorts: True` to disambiguate before the 2026-06-05 wind-down meeting. Without V25 the wind-down fires on incomplete evidence.
+* **§2 Bug A** the local-laptop daemon emitted xgboost BUYs for AAPL/MSFT 36 minutes after commit c9d3936 ("retire xgboost_classifier"). Root cause: c9d3936 retired the strategy at the V15 backtest variant level only; the live `config.yaml:strategies.active` had been disabled in commit f32009c earlier, but the local checkout had a stale config. No defence-in-depth gate refused a retired name.
+* **§2 Bug B** `_persist_runtime_state` raised `AttributeError("'TradingAgent' object has no attribute '_strategy_state'")` every cycle. The 2026-05-18 audit fix at line ~1090 should have fixed this, but a partially-constructed agent (e.g. an `__init__` exception before that line + a reconcile path that calls back into `_persist_runtime_state`) re-opens the bug. The unguarded `except` swallows the AttributeError into a WARN log; protective runtime state silently does not persist.
+* **§3 Finding 6** supervisor restart loop: 21 cycles by 10:10 IST on a Saturday, hammering AngelOne WS reconnects on a closed market. Session 1 Finding 6 was unfixed; the brutal review escalated it.
+
+### 30.1 Fix A ? Deprecated-strategy denylist (Bug A defence-in-depth)
+
+`trading_agent.py`:
+
+* New module-level constant `DEPRECATED_STRATEGIES: set = {"xgboost_classifier"}` with retirement-evidence docstring.
+* `_load_strategies` now refuses to instantiate any name in `DEPRECATED_STRATEGIES` and logs `[STRATEGY-DEPRECATED]` at CRITICAL. A stale `config.yaml` cannot silently revive a retired strategy.
+
+To revive a retired name: REMOVE it from `DEPRECATED_STRATEGIES` in the same commit that documents why the verdict is overturned (clean retrain + held-out PF >= 0.90).
+
+### 30.2 Fix B ? `_persist_runtime_state` partial-init guard (Bug B)
+
+`trading_agent.py`:
+
+* Added a `hasattr` check across the three required attributes (`_strategy_state`, `_recent_opens`, `_consec_tp_today`).
+* If any are missing, log CRITICAL `[RUNTIME-PERSIST] save SKIPPED (preserving on-disk snapshot)` and return WITHOUT writing.
+* Rationale: a naive `getattr(self, name, {})` default would clobber the on-disk snapshot with empty state, silently zeroing suspended-strategy / open-rate / TP-streak counters on the next load. The skip-and-shout approach preserves the disk snapshot AND surfaces the bug.
+
+### 30.3 Fix C ? V25_swing_combined_shorts variant (Brutal-review §1 disambiguation)
+
+`packages/research/battery.py`:
+
+* New variant `V25_swing_combined_shorts = V22 + ("risk.allow_shorts", True)`. Same universe, same window, same fill_mode, same warmup as V22 -- only difference is the long-only veto is dropped.
+* Documented the **asymmetric short caveat** in the variant block: trend_pullback's SELL emission has ONE gate (`close < sma_50`) vs the BUY's FIVE gates. With `allow_shorts: True`, SELL on a flat book opens a SHORT with engine-fallback ATR-based SL/TP. V25 is necessary-but-not-sufficient evidence for "the bidirectional trend_pullback has no edge"; a TRULY symmetric short would mirror the long's five gates as a separate strategy (`trend_pullback_short`), which is a v3.1 hypothesis.
+* Added queue entry `v3_swing_a5_v25_shorts` in `data/battery_queue.yaml`. Estimated runtime: ~12-25 min on workers=2.
+
+**Verdict tree (operator decision 2026-06-05):**
+
+* V25 PF < 1.0 -> Phase A5 forensic verdict honest. The simpler short side ALSO has no edge. Wind-down on complete-enough data; the "what about shorts" objection is addressed for the simpler short. A truly symmetric short remains a v3.1 hypothesis the operator can pursue separately.
+* V25 PF >= 1.0 -> MATERIAL FINDING. The long arm has no edge but the simpler "below-trend short" does. Wind-down deferred until a proper bidirectional version (`trend_pullback_short`) is implemented and tested. Under no circumstances should the asymmetric V25 alone be deployed live.
+
+### 30.4 Fix D ? Supervisor `--no-restart-on-clean-exit` (Finding 6)
+
+`tools/run_daemon_resilient.ps1`:
+
+* After daemon process exit, check `$exitCode -eq 0`. If true, log `[SUPERVISOR-CLEAN-EXIT]` and `exit 0` -- the daemon shut down intentionally (intraday cutoff, SIGTERM, kill-switch), don't relaunch.
+* Non-zero exit (crash, OOM, broker-init failure) still triggers the cooldown-and-retry path so transient failures self-heal.
+* Opt-out: env var `SUPERVISOR_RESTART_ON_CLEAN_EXIT=1` restores the legacy "always restart" behaviour. Documented in the supervisor's own log line so an operator can discover the knob from grep output.
+
+This closes session-1 Finding 6 (mentioned but unfixed at 01:24 IST) and session-2 §3 (still unfixed by 10:10 IST after 13 commits had landed).
+
+### 30.5 Tests added (zero regressions; full suite 1,765 passes)
+
+* `tests/unit/test_brutal_review_2026_05_30_fixes.py` (6 tests): denylist contains xgboost, `_load_strategies` denies retired names, denylist branch logs CRITICAL, `_persist_runtime_state` skips save when attrs missing, `_persist_runtime_state` happy-path unchanged, all-three-attrs check.
+* `tests/unit/test_v25_shorts_disambiguation_2026_05_30.py` (6 tests): V25 exists, V25 resolves `allow_shorts: True`, V25 byte-identical to V22 except `allow_shorts`, BacktestConfig propagates the flag, asymmetric-short caveat phrases pinned, battery queue includes V25 with the right universe / interval / days.
+* `tests/unit/test_supervisor_clean_exit_2026_05_30.py` (4 tests): supervisor file exists, clean-exit branch present, opt-out env var consulted (not just mentioned), `exit 0` precedes the relaunch loop.
+
+### 30.6 What was NOT fixed in this batch
+
+Per scope discipline:
+
+* Session 1 Finding 3 (acceptance-rate gate on checkpoint) -- chose Finding 6 instead because it had concrete daemon-side evidence in this morning's log.
+* Session 1 Finding 5 (conftest test->prod isolation) -- still open; ~30 min when the operator picks it up.
+* Source-of-truth drift (Session 2 §5) -- still open; ~15 min for the EOD assertion.
+* Trader VM check that xgboost is gone from `config.yaml:strategies.active` -- the source-tree is correct (commented out at line 118 + denylist now refuses it). The local-laptop daemon was already dead before this batch began.
+
+**Phase A5 closure stands; V25 disambiguation queued; two live bugs and one observability gap closed; full suite green.**
+
