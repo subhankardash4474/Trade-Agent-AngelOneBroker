@@ -137,11 +137,37 @@ while ($true) {
     }
     catch {
         Write-Sup "[DAEMON-LAUNCH-FAIL] $($_.Exception.Message)"
+        $exitCode = 1   # treat launch failure as a non-clean exit so the cooldown-and-retry path fires
+    }
+
+    # 2026-05-30 brutal review Finding 6 (Session 2 §3): the supervisor
+    # was restarting the daemon UNCONDITIONALLY, including after a clean
+    # post-close exit (intraday cutoff at 15:15 IST flips _running=False
+    # and the daemon returns 0). On 2026-05-30 the local laptop logged
+    # 21 restart cycles by 10:10 IST -- a Saturday with the broker WS
+    # closed -- generating dozens of failed reconnect attempts that
+    # could mark the AngelOne client_id as suspicious in the next live
+    # session.
+    #
+    # Fix: exit_code == 0 means the daemon shut down INTENTIONALLY (clean
+    # shutdown via SIGTERM, post-close cutoff, or explicit kill-switch).
+    # Don't relaunch -- trust the daemon's exit. Non-zero (crash, OOM,
+    # broker-init failure, etc.) still triggers the cooldown-and-retry
+    # path so transient failures self-heal.
+    #
+    # Activation: the env var SUPERVISOR_RESTART_ON_CLEAN_EXIT=1 restores
+    # the legacy "always restart" behaviour for operators who had a
+    # specific reason to depend on it. Default is "exit on clean".
+    $restartOnClean = [bool]([System.Environment]::GetEnvironmentVariable(
+        "SUPERVISOR_RESTART_ON_CLEAN_EXIT") -eq "1")
+    if ($exitCode -eq 0 -and -not $restartOnClean) {
+        Write-Sup "[SUPERVISOR-CLEAN-EXIT] daemon exit_code=0 (intentional). Supervisor exiting -- relaunch only on crash. Set SUPERVISOR_RESTART_ON_CLEAN_EXIT=1 to restore legacy always-restart behaviour."
+        exit 0
     }
 
     # Brief cooldown before the next launch - prevents tight-loop on
     # repeatable startup failure (e.g. config file syntax error).
     $cooldown = $RestartDelaySeconds
-    Write-Sup "[SUPERVISOR-COOLDOWN] sleeping ${cooldown}s before relaunch"
+    Write-Sup "[SUPERVISOR-COOLDOWN] sleeping ${cooldown}s before relaunch (exit_code=$exitCode)"
     Start-Sleep -Seconds $cooldown
 }
