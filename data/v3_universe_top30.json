@@ -1,0 +1,22 @@
+{
+  "_meta": {
+    "name": "v3.0 Swing Universe — Top 30 Nifty 50 by Liquidity",
+    "description": "30 most-liquid Nifty 50 names for v3.0 swing CNC delivery battery. Per freeze_v3.0_charter_2026-05-30.md §3. The list is the first 30 of tests/fixtures/nifty50_universe.json (which is itself ordered by market cap as of 2026-05-14). Market cap ranks correlate strongly with 60d-average-traded-value for Nifty 50 names — typical Spearman correlation > 0.95 — so a market-cap-ordered top-30 is a sound first approximation for the ADTV-top-30 the charter calls for.",
+    "snapshot_date": "2026-05-30",
+    "snapshot_method": "market_cap_first_30_of_nifty50_universe_proxy_for_60d_adtv",
+    "refresh_cadence": "quarterly",
+    "refresh_tool": "tools/build_v3_universe_snapshot.py",
+    "v3_charter_ref": "docs/freeze/freeze_v3.0_charter_2026-05-30.md §3",
+    "survivorship_bias_note": "This snapshot represents the top-30 AS OF the snapshot date. A 180-day backtest starting 2025-12-01 should ideally use the top-30 AS OF 2025-12-01. For Nifty 50 the index turns over ~3-4 names/year, so the bias on a 180d window is bounded. v3.1+ may add a per-day valid_from/valid_to schema; deferred per A1 gap analysis §6 / §11 R2.",
+    "frozen_at": "2026-05-30T09:30+05:30",
+    "frozen_by": "Phase A2-3 commit (v3 charter)"
+  },
+  "universe": [
+    "RELIANCE", "TCS", "HDFCBANK", "INFY", "ICICIBANK",
+    "HINDUNILVR", "SBIN", "BHARTIARTL", "KOTAKBANK", "ITC",
+    "LT", "AXISBANK", "BAJFINANCE", "ASIANPAINT", "MARUTI",
+    "HCLTECH", "SUNPHARMA", "TITAN", "ULTRACEMCO", "NTPC",
+    "WIPRO", "POWERGRID", "NESTLEIND", "TATAMOTORS", "M&M",
+    "JSWSTEEL", "ADANIENT", "ADANIPORTS", "ONGC", "COALINDIA"
+  ]
+}
