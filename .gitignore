@@ -69,8 +69,14 @@ models/*.onnx
 
 # Backtest scratch state
 **/market_data.pkl
+**/market_data.pkl.sha256
 **/cycle_state.pkl
 *.cache
+# Generic sidecar checksums for any pickle artefact (e.g. battery-scheduler
+# writes *.pkl.sha256 next to market_data.pkl so workers can verify cache
+# validity). The .pkl itself is already ignored above; the checksum is
+# meaningless without it, so don't surface as untracked either.
+**/*.pkl.sha256
 
 # 2026-05-14: self-sufficiency ledger is per-deployment runtime state,
 # not source. Each operator's cumulative realised P&L stays local.
