@@ -24,8 +24,18 @@
 | **T2** — Is the H3 entry-lag forensic actionable? | Median lag < 30 s = healthy · 30-120 s = pilot PERF · > 120 s = deploy PERF under new freeze | **Deliverable not produced** (operator did not run the H3 forensic between 2026-05-29 and 2026-06-01) | **Defer to T3** (which is reached on T2 silence) |
 | **T3** — Is the experiment concluded? | If by 2026-06-08 **both** (a) no PERF-paper window achieves rolling PF ≥ 1.20 over 5 days, and (b) no H3 / H1 finding names a single bug whose fix could move PF above 1.0 — then declare experiment concluded | (a) No PERF paper window was run. (b) The CHG sweep retroactively re-prices the entire backtest suite; the strongest v3 candidate (V25 with shorts) re-prices from PF 0.23 to **PF 0.04** and MaxDD 30% → **76.6%**. The capital-cap-loosening V26 re-prices to **PF 0.01 / MaxDD 82.3%**. No single bug exists whose fix moves either above 1.0 | **TRIGGERED → wind-down** |
 | **NEW evidence (post-2026-05-29 pre-commit)** | n/a | CHG-01..CHG-05 in `packages/core/charges.py` corrects a Zerodha-vs-AngelOne calibration error that the live trader has carried since 2026-05-08 (24 trading days). Every historical PF in the verdict-meeting packet is optimistic by ~50-80% under the corrected charges. | Reinforces wind-down |
+| **Live ledger correction** | n/a | The live-trader's internal PnL ledger has been silently optimistic since the AngelOne broker switch on 2026-05-08 by ~₹20-25/trade. Cumulative realised: **₹-1,212 (internal ledger, Zerodha-calibrated)** / **₹-1,800 to ₹-1,950 (broker-charged, AngelOne reality, ~₹600-750 worse)**. CHG corrects the model forward but cannot retroactively re-price already-closed trades. | Reinforces wind-down |
+| **Winners-cluster check** | n/a | V25's 4 winning trades at AngelOne rates are 4 different symbols (BAJFINANCE, RELIANCE, NESTLEIND, SBIN), all BUYs, distributed across the 600-day window. PF 0.04 is NOT a single-symbol fluke. **Zero winning shorts in 190 trades** despite shorts being V25's whole purpose. | "Single-symbol cluster" defender is closed |
 
 **Mechanical reading:** T1 retire, T3 trigger, no defender for the "defer to V26 / v3.1" objection. **Wind down v2.1; activate v3 Phase A only if the charter §1 finding #4 economic case can be re-stated at AngelOne rates and still hold up — it cannot.**
+
+> **Cost-coverage source-of-truth (for the meeting):** when reading the
+> "are we paying for ourselves" figure, use the **broker-charged**
+> ₹-1,800 to ₹-1,950 cumulative, NOT the internal-ledger ₹-1,212.
+> The latter understates the loss by ~50% in the cost-coverage
+> ratio. Treating the broker-charged figure as authoritative is also
+> consistent with charter §1 finding #4's "5-15% commission drag"
+> framing being re-stated at the actual rate card.
 
 ---
 
@@ -63,6 +73,8 @@ The packet below establishes both (a) and (b).
 - V25 was the single best v3 swing variant — `trend_pullback` + `breakout_20d` with shorts allowed, the explicit test of "what if we let the strategy take the side that was vetoed in v3 Phase A". Its 2026-05-30 Zerodha-rate reading was PF 0.23, which charter §1 finding #4 used to project ₹250-700/month seed-phase income at AngelOne (the calibration error that CHG corrects).
 - At the broker's actual rate card, **V25 bleeds 76.6% of capital over the 600-day window** — three out of every four rupees the operator deploys at the strategy disappear into the cost structure. The "₹250-700/month income" projection becomes **₹0/month with strong negative tail risk**.
 - V26 was added to the catalogue specifically to close Session 3's "position-cap dilution" objection (the assertion that V25's PF 0.23 was an artefact of the 5-position live cap and would relax at a 15-position cap). **V26 is worse, not better.** PF 0.01 < V25's 0.04, MaxDD 82.3% > 76.6%. The position-cap thesis is decisively refuted: more positions = more losing trades × AngelOne's per-trade cost floor.
+- **Cost-vs-PnL breakdown.** Brokerage + STT + DP charges + stamp duty are **92% of V25's loss line** (₹7,040 charges on ₹-7,662 PnL) and **88% of V26's** (₹7,190 charges on ₹-8,229 PnL). The strategy doesn't merely underperform; it transfers operator capital to broker, exchange, and government at a near-1:1 ratio with its own loss-making trades. This is the AngelOne version of the v3 charter §1 finding #4's "cost-regime drag" — the drag is the strategy.
+- **Winners-cluster check** (added per Session 3 verification): V25's 4 winning trades are 4 different symbols — BAJFINANCE (₹+48, Jan'25), RELIANCE (₹+122, Apr-Jul'25), NESTLEIND (₹+61, Oct'25), SBIN (₹+69, Oct'25-Jan'26). All BUYs. V26's 2 winners are subsets of V25's. **The PF 0.04 / 0.01 reads are not single-symbol or single-cluster artefacts.** Of equally diagnostic value: **zero winning short trades in 190 V25 trades**, despite shorts being V25's entire reason for existing — the bear-blindness pattern from the 4-consecutive-zero-trade-session signature continues into the backtest universe.
 
 **This number set satisfies T3(b):** no single bug exists whose fix could move either V25 or V26 above PF 1.0. The cost structure is the cost structure; the strategy edge is missing.
 
@@ -112,7 +124,7 @@ Key findings carried into this meeting:
 | §1 — Uncommitted CHG diff weakening verdict-meeting framing | **CLOSED** — diff committed in `e277e21` chain; CHG numbers now quoteable. |
 | §2 — V26 never run despite 2026-05-30 catalogue addition | **CLOSED** — first execution today, results in §2 of this packet. Position-cap-dilution objection refuted. |
 | §3 — Bug O pytest → production-log leak | **DEFERRED** — dev-time noise, post-verdict cleanup. Not verdict-meeting blocking. |
-| §4 — Audit checkpoint cadence outage | **SELF-RESOLVED** — 4 hourly checkpoints today (09:00 / 10:01 / 11:00 / 11:36); cadence healthy. |
+| §4 — Audit checkpoint cadence outage | **SELF-RESOLVED at source, OneDrive-sync-lagged at local view.** 4 checkpoint files exist for today with **contents** live-emitted by the daemon (PID 7 for 09:00/10:01/11:00, PID 6 for 11:36 — verified from `health.json` uptime fields embedded in each file). **Local Windows mtimes** all cluster at 11:44:30 IST, a OneDrive sync artefact (not a backfill). Implication for verdict-week: the remote daemon's cadence is the authoritative source; my local view is eventually-consistent. If verdict-meeting will quote in-week checkpoints, refresh from remote (or trust source-of-truth) before quoting. |
 | §5 — Kill PID 7 (66+ hour stale daemon) | **SELF-RESOLVED** — daemon restarted at 11:34:36 IST; new PID 6 booted with CHG-01..CHG-05 active (verified via `_log_active_rates` startup log line). |
 | §6 — DB-CSV blindspot (7 missing rows) | **NOTED** — verdict-meeting reads `logs/trades.csv` directly; DB diagnostic incomplete. Backfill is a post-verdict task. |
 | §7 — Trader-VM deploy status | **CONFIRMED untouched** — `tools/cloud/deploy.ps1` not invoked today per freeze charter §6.1. Live trader runs pre-Saturday code. The CHG fix is NOT on the trader VM; live broker orders since 2026-05-08 have been silently more expensive than the daemon's internal PnL ledger believes. |
@@ -157,6 +169,22 @@ The cost-regime thesis as written is incorrect at the operator's broker. Re-stat
 2. **2026-06-06 (Sat)** — operator decides whether to (a) keep the daemon down indefinitely, (b) run a paper-mode-only daemon for ongoing research, or (c) deploy the CHG fix and resume live only if a NEW edge thesis is identified outside of the current strategy set.
 3. **2026-06-08 (Mon)** — final post-mortem document; archive `FREEZE_v2.1.md` as concluded; archive `freeze_v3.0_charter_2026-05-30.md` as "never activated, see verdict packet 2026-06-05".
 
+> **Forward-plan note (filed 2026-06-01 12:14-12:18 IST, post-CHG sweep):**
+> The "what comes after wind-down" conversation has been pre-committed
+> in two parallel artefacts — operator chose option 2(b)+(c)
+> (continued research + new edge thesis) over 2(a) (indefinite
+> shutdown). See **[`../reviews/path_forward_assessment_2026-06-01.md`](../reviews/path_forward_assessment_2026-06-01.md)**
+> (the operator's decision paper: 4 parallel tracks, ₹42k/year
+> cost-of-fight at ₹120k capital, PK1 18-month timeout) and
+> **[`../reviews/strategy_charter_v4_2026-06-01.md`](../reviews/strategy_charter_v4_2026-06-01.md)**
+> (the technical charter: mode-flag dispatcher schema, V27 cross-asset
+> trend spec, F&O paper-mode requirements, ~98 person-day build
+> estimate). **Friday's meeting does not need to discuss these** — they
+> are pointers, not decisions. The meeting's only job is the
+> mechanical wind-down call. The forward plan activates Mon 2026-06-08
+> conditional on operator answering the charter's §10 Q1-Q10 open
+> questions in writing first.
+
 If, however, the operator does NOT wish to apply the criteria mechanically, the failure mode flagged in `wind_down_criteria_2026-06-05.md` §5 should be re-read aloud at the meeting.
 
 ---
@@ -199,6 +227,40 @@ For verdict-meeting cross-reference. Every claim in this packet is rooted in one
 ### F. Historical decision docs (with CHG footnotes)
 - [`docs/diagnoses/v3_phase_a5_forensic_2026-05-30.md`](../diagnoses/v3_phase_a5_forensic_2026-05-30.md) — the forensic that produced V25's PF 0.23 reading (now footnoted with the AngelOne re-derivation).
 - [`docs/reviews/friday_review_2026-05-29.md`](../reviews/friday_review_2026-05-29.md) — the previous Friday's framing (footnoted).
+
+### G. Forward plan (post-verdict, filed 2026-06-01 12:14-12:18 IST)
+
+For reference only — not part of Friday's decision logic. These two
+docs are what activates IF the verdict goes wind-down (the
+overdetermined outcome per §0 and §2).
+
+- [`../reviews/path_forward_assessment_2026-06-01.md`](../reviews/path_forward_assessment_2026-06-01.md)
+ — operator decision paper. Records the "fight till the end" stance
+ verbatim, the cost-of-fight arithmetic at ₹120k capital (₹42k/year
+ total, requires +35% CAGR to break even), the four parallel research
+ tracks (Mode A cross-asset trend cash / Mode B F&O swing paper /
+ Mode C F&O options paper / Mode D cointegration research),
+ mode-flag architecture, six-phase 18-month calendar, five
+ project-wide kill criteria (PK1=18mo timeout being the most
+ important), and seven open questions for operator decision before
+ Phase 1 starts.
+- [`../reviews/strategy_charter_v4_2026-06-01.md`](../reviews/strategy_charter_v4_2026-06-01.md)
+ — technical companion charter. Four falsifiable hypotheses, the 21
+ net-new modules to build, the full canonical `config.yaml` mode-flag
+ schema with capital-gate enforcement, V27 cross-asset trend complete
+ spec (75 instruments, Donchian-55/20, vol-targeted 0.5% risk,
+ risk-parity allocation, AngelOne charges, NIFTYBEES benchmark, A1-A5
+ stop criteria), F&O backtester extensions (six new failure modes,
+ 10-day NSE premium validation gate, ~52 person-days of dev), mode
+ dispatcher contract + paper-broker isolation tests, ten open design
+ questions (Q1-Q10).
+
+These docs **succeed** [`freeze_v3.0_charter_2026-05-30.md`](freeze_v3.0_charter_2026-05-30.md)
+post-wind-down. They do NOT override the v3.0 charter pre-verdict —
+that charter remains the active forward-plan-of-record until Friday's
+verdict is rendered, at which point v3.0 is archived "never activated"
+and v4 activates conditional on operator answering its §10 open
+questions in writing.
 
 ---
 

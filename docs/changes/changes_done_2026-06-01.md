@@ -160,7 +160,7 @@ No historical numbers were altered — only contextualised. The pre-CHG PFs rema
 | `checkpoint_1100.md` | 11:00 IST | PID 7 | **4080.6 min (68 h)** |
 | `checkpoint_1136.md` | 11:36 IST | **PID 6** | **2.1 min** |
 
-The audit cadence **is** healthy — 4 checkpoints today on the hourly cadence. The §4 finding was a transient observation that resolved before the CHG sweep completed.
+The audit cadence is healthy **at the daemon source-of-truth** — 4 checkpoints, each live-emitted by the running daemon for its respective hour window (verified by the PID + uptime stamps embedded in each file's body). The brutal-review Session 3 (filed 12:00 IST) correctly flagged that all 4 files have **local mtime 11:44:30** IST — that is a **OneDrive sync artefact**, not a backfill. The contents were written remotely at their nominal times; they arrived at this local Windows host in one sync batch when PID 6 booted and triggered an apparent file-set change OneDrive then propagated. **Implication for verdict-week observability**: treat checkpoint files as eventually-consistent from this local host; the authoritative cadence read is whatever the remote daemon writes. If verdict-meeting will quote in-week checkpoints, refresh from remote (or quote the daemon's `health.json` directly) before EOD on each day.
 
 **The daemon restarted at 11:34:36 IST.** PID 7 (66+ hours uptime, on pre-CHG code) was killed (operator action or container health-check) and replaced by PID 6 which booted with the new AngelOne charges (the `[charges] active rates: broker=AngelOne ...` line in `logs/daemon_2026-06-01.log` is `_log_active_rates()` from commit `e277e21`).
 
@@ -220,11 +220,138 @@ Launched at 11:48:54 IST as `logs/backtests/battery_chg_recompute_20260601T11450
 
 ---
 
+## Phase 6 — Forward plan (path-forward assessment + v4 strategy charter)
+
+> **Time:** 12:14-12:18 IST. **Trigger:** operator question at 12:09 IST
+> ("If I have to make the agent profitable what should I do, the strategies
+> that we discussed can we build them and test in backtesting setup?") +
+> 12:20 IST confirmation to file both `(a) path-forward` and `(b) V27 spec`
+> AND add F&O paper-mode + mode-toggle flag system. **Commits:** uncommitted
+> at time of writing.
+
+Pure advisory writing, no code edits. Two markdown files filed under
+`docs/reviews/` per `repo-conventions` "named non-EOD reviews + proposals"
+convention. These docs are the post-wind-down forward plan; they do NOT
+override `freeze_v3.0_charter_2026-05-30.md` pre-verdict — v3.0 remains
+forward-plan-of-record until Friday, at which point it is archived
+"never activated" and v4 activates conditional on operator answering
+the charter's §10 Q1-Q10 in writing first.
+
+| Artefact | Path | Length | Purpose |
+|---|---|---:|---|
+| Path-forward assessment | `docs/reviews/path_forward_assessment_2026-06-01.md` | 33 KB | Operator decision paper: records "fight till the end" stance verbatim, ₹42k/year cost-of-fight arithmetic at ₹120k capital, 4 parallel tracks (A cross-asset trend cash / B F&O swing paper / C F&O options paper / D cointegration research) + Track D discretionary parallel cross-check, mode-flag architecture, six-phase 18-month calendar, five project-wide kill criteria (PK1 18mo timeout most important), probability calibration table, seven open questions. |
+| v4 strategy charter | `docs/reviews/strategy_charter_v4_2026-06-01.md` | 47 KB | Technical companion: four falsifiable hypotheses, 21 net-new modules, full canonical `config.yaml` mode-flag schema with capital-gate enforcement ("I accept ruin risk" override string), V27 cross-asset trend complete spec (75-instrument universe, Donchian-55/20, vol-targeted 0.5% risk, risk-parity allocator, AngelOne charges, NIFTYBEES benchmark, A1-A5 backtest stop criteria, V28-30 retune budget), F&O backtester extensions with six new failure modes + 10-day NSE premium validation gate (~52 person-day dev block), mode dispatcher contract + paper-broker isolation tests, ten open design questions. |
+
+**Verdict-meeting packet edit** (same time-window): added a forward-plan
+note between §7 step 2 and step 3 + a new §8.G appendix subsection
+pointing at both new docs. Edits are non-disruptive to the mechanical
+wind-down logic — they are pointers, not decisions.
+
+| File touched | Edit type | Diff |
+|---|---|---|
+| `docs/freeze/verdict_meeting_packet_2026-06-05.md` | append in §7 + new §8.G | ~30 lines added, 0 modified |
+
+### Why
+
+Operator's 12:09 IST question pivoted the conversation from
+verdict-week tactical review to post-wind-down strategic planning.
+Two adversarial reasons to file BOTH a decision paper AND a separate
+technical charter, instead of one combined document:
+
+1. **Decision-evidence separation.** The decision paper (§2 cost
+ arithmetic, §6 PK1-PK5 kill criteria, §7 probability calibration)
+ should be re-readable in 6 months when the operator might be
+ emotionally invested in defending a specific track. The technical
+ charter (V27 params, F&O engine requirements, dispatcher
+ contract) is reference material consulted during builds. Mixing
+ them dilutes both.
+2. **Pre-commit discipline.** Both docs are pre-committed BEFORE
+ Phase 1 dev starts (Mon 2026-06-08), so the framing cannot be
+ calibrated by what the first backtest produces. This is the same
+ discipline `freeze_v3.0_charter_2026-05-30.md` v1.0/v1.1 used and
+ the discipline `wind_down_criteria_2026-06-05.md` enforces for
+ Friday.
+
+The mode-flag dispatcher architecture (charter §2) is the
+**single most important design decision** in the v4 plan. Building
+it later requires a rewrite; building it up-front pays compound
+interest as Modes B, C, D land. The charter's §10 Q5 (hard cutover
+vs feature-flag rollout) is the operator's first non-trivial design
+call.
+
+### Type / Risk / Rollback / Verification
+
+- **Type:** docs (pure markdown; no source-code edits).
+- **Files touched:** 2 new + 1 modified
+ - `docs/reviews/path_forward_assessment_2026-06-01.md` (new, 33 KB)
+ - `docs/reviews/strategy_charter_v4_2026-06-01.md` (new, 47 KB)
+ - `docs/freeze/verdict_meeting_packet_2026-06-05.md` (modified — §7 forward-plan note + §8.G appendix subsection added)
+- **Trigger:** operator-requested (`yes please do both`, 12:11 IST and
+ `yes both please both`, 12:20 IST).
+- **Risk:** LOW. Pure documentation. Cannot affect daemon, trader VM,
+ backtester, DB, or any executable code path. The
+ verdict-meeting-packet edit adds content WITHOUT altering the
+ mechanical wind-down logic (the recommendation in §7 and the
+ evidence in §0-§6 are untouched).
+- **Rollback:** `Remove-Item docs/reviews/path_forward_assessment_2026-06-01.md`
+ + `Remove-Item docs/reviews/strategy_charter_v4_2026-06-01.md`
+ + `git checkout docs/freeze/verdict_meeting_packet_2026-06-05.md`
+ (or `git restore` equivalent). No downstream references exist yet —
+ these docs are top-of-chain, nothing imports or links INTO them
+ except the verdict-packet edit itself which the rollback also reverts.
+- **Verification:** Both new files written, byte sizes match expected
+ (33 KB / 47 KB), `ReadLints` clean on both. Verdict-packet edit
+ verified by re-read of §7 (forward-plan note present between steps
+ 2 and 3) and §8 (G subsection present after F). Operator can grep
+ `grep -r "path_forward_assessment" docs/` to confirm cross-references
+ land.
+
+### Freeze impact
+
+ZERO slots consumed. Pure documentation under `docs/reviews/` and
+`docs/freeze/` (the latter is appendix-only, not a freeze-list edit).
+No `packages/` code touched. No `config.yaml` touched. No `tests/`
+touched. The freeze contract is unaffected.
+
+The charter explicitly states v4 activation is conditional on operator
+answering its §10 Q1-Q10 in writing AND on the Friday verdict
+producing wind-down. If the verdict surprises with "don't wind down"
+(rendered overdetermined-improbable by V25/V26 at AngelOne rates per
+§5b above), the v4 charter is shelved alongside v3.0 with the same
+"never activated" archive treatment.
+
+### Cross-links
+
+- Companion: this file's Phase 5c (verdict-meeting packet drafting)
+ — the v4 charter is a successor-pointer added to that packet.
+- Up-chain: `docs/reviews/brutal_review_2026-06-01.md` Sessions 1-3
+ — evidence base for why v2.1/v3 is winding down.
+- Up-chain: `docs/reviews/strategy_reference_review_2026-06-01.md`
+ — calibration of what's realistic for retail (3-7% CAGR trend,
+ Virtu/Medallion impossible) that informs the charter's hypotheses.
+- Sibling: `docs/freeze/verdict_meeting_packet_2026-06-05.md` §7 + §8.G
+ (edited in this same phase).
+- Successor: `docs/reviews/strategy_charter_v4_operator_responses_2026-06-XX.md`
+ (NOT YET WRITTEN — operator's answers to charter §10 Q1-Q10, to
+ be filed before Phase 1 starts 2026-06-08).
+
+### Open follow-ups before Phase 1
+
+| # | Action | Owner | Due |
+|---|---|---|---:|
+| 1 | Operator answers charter §10 Q1-Q10 in writing | operator | by 2026-06-08 |
+| 2 | File `docs/reviews/strategy_charter_v4_operator_responses_2026-06-XX.md` | operator + agent | by 2026-06-08 |
+| 3 | (Optional) Start Track D (manual discretionary swing) on existing capital | operator | any time post-verdict |
+| 4 | Commit this changes-done update + the two new doc files + the verdict-packet edit | operator | EOD 2026-06-01 |
+
+---
+
 ## Tests
 
 - **2,056 / 2,056 passing.** No skipped tests in the new suite.
 - New regression file: `tests/unit/test_charges_angelone_2026_06_01.py` (22 tests pinning defaults, the AngelOne calculator example, brokerage cap/floor logic, product-aware stamp duty, DP charge, deprecated env var handling, and the NUM-10 invariant).
 - Three rate-set-coupled tests rewritten to be **structural-invariant** rather than hard-pinned to a specific rate set (Phase 2 table) — so the next broker switch won't need them re-touched.
+- **Phase 6 (forward plan):** no tests; pure markdown.
 
 ---
 
@@ -247,11 +374,13 @@ post-2026-06-05:
 
 - `docs/findings/findings_log_2026-06-01.md` — full CHG-01..CHG-05 + NUM-10 detail.
 - `docs/findings/charges_pf_adjustment_2026-06-01.md` + `.csv` — per-variant post-hoc PF adjustment.
-- `docs/reviews/brutal_review_2026-06-01.md` (both sessions) + `docs/reviews/strategy_reference_review_2026-06-01.md` — the morning adversarial review and the strategy-folklore companion.
-- `docs/freeze/verdict_meeting_packet_2026-06-05.md` — assembled in Phase 5c; references this file as ledger.
+- `docs/reviews/brutal_review_2026-06-01.md` (Sessions 1-3) + `docs/reviews/strategy_reference_review_2026-06-01.md` — the morning adversarial review and the strategy-folklore companion.
+- **`docs/reviews/path_forward_assessment_2026-06-01.md`** (new, Phase 6) — post-wind-down operator decision paper.
+- **`docs/reviews/strategy_charter_v4_2026-06-01.md`** (new, Phase 6) — technical companion charter (V27 spec + mode-flag dispatcher + F&O paper-mode).
+- `docs/freeze/verdict_meeting_packet_2026-06-05.md` — assembled in Phase 5c; references this file as ledger. **Modified in Phase 6** (§7 forward-plan note + §8.G appendix).
 - `FREEZE_v2.1.md` — frozen-file list. Cross-checked 2026-06-01 11:25 IST: `packages/core/charges.py` is **not** enumerated; CHG diff is freeze-safe.
 - `logs/backtests/battery_chg_recompute_20260601T114500/` — V25-AngelOne + V26 true re-sim (in flight at time of writing).
-- Commit hashes (origin/main): `e277e21`, `0d541ed`, `4a00e82`, `4e381a7`, `52f650c`, `22434cd`, `135d749`.
+- Commit hashes (origin/main): `e277e21`, `0d541ed`, `4a00e82`, `4e381a7`, `52f650c`, `22434cd`, `135d749`. **Phase 6 files: uncommitted at time of writing — operator follow-up #4.**
 
 ---
 
