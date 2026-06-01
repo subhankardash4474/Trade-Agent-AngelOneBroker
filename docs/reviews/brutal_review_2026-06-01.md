@@ -1418,3 +1418,255 @@ hygiene around the verdict packet, not technical risk.**
   read this session.
 * `logs/audit/2026-06-01/checkpoint_1136.{md,json}` — current
   live-state snapshot; PID 6, 2.1 min uptime.
+
+---
+
+## Session @ 17:15 IST — EOD #4 (post-Phase-15 sprint)
+
+**BRUTAL REVIEW — 2026-06-01 (Session 4 of 4)**
+Window reviewed: today only (the 4h45m sprint between Session 3 and now). 20 commits, ~27 backtest variants, 6 new strategy modules, 1 new engine, 3 charter amendments, 5 new tool scripts. Re-derived from `git log`, `logs/audit/2026-06-01/*`, `logs/trading_agent_2026-06-01.log`, `logs/signal_audit_2026-06-01.csv`, `logs/health.json`, the 4 new doc files, the V35-V40 source modules, and `tests/unit/`.
+Persona: same. The verdict-week framing I helped write 4 hours ago has been bypassed; my job is to call it.
+
+---
+
+### Verdict (one line)
+
+**RED — pre-commit discipline collapsed; "Mode A V32 → paper" decision is an A3 result re-classified A4 via mid-flight charter amendment under explicit anti-temptation rule.**
+
+The engineering work today is real and partially excellent. The DECISION made on top of that engineering — to deploy a strategy that underperforms passive NIFTYBEES to paper-mode in 7 days, on in-sample-only validation, with a charter amendment that retroactively removed the gate it was failing — is the exact failure mode that v3.0 charter §10.5 R1 and v4 charter §9 rule 8 were filed at 12:35 IST today specifically to prevent. Both were filed before the violation happened. Both were broken within 5 hours.
+
+### Bottom-line numbers (independently derived, not from checkpoint)
+
+* **Realised P&L today:** ₹0 (no trades). `logs/health.json:15:24:55+05:30`: `daily_pnl=0.0`, `daily_trades=0`, `open_position_count=0`. Live agent did nothing — its only contribution to today is the EOD-ASSERT CRITICAL it self-emitted (Finding 3).
+* **Cumulative realised since 2026-05-14:** **TWO DIFFERENT NUMBERS** — `self_sufficiency.cumulative_realised_inr = Rs -1,212.26` vs `DB SUM(pnl) = Rs -1,804.42`. Diff +Rs 592.16 (the in-memory ledger is OPTIMISTIC by ~33%). The daemon itself logged this at `logs/trading_agent_2026-06-01.log:2026-06-01 15:20:53 | CRITICAL | [EOD-ASSERT]`. **Operator was warned at 15:20, has not acted at 17:12. Was deep in Phase 15 sweep at the time of the assertion.**
+* **Live signals today:** 100% rejection rate continues. Every signal SELL, every one stamped `REJECTED,allow_shorts:false`. Sample tail: `HCLTECH 13:53 → REJECTED`, `TORNTPOWER 14:02 → REJECTED`, `MARICO 14:16 → REJECTED`, `SBILIFE 14:35 → REJECTED`, `NATIONALUM 14:53 + 14:55 → REJECTED ×2`, `BALRAMCHIN 15:06 → REJECTED`, `TTML 15:12 → REJECTED`. Structural bear-blindness unchanged from Session 1.
+* **Audit-checkpoint cadence:** **Fraudulent.** 8 checkpoint files in `logs/audit/2026-06-01/` (09:00, 10:01, 11:00, 11:36, 12:00, 13:00, 14:00, 15:01) — all 16 `.md`+`.json` files have **identical `LastWriteTime` = 6/1/2026 3:25:00 PM**. The scheduler did not run hourly; the files were mass-backfilled in one batch at 15:25. Session 3 flagged this at 4 files at 11:44; the pattern is now worse, not fixed. `changes_done_2026-06-01.md` Phase 5a still claims "audit cadence is healthy — 4 checkpoints today on the hourly cadence" — false then by mtime, doubly false now.
+* **Backtest velocity:** 20 commits in 4h45m = 1 every 14 minutes. ~27 backtest variants tested. 6 new strategy modules + 1 new engine + 1 ModeDispatcher + 5 new tool scripts. **Unit tests added in the same window: 0** (V27 had 2 pin tests written before Phase 12, none of V35-V40 do).
+* **Charter amendments adopted today:** **3** (§3.6 sector cap → informational, §3.10 CAGR-vs-NIFTYBEES → informational, §3.10 portfolio-allocation note). All three were drafted at 15:26 IST after V32 failed the CAGR gate at 15:06 IST. **Elapsed time from gate-failure to amendment-adopted: 20 minutes.** Charter §9 rule 8 explicitly requires a **7-day cooling-off period after any kill-criterion fires**. The rule was filed in the same charter, at 12:35 IST, by the same author.
+
+### Top suspicions, ranked by ₹ impact
+
+#### 1. Charter discipline collapsed — V32 ships to paper-mode 06-08 as an A3 result re-classified A4 via mid-flight amendment under explicit anti-temptation rule
+
+**Evidence:**
+- `docs/reviews/strategy_charter_v4_2026-06-01.md` §3.10 acceptance criteria A4 = "**PF ≥ 1.20 AND CAGR ≥ NIFTYBEES + 2% AND MaxDD ≤ 25%**". V32 actuals: PF 1.36 ✓ / CAGR-vs-NIFTYBEES **-6.14pp ✗** / MaxDD -7.80% ✓. **2 of 3 gates pass = A3.**
+- Charter §3.10 A3 verbatim: "PF ≥ 1.20 BUT CAGR < NIFTYBEES + 2% — **Do not advance to paper. Treat as 'academic interest only'.**"
+- `docs/reviews/mode_a_decision_v32_2026-06-01.md:325-337` proposes "Amendment #2: §3.10 CAGR-vs-benchmark → informational metric." Justification: "This gate is unreachable on this spec." (The charter §10 Q3 acceptance was 4h21m earlier; the gate was characterized as "the hard ceiling" in path-forward §3 Track A.)
+- Charter §9 rule 8 verbatim: "**Do not amend this charter under emotional load.** If after a bad week the operator wants to 'rewrite the plan', they wait 7 days before doing so. Edits made within 7 days of a kill-criterion trigger are flagged in `changes-done` with `flag: under_emotional_load`."
+- Timeline: V27 first-cut PF 1.10 (FAILS A2) at 13:15 (`92c63b2`). V32 PF 1.36 / CAGR-gap -6.14pp (A3) at 15:06 (`81a88fc`). V34 sector cap test (also fails) at 15:18 (`8e33e05`). Amendment proposal and "V32 deploys paper-mode" decision at 15:26 (`ead53d6`) — **20 minutes after the gate failure was confirmed.**
+- `changes_done_2026-06-01.md` Phase 12 entry does NOT carry the `flag: under_emotional_load` tag.
+
+**Business interpretation:** The 18-month / ₹100k cost-of-fight discipline (path-forward §6 PK1/PK3) is structurally dependent on the kill-criteria being kill-criteria. If a failing gate can be re-classified as informational within 20 minutes of failure, **the kill criteria are theatre**. The charter framework filed 4h45m ago becomes a non-binding suggestion. The pre-commit discipline that v3.0 charter §10.5 R1 was specifically built to enforce is bypassed on day 1. This is the operator's prior anti-pattern (per v3.0 charter §1 finding "5 variants in V20-V25 to chase the gate") recurring at higher engineering velocity.
+
+**Estimated ₹ impact / day:** Cannot quantify on day-1; the impact is on the trajectory. If Profile A turns out to be in-sample overfitting (Finding 7), the cost of having amended away the gate is the ₹120k capital + 6 months of paper-mode opportunity cost (~₹6,000 vs NIFTYBEES) + the agent's own cost burn (₹15,000 over 6 months). **Plus the precedent: every future kill-criterion is now amendable.** That's the binding cost.
+
+**Recommended action:**
+1. **Revert Amendments #1 and #2.** Re-instate the §3.6 sector cap and §3.10 CAGR-vs-benchmark as binding gates. The empirical V34 evidence (sector cap costs 0.91pp CAGR) is true and worth recording — BUT the response is "next variant must respect the cap and find edge elsewhere", not "remove the cap because it's binding".
+2. **Honor the 7-day cooling-off.** Re-evaluate Amendment proposals on 2026-06-08 at earliest. Until then, V32/V38 stay at A3 = "academic interest only, do not advance to paper".
+3. **If the cooling-off review re-confirms the amendments,** tag them `flag: under_emotional_load` in `changes_done` per the rule and proceed. The rule does not forbid amendments; it forbids amendments under load.
+4. **Read path-forward §9 rule 2 aloud:** "Do not add a 5th track mid-project." V35-V40 (5 new strategy hypotheses bolted into Engine B in commit `994e6f6` at 16:04) is the spirit-violation. Track A was Donchian. V36 (mean-reversion), V37 (SMA pullback), V38 (weekly breakout), V39 (MACD), V40 (dual-momentum-relstrength) are 5 separate strategy hypotheses dressed as "Mode A variants".
+
+#### 2. Profile A (the planned 2026-06-08 deployment) UNDERPERFORMS NIFTYBEES on absolute CAGR with in-sample-only validation
+
+**Evidence:**
+- `docs/changes/changes_done_2026-06-01.md:1346` Phase 14 §C: "Best absolute CAGR | 100% NIFTYBEES | +12.73%".
+- Phase 15 New Profile A (Mon 06-08 deployment): `70% NIFTYBEES + 30% V38(n=25, m=12)` → **+11.14% CAGR / -12.56% MaxDD / Calmar 0.89 / Sharpe 1.17**.
+- NIFTYBEES alone over same window (Phase 13): +12.73% CAGR / -15.22% MaxDD / Calmar 0.84.
+- **CAGR delta: -1.59pp.** **Calmar delta: +0.05** (5.9% relative improvement). **Sharpe delta: +0.03.**
+- Backtest window: 2022-04-21 → 2026-05-29 (~4 years). **No walk-forward holdout, no out-of-sample test.** `docs/reviews/mode_a_decision_v32_2026-06-01.md:231` "For V38 (deploys 2026-06-08 with default params; sensitivity for later): [ ] Sweep weekly_entry_n ∈ {30, 35, 40}". The Phase 15 winner is `n=25, m=12` — chosen by **grid search on the SAME window**. Pure selection bias.
+- Phase 15 §F lists "Walk-forward holdout: train on 2021-2024, test on 2025-2026" as an UNCHECKED TODO. Not blocking the 06-08 deployment.
+- Phase 15 attribution: 16.5% full-portfolio commodity-ETF exposure (SILVERBEES + GOLDBEES). Window-dependent: 2022-2024 was the gold/silver bull. Future windows may not repeat.
+
+**Business interpretation:** At ₹120k capital, Profile A's CAGR underperformance of NIFTYBEES = **-₹1,908/year of foregone return** vs holding the index alone. Add ~₹30k/year cost burn = **₹31,908/year cost** to run Profile A vs index hold. The improvement in Calmar (0.05 absolute, 5.9% relative) is real but small; the cost to obtain it is ~₹32k/year. **The "Profile A wins on Calmar/Sharpe" framing buries that on the metric that pays the rent (absolute CAGR at retail capital), Profile A LOSES to NIFTYBEES.** This is exactly the question path-forward §2.3 forced into writing: "what CAGR do you need to break even?" at ₹120k = +35%. Profile A delivers +11.14%, NIFTYBEES delivers +12.73%, the bar is +35%. Both lose. The honest framing per path-forward §3 Track A was "Track A passes IF PF ≥ 1.2 AND CAGR ≥ NIFTYBEES + 2%". Profile A passes the first; fails the second by 3.59pp.
+
+**Estimated ₹ impact / day:** ₹1,908/year (CAGR shortfall) ÷ 252 trading days = **~₹7.50/day** vs NIFTYBEES. Plus cost burn at ₹120/day. **Total ~₹130/day economic cost to run Profile A vs index hold**, on a backtest that has zero out-of-sample evidence. Until walk-forward passes, Profile A's edge is "what fit best on 2022-2026, by construction".
+
+**Recommended action:**
+1. **Walk-forward holdout BEFORE 06-08 deployment.** Train on 2021-2024, test on 2025-2026 (Phase 15 §F checklist line 1). If V38(n=25, m=12) does NOT survive the 2025-2026 holdout with ≥ PF 1.5 and ≥ +3pp CAGR vs NIFTYBEES over the holdout window, the deployment is in-sample overfitting and must be deferred.
+2. **Compare Profile A vs 100% NIFTYBEES explicitly in the deployment doc.** The current decision doc compares Phase 15 A vs Phase 14 A (both active strategies). It does NOT compare Phase 15 A vs the operator's actual alternative (do nothing, buy NIFTYBEES with the ₹120k, run zero algo).
+3. **Don't pretend the Calmar gain pays the rent.** Calmar 0.89 vs 0.84 is a 5.9% improvement in risk-adjusted return. The operator is paying ₹30k/year for that improvement on ₹120k capital. **Express that as a ratio**: ₹30k cost / (₹120k × 5.9% Calmar uplift) = 4.2× over-budget on risk-adjusted-improvement-per-rupee. NIFTYBEES alone wins on this lens.
+
+#### 3. Daemon CRITICAL self-assertion of ledger drift unresolved 2+ hours after detection
+
+**Evidence:**
+- `logs/trading_agent_2026-06-01.log:15:20:53` verbatim: "`CRITICAL | [EOD-ASSERT] SOURCE-OF-TRUTH DRIFT: self_sufficiency.cumulative_realised_inr=Rs -1,212.26 vs DB SUM(pnl since 2026-05-14)=Rs -1,804.42; diff=Rs +592.16 > tolerance Rs 0.01. The in-process trader and the on-disk ledger no longer agree on lifetime realised P&L. Most likely cause: a write to data/self_sufficiency.json failed silently in a prior cycle (see SelfSufficiencyTracker.record_realised_pnl exception handler — it logs WARNING but the agent keeps trading). Operator action: rebuild the ledger from the DB OR identify the missing close events from the daemon log.`"
+- 15:20:53 + 1h54m = current time (17:15). Operator has been actively committing Phase 14 + 15 sweeps in the same window (commits `7c1dafa` at 16:29 and `aac7bfc` at 17:00).
+- This is the same finding flagged in Session 3 ("silently optimistic live ledger by ~₹20-25/trade since 2026-05-08, estimating cumulative ₹-1,500 to ₹-1,700"). The actual realised drift is **₹592.16 = larger than Session 3's mid-point estimate**.
+- Verdict-week packet (`docs/freeze/verdict_meeting_packet_2026-06-05.md:88`) cites "₹-1,500 to ₹-1,700" — also lower than the daemon's own measured ₹-1,804.42.
+
+**Business interpretation:** This is the daemon screaming about a P0 data-integrity bug while the operator is heads-down on V40 dual-momentum sweeps. **Two concrete failures: (a) the underlying bug** — `SelfSufficiencyTracker.record_realised_pnl` swallows write exceptions and continues — **is unfixed**; (b) **the operator's response loop** — the daemon's `CRITICAL` does not surface in any review the operator reads. The audit-checkpoint backfill (Finding 4) means even the hourly checkpoint summaries the operator reads aren't generated when the assertion fires; the only place this surfaces is the deep daemon log.
+
+**Estimated ₹ impact / day:** ₹592 of mis-reported P&L today; the bug will continue to widen the gap until fixed. More importantly: **the verdict-week packet and Friday's wind-down decision quote the optimistic ₹-1,212 number**. The DB-derived correct number is ₹-1,804.42. **Friday's meeting will be informed by stale data unless this is corrected before then.**
+
+**Recommended action:**
+1. **Rebuild the ledger from the DB.** Set `data/self_sufficiency.json:cumulative_realised_inr = -1804.42` (the daemon's own recommendation in the EOD-ASSERT log). Backup the old file first per `repo-conventions` DB-snapshot pattern.
+2. **Fix the swallowed-exception bug** in `SelfSufficiencyTracker.record_realised_pnl`. The exception handler currently logs WARNING and continues. Should raise (per fail-fast on ledger writes) OR retry with backoff. P1 because it directly causes the drift this finding is about.
+3. **Surface CRITICAL log lines in the audit checkpoint.** Today's checkpoint template doesn't include daemon-emitted CRITICAL events. If it did, the operator would have seen the EOD-ASSERT at 15:30 instead of buried in the deep log. (Code-bug-review territory; out of brutal-review scope to spec the fix.)
+4. **Update the verdict-week packet** with the corrected ₹-1,804.42 figure before Friday's meeting.
+
+#### 4. Audit-checkpoint scheduler fraudulently reports healthy cadence — 8 checkpoints batch-backfilled at 15:25:00 with identical mtime
+
+**Evidence:**
+- `logs/audit/2026-06-01/` directory listing (PowerShell `Get-ChildItem | Sort-Object LastWriteTime`): all 16 files (`checkpoint_0900.{md,json}` through `checkpoint_1501.{md,json}`) have **`LastWriteTime = 6/1/2026 3:25:00 PM`**. Verified via direct shell, not glob.
+- `changes_done_2026-06-01.md` Phase 5a (committed `22434cd`): "The audit cadence **is** healthy — 4 checkpoints today on the hourly cadence." This was already wrong at write-time (Session 3 §4) — the 4 morning files all had mtime 11:44. Now 4 more files were added in a second batch at 15:25 — the pattern is repeating and worsening, not fixing.
+- No commit today modifies `tools/audit_checkpoint.py` or the scheduler. The "checkpoints look hourly" appearance is being maintained by mass-backfill, not by a working scheduler.
+- Session 3 flagged this as "Action 5" (recommended verifying scheduler health). Action not taken.
+
+**Business interpretation:** Friday's verdict-meeting packet at `docs/freeze/verdict_meeting_packet_2026-06-05.md:115` cites: "Audit checkpoint cadence outage | **SELF-RESOLVED** — 4 hourly checkpoints today (09:00 / 10:01 / 11:00 / 11:36); cadence healthy." **This is false twice over**: (a) the 4 morning checkpoints were not generated hourly, they were backfilled at 11:44, and (b) the next 4 (12:00, 13:00, 14:00, 15:01) were ALSO backfilled at 15:25, NOT generated at the hours their filenames claim. **The verdict-week observability story is fictional**. The operator and any reviewer on Friday reads "cadence healthy" and forms an opinion on stale, batched data. The whole point of hourly cadence is that the operator sees the daemon state DURING the trading day, not in a single end-of-day batch.
+
+**Estimated ₹ impact / day:** Cannot quantify on a per-day basis; the impact is on the integrity of every decision made between now and the Friday verdict meeting. **If the meeting decides to "keep v2.1 running one more week" because checkpoints "look healthy", that decision is rooted in invented observability**. Today's only-zero-trades day is small impact; a future day with real trades and stale checkpoints could mask a real position-drift incident for hours.
+
+**Recommended action:**
+1. **Verify the scheduler** in `tools/audit_checkpoint.py` and the cron/Task Scheduler entry that should be invoking it. If the scheduler isn't running, fix it. If the scheduler is running but failing, capture the failure.
+2. **Correct the verdict-week packet** before Friday. Change "cadence healthy" to "checkpoints are mass-backfilled at end-of-day, real-time cadence broken, operator should not assume during-day visibility". This is the truth.
+3. **Correct `changes_done_2026-06-01.md` Phase 5a** (already noted in Session 3 P2 #5 — not actioned in any of today's 20 commits).
+
+#### 5. V35-V40 (5 new strategies + Engine B + 700 LOC) shipped to `packages/strategies/swing_cash/` with ZERO unit tests; V38 weekly_breakout is Mon 06-08 paper-mode candidate
+
+**Evidence:**
+- Commit `994e6f6` (16:04): "Engine B + 5 new swing strategies (V35-V40 multi-strategy scale-up)". New modules: `donchian_55_20_spec.py`, `mean_reversion_swing_v1.py`, `pullback_to_sma50_v1.py`, `weekly_breakout_v1.py`, `macd_swing_v1.py`, `dual_momentum_relstrength_v1.py`. Plus `packages/research/swing_backtester.py` (Engine B, ~700 LOC).
+- `changes_done_2026-06-01.md:1260` Phase 13 totals: "Tests added | 0 (deferred — engine sanity check serves as the smoke test; unit tests for each strategy's entry/exit logic are queued for v4.1)".
+- Commit `7c1dafa` (16:29): V40 v4.1 engine fix — changed `ExitFn` type signature, added per-bar context. **Engine API change** with **no unit tests**. Phase 14 totals: "Tests added | 0".
+- File check: `tests/unit/test_weekly_breakout*`, `test_dual_momentum*`, `test_macd_swing*`, `test_mean_reversion_swing*`, `test_pullback_to_sma50*` — **NONE EXIST** (verified via Get-ChildItem).
+- V27 in contrast has `tests/unit/test_cross_asset_trend_v27_2026_06_01.py` (7.2 KB) and `tests/unit/test_v27_signals_2026_06_01.py` (17.8 KB). Operator pinned V27 before retuning. V35-V40 were NOT pinned before today's Phase 15 sweep selected one (V38) for Monday paper deployment.
+- Phase 15 §F operator action items line 4: "Phase 16 queued: walk-forward holdout for V38(n=25, m=12) AND V40_decile15 (out-of-sample 2026-01→05) | queued". Walk-forward is queued; unit tests are not on the queue at all.
+
+**Business interpretation:** V38 weekly_breakout is the proposed Monday 06-08 paper-mode strategy. It has ZERO test coverage on its entry rules, exit rules, weekly-resampling logic, or interaction with Engine B's new context-aware exit_fn. The Engine B refactor at 16:29 changed the exit_fn signature for ALL 6 strategies; "engine sanity check re-ran" is described as the regression check — but a sanity check on ONE param set (V35 = V32 baseline) on ONE strategy is NOT regression coverage for 6 strategies × N param settings. This is the v2.1 ensemble anti-pattern recurring: ship now, test later, "test later" never arrives. The forward-plan §9 rule 3 explicitly: "Do not skip the backtest gate to go straight to paper. The backtester is the cheap falsifier." The current plan does the inverse — skips the unit-test gate to go straight to paper backtest. Unit tests are the cheapest falsifier; they catch the silent off-by-one errors that backtests render as "edge".
+
+**Estimated ₹ impact / day:** Bounded on Monday because mode is paper, not live. **Real risk: a logic bug in V38's weekly-resample or rank-drop exit produces a paper P&L that looks favorable for in-sample evidence and triggers a "promote to live" decision** at day 90. The cost of catching that bug post-live (vs pre-paper) is the live capital deployed at the point of detection. At ₹300k+ live capital and a 10% drawdown caused by a logic bug, that's ₹30k+ — order of magnitude larger than the cost of writing 6 modules × 10-15 unit tests each = ~2 days of work.
+
+**Recommended action:**
+1. **Block Monday 06-08 V38 paper-mode deployment until V38 has unit tests.** Minimum: 10 tests on entry signal (Donchian weekly), 10 on exit signal (Donchian weekly + chandelier), 5 on resample correctness (daily → weekly without lookahead). Same for the new Engine B per-bar context behavior.
+2. **Backfill tests for V35, V36, V37, V39, V40** in the same pass even if those aren't Monday's candidate. They will be future candidates per the Phase 15 deployment ladder.
+3. **Run `pytest -q` end-to-end** AFTER the test backfill. The 2,056-passing claim from Phase 5 has not been re-validated since 6+ engine refactors landed.
+
+#### 6. Phase 1 calendar slip — operator started building Mode A at 13:11 IST, 41 minutes after committing Q9 = "start Mon 2026-06-08"
+
+**Evidence:**
+- `docs/reviews/strategy_charter_v4_operator_responses_2026-06-01.md:37` verbatim: "**Q9** | Phase 1 calendar start date | **Mon 2026-06-08** for official Phase 1 (mode-flag flip to paper / live). Pre-Phase-1 scaffolding (new files, no deployment) starts 2026-06-01 afternoon."
+- Commit `2b3088e` at 13:11:38 IST: operator-responses committed. Commit `6cbd348` at 13:12:16 IST: "feat(core): V4 Mode A signal utilities + 75-instrument universe". **Elapsed: 38 seconds.**
+- Operator-responses doc paraphrases the operator's rationale: "if good backtest results come in, we quickly start ASAP on paper-mode for live data on the next Monday."
+- Charter §6 phase calendar: "Phase 1 — Track A backtester build (2026-06-08 to 2026-06-21, ~2 weeks)". The two weeks were the BUILD time, not the back-to-paper time. Phase 2 paper-mode was "2026-06-22 to 2026-09-22, ~3 months".
+- Today's actual cadence: build started 13:12, Phase 13/14/15 retunes done by 17:00, V38 paper-mode decision made for 06-08 deployment. **The Phase 1 + Phase 2 transition has been compressed from "2 weeks build + 3 months paper" into "5 hours build + immediate paper on Monday"**.
+- The "pre-Phase-1 scaffolding" framing is a rebrand. Same code, same commits, same dispatcher, same backtests, same paper-mode plan — re-labeled.
+
+**Business interpretation:** Not strictly a charter violation (the charter §9 rule 1 applies to mid-PAPER iteration). But spirit-violation of the path-forward §6 phase calendar that took 90 minutes to negotiate and the operator agreed to in writing 4 hours ago. The framework was: each phase has its own focus; the discipline is finishing one phase before starting the next. Compressing 3.5 months of phase-1-to-phase-2 timing into 5 hours discards the framework. **The point of the phase structure is that backtest evidence accumulates BEFORE paper deployment**. Today's backtests are all from the SAME 4-hour window on the SAME 4-year universe — no time has elapsed, no walk-forward holdout has been done, no test suite has been run end-to-end.
+
+**Estimated ₹ impact / day:** Indirect — every shortcut from the phase calendar moves the project's expected outcome toward path-forward §7's "Track A backtest passes, paper trades flat, never lives" (25% probability) or "Track A backtest fails" (35-40% probability), and away from the "Track A backtest passes, paper passes, lives" (10-15% probability) outcome. The expected-value cost of compressing the calendar is not capital-loss (paper is paper) but **trajectory-loss**: 6 months from now the operator finds out V38 was overfit, but with 6 months less of "what would the v4 framework have produced if followed"-counterfactual data.
+
+**Recommended action:**
+1. **Stop committing strategy/engine code until the test backfill (Finding 5) lands** AND a fresh `pytest -q` confirms no regression.
+2. **Re-read path-forward §5 phase calendar.** The two-week Phase 1 build was sized for: ETF universe loader (2 days), Donchian (1d), ADX (1d), vol-sizer (2d), risk-parity (3d), benchmark in comparison report (2d), universe manifest with SHA (1d) — total ~12 person-days at 20h/wk = 2 weeks. **You did all this plus 6 new strategies plus a new engine in ONE day** — but at the cost of all unit tests, all walk-forward holdouts, and 3 charter amendments.
+3. **Restore the spirit of the phase calendar**: take the next 5 calendar days (Mon 06-02 through Fri 06-06) to write tests, do walk-forward, fix the EOD-ASSERT, fix the audit-checkpoint scheduler. THEN make the 06-08 paper-mode go/no-go decision based on the walk-forward result, not on the in-sample grid-search.
+
+#### 7. In-sample-only Phase 15 hit-and-trial grid search produces "13 strict-dominance candidates" — textbook selection bias
+
+**Evidence:**
+- `tools/_phase15_profile_a_search_2026_06_01.py:101-247`: loads 14 variant equity curves on the SAME 2022-2026 window, grid-searches across `nb_weight ∈ {50, 60, 65, 70, 75, 80}%` × `active_split ∈ {(100,0), (70,30), (50,50), (30,70), (0,100)}` = 30+ blends per variant pair. Plus single-strategy blends. Selection criterion: "STRICT DOMINANCE = ALL four metrics (CAGR, MaxDD, Calmar, Sharpe) ≥ current Profile A".
+- Output: "13 strict-dominance candidates".
+- Walk-forward holdout listed at Phase 15 §F as TODO, not run.
+- The new Profile A (n=25, m=12) was a winner BY CONSTRUCTION — the only thing tested was "what fits 2022-2026 best". No statistical correction for the multiple comparisons (~30 V38 sweeps × 30 V40 sweeps × 30 blend combinations = on the order of 10,000+ candidate (variant, weight) pairs evaluated; 13 strict winners is below-chance for "true" edge if the underlying signal is noise).
+
+**Business interpretation:** This is the classic "let me try every combination on the same window until one passes" pattern. The path-forward §3 Track A specifically committed "If V27 falls in A2 (borderline), V28 may change EXACTLY ONE parameter... V30 is the FINAL retune. After V30, Mode A is closed for at least 90 days." Today's actual work: 27 variants tested in 4 hours. The discipline that anti-temptation rule 9 ("Do not run V28+ until V27 result is pinned") was filed to enforce is bypassed not by malice but by velocity. **The Phase 15 "strict-dominance upgrade" is the same overfitting that v2.1 V4 was — a winner from a same-window grid search**. v2.1 V4 backtested at PF 1.35, lived at PF < 1.0, was retired in May. There is no out-of-sample evidence that Phase 15 Profile A is different.
+
+**Estimated ₹ impact / day:** Same as Finding 2 (~₹130/day cost burn + CAGR shortfall vs NIFTYBEES). Plus the trajectory risk of mis-attributing in-sample fit to real edge for the next 90 paper days.
+
+**Recommended action:**
+1. **Walk-forward holdout BEFORE Monday deployment.** Train on 2021-2024, test on 2025-2026 with the V38(n=25, m=12) params SELECTED ONLY FROM THE TRAIN WINDOW (i.e. choose params on 2021-2024 alone, then evaluate on 2025-2026 alone). If the test-window CAGR is < +5% AND PF < 1.3, the in-sample fit is not the same animal as out-of-sample edge.
+2. **Adopt walk-forward as Mode A's binding gate** for the next variant sweep, not as a "Phase 16 followup". One walk-forward result is worth more than 14 same-window sweep variants.
+3. **Bonferroni-correct the t-test** that's implicit in "13 strict-dominance candidates". 13 / 10,000 candidate evaluations is ~0.13% — below any reasonable p-value threshold. Recompute the apparent edge with the multiple-comparison correction.
+
+### Things the daemon is telling itself that are not true
+
+* `changes_done_2026-06-01.md` Phase 5a: "audit cadence is healthy" — false twice over (Finding 4). All 16 audit files have mtime 6/1/2026 3:25:00 PM.
+* `mode_a_decision_v32_2026-06-01.md` TL;DR: "**Decision:** Deploy V32... starting 2026-06-08" — was the operative decision at 15:26; superseded at 17:00 by Phase 14 (V38), then by Phase 15 (V38(n=25, m=12)). The doc's TL;DR was correctly UPDATED at the top — but the verdict-meeting packet that points to all these docs has not been updated to reflect that the strategy identity changed THREE TIMES today.
+* `verdict_meeting_packet_2026-06-05.md` §6 "DB-blindspot": "Verdict packet will quote CSV directly and note the DB gap" — actual finding is the OPPOSITE: the DB has data (₹-1,804.42) that's RIGHT, the in-memory ledger has data (₹-1,212.26) that's WRONG. The CSV-vs-DB mismatch from Session 3 is a different bug; this is a third bug (ledger-vs-DB) the daemon caught itself today.
+* Operator-responses doc Q9 commitment: "Phase 1 official start = 2026-06-08; pre-Phase-1 scaffolding starts 06-01 afternoon" — true to the letter, broken in spirit (Finding 6). What was actually executed: Phase 1 build + Phase 2 paper-mode decision compressed into 5 hours.
+* `path_forward_assessment_2026-06-01.md` §6 PK2: "Any single track fires its kill criteria 3 separate times across iterations → that track is permanently closed." Mode A V27 fired A2 (PF 1.10 < 1.20) at 13:15. V28 fired A2/A3 at 14:54. V29 fired A3 (NET LOSS) at 14:54. V32 fired A3 (CAGR fail) at 15:06. **That's 4 kill-criterion fires on Track A in 2 hours**. By PK2 the track is permanently closed. By the charter amendment at 15:26, the failing gate becomes informational and the count resets to zero. **The amendment-mechanic and the kill-mechanic are now in direct conflict**; the amendment-mechanic won today.
+
+### Things that look fine
+
+* V27 module + pin tests are legitimate engineering (2 test files, 25 KB, written before the retunes started).
+* ModeDispatcher skeleton (`b381012`) lands per Q5's hard-cutover commitment — the API surface design is correct.
+* Engine B (`994e6f6`) is genuinely strategy-agnostic — V35 reproducing V32 exactly is a real sanity check on the extraction.
+* V40 v4.1 fix (`7c1dafa`) — the `month_end_rebalance` hack being replaced with proper `rank_drop_out_of_band` is a real improvement (was 69% of V40 v4.0's exits; reduced to 0%). The fix is good; the lack of unit tests around it is the problem.
+* V32 attribution analysis (commit `81a88fc`) confirmed broad-ETF concentration only 3.5% — a real closet-indexing falsification.
+* The §3.10 amendment is at least DOCUMENTED in `mode_a_decision_v32_2026-06-01.md`, not silently shipped. The audit trail exists; what's missing is the `flag: under_emotional_load` per the charter's own rule.
+
+### What I refused to conclude (insufficient evidence)
+
+* **Did `pytest -q` pass after the V35-V40 + Engine B + v4.1 refactor?** No commit message mentions a green run after `c7afba2` (14:30). 5 substantive engine/strategy commits land after that (`ae00241`, `81a88fc`, `8e33e05`, `ead53d6`, `994e6f6`, `7c1dafa`, `aac7bfc`). The 2,056-passing claim from Phase 5 is **stale**.
+* **What's the V32 vs V35 sanity-check tolerance?** "Reproduces exactly to 2 dp" sounds tight, but if the engine refactor introduces a 1-paisa-per-trade drift that grows with N trades, 5 years × 180 trades = 5-figure aggregate drift. Need to see absolute equity-curve diff, not just summary metrics.
+* **What did the operator's local terminal do during 13:11-17:00?** 20 commits at 14-minute average is consistent with heavy delegation to an AI agent. The brutal-review skill explicitly forbids me from reading the operator's terminal transcripts; I can only infer from commit messages. If the operator was reviewing each commit, the velocity is humanly possible but exhausting. If the operator was rubber-stamping, the velocity is the bug.
+* **Is the EOD-ASSERT bug pre-existing or introduced today?** The daemon was restarted at 11:34:36 with CHG-charges code. The EOD-ASSERT fired at 15:20. Without older runs to compare, I can't say whether the SelfSufficiencyTracker bug is from May (silently degrading since 05-08) or from a charge-related interaction introduced today. Code-bug-review territory.
+* **Is `weekly_breakout_v1.py`'s weekly resample correct (no lookahead)?** Cannot verify from review. The strategy module is 200 LOC, written in 4 minutes per the commit-pace heuristic. ZERO unit tests. The exact bug class — "resample includes the current week's incomplete bar in the breakout test" — is the most common silent-edge-creator in weekly-resampled equity strategies. **This must be inspected before paper-mode**.
+
+### Next 24h checklist — operator actions, ranked by P0 → P3
+
+#### P0 — must do before any further code lands
+
+1. **STOP committing strategy/engine code.** No new variants, no new strategies, no engine refactors, no charter amendments. The next 5 days are: test, validate, fix, observe. Not build.
+2. **Fix the EOD-ASSERT.** Rebuild `data/self_sufficiency.json:cumulative_realised_inr` from the DB (`-1804.42` per daemon's own message). Backup the old file to `data/self_sufficiency_pre_ledger_rebuild_2026-06-01.json`. Verify with one cycle. (~10 minutes.)
+3. **Run `pytest -q` end-to-end** to verify the 2,056-passing claim still holds after Phase 13/14/15 code. If anything is red, that's the next finding to file in `docs/bug_found_2026-06-01/`. (~5 minutes.)
+
+#### P1 — must do before Friday's verdict meeting
+
+4. **Revert Amendments #1 and #2 to the charter, OR tag them `flag: under_emotional_load`** in `changes_done_2026-06-01.md` per the charter's own §9 rule 8 (Finding 1). Operator's call which path; either honors the rule. Doing neither is the violation.
+5. **Run the walk-forward holdout for V38(n=25, m=12)**: train on 2021-2024, test on 2025-2026. Use the SAME tool that selected the in-sample winner; just split the window. Result is a pass/fail input to the 06-08 deployment decision. If V38 fails out-of-sample, Mode A is A3 by the unamended charter and 06-08 paper-mode deployment is deferred. (~1 hour of compute + 30 min to write the comparison.)
+6. **Update verdict-meeting packet** with: (a) Phase 12-15 supersession chain (the docs the packet currently points at have all been re-decisioned), (b) the corrected cumulative loss figure (₹-1,804.42 not ₹-1,500 to -1,700), (c) the audit-checkpoint backfill correction (cadence is NOT healthy). Section §6 and §8.G specifically. (~30 minutes.)
+7. **Write unit tests for V38 weekly_breakout** before Monday paper-mode deployment. Minimum 25 tests covering entry signal, exit signal, weekly resample (no lookahead), edge cases (start-of-history, gap days, end-of-window). Without these, do not deploy. (~3-4 hours.)
+
+#### P2 — must do this week
+
+8. **Fix or replace the audit-checkpoint scheduler.** Either (a) repair `tools/audit_checkpoint.py` invocation so checkpoints actually generate hourly, or (b) document that checkpoints are EOD-batch and remove the "cadence healthy" claims from anywhere they appear. The current "fake hourly" pattern is worse than honest end-of-day.
+9. **Backfill unit tests for V35, V36, V37, V39, V40 + Engine B v4.1 context-aware exit_fn**. If V38 passes walk-forward and goes to paper, the other strategies are next candidates; their tests should land before the candidate moment, not after.
+10. **Reconcile the trades.csv vs DB gap** (Session 3 Finding 6 — still open). The today-fired EOD-ASSERT proves the daemon knows there's drift. Either backfill or formally write off; do not leave in limbo through verdict week.
+
+#### P3 — should do this week
+
+11. **Re-read path-forward §9 anti-temptation list aloud.** Specifically rules 2 (no 5th track), 3 (don't skip backtest), 7 (single profitable month ≠ edge), 8 (no amendments under load). Today violated 2, 3 (in spirit), 8 explicitly.
+12. **File a code-bug-review** on `SelfSufficiencyTracker.record_realised_pnl`'s swallowed-exception pattern. Going via `code-bug-review` skill puts it in `docs/bug_found_2026-06-01/`.
+13. **Walk away from the laptop for the rest of today.** The cost-of-fight framework (path-forward §2) explicitly priced in operator-hours; today already burned 5-7 hours of high-cognitive-load delegation. Adding more hours tonight is negative-EV.
+
+### Tomorrow's plan (2026-06-02 Tue) — exact sequence
+
+If the operator picks **discipline over velocity** tomorrow morning:
+
+```
+0900-0930  Run `pytest -q`. Capture results. If red, halt and address.
+0930-0945  Fix EOD-ASSERT. Rebuild self_sufficiency.json from DB. Verify.
+0945-1015  Update verdict-meeting packet with Phase 12-15 supersession + corrected ₹-1,804.42.
+1015-1100  Decision: revert Amendments #1 / #2 OR tag with `flag: under_emotional_load`.
+           File the decision in `changes_done_2026-06-02.md`.
+1100-1230  Walk-forward holdout for V38(n=25, m=12). Train 2021-2024, test 2025-2026.
+           Result determines Mon 06-08 deployment go/no-go.
+1230-1330  Lunch. No commits.
+1330-1700  Write unit tests for V38 (25 minimum). Do not deploy without these.
+1700-1730  Fresh `pytest -q`. Verify green. EOD.
+```
+
+If the operator picks **velocity over discipline** tomorrow morning:
+
+```
+0900-EOD  Whatever feels productive at the time. Strategy variants accumulate.
+          Charter amendments accumulate. Untested code accumulates.
+          On 2026-06-08, V38 deploys to paper without walk-forward.
+          On 2026-09-06 (90-day paper review), the result is whatever
+          in-sample overfitting produces — known unknown probability
+          per path-forward §7.
+          Project converges to the median outcome path-forward §7 predicted
+          ("12-18 months of build, sober wind-down"), but with worse
+          codebase hygiene and zero process learnings.
+```
+
+The first plan honors the framework filed at 12:35 IST. The second plan does not. The adviser's recommendation is the first plan. The choice is the operator's.
+
+### One-sentence Friday-meeting amendment
+
+Add to `verdict_meeting_packet_2026-06-05.md` §7 forward-plan note (filed 12:14-12:18 IST today): **"After-action 17:15 IST: the forward plan referenced above was substantially re-decisioned in 20 commits across 4h45m on the same day it was filed, including 3 charter amendments adopted within 20 minutes of the gates they removed; before Friday's verdict, the post-wind-down forward plan should be re-read against the v4 charter operator-responses doc AND against the brutal-review Session 4 findings, in that order."**
+
+### Verdict — restated
+
+**RED.** The work product is real. The decision discipline that the work product was supposed to be governed by is not.
+
+Wind down v2.1 on Friday as planned. Then decide whether v4 actually has a chance: discipline-first restart vs velocity-first surrender. Today's data points at the latter. Tomorrow morning is the chance to invert that trajectory before paper-mode deployment locks the choice in.
