@@ -1383,7 +1383,7 @@ Added `--strategy-params-file PATH` flag to
 `tools/multi_swing_backtest_2026_06_01.py` (the `--strategy-params-json`
 flag added in the same change has a PowerShell-quote-mangling pitfall,
 documented in the help string). Inputs at
-`tools/_v38_sensitivity_n15.json` and `_v38_sensitivity_n25.json`.
+`data/sweep_params/v38_n15_m8_2026-06-01.json` and `v38_n25_m12_2026-06-01.json` (moved from `tools/` in Phase 16 cleanup).
 
 | `weekly_entry_n` | `weekly_exit_m` | CAGR | PF | MaxDD | Trades |
 |---:|---:|---:|---:|---:|---:|
@@ -1426,7 +1426,7 @@ validating the rank-drop exit logic).
 | `packages/strategies/swing_cash/macd_swing_v1.py` | MODIFIED | exit_fn signature (no behavior change) |
 | `tools/multi_swing_backtest_2026_06_01.py` | MODIFIED | `--strategy-params-file` flag |
 | `tools/_multi_strategy_combo_2026_06_01.py` | NEW | Combo + correlation matrix |
-| `tools/_v38_sensitivity_n15.json` / `_v38_sensitivity_n25.json` | NEW | Sweep inputs |
+| `data/sweep_params/v38_n15_m8_2026-06-01.json` + `v38_n25_m12_2026-06-01.json` | NEW (Phase 16: moved from `tools/_v38_sensitivity_n*.json`) | Sweep inputs |
 | `docs/findings/multi_swing_v35_v40_results_2026-06-01.md` | EXTENDED | Phase 14 addendum (~250 LOC) |
 | `docs/reviews/mode_a_decision_v32_2026-06-01.md` | EXTENDED | Phase 14 supersession header |
 | `logs/v35_attribution_2026-06-01.log` | NEW | V35 = V32 attribution |
@@ -1580,7 +1580,7 @@ Operator may instead pick:
 |---|---|---|
 | `tools/_phase15_sweep_2026_06_01.py` | NEW | 9-variant sweep tool (fetches universe once) |
 | `tools/_phase15_profile_a_search_2026_06_01.py` | NEW | Grid-search Profile A challengers |
-| `tools/_v40_decile_tighter.json` / `_v40_decile_between.json` | NEW | V40 sweep inputs (decile=0.10, 0.18) |
+| `data/sweep_params/v40_decile10_2026-06-01.json` + `v40_decile18_2026-06-01.json` | NEW (Phase 16: moved from `tools/_v40_decile_*.json`) | V40 sweep inputs (decile=0.10, 0.18) |
 | `logs/phase15_sweep_2026-06-01.log` | NEW | 9-variant sweep stdout |
 | `logs/phase15_profile_a_search_2026-06-01.log` | NEW | Portfolio search stdout |
 | `logs/v40_decile15_attribution_2026-06-01.log` | NEW | V40_decile15 attribution (caught 67.6% commodity concentration) |
@@ -1609,6 +1609,112 @@ Operator may instead pick:
 | 2 | Phase 15 SUPERSEDES Phase 14 items 4 (V38 sensitivity) and partially 3 (V40 decile sensitivity done; walk-forward holdout still queued for Phase 16) | — | acknowledge supersession |
 | 3 | If A-Plus chosen instead: explicit acceptance of 33.8% full-portfolio commodity exposure | NO | "agreed and accept" or pick safer profile |
 | 4 | Phase 16 queued: walk-forward holdout for V38(n=25, m=12) AND V40_decile15 (out-of-sample 2026-01→05) | queued | "agreed" or "defer" |
+
+---
+
+## Phase 16 — Convention audit + sweep-param relocation (2026-06-01, 17:45-18:30 IST)
+
+### TL;DR (Phase 16)
+
+Operator asked for a deep mapping of the runtime stack and a self-review
+of whether Phase 13/14/15 introduced format drift. Three parallel
+deep-mapping explorations ran (trader-VM stack, backtester-VM stack,
+directory conventions). Result: **the core Phase 13/14/15 work is
+freeze-safe and conventionally correct in most placement decisions, BUT
+4 sweep-param JSONs were created in the wrong location** (`tools/`
+instead of `data/sweep_params/`). Phase 16 fixes that single drift via
+`git mv` (history preserved) and documents 4 deferred drifts that are
+real but too risky to fix today.
+
+### Phase 16 §A — What was verified (system map)
+
+#### Trader VM (`80.225.251.79`, container `trader`)
+- Entry: `run_daemon.py --paper --interval 60` via `docker compose up -d trader`
+- Live strategies: `rsi_momentum`, `vwap_bounce`, `opening_range_breakout`, `supertrend_follow`
+- Strategy loading: hard-coded imports in `trading_agent.py:_load_registry()` (lines 84-116)
+- **Zero imports of `packages/research/` or `packages/strategies/swing_cash/`** at runtime — confirmed via grep across `trading_agent.py`, `run_daemon.py`, `packages/trader/`, `packages/core/`
+- Audit checkpoint: `trading_agent.py:_maybe_audit_checkpoint()` → `tools/audit_checkpoint.py:run_and_save()` → `logs/audit/<date>/checkpoint_HHMM.{md,json}` (hourly during 09:00-16:00 IST)
+- Logs pulled via `tools/cloud/pull_logs.ps1` (SCP, NOT git or OneDrive sync)
+
+#### Backtester VM (`80.225.197.125`, containers `battery_*`)
+- Entry: `battery-scheduler.service` (systemd) → `tools/run_battery_queue.py` → `docker run python tools/run_battery.py` per job
+- Variants V1-V26 in `packages/research/battery.py:378-677` (legacy `EnsembleBacktester`)
+- Output: `logs/backtests/<run_id>/results/<variant>.json`
+- Retention: `tools/cloud/prune_old_battery_runs.sh` daily at 02:00 UTC
+
+#### Phase 13/14/15 runtime location
+- `packages/research/swing_backtester.py` — research pod, library home, **correct placement**
+- `packages/strategies/swing_cash/*_spec.py` + `*_v1.py` — strategy pod, dual-path naming **correct**
+- `tools/multi_swing_backtest_2026_06_01.py` — runs ONLY on this Windows laptop today, NOT yet integrated with `data/battery_queue.yaml` (Phase 16b will close that gap if V38 is signed off)
+
+### Phase 16 §B — Drifts identified
+
+| # | Drift | Severity | Phase 16 action |
+|---|---|---|---|
+| 1 | 4 JSON sweep params in `tools/` (`_v38_sensitivity_*.json`, `_v40_decile_*.json`) | Convention violation | **FIXED**: `git mv` to `data/sweep_params/` |
+| 2 | `packages/strategies/swing_cash/*_v1.py` import from `packages/research/` | Architectural (pod boundary) | **DEFERRED**: needs `core.strategy_spec` extraction (5+ file refactor); freeze-safe today since no live import path; Phase 17 candidate |
+| 3 | New leading-underscore tools added (`_phase15_*`, `_multi_strategy_combo_*`) violate "no new underscore scripts" rule | Convention | **DOCUMENTED**: matches existing `_v32_*` precedent; lifecycle is "archive after phase complete" or move to `scripts/ops/` in repo-conventions Phase D |
+| 4 | Log run dirs use `2026_06_01` (Python-identifier style) instead of ISO `2026-06-01` | Cosmetic | **APPLY TO FUTURE RUNS ONLY**: renaming committed dirs would break all reproducer commands in docs |
+| 5 | `tools/multi_swing_backtest_2026_06_01.py` is date-stamped but NOT underscored — ambiguous identity | Identity | **DEFERRED**: if Engine B becomes permanent post-verdict, rename to `tools/run_swing_backtest.py` in Phase 17 |
+| 6 | No `data/battery_queue.yaml` entry for V35-V40 / Engine B — runners can't run on backtester VM via systemd today | Deployment gap | **PHASE 16b**: add queue entries before/with V38 paper deploy 06-08; see `docs/reviews/next_steps_2026-06-01.md` |
+| 7 | Hardcoded run-dir paths in `_multi_strategy_combo_*`, `_phase15_profile_a_search_*`, `_v32_*` | Reproducibility | **ACCEPTABLE FOR ONE-OFF ANALYSIS**: documented as known limitation |
+
+### Phase 16 §C — Pre-existing drifts surfaced (not introduced today)
+
+| Item | Status |
+|---|---|
+| `packages/strategies/__init__.py` exports `STRATEGY_REGISTRY` with `trend_pullback` + `breakout_20d` that disagree with `trading_agent.py:_load_registry()` | Pre-existing; risk: tools importing the wrong registry see different roster than live daemon |
+| `position_sizer.py` and `breaker.py` listed in `docs/freeze/FREEZE_v2.1.md` don't exist in tree (sizing in `risk_manager.py`) | Freeze contract references stale file paths |
+| `docs/backtester_vm_runbook.md:21` says `logs/battery/<run_id>/` but code uses `logs/backtests/<run_id>/` | Stale runbook |
+
+These are not Phase 16's problems to fix but are documented here as a pointer for future cleanup or `findings_log` entries.
+
+### Phase 16 §D — What got moved (git mv, history preserved)
+
+| From | To | History |
+|---|---|---|
+| `tools/_v38_sensitivity_n15.json` | `data/sweep_params/v38_n15_m8_2026-06-01.json` | preserved (`R` in git status) |
+| `tools/_v38_sensitivity_n25.json` | `data/sweep_params/v38_n25_m12_2026-06-01.json` | preserved |
+| `tools/_v40_decile_tighter.json` | `data/sweep_params/v40_decile10_2026-06-01.json` | preserved |
+| `tools/_v40_decile_between.json` | `data/sweep_params/v40_decile18_2026-06-01.json` | preserved |
+
+Filename conventions: `<variant>_<param-summary>_<YYYY-MM-DD>.json` (ISO date, descriptive param tag). Same content; just better location and clearer name.
+
+Doc references updated in same commit:
+- `docs/changes/changes_done_2026-06-01.md` (Phase 14 + 15 entries)
+- `docs/reviews/mode_a_decision_v32_2026-06-01.md` (Phase 14 + 15 supersession blocks)
+- `docs/findings/multi_swing_v35_v40_results_2026-06-01.md` (Phase 14 reproducer commands + files list)
+
+### Phase 16 §E — What's NOT being moved (and why)
+
+| File/dir | Reason for keeping in place |
+|---|---|
+| `tools/_phase15_sweep_2026_06_01.py` | Historical reproducer; matches `_v32_*` precedent; moving breaks Phase 15 reproducer commands |
+| `tools/_phase15_profile_a_search_2026_06_01.py` | Same |
+| `tools/_multi_strategy_combo_2026_06_01.py` | Same |
+| `tools/multi_swing_backtest_2026_06_01.py` | Phase 17 candidate for promotion to `tools/run_swing_backtest.py` |
+| `logs/backtests/multi_swing_*_2026_06_01/` | Renaming committed dirs breaks all doc-cited paths |
+| `packages/strategies/swing_cash/*_v1.py` | Naming OK; import-boundary violation is the real fix (Phase 17) |
+
+### Phase 16 §F — Freeze-contract audit
+
+| Item | Status |
+|---|---|
+| Frozen files touched | **0** (no `trading_agent.py`, `config.yaml`, `packages/strategies/*.py` flat, etc. touched) |
+| Trader runtime imports changed | **0** (`packages/research/` and `packages/strategies/swing_cash/` still not imported by live daemon) |
+| Live-behavior changes | **0** (pure filesystem reorg) |
+| Trader-VM SSH commands run | **0** |
+| Sweep params relocated | 4 (all `git mv`, history preserved) |
+| Doc references updated | 6 sections across 3 docs |
+| New files | 1 (`docs/reviews/next_steps_2026-06-01.md` — deploy path for V38) |
+
+### Phase 16 §G — Operator action items
+
+| # | Item | Default | Operator reply needed |
+|---|---|---|---|
+| 1 | Acknowledge Phase 16 reorg (4 JSONs moved; doc refs updated; history preserved) | n/a | "acknowledged" or push back |
+| 2 | Review `docs/reviews/next_steps_2026-06-01.md` for the actual V38 deployment path (the 06-08 dev work + the deferred drifts) | RECOMMENDED | "agreed" or "amend" |
+| 3 | Phase 17 cleanup queued: pod-boundary fix (`StrategySpec` → `core`), runner rename, log-dir date format for future runs | queued | "agreed" or "defer to post-verdict" |
 
 ---
 

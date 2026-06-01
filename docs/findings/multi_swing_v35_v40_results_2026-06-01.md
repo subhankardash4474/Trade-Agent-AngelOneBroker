@@ -481,9 +481,9 @@ same universe, same window. Triggered via:
 
 ```
 python tools/multi_swing_backtest_2026_06_01.py --variants V38 \
-       --tag v38_n15 --strategy-params-file tools/_v38_sensitivity_n15.json
+       --tag v38_n15 --strategy-params-file data/sweep_params/v38_n15_m8_2026-06-01.json
 python tools/multi_swing_backtest_2026_06_01.py --variants V38 \
-       --tag v38_n25 --strategy-params-file tools/_v38_sensitivity_n25.json
+       --tag v38_n25 --strategy-params-file data/sweep_params/v38_n25_m12_2026-06-01.json
 ```
 
 | `weekly_entry_n` | `weekly_exit_m` | CAGR % | PF | MaxDD % | Trades |
@@ -662,7 +662,7 @@ Reasoning:
 ### Files this addendum
 
 - `tools/_multi_strategy_combo_2026_06_01.py` (new, ~250 LOC)
-- `tools/_v38_sensitivity_n15.json` / `_v38_sensitivity_n25.json` (small JSON inputs)
+- `data/sweep_params/v38_n15_m8_2026-06-01.json` / `v38_n25_m12_2026-06-01.json` (small JSON inputs; moved from `tools/` in Phase 16)
 - `packages/research/swing_backtester.py` (engine v4.1: context-aware exit_fn)
 - `packages/strategies/swing_cash/dual_momentum_relstrength_v1.py` (V40 v4.1: rank-drop exits)
 - `packages/strategies/swing_cash/{donchian_55_20_spec,mean_reversion_swing_v1,pullback_to_sma50_v1,weekly_breakout_v1,macd_swing_v1}.py` (exit_fn signature update — context arg)

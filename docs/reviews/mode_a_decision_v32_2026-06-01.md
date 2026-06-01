@@ -209,7 +209,7 @@ strategies:
 |---|---|---|
 | `tools/_phase15_sweep_2026_06_01.py` | NEW | 9-variant sweep tool, fetches universe once |
 | `tools/_phase15_profile_a_search_2026_06_01.py` | NEW | Grid-search Profile A challengers |
-| `tools/_v40_decile_tighter.json` / `_v40_decile_between.json` | NEW | V40 sweep inputs |
+| `data/sweep_params/v40_decile10_2026-06-01.json` + `v40_decile18_2026-06-01.json` | NEW (Phase 16: moved from `tools/`) | V40 sweep inputs |
 | `logs/phase15_sweep_2026-06-01.log` | NEW | 9-variant sweep stdout |
 | `logs/phase15_profile_a_search_2026-06-01.log` | NEW | Portfolio search stdout |
 | `logs/v40_decile15_attribution_2026-06-01.log` | NEW | V40_decile15 attribution (caught commodity concentration) |
@@ -247,7 +247,7 @@ For V38 (deploys 2026-06-08 with default params; sensitivity for later):
 - `docs/findings/multi_swing_v35_v40_results_2026-06-01.md` (Phase 14 addendum)
 - `docs/changes/changes_done_2026-06-01.md` (Phase 14 entry)
 - `tools/_multi_strategy_combo_2026_06_01.py` (combo + correlation tool)
-- `tools/_v38_sensitivity_n15.json`, `tools/_v38_sensitivity_n25.json` (param sweep inputs)
+- `data/sweep_params/v38_n15_m8_2026-06-01.json`, `data/sweep_params/v38_n25_m12_2026-06-01.json` (param sweep inputs; moved from `tools/` in Phase 16)
 - `packages/research/swing_backtester.py` (engine v4.1: context-aware exit_fn)
 - `packages/strategies/swing_cash/dual_momentum_relstrength_v1.py` (V40 v4.1 fix)
 - `logs/multi_strategy_combo_v41_2026-06-01.log` (full combo output)
