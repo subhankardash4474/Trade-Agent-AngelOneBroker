@@ -152,6 +152,7 @@ def _exit(
     df_today: pd.DataFrame,
     position: OpenPosition,
     params: Dict[str, Any],
+    context: Dict[str, Any],  # v4.1: engine passes per-bar context; unused here
 ) -> Optional[str]:
     exit_m_weeks = int(params.get("weekly_exit_m", DEFAULT_WEEKLY_EXIT_M))
     max_time = int(params.get("max_time_in_trade_bars", DEFAULT_MAX_TIME_BARS))

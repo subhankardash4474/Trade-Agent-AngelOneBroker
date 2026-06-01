@@ -171,6 +171,7 @@ def _exit(
     df_today: pd.DataFrame,
     position: OpenPosition,
     params: Dict[str, Any],
+    context: Dict[str, Any],  # v4.1: engine passes per-bar context; unused here
 ) -> Optional[str]:
     fast = int(params.get("macd_fast", DEFAULT_MACD_FAST))
     slow = int(params.get("macd_slow", DEFAULT_MACD_SLOW))

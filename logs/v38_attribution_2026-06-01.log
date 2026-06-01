@@ -1,0 +1,52 @@
+﻿=== V32 per-symbol attribution ===
+Source: logs\backtests\multi_swing_firstrun_2026_06_01\V38_weekly_breakout\trades.csv
+Total trades: 81
+Total net P&L: Γé╣20,765.41
+Win rate: 39.5%
+
+=== TOP 15 CONTRIBUTORS (by net P&L) ===
+            n_trades  wins  net_pnl  gross_profit  gross_loss  pct_of_net
+symbol                                                                   
+SILVERBEES         2     1    8,117         8,425        -308          39
+GOLDBEES           2     2    4,609         4,609           0          22
+BAJAJ-AUTO         2     2    3,973         3,973           0          19
+EICHERMOT          5     3    2,312         3,023        -711          11
+HEROMOTOCO         2     2    2,039         2,039           0          10
+NTPC               3     1    1,700         2,796      -1,096           8
+BHARTIARTL         1     1    1,662         1,662           0           8
+ITC                3     2    1,495         2,033        -538           7
+SBIN               1     1    1,164         1,164           0           6
+ADANIGREEN         1     1    1,143         1,143           0           6
+GRASIM             1     1      881           881           0           4
+BAJFINANCE         1     1      824           824           0           4
+ABB                1     1      806           806           0           4
+GAIL               1     1      777           777           0           4
+ZYDUSLIFE          1     1      745           745           0           4
+
+=== BOTTOM 10 (worst losers) ===
+            n_trades  wins  net_pnl  gross_profit  gross_loss  pct_of_net
+symbol                                                                   
+APOLLOHOSP         1     0     -619             0        -619          -3
+PSUBNKBEES         2     0     -635             0        -635          -3
+TECHM              1     0     -646             0        -646          -3
+WIPRO              1     0     -685             0        -685          -3
+DMART              1     0     -755             0        -755          -4
+ADANIPORTS         2     0     -812             0        -812          -4
+TATASTEEL          1     0     -850             0        -850          -4
+TITAN              1     0     -962             0        -962          -5
+RELIANCE           2     0   -1,035             0      -1,035          -5
+COALINDIA          2     0   -1,429             0      -1,429          -7
+
+=== AGGREGATED BY BUCKET ===
+                  n_trades  net_pnl  unique_symbols  pct_of_net
+bucket                                                         
+commodity_etf            4 12,726.3               2        61.3
+individual_stock        70  8,510.0              44        41.0
+broad_etf                4    486.1               2         2.3
+sector_etf               3   -956.9               2        -4.6
+
+=== HEADLINE ===
+Broad ETFs (NIFTYBEES+JUNIORBEES+BANKBEES+NIFTYIETF) contribute 2.3% of V32's net P&L.
+
+VERDICT: V32's edge comes primarily from individual stocks;
+         broad-ETF concentration is a minor factor.

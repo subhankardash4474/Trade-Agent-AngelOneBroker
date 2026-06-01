@@ -1,0 +1,100 @@
+﻿Loading equity curves for V35, V38, V40 (v4.1) ...
+  V35: 1016 daily bars, 2022-04-21 ΓåÆ 2026-05-29, end Γé╣112,185
+  V38: 1016 daily bars, 2022-04-21 ΓåÆ 2026-05-29, end Γé╣120,996
+  V40: 976 daily bars, 2022-06-17 ΓåÆ 2026-05-29, end Γé╣126,825
+
+Loading NIFTYBEES daily prices via yfinance ...
+  NIFTYBEES: 976 bars, end Γé╣160,472
+
+Window:          2022-06-17 ΓåÆ 2026-05-29 (3.95 years)
+Initial capital: Γé╣100,000
+
+==============================================================================================================
+PURE BASELINES (100% capital in one instrument)
+==============================================================================================================
+NIFTYBEES alone (100%)                             CAGR= +12.73%  MaxDD= -15.23%  Calmar= 0.84  Sharpe= 1.10
+V35 (= V32 Donchian-55/20) alone (100%)            CAGR=  +3.82%  MaxDD=  -7.80%  Calmar= 0.49  Sharpe= 0.76
+V38 weekly_breakout alone (100%)                   CAGR=  +6.37%  MaxDD=  -8.35%  Calmar= 0.76  Sharpe= 0.99
+V40 dual_momentum (v4.1) alone (100%)              CAGR=  +6.20%  MaxDD=  -7.88%  Calmar= 0.79  Sharpe= 1.10
+
+==============================================================================================================
+DAILY-RETURN CORRELATION MATRIX
+==============================================================================================================
+       V35    V38    V40     NB
+V35  1.000  0.698  0.551  0.501
+V38  0.698  1.000  0.590  0.461
+V40  0.551  0.590  1.000  0.594
+NB   0.501  0.461  0.594  1.000
+
+Interpretation:
+  V35 Γåö V38:  0.698  (load-bearing ΓÇö are V32 and V38 actually different strategies?)
+  V35 Γåö V40:  0.551  (load-bearing ΓÇö V40 is the cleanest individual-stock-driven candidate)
+  V38 Γåö V40:  0.590  (if low, V38 + V40 is a strong pair without V32)
+  V35 Γåö NB:   0.501  (V32 vs passive ΓÇö should be low; if not, V32 IS closet-indexing)
+  V38 Γåö NB:   0.461  (V38 vs passive)
+  V40 Γåö NB:   0.594  (V40 vs passive)
+
+==============================================================================================================
+NIFTYBEES + SINGLE-STRATEGY BLENDS
+==============================================================================================================
+30% NB + 70% V35                                   CAGR=  +6.79%  MaxDD=  -8.64%  Calmar= 0.79  Sharpe= 1.05
+50% NB + 50% V35                                   CAGR=  +8.61%  MaxDD= -10.93%  Calmar= 0.79  Sharpe= 1.08
+70% NB + 30% V35                                   CAGR= +10.33%  MaxDD= -12.86%  Calmar= 0.80  Sharpe= 1.09
+
+30% NB + 70% V38                                   CAGR=  +8.47%  MaxDD=  -9.28%  Calmar= 0.91  Sharpe= 1.18
+50% NB + 50% V38                                   CAGR=  +9.77%  MaxDD= -11.15%  Calmar= 0.88  Sharpe= 1.18
+70% NB + 30% V38                                   CAGR= +11.00%  MaxDD= -12.86%  Calmar= 0.86  Sharpe= 1.14
+
+30% NB + 70% V40                                   CAGR=  +8.28%  MaxDD= -10.32%  Calmar= 0.80  Sharpe= 1.20
+50% NB + 50% V40                                   CAGR=  +9.61%  MaxDD= -11.75%  Calmar= 0.82  Sharpe= 1.18
+70% NB + 30% V40                                   CAGR= +10.89%  MaxDD= -13.24%  Calmar= 0.82  Sharpe= 1.14
+
+==============================================================================================================
+MULTI-STRATEGY ACTIVE SLEEVES (V32 + V38 + V40 in various weightings)
+==============================================================================================================
+100% equal_thirds (V35=33%, V38=33%, V40=33%)      CAGR=  +5.48%  MaxDD=  -6.46%  Calmar= 0.85  Sharpe= 1.10
+100% pf_weighted (V35=24%, V38=36%, V40=38%)       CAGR=  +5.69%  MaxDD=  -6.49%  Calmar= 0.88  Sharpe= 1.13
+100% v38_v40_only_eq (V35=0%, V38=50%, V40=50%)    CAGR=  +6.28%  MaxDD=  -6.84%  Calmar= 0.92  Sharpe= 1.16
+100% v40_heavy (V35=10%, V38=30%, V40=60%)         CAGR=  +6.02%  MaxDD=  -6.91%  Calmar= 0.87  Sharpe= 1.16
+100% v38_heavy (V35=10%, V38=60%, V40=30%)         CAGR=  +6.07%  MaxDD=  -6.28%  Calmar= 0.97  Sharpe= 1.11
+
+--------------------------------------------------------------------------------------------------------------
+NIFTYBEES + MULTI-STRATEGY BLENDS (sleeve = equal_thirds)
+--------------------------------------------------------------------------------------------------------------
+30% NB + 70% multi(eq3)                            CAGR=  +7.86%  MaxDD=  -9.36%  Calmar= 0.84  Sharpe= 1.19
+50% NB + 50% multi(eq3)                            CAGR=  +9.33%  MaxDD= -11.21%  Calmar= 0.83  Sharpe= 1.16
+70% NB + 30% multi(eq3)                            CAGR= +10.74%  MaxDD= -12.99%  Calmar= 0.83  Sharpe= 1.13
+
+--------------------------------------------------------------------------------------------------------------
+NIFTYBEES + MULTI-STRATEGY BLENDS (sleeve = pf_weighted)
+--------------------------------------------------------------------------------------------------------------
+30% NB + 70% multi(pf-w)                           CAGR=  +7.99%  MaxDD=  -9.49%  Calmar= 0.84  Sharpe= 1.20
+50% NB + 50% multi(pf-w)                           CAGR=  +9.42%  MaxDD= -11.25%  Calmar= 0.84  Sharpe= 1.17
+70% NB + 30% multi(pf-w)                           CAGR= +10.79%  MaxDD= -13.01%  Calmar= 0.83  Sharpe= 1.13
+
+==============================================================================================================
+MAX-DRAWDOWN TIMING DECOMPOSITION
+==============================================================================================================
+When each strategy hits its own MaxDD trough, what are the OTHERS doing?
+(if they're also at -ve DD it's a synchronized DD; if they're flat/up it's
+ genuine diversification)
+
+
+V35 MaxDD: -7.80% at 2023-05-23
+    on this date V38 dd = -3.28%
+    on this date V40 dd = -6.22%
+    on this date NB dd = -2.20%
+
+V38 MaxDD: -8.35% at 2026-02-02
+    on this date V35 dd = -6.21%
+    on this date V40 dd = -1.25%
+    on this date NB dd = -4.57%
+
+V40 MaxDD: -7.88% at 2025-04-07
+    on this date V35 dd = -4.60%
+    on this date V38 dd = -5.72%
+    on this date NB dd = -14.68%
+
+==============================================================================================================
+END
+==============================================================================================================

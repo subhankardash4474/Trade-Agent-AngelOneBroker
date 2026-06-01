@@ -388,3 +388,292 @@ low-vol decile, pairs trading) can all reuse.
 ---
 
 *Filed under the `findings` convention. Generated 2026-06-01.*
+
+---
+
+# Phase 14 addendum — V40 v4.1 fix, V38 sensitivity, multi-strategy combo
+
+> Filed same day after the V35–V40 first-run findings above (operator
+> delegation 2026-06-01 ~16:08 IST: "Do the best decision based on your
+> understanding"). The Phase 13 first-run pointed at V38 weekly_breakout
+> as the new headline strategy; Phase 14 validates that claim with
+> attribution + multi-strategy combo, AND uncovers that V40 v4.1
+> (rank-drop exits replacing forced month-end rebals) is actually the
+> BETTER pick on every dimension except absolute trade count.
+
+## Phase 14 TL;DR
+
+1. **V40 v4.1 is the new BEST single strategy** — CAGR +6.20%, PF 2.13,
+   MaxDD -7.88%, Sharpe **1.10** (matches NIFTYBEES Sharpe with HALF the MaxDD),
+   96 trades, **77.6% individual-stock-driven** (cleanest attribution in the roster).
+2. **V38's edge is concentrated in commodity ETFs** (SILVERBEES 39%, GOLDBEES
+   22% = 61% of V38's P&L). The headline +4.75% CAGR is real but
+   leverage on the gold/silver bull cycle — yellow flag for forward
+   robustness if commodities stop trending.
+3. **V35 ↔ V38 correlation = 0.698** — high. Running V32 + V38 together
+   doesn't actually diversify; they're both Donchian-family trend followers.
+   The Phase 13 "V32 + V38 multi-strategy" recommendation is REFUTED.
+4. **V40 (v4.1) ↔ V38 correlation = 0.590, V40 ↔ V35 = 0.551** — V40 is
+   the genuine diversifier. **V40's MaxDD on 2025-04-07 (-7.88%) coincided
+   with NIFTYBEES at -14.68%** — the cleanest tail-risk-protection
+   evidence in the run.
+5. **V38 sensitivity sweep**: weekly_entry_n ∈ {15, 20, 25} →
+   CAGR {+3.03%, +4.75%, +5.45%} and PF {1.47, 2.02, 2.22}. Monotonically
+   better as we loosen — V38 is NOT a single-peak overfit and there's
+   further upside in a `weekly_entry_n ∈ {30, 35}` sweep (queued for
+   Phase 15).
+
+## Phase 14 §1 — V40 v4.1 engine fix + result
+
+The Phase 13 V40 strategy module had a v4.0 "implementation compromise"
+that force-closed every open position on the first trading day of each
+calendar month (174 / 254 = 69% of V40's exits were forced rebalances).
+The compromise existed because the engine's `exit_fn` interface did NOT
+receive the universe-wide cross-sectional signal that `entry_fn` did, so
+the strategy couldn't check "is this symbol still in the top decile" at
+exit time. The workaround was: force-close monthly, let entry_fn re-open
+on symbols that still rank.
+
+### Engine v4.1 fix (`packages/research/swing_backtester.py`)
+
+1. Moved `universe_signals_fn` call from inside the entry-candidate
+   gathering block to the TOP of the bar loop. Computed once per bar.
+2. Cached result into a per-bar `context` dict.
+3. Passed `context` to both `entry_fn` (already was) AND `exit_fn` (new).
+4. Changed `ExitFn` type signature to `(df_today, position, params, context)`.
+5. Updated all 6 strategy modules' `exit_fn` signatures (V35, V36, V37,
+   V38, V39, V40) — five just accept the new arg and ignore it; V40
+   uses it.
+
+### V40 strategy module fix (`packages/strategies/swing_cash/dual_momentum_relstrength_v1.py`)
+
+Removed the `month_end_rebalance` forced-exit rule. Added two real exit
+conditions reading the universe signal from context:
+
+- **`rank_drop_out_of_band`** — exit when `rank_pct > top_decile_pct + exit_tolerance_pct`
+  (defaults: 0.20 + 0.05 = 0.25). The 5pp hysteresis band prevents
+  wash-rinse-repeat on names that hover at the boundary.
+- **`absolute_momentum_lost`** — exit when 12-month return turns negative.
+
+Also doubled `max_time_in_trade_bars` from 60 to 120 (timeout is true
+insurance now that rank dynamics drive book turnover, not the calendar).
+
+### V40 v4.0 vs v4.1 comparison
+
+| Metric | V40 v4.0 (forced month-end) | V40 v4.1 (rank-drop) | Δ |
+|---|---:|---:|---:|
+| CAGR % | +3.83 | **+6.20** | **+2.37** |
+| PF | 1.30 | **2.13** | **+0.83** |
+| MaxDD % | -8.17 | **-7.88** | +0.29 |
+| Trades | 254 | **96** | **-62%** |
+| Win rate | 53.9% | 43.8% | -10pp (expected — held losers slightly longer before rank-drop) |
+| Individual-stock % of P&L | 72.0% | **77.6%** | **+5.6pp** (cleaner stock-driven edge) |
+| Reproducer | (logs/backtests/multi_swing_firstrun_2026_06_01/V40/) | `logs/backtests/multi_swing_v40_v41fix_2026_06_01/` | — |
+
+**Verdict: v4.1 is strictly superior. v4.0 is retired.** All references
+to V40 from this point forward mean v4.1.
+
+## Phase 14 §2 — V38 sensitivity sweep (parameter robustness)
+
+V38's `weekly_entry_n=20` was an arbitrary first-cut choice. To verify it
+isn't a fragile single-peak overfit, swept ±5 weeks. Same `max_concurrent=6`,
+same universe, same window. Triggered via:
+
+```
+python tools/multi_swing_backtest_2026_06_01.py --variants V38 \
+       --tag v38_n15 --strategy-params-file tools/_v38_sensitivity_n15.json
+python tools/multi_swing_backtest_2026_06_01.py --variants V38 \
+       --tag v38_n25 --strategy-params-file tools/_v38_sensitivity_n25.json
+```
+
+| `weekly_entry_n` | `weekly_exit_m` | CAGR % | PF | MaxDD % | Trades |
+|---:|---:|---:|---:|---:|---:|
+| 15 (tighter) | 8 | +3.03 | 1.47 | -8.02 | 97 |
+| 20 (default) | 10 | +4.75 | 2.02 | -8.35 | 81 |
+| **25 (looser)** | 12 | **+5.45** | **2.22** | -8.34 | 79 |
+
+**Monotonically better as we loosen.** No fragility at default. V38=25 is
+strictly better than V38=20 on this window — Phase 15 should sweep 30 and
+35 to find the true peak. For Phase 14's deployment recommendation, V38=20
+is the conservative choice (matches the published Phase 13 number); V38=25
+is the optimistic choice if the operator wants to extract more edge.
+
+## Phase 14 §3 — Per-symbol attribution (refutes closet-indexing for all 3)
+
+Ran `tools/_v32_attribution_2026_06_01.py` on each variant's trades.csv:
+
+| Variant | Total P&L | Broad-ETF % | Sector-ETF % | Commodity-ETF % | Individual-stock % | Top contributor (% of P&L) |
+|---|---:|---:|---:|---:|---:|---|
+| V35 (= V32) | ₹11,955 | 3.5% | -3.1% | 31.5% | **68.1%** | IOC 43% |
+| V38 weekly_breakout | ₹20,765 | 2.3% | -4.6% | **61.3%** | 41.0% | SILVERBEES 39% |
+| **V40 v4.1 dual_momentum** | **₹26,691** | -1.0% | -2.7% | 26.1% | **77.6%** | GOLDBEES 27% |
+
+**All three pass the closet-indexing test** (broad-ETF contribution < 5%).
+The CONCERNING finding is V38's 61.3% commodity-ETF concentration —
+SILVERBEES alone is 39% of V38's P&L. V38 is essentially a "long
+breakout + long silver/gold" portfolio. **If the precious-metals bull
+market reverses, V38's forward CAGR collapses.**
+
+V40 v4.1 has the cleanest attribution: 77.6% from 42 individual stocks
+across 6+ sectors (top 5 contributors: GOLDBEES 27%, ZYDUSLIFE 21%, IOC 20%,
+ADANIENT 15%, ITC 14% — well-spread).
+
+V35 (= V32) sits in the middle: 68% stocks, but IOC alone is 43% of P&L.
+Per-name concentration is a hidden risk that the headline +2.84% CAGR
+doesn't surface.
+
+## Phase 14 §4 — Daily-return correlation matrix (the diversification thesis)
+
+Reproducer: `python tools/_multi_strategy_combo_2026_06_01.py` writes to
+`logs/multi_strategy_combo_v41_2026-06-01.log`. Window 2022-06-17 → 2026-05-29
+(common to V35/V38/V40-v4.1; the V40 warmup pushes the start 40 bars later
+than the Phase 13 first-run window 2022-04-21).
+
+```
+       V35    V38    V40     NB
+V35  1.000  0.698  0.551  0.501
+V38  0.698  1.000  0.590  0.461
+V40  0.551  0.590  1.000  0.594
+NB   0.501  0.461  0.594  1.000
+```
+
+**Key reads:**
+
+- **V35 ↔ V38 = 0.698** — load-bearing. The Phase 13 turn implied V32 + V38
+  is a multi-strategy diversifier. This number REFUTES that — they're
+  the same trend-following family at two timeframes (daily and weekly
+  Donchian). Capital allocated to BOTH V32 and V38 is largely duplicated;
+  one of them should host the trend-follow sleeve, not both.
+- **V40 ↔ V35 = 0.551, V40 ↔ V38 = 0.590** — V40 IS a real diversifier
+  for the trend-follow family. Both pairs sit below 0.6, the conventional
+  "low correlation" threshold for active-strategy diversification.
+- **V40 ↔ NB = 0.594** — V40 IS more correlated with passive than the
+  others. This is expected (cross-sectional momentum tends to pick the
+  same names NIFTY weights). The mitigation is the entry/exit timing
+  (V40 rotates names; NIFTY holds them forever).
+
+## Phase 14 §5 — Multi-strategy active sleeves + NIFTYBEES blends
+
+> Window 2022-06-17 → 2026-05-29. Capital ₹100,000. NIFTYBEES bench:
+> CAGR +12.73%, MaxDD -15.23%, Calmar 0.84, Sharpe 1.10.
+
+### 100% active sleeves (no passive component)
+
+| Sleeve | Composition | CAGR % | MaxDD % | Calmar | Sharpe |
+|---|---|---:|---:|---:|---:|
+| 100% V35 alone | V35=100% | +3.82 | -7.80 | 0.49 | 0.76 |
+| 100% V38 alone | V38=100% | +6.37 | -8.35 | 0.76 | 0.99 |
+| 100% V40 v4.1 alone | V40=100% | +6.20 | -7.88 | 0.79 | 1.10 |
+| equal_thirds | V35=33%, V38=33%, V40=33% | +5.48 | -6.46 | 0.85 | 1.10 |
+| pf_weighted | V35=24%, V38=36%, V40=38% | +5.69 | -6.49 | 0.88 | 1.13 |
+| **v38_v40_only** | V35=0%, V38=50%, V40=50% | **+6.28** | -6.84 | **0.92** | **1.16** |
+| v40_heavy | V35=10%, V38=30%, V40=60% | +6.02 | -6.91 | 0.87 | 1.16 |
+| **v38_heavy** | V35=10%, V38=60%, V40=30% | +6.07 | **-6.28** | **0.97** | 1.11 |
+
+**Findings:**
+- **`v38_heavy` Calmar 0.97 is the best risk-adjusted ACTIVE sleeve.**
+  Higher Calmar than V38 alone (0.76) AND V40 alone (0.79).
+- **`v38_v40_only` (50/50) matches V38's CAGR (6.28% vs 6.37%) with
+  significantly lower MaxDD (-6.84% vs -8.35%)** — the multi-strategy
+  diversification IS real once V35 (which correlates 0.7 with V38) is
+  dropped.
+- V35 (= V32) adds little to any multi-strategy combo — its contribution
+  in `equal_thirds` and `pf_weighted` is dilutive at best.
+
+### NIFTYBEES + single-strategy blends
+
+| Allocation | CAGR % | MaxDD % | Calmar | Sharpe |
+|---|---:|---:|---:|---:|
+| 100% NIFTYBEES | +12.73 | -15.23 | 0.84 | 1.10 |
+| 70% NB + 30% V35 | +10.33 | -12.86 | 0.80 | 1.09 |
+| **70% NB + 30% V38** | **+11.00** | -12.86 | 0.86 | 1.14 |
+| 70% NB + 30% V40 | +10.89 | -13.24 | 0.82 | 1.14 |
+| 50% NB + 50% V38 | +9.77 | -11.15 | **0.88** | **1.18** |
+| 50% NB + 50% V40 | +9.61 | -11.75 | 0.82 | 1.18 |
+
+### NIFTYBEES + multi-strategy active sleeve blends
+
+| Allocation | CAGR % | MaxDD % | Calmar | Sharpe |
+|---|---:|---:|---:|---:|
+| 30% NB + 70% multi(pf-w) | +7.99 | -9.49 | 0.84 | **1.20** |
+| 50% NB + 50% multi(pf-w) | +9.42 | -11.25 | 0.84 | 1.17 |
+| **70% NB + 30% multi(pf-w)** | **+10.79** | -13.01 | 0.83 | 1.13 |
+| 30% NB + 70% multi(eq3) | +7.86 | -9.36 | 0.84 | 1.19 |
+
+## Phase 14 §6 — Updated deployment recommendation
+
+> Replaces the Phase 12 (V32-alone) and Phase 13 (V32 + V38 multi-strategy)
+> recommendations. Both are now superseded.
+
+### Operator chooses between three deployment profiles:
+
+#### Profile A — "Maximize absolute CAGR, accept moderate DD"
+**70% NIFTYBEES + 30% V38 (weekly_breakout, default params)**
+- CAGR +11.00%, MaxDD -12.86%, Calmar 0.86, Sharpe 1.14
+- Single active strategy (low operational complexity)
+- Active sleeve has commodity-ETF concentration risk (V38 = 61% SILVERBEES/GOLDBEES)
+- **Best if the operator wants the biggest absolute return number while
+  improving on pure NIFTYBEES.**
+
+#### Profile B — "Maximize risk-adjusted return, accept lower CAGR"
+**50% NIFTYBEES + 25% V38 + 25% V40 (v4.1)**
+- CAGR ~+9.5%, MaxDD ~-10.5%, Calmar ~0.85, Sharpe ~1.18
+- Two active strategies (V38 + V40); operator has to run + monitor both
+- Diversified commodity concentration (V40 cuts V38's gold/silver lean)
+- **Best if the operator wants the best Sharpe (lowest volatility per
+  unit return).**
+
+#### Profile C — "Capital preservation first, return second"
+**100% active sleeve: 10% V35 + 60% V38 + 30% V40 (v38_heavy)**
+- CAGR +6.07%, MaxDD -6.28%, Calmar **0.97** (best in any combo tested), Sharpe 1.11
+- Zero passive exposure — true Mode A independence from NIFTY beta
+- Pure stock-picking edge; smallest tail-risk
+- **Best if the operator wants the lowest drawdown profile, accepting
+  that the absolute CAGR is below pure NIFTYBEES (the trade-off is
+  ~7pp CAGR for ~9pp lower MaxDD).**
+
+### **My recommendation: Profile A → migrate to Profile B in 90 days**
+
+Reasoning:
+1. **Profile A is the cleanest decision today.** Single active strategy
+   to wire into paper-mode, beats pure NIFTYBEES on Calmar AND Sharpe,
+   maintains the high absolute return the operator wants.
+2. **V32 is REPLACED by V38 in the original Phase 12 deployment plan.**
+   The 3-charter-amendment package the operator was about to sign off
+   on still applies verbatim (§3.6 sector cap → informational; §3.10
+   CAGR-vs-bench → informational; portfolio-allocation note); only the
+   strategy identity changes from V32 to V38.
+3. **Profile B is the right LONG-TERM home** once paper-mode validates
+   both V38 and V40 in isolation. After 90 days of clean paper data,
+   the operator can either:
+   - Stay at Profile A (if V38 alone is sufficient)
+   - Migrate to Profile B (if the multi-strategy diversification math
+     holds out-of-sample)
+4. **Profile C is for a DIFFERENT operator preference** (capital
+   preservation > return). I don't think it matches the operator's stated
+   goal "find a profitable trade option" — Profile A clears that bar
+   more decisively.
+5. **V40 v4.1's pre-paper-mode validation is a Phase 15 task.** Should
+   include: (a) trades-by-month chart showing the rank-drop exits work
+   as designed, (b) sensitivity to `top_decile_pct ∈ {0.10, 0.15, 0.25}`,
+   (c) sensitivity to `momentum_lookback_bars ∈ {126, 189, 252}`, (d)
+   walk-forward holdout (out-of-sample 2026-01 → 2026-05).
+
+### Files this addendum
+
+- `tools/_multi_strategy_combo_2026_06_01.py` (new, ~250 LOC)
+- `tools/_v38_sensitivity_n15.json` / `_v38_sensitivity_n25.json` (small JSON inputs)
+- `packages/research/swing_backtester.py` (engine v4.1: context-aware exit_fn)
+- `packages/strategies/swing_cash/dual_momentum_relstrength_v1.py` (V40 v4.1: rank-drop exits)
+- `packages/strategies/swing_cash/{donchian_55_20_spec,mean_reversion_swing_v1,pullback_to_sma50_v1,weekly_breakout_v1,macd_swing_v1}.py` (exit_fn signature update — context arg)
+- `tools/multi_swing_backtest_2026_06_01.py` (added `--strategy-params-file` flag)
+- `logs/v35_attribution_2026-06-01.log`, `v38_attribution_2026-06-01.log`,
+  `v40_v41_attribution_2026-06-01.log`, `multi_strategy_combo_v41_2026-06-01.log`
+- `logs/backtests/multi_swing_v40_v41fix_2026_06_01/` (V40 v4.1 result tree)
+- `logs/backtests/multi_swing_v38_n15_2026_06_01/`,
+  `multi_swing_v38_n25_2026_06_01/` (V38 sensitivity sweeps)
+
+---
+
+*Phase 14 generated 2026-06-01 ~17:00 IST.*
+

@@ -143,8 +143,15 @@ EntryFn = Callable[
     Tuple[bool, Dict[str, Any]],
 ]
 
-# exit_fn(df_today, position, params) -> exit_reason | None
-ExitFn = Callable[[pd.DataFrame, "OpenPosition", Dict[str, Any]], Optional[str]]
+# exit_fn(df_today, position, params, context) -> exit_reason | None
+# v4.1: ``context`` carries the engine's per-bar dict (``today`` +
+# ``universe_signal``) so strategies that need cross-sectional info at
+# EXIT time (V40 dual-momentum rank-drop) can read it. Strategies that
+# don't need context just ignore the 4th arg.
+ExitFn = Callable[
+    [pd.DataFrame, "OpenPosition", Dict[str, Any], Dict[str, Any]],
+    Optional[str],
+]
 
 # initial_state_fn(df_at_entry, params) -> initial state dict
 InitialStateFn = Callable[[pd.DataFrame, Dict[str, Any]], Dict[str, Any]]
@@ -332,6 +339,26 @@ def run_swing_backtest(
         if date_idx < warmup_bars:
             continue
 
+        # ── (0) Cross-sectional pre-pass (v4.1: now fires at the START
+        # of the bar so EXIT logic can also read the universe signal,
+        # not just entries. The result is reused inside step (2) so
+        # universe_signals_fn is still called only ONCE per bar.).
+        if spec.universe_signals_fn is not None:
+            try:
+                universe_signal = spec.universe_signals_fn(history, today, strat_params)
+            except Exception as exc:  # noqa: BLE001
+                if verbose:
+                    print(f"[{spec.name}] universe_signals_fn raised "
+                          f"{type(exc).__name__}: {exc}; treating as empty signal")
+                universe_signal = None
+        else:
+            universe_signal = None
+
+        bar_context: Dict[str, Any] = {
+            "today": today,
+            "universe_signal": universe_signal,
+        }
+
         # ── (1) Check exits + on_bar updates for all open positions.
         for sym in list(open_positions.keys()):
             pos = open_positions[sym]
@@ -348,7 +375,10 @@ def run_swing_backtest(
             if spec.on_bar_fn is not None:
                 spec.on_bar_fn(pos, df_today, strat_params)
 
-            exit_reason = spec.exit_fn(df_today, pos, strat_params)
+            # Per-symbol context augmentation for exit_fn (mirrors entry pattern).
+            exit_context = dict(bar_context)
+            exit_context["symbol"] = sym
+            exit_reason = spec.exit_fn(df_today, pos, strat_params, exit_context)
 
             if exit_reason is not None:
                 exit_price = float(df_today["close"].iloc[-1])
@@ -376,25 +406,11 @@ def run_swing_backtest(
 
         # ── (2) Gather entry candidates.
         if len(open_positions) < eng.max_concurrent_positions:
-            # Cross-sectional pre-pass (charter §3.5 risk-parity does its
-            # own variance-driven selection at allocation time; this hook
-            # is for strategy-level cross-sectional rules like dual-momentum
-            # relative-strength's top-decile rank).
-            if spec.universe_signals_fn is not None:
-                try:
-                    universe_signal = spec.universe_signals_fn(history, today, strat_params)
-                except Exception as exc:  # noqa: BLE001
-                    if verbose:
-                        print(f"[{spec.name}] universe_signals_fn raised "
-                              f"{type(exc).__name__}: {exc}; treating as empty signal")
-                    universe_signal = None
-            else:
-                universe_signal = None
-
-            context: Dict[str, Any] = {
-                "today": today,
-                "universe_signal": universe_signal,
-            }
+            # universe_signal already computed in step (0) of this bar;
+            # reuse it here (charter §3.5 risk-parity does its own variance-
+            # driven selection at allocation time; this hook is for strategy-
+            # level cross-sectional rules like dual-momentum's top-decile rank).
+            context: Dict[str, Any] = dict(bar_context)
 
             candidates: List[Tuple[str, pd.DataFrame, dict]] = []
             for sym, df in history.items():

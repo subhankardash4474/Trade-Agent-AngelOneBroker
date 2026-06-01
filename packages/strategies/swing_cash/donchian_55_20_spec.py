@@ -74,6 +74,7 @@ def _exit(
     df_today: pd.DataFrame,
     position: OpenPosition,
     params: Dict[str, Any],
+    context: Dict[str, Any],  # v4.1: engine passes per-bar context; unused here
 ) -> Optional[str]:
     """V27 long-exit gate stack:
         (a) Donchian exit: today_close < rolling_min(low, M)

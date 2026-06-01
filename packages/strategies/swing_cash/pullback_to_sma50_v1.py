@@ -153,6 +153,7 @@ def _exit(
     df_today: pd.DataFrame,
     position: OpenPosition,
     params: Dict[str, Any],
+    context: Dict[str, Any],  # v4.1: engine passes per-bar context; unused here
 ) -> Optional[str]:
     sma_support = int(params.get("sma_support", DEFAULT_SMA_SUPPORT))
     profit_take = float(params.get("profit_take_pct", DEFAULT_PROFIT_TAKE_PCT))

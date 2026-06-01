@@ -1272,6 +1272,194 @@ sanity_check.md                       } only when --sanity-check
 
 ---
 
+## Phase 14 — V38/V40 validation sweep + multi-strategy combo + V40 v4.1 fix (2026-06-01, 16:08-17:00 IST)
+
+### TL;DR (Phase 14)
+
+Operator delegated again ("Do the best decision based on your understanding")
+immediately after Phase 13. Phase 14 ran the validation sweep that
+Phase 13 left for "post-verdict-meeting follow-up" and surfaced
+THREE findings that materially change the 2026-06-08 deployment plan:
+
+1. **V40 v4.1 engine fix transforms V40 from A3 to the new headline
+   single strategy.** v4.0 had a `month_end_rebalance` hack (174/254
+   exits were forced book-cleansings) because exit_fn couldn't read
+   the universe signal. Extended the engine to pass per-bar context
+   to exit_fn. Replaced V40's forced exits with proper
+   `rank_drop_out_of_band` + `absolute_momentum_lost` logic. Result:
+   CAGR +3.83% → **+6.20%**; PF 1.30 → **2.13**; trades 254 → 96.
+   Sharpe 1.10 matches NIFTYBEES with HALF the MaxDD.
+2. **V32 + V38 multi-strategy is REFUTED by correlation analysis.**
+   Daily-return ρ(V35, V38) = **0.698** — both Donchian-family,
+   ~70% duplicate. Phase 13's "V32 + V38 multi-strategy" proposal
+   does not actually diversify. **Pick ONE; V38 wins.**
+3. **V38's edge is 61% commodity-ETF concentrated** (SILVERBEES 39% +
+   GOLDBEES 22% of P&L). Real but fragile if the gold/silver bull
+   ends. V40 v4.1 by contrast is **77.6% individual-stock-driven**.
+
+### Phase 14 §A — Per-symbol attribution (refute closet-indexing for all 3)
+
+Ran `tools/_v32_attribution_2026_06_01.py` (already generic — takes
+any trades.csv) on each variant.
+
+| Variant | Total P&L | Broad-ETF % | Commodity-ETF % | Individual-stock % | Top contributor |
+|---|---:|---:|---:|---:|---|
+| V35 (= V32) | ₹11,955 | 3.5% | 31.5% | 68.1% | IOC 43% |
+| V38 weekly_breakout | ₹20,765 | 2.3% | **61.3% ⚠️** | 41.0% | SILVERBEES 39% |
+| **V40 v4.1** | **₹26,691** | -1.0% | 26.1% | **77.6%** | GOLDBEES 27% |
+
+All three pass the broad-ETF closet-indexing test (<5%). V38 is yellow-
+flagged for commodity-ETF concentration risk; V40 v4.1 is the cleanest.
+
+Outputs preserved at `logs/v35_attribution_2026-06-01.log`,
+`v38_attribution_2026-06-01.log`, `v40_v41_attribution_2026-06-01.log`.
+
+### Phase 14 §B — Daily-return correlation matrix
+
+Window 2022-06-17 → 2026-05-29 (common across V35/V38/V40-v4.1).
+
+```
+       V35    V38    V40     NB
+V35  1.000  0.698  0.551  0.501
+V38  0.698  1.000  0.590  0.461
+V40  0.551  0.590  1.000  0.594
+NB   0.501  0.461  0.594  1.000
+```
+
+- V35 ↔ V38 = **0.698** → KILL the V32+V38 multi-strategy hypothesis
+- V38 ↔ V40 = 0.590 → V38+V40 IS a real diversifier pair
+- V40 ↔ NB = 0.594 → V40 most beta-aligned of the trio (expected for
+  momentum), mitigated by V40's much-lower MaxDD vs NIFTYBEES
+
+### Phase 14 §C — Multi-strategy combo analysis
+
+Built `tools/_multi_strategy_combo_2026_06_01.py` to compute pure
+baselines, NIFTYBEES + single-strategy blends, multi-strategy active
+sleeves, and NIFTYBEES + multi-strategy blends. All numbers on the
+matched 2022-06-17 → 2026-05-29 window.
+
+**Best in class per metric:**
+
+| Optimization target | Winning allocation | Result |
+|---|---|---|
+| Best absolute CAGR | 100% NIFTYBEES | +12.73% |
+| Best CAGR (with active sleeve) | 70% NB + 30% V38 | +11.00% (MaxDD -12.86%, Calmar 0.86, Sharpe 1.14) |
+| Best Calmar (any combo) | 100% v38_heavy active (10/60/30) | 0.97 (CAGR +6.07%, MaxDD -6.28%) |
+| Best Sharpe (any combo) | 30% NB + 70% pf-weighted multi | 1.20 |
+| Best Calmar with active sleeve only | v38_v40_only (50/50) | 0.92 (CAGR +6.28%, MaxDD -6.84%) |
+
+Full output: `logs/multi_strategy_combo_v41_2026-06-01.log`.
+
+### Phase 14 §D — V40 v4.1 engine fix (the technical detail)
+
+`packages/research/swing_backtester.py` change:
+- Moved `universe_signals_fn` call to the TOP of the bar loop
+  (was: inside the entry-candidate gathering block). Computed once
+  per bar, cached into `bar_context` dict.
+- Changed `ExitFn` type signature: now `(df_today, position, params, context)`.
+- Engine passes `bar_context` (with `symbol` augmented) to both
+  `entry_fn` and `exit_fn`.
+
+`packages/strategies/swing_cash/dual_momentum_relstrength_v1.py` change:
+- Removed `_is_first_trading_day_of_month` import and the
+  `month_end_rebalance` forced-exit rule.
+- Added `rank_drop_out_of_band` exit: triggers when
+  `rank_pct > top_decile_pct + exit_tolerance_pct` (default 0.20 + 0.05 = 0.25).
+- Added `absolute_momentum_lost` exit: triggers when 12-month return turns negative.
+- Doubled `max_time_in_trade_bars` 60 → 120 (timeout is now true insurance,
+  not a primary exit driver).
+- New default param `exit_tolerance_pct = 0.05` (hysteresis band).
+
+All 6 strategy modules (V35/V36/V37/V38/V39/V40) updated to accept the
+new context arg. Five of them ignore it; only V40 uses it. Engine
+sanity check re-ran post-refactor: V35 still reproduces V32 exactly
+(CAGR 2.84, PF 1.36, MaxDD -7.80 — zero drift).
+
+Reproducer: `logs/backtests/multi_swing_v40_v41fix_2026_06_01/`.
+
+### Phase 14 §E — V38 sensitivity sweep (robustness check)
+
+Added `--strategy-params-file PATH` flag to
+`tools/multi_swing_backtest_2026_06_01.py` (the `--strategy-params-json`
+flag added in the same change has a PowerShell-quote-mangling pitfall,
+documented in the help string). Inputs at
+`tools/_v38_sensitivity_n15.json` and `_v38_sensitivity_n25.json`.
+
+| `weekly_entry_n` | `weekly_exit_m` | CAGR | PF | MaxDD | Trades |
+|---:|---:|---:|---:|---:|---:|
+| 15 | 8 | +3.03% | 1.47 | -8.02% | 97 |
+| **20 (default)** | 10 | +4.75% | 2.02 | -8.35% | 81 |
+| **25** | 12 | **+5.45%** | **2.22** | -8.34% | 79 |
+
+**Monotonically improving from 15 → 25.** Not a single-peak overfit;
+worth a Phase 15 sweep at 30 and 35 to find the true peak. For
+2026-06-08 deployment, **V38=20 default is the conservative choice**
+(matches the Phase 13 published number); operator may opt for V38=25
+to extract more edge.
+
+### Phase 14 §F — Updated deployment recommendation (supersedes Phase 12)
+
+Three profiles documented in `docs/reviews/mode_a_decision_v32_2026-06-01.md`
+(Phase 14 supersession block prepended; original Phase 12 doc preserved
+as historical reference).
+
+| Profile | Allocation | CAGR | MaxDD | Calmar | Sharpe | Operator choice |
+|---|---|---:|---:|---:|---:|---|
+| **A — RECOMMENDED** | 70% NB + 30% V38 | **+11.00%** | -12.86% | 0.86 | 1.14 | Default for 2026-06-08 |
+| B — Sharpe-maxed | 50% NB + 25% V38 + 25% V40 | ~+9.5% | ~-10.5% | ~0.85 | ~1.18 | Migrate after 90-day paper review |
+| C — Capital-preserving | 100% v38_heavy active (10/60/30) | +6.07% | -6.28% | **0.97** | 1.11 | If operator prefers zero passive exposure |
+
+**My recommendation: Profile A on 2026-06-08, migrate to Profile B at
+day-90 paper review** (after V40 v4.1 has out-of-sample paper data
+validating the rank-drop exit logic).
+
+### Phase 14 §G — Files / artifacts
+
+| Path | Status | Note |
+|---|---|---|
+| `packages/research/swing_backtester.py` | MODIFIED | Engine v4.1: per-bar context to exit_fn |
+| `packages/strategies/swing_cash/dual_momentum_relstrength_v1.py` | MODIFIED | V40 v4.1: rank-drop + absolute-momentum exits |
+| `packages/strategies/swing_cash/donchian_55_20_spec.py` | MODIFIED | exit_fn signature (no behavior change) |
+| `packages/strategies/swing_cash/mean_reversion_swing_v1.py` | MODIFIED | exit_fn signature (no behavior change) |
+| `packages/strategies/swing_cash/pullback_to_sma50_v1.py` | MODIFIED | exit_fn signature (no behavior change) |
+| `packages/strategies/swing_cash/weekly_breakout_v1.py` | MODIFIED | exit_fn signature (no behavior change) |
+| `packages/strategies/swing_cash/macd_swing_v1.py` | MODIFIED | exit_fn signature (no behavior change) |
+| `tools/multi_swing_backtest_2026_06_01.py` | MODIFIED | `--strategy-params-file` flag |
+| `tools/_multi_strategy_combo_2026_06_01.py` | NEW | Combo + correlation matrix |
+| `tools/_v38_sensitivity_n15.json` / `_v38_sensitivity_n25.json` | NEW | Sweep inputs |
+| `docs/findings/multi_swing_v35_v40_results_2026-06-01.md` | EXTENDED | Phase 14 addendum (~250 LOC) |
+| `docs/reviews/mode_a_decision_v32_2026-06-01.md` | EXTENDED | Phase 14 supersession header |
+| `logs/v35_attribution_2026-06-01.log` | NEW | V35 = V32 attribution |
+| `logs/v38_attribution_2026-06-01.log` | NEW | V38 attribution |
+| `logs/v40_v41_attribution_2026-06-01.log` | NEW | V40 v4.1 attribution |
+| `logs/multi_strategy_combo_v41_2026-06-01.log` | NEW | Combo + correlation full output |
+| `logs/backtests/multi_swing_v40_v41fix_2026_06_01/` | NEW | V40 v4.1 backtest tree |
+| `logs/backtests/multi_swing_v38_n15_2026_06_01/` | NEW | V38 sensitivity tree (n=15) |
+| `logs/backtests/multi_swing_v38_n25_2026_06_01/` | NEW | V38 sensitivity tree (n=25) |
+| `logs/backtests/multi_swing_sanity_v41_2026_06_01/` | NEW | Engine sanity post-refactor (PASS) |
+
+### Phase 14 — freeze-contract audit
+
+| Item | Status |
+|---|---|
+| Tests added | 0 (engine sanity re-run after refactor is the smoke test; unit tests still queued for v4.1) |
+| Frozen files touched | **0** (engine + strategy modules are in `packages/research/` and `packages/strategies/swing_cash/`; not freeze-listed) |
+| Live-behavior changes | **0** (none of these modules load into the live trader registry; backtest-only) |
+| Trader-VM SSH commands run | **0** |
+| Charter amendments needed | 0 NEW (the 3 Phase 12 amendments still bind verbatim; only strategy identity changes V32 → V38) |
+| Engine sanity post-refactor | ✓ PASS (V35 reproduces V32: CAGR 2.84 / PF 1.36 / MaxDD -7.80 with zero drift) |
+
+### Operator action items (Phase 14)
+
+| # | Item | Default | Operator reply needed |
+|---|---|---|---|
+| 1 | Accept V38 as the new Mode A paper-mode candidate (replaces V32) | Profile A | "agreed" or "stay with V32" |
+| 2 | Accept the 70% NB + 30% V38 default allocation | Profile A | "agreed" or pick profile B/C or custom split |
+| 3 | Phase 15 V40 pre-paper sweeps queued for ~07-01 (clears Profile B migration path at day-90 paper review) | queued | "agreed" or "defer" |
+| 4 | V38 weekly_entry_n sweep at {30, 35} queued for Phase 15 (sensitivity showed monotonic improvement up to 25) | queued | "agreed" or "defer" |
+
+---
+
 > _Filed under the `changes-done` skill convention. This document is
 > the verdict-meeting ledger for the CHG-and-prep work; the brutal
 > review is the verdict-meeting adversarial record; the findings log

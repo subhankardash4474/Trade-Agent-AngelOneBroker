@@ -335,7 +335,45 @@ def _cli() -> int:
                         "on failure so this can be wired into CI later.")
     p.add_argument("--exclude", default="",
                    help="Comma-separated symbols to EXCLUDE from signal candidates")
+    p.add_argument("--strategy-params-json", default=None,
+                   help="JSON dict of strategy-level param overrides applied "
+                        "to EVERY variant in the run. Use to sweep one knob "
+                        "across one variant. Example (POSIX/bash): "
+                        "--variants V38 --strategy-params-json '{\"weekly_entry_n\": 15}' "
+                        "--tag v38_n15. PowerShell often mangles inline JSON; "
+                        "use --strategy-params-file PATH instead on Windows. "
+                        "Engine-level knobs (max_concurrent, sector_cap) have "
+                        "their own flags; this is strictly for the strategy "
+                        "module's default_params keys.")
+    p.add_argument("--strategy-params-file", default=None,
+                   help="Path to a JSON file with strategy-level param overrides. "
+                        "Equivalent to --strategy-params-json but reads from disk, "
+                        "avoiding the PowerShell-quote-mangling pitfall.")
     args = p.parse_args()
+
+    strategy_params_override: Optional[Dict[str, Any]] = None
+    if args.strategy_params_json and args.strategy_params_file:
+        print("[multi_swing] use either --strategy-params-json OR --strategy-params-file, not both")
+        return 2
+    if args.strategy_params_json:
+        try:
+            strategy_params_override = json.loads(args.strategy_params_json)
+        except json.JSONDecodeError as exc:
+            print(f"[multi_swing] --strategy-params-json invalid: {exc}")
+            return 2
+    elif args.strategy_params_file:
+        sp_path = Path(args.strategy_params_file)
+        if not sp_path.exists():
+            print(f"[multi_swing] --strategy-params-file not found: {sp_path}")
+            return 2
+        try:
+            strategy_params_override = json.loads(sp_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            print(f"[multi_swing] {sp_path} contained invalid JSON: {exc}")
+            return 2
+    if strategy_params_override is not None and not isinstance(strategy_params_override, dict):
+        print("[multi_swing] strategy params must be a JSON object")
+        return 2
 
     end = args.end or datetime.now().date().strftime("%Y-%m-%d")
     if args.start:
@@ -396,6 +434,7 @@ def _cli() -> int:
             capital_inr=args.capital,
             start=start, end=end,
             engine_params=engine_params,
+            strategy_params_override=strategy_params_override,
             output_dir=variant_dir,
             excluded_from_signals=excluded,
         )

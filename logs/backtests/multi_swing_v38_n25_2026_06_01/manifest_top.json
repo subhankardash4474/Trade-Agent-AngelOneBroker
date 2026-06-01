@@ -1,0 +1,20 @@
+{
+  "engine": "swing_backtester (Engine B, Path B)",
+  "runner": "tools/multi_swing_backtest_2026_06_01.py",
+  "window_start": "2021-06-02",
+  "window_end": "2026-06-01",
+  "capital_inr": 100000.0,
+  "max_concurrent_positions": 6,
+  "sector_cap": null,
+  "excluded_from_signals": [],
+  "variants": [
+    {
+      "alias": "V38",
+      "module": "strategies.swing_cash.weekly_breakout_v1",
+      "spec_name": "V38_weekly_breakout",
+      "result_dir": "logs\\backtests\\multi_swing_v38_n25_2026_06_01\\V38_weekly_breakout"
+    }
+  ],
+  "benchmark_niftybees_cagr_pct": 8.98,
+  "benchmark_niftybees_max_dd_pct": -15.22
+}

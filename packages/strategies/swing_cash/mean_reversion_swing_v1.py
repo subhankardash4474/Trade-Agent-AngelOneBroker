@@ -149,6 +149,7 @@ def _exit(
     df_today: pd.DataFrame,
     position: OpenPosition,
     params: Dict[str, Any],
+    context: Dict[str, Any],  # v4.1: engine passes per-bar context; unused here
 ) -> Optional[str]:
     rsi_period = int(params.get("rsi_period", DEFAULT_RSI_PERIOD))
     rsi_overbought = float(params.get("rsi_overbought", DEFAULT_RSI_OVERBOUGHT))

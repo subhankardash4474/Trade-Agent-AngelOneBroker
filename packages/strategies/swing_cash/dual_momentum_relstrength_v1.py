@@ -48,12 +48,13 @@ from research.swing_backtester import OpenPosition, StrategySpec
 
 DEFAULT_MOMENTUM_LOOKBACK_BARS = 252      # ~12 months
 DEFAULT_TOP_DECILE_PCT = 0.20             # actually "top quintile" — was top 10% too restrictive on 75-symbol universe
+DEFAULT_EXIT_TOLERANCE_PCT = 0.05         # v4.1: hysteresis band so a name that hovers at rank 21% doesn't wash-rinse-repeat
 DEFAULT_BENCHMARK_SYMBOL = "NIFTYBEES"
 DEFAULT_SMA_FILTER = 50
 DEFAULT_ATR_PERIOD = 14
 DEFAULT_STOP_ATR_MULT = 2.5
 DEFAULT_STOP_FALLBACK_PCT = 0.88
-DEFAULT_MAX_TIME_BARS = 60
+DEFAULT_MAX_TIME_BARS = 120               # v4.1: doubled from 60 because rank-based exits now do the active book-cleansing; timeout is true insurance
 
 
 def _atr(df: pd.DataFrame, period: int = 14) -> float:
@@ -196,8 +197,32 @@ def _exit(
     df_today: pd.DataFrame,
     position: OpenPosition,
     params: Dict[str, Any],
+    context: Dict[str, Any],
 ) -> Optional[str]:
+    """V4.1: rank-drop check on EVERY bar using engine-supplied context.
+
+    The v4.0 implementation force-closed at every monthly boundary because
+    exit_fn couldn't see the universe_signal. That dominated the exit-reason
+    mix (174 / 254 = 69% of V40 exits were forced month-end rebalances) and
+    paid double charges on names that would have stayed top-decile across
+    months. v4.1's engine change passes the cached universe_signal to exit_fn
+    via context, so we can do the right thing:
+
+    Exit reasons (any of):
+        1. hard stop (close < initial_stop)
+        2. rank dropped out of top-decile + exit-tolerance band (e.g. if
+           top_decile_pct=0.20 and exit_tolerance_pct=0.05, exit when
+           rank_pct > 0.25 — gives a small hysteresis band to avoid
+           wash-rinse-repeat on names that hover at the boundary)
+        3. absolute momentum turned negative
+        4. timeout (insurance against multi-year drifters)
+
+    No more forced month-end rebalance. Position lifetime is now driven by
+    rank dynamics, not the calendar.
+    """
     max_time = int(params.get("max_time_in_trade_bars", DEFAULT_MAX_TIME_BARS))
+    top_decile_pct = float(params.get("top_decile_pct", DEFAULT_TOP_DECILE_PCT))
+    exit_tolerance_pct = float(params.get("exit_tolerance_pct", DEFAULT_EXIT_TOLERANCE_PCT))
 
     today_close = float(df_today["close"].iloc[-1])
     today_pos = len(df_today) - 1
@@ -206,30 +231,26 @@ def _exit(
     if position.initial_stop > 0 and today_close < position.initial_stop:
         return "stop_loss"
 
-    # (b) Rank-drop check is deferred until monthly rebalance because the
-    # engine's exit_fn doesn't see the universe_signal (only entry_fn
-    # does). A cleaner v4.1 evolution would extend exit_fn to also
-    # receive context, BUT today the simpler hack is: implement
-    # rank-drop via a "force exit on first day of next month" rule and
-    # rely on entry_fn to re-establish positions only for symbols that
-    # still rank top-decile. We approximate this by exiting at month
-    # boundaries on a fixed schedule.
-    #
-    # NOTE: this is a CORRECTNESS COMPROMISE for the V40 prototype.
-    # Trade attribution will show a spike of "month_end_rebalance"
-    # exits on the first trading day of each month — those are the
-    # forced book-cleansings. If V40 shows edge, the v4.1 follow-up
-    # adds context-aware exit_fn and removes this rule.
-    if _is_first_trading_day_of_month(df_today):
-        # The position was OPENED on the first day of *some* month; we
-        # want to force-close on EVERY subsequent first-of-month boundary
-        # (not on the entry's own first-of-month). The entry_bar_index
-        # check guards against immediate same-day exit.
-        bars_held = today_pos - position.entry_bar_index
-        if bars_held >= 1:
-            return "month_end_rebalance"
+    # (b) + (c) rank/momentum-driven exits — require universe_signal
+    universe_signal = context.get("universe_signal") if context else None
+    sym = position.symbol
+    if universe_signal and sym in universe_signal:
+        sig = universe_signal[sym]
+        rank_pct = float(sig.get("rank_pct", 1.0))
+        ret_12m = float(sig.get("return_12m", 0.0))
 
-    # (c) timeout (insurance — momentum positions sometimes drift)
+        # (b) rank dropped out of band
+        if rank_pct > top_decile_pct + exit_tolerance_pct:
+            return "rank_drop_out_of_band"
+
+        # (c) absolute momentum turned negative
+        if ret_12m <= 0:
+            return "absolute_momentum_lost"
+    # Note: if universe_signal is missing (shouldn't happen since we wired
+    # universe_signals_fn at engine step (0)), we keep the position open
+    # and rely on stop/timeout. This is the safe default.
+
+    # (d) timeout insurance
     if (today_pos - position.entry_bar_index) > max_time:
         return "time_in_trade"
 
@@ -262,6 +283,7 @@ SPEC = StrategySpec(
     default_params={
         "momentum_lookback_bars": DEFAULT_MOMENTUM_LOOKBACK_BARS,
         "top_decile_pct": DEFAULT_TOP_DECILE_PCT,
+        "exit_tolerance_pct": DEFAULT_EXIT_TOLERANCE_PCT,
         "benchmark_symbol": DEFAULT_BENCHMARK_SYMBOL,
         "sma_filter": DEFAULT_SMA_FILTER,
         "atr_period": DEFAULT_ATR_PERIOD,

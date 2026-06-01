@@ -1,5 +1,117 @@
 # Mode A decision — V32 deploys paper-mode 2026-06-08
 
+> ⚠️ **SUPERSEDED 2026-06-01 ~17:00 IST by Phase 14.** V32 is no longer
+> the recommended paper-mode deployment. **V38 weekly_breakout (default
+> params)** is strictly better and should be deployed in V32's place;
+> **V40 v4.1 dual_momentum_relstrength** is a stronger candidate still
+> but warrants one additional sensitivity sweep before paper-mode wire-up.
+> See the supersession block immediately below; the original Phase 12
+> document is preserved as a historical record from § "## TL;DR" onward.
+
+---
+
+## Phase 14 supersession (2026-06-01 ~17:00 IST)
+
+**Operator delegation:** "Do the best decision based on your understanding."
+
+**New decision:** Replace V32 with **V38** in the original 2026-06-08
+paper-mode deployment plan. All three Phase 12 charter amendments (§3.6
+sector cap → informational; §3.10 CAGR-vs-benchmark → informational;
+§3.10 portfolio-allocation note) still apply VERBATIM — only the strategy
+identity changes (V32 → V38).
+
+**Why V38 strictly dominates V32:**
+
+| Metric | V32 (= V35) | V38 weekly_breakout | V40 v4.1 (rank-drop) |
+|---|---:|---:|---:|
+| CAGR (full window) | +2.84% | **+4.75%** | **+6.20%** |
+| CAGR (matched 3.95y window) | +3.82% | +6.37% | **+6.20%** |
+| Profit Factor | 1.36 | 2.02 | **2.13** |
+| MaxDD | -7.80% | -8.35% | -7.88% |
+| Calmar | 0.49 | 0.76 | **0.79** |
+| Sharpe | 0.76 | 0.99 | **1.10** |
+| Trades over 5y | 180 | **81** | 96 |
+| Individual-stock % of P&L | 68.1% | 41.0% | **77.6%** |
+| Commodity-ETF concentration | 31.5% | **61.3% ⚠️** | 26.1% |
+| Reproducer | `logs/backtests/v27_v32_maxc6_2026_06_01/` | `logs/backtests/multi_swing_firstrun_2026_06_01/V38_weekly_breakout/` | `logs/backtests/multi_swing_v40_v41fix_2026_06_01/` |
+
+V38 is better than V32 on every metric except absolute MaxDD (loses by
+0.55pp). V40 v4.1 is better than V38 on Sharpe / CAGR / MaxDD but has
+some additional model risk (rank-drop exits are newer code; see Phase
+15 pre-paper sweep below).
+
+**Why V32 + V38 multi-strategy was REJECTED:**
+Daily-return correlation V32 ↔ V38 = **0.698** — they are both
+Donchian-family trend-followers and largely DUPLICATE rather than
+diversify. Capital allocated to both is wasted. Pick one. V38 wins.
+
+**Why V38 + V40 (v4.1) multi-strategy is PROMISING but DEFERRED:**
+Correlation V38 ↔ V40 = 0.590 (genuine diversifier).
+A 50/50 V38+V40 active sleeve yields CAGR +6.28% / MaxDD -6.84% /
+Calmar 0.92 (vs V38-alone 6.37/-8.35/0.76). The multi-strategy IS real
+once V32 is dropped. But running TWO active strategies on day-1 adds
+operational complexity (separate position books, separate exit logic,
+attribution headaches). **Defer to 90-day paper-mode review.**
+
+### Updated deployment recommendation (3 profiles)
+
+| Profile | Allocation | CAGR | MaxDD | Calmar | Sharpe | Notes |
+|---|---|---:|---:|---:|---:|---|
+| **A — RECOMMENDED** | 70% NIFTYBEES + 30% V38 | **+11.00%** | -12.86% | 0.86 | 1.14 | Best absolute CAGR while improving on pure NB risk-adjusted |
+| B — Sharpe-maxed | 50% NB + 25% V38 + 25% V40 | ~+9.5% | ~-10.5% | ~0.85 | ~1.18 | Two active strategies; 90-day complexity bump |
+| C — Capital-preserving | 100% v38_heavy active (10/60/30) | +6.07% | -6.28% | **0.97** | 1.11 | Lowest DD; zero passive exposure |
+
+**Profile A is the new default deployment plan for 2026-06-08.**
+Strategy = V38; allocation = 70/30 (operator may adjust). All
+operational mechanics (dispatcher wiring, PaperBroker, config.yaml
+block) remain identical to the original V32 plan — swap the
+strategy module identifier from `swing_cash_v27` to
+`swing_cash_v38_weekly_breakout`.
+
+### Pre-paper-mode Phase 15 checklist (does NOT block 2026-06-08)
+
+For V40 (if operator decides to add it later — Profile B migration):
+- [ ] Walk-forward holdout: train on 2021-2024, test on 2025-2026
+- [ ] Sensitivity to `top_decile_pct ∈ {0.10, 0.15, 0.20, 0.25}`
+- [ ] Sensitivity to `momentum_lookback_bars ∈ {126, 189, 252}`
+- [ ] Sensitivity to `exit_tolerance_pct ∈ {0.03, 0.05, 0.07}`
+- [ ] Verify rank-drop exit attribution (no spike of exits on single dates)
+
+For V38 (deploys 2026-06-08 with default params; sensitivity for later):
+- [ ] Sweep `weekly_entry_n ∈ {30, 35, 40}` — Phase 14 sweep showed
+      monotonic improvement from 15 → 20 → 25; need to find the peak
+- [ ] Sweep `weekly_sma_regime_n` and `weekly_exit_m` (one-at-a-time)
+- [ ] Commodity-ETF exposure cap test (force V38 to skip SILVERBEES/GOLDBEES;
+      measure the CAGR cost) — if cap-able exposure costs <1pp CAGR, build
+      a Phase 16 commodity-cap variant
+
+### Files this supersession
+
+- `docs/findings/multi_swing_v35_v40_results_2026-06-01.md` (Phase 14 addendum)
+- `docs/changes/changes_done_2026-06-01.md` (Phase 14 entry)
+- `tools/_multi_strategy_combo_2026_06_01.py` (combo + correlation tool)
+- `tools/_v38_sensitivity_n15.json`, `tools/_v38_sensitivity_n25.json` (param sweep inputs)
+- `packages/research/swing_backtester.py` (engine v4.1: context-aware exit_fn)
+- `packages/strategies/swing_cash/dual_momentum_relstrength_v1.py` (V40 v4.1 fix)
+- `logs/multi_strategy_combo_v41_2026-06-01.log` (full combo output)
+- `logs/v40_v41_attribution_2026-06-01.log` (V40 v4.1 attribution)
+- `logs/v38_attribution_2026-06-01.log` (V38 attribution)
+- `logs/v35_attribution_2026-06-01.log` (V35 = V32 re-attribution through new engine)
+
+### Operator sign-off (additive — Phase 12 sign-offs still valid)
+
+| Item | Operator action | Status |
+|---|---|---|
+| Accept V38 (in V32's place) as Mode A paper-mode candidate | Reply "agreed" or "stay with V32" | OPEN |
+| Accept Profile A (70% NB + 30% V38) as default allocation | Reply with chosen profile (A/B/C) or custom split | OPEN |
+| Confirm 2026-06-08 deployment date holds (one extra dev-day to wire V38 module instead of V27) | Reply "confirmed" or propose alternative | OPEN |
+| Phase 12 charter amendments (§3.6, §3.10) still bind for V38 deployment | Reply "agreed" | OPEN |
+| Phase 15 V40 pre-paper sweeps queued for ~07-01 to clear Profile B migration path | Reply "agreed" or "defer" | OPEN |
+
+---
+
+## ORIGINAL PHASE 12 DOCUMENT (historical reference — V32 plan)
+
 > Filed 2026-06-01 ~18:30 IST. Phase 12 of v4 Mode A scaffolding. Decision delegated by the operator with the mandate: "Take the best decision for my stead. We need to find a profitable trade option."
 >
 > This document **decides** the post-parametric-search question and **proposes the charter amendments** needed to ship V32 to paper-mode on 2026-06-08. The operator's only remaining action is signing off on the proposed §3.6 and §3.10 amendment language at the end of this document.
