@@ -394,6 +394,18 @@ def build_docker_run_argv(job: dict, run_id: str, image: str,
         # full image rebuild. Read-only so a stray edit during a battery
         # run can't crash a worker mid-stream.
         "-v", f"{TRADER_HOME}/packages:/app/packages:ro",
+        # 2026-06-01 Phase 16b read-only tools mount. Symmetric with the
+        # 2026-05-25 packages mount above. Without this, NEW operator
+        # tools like Phase 16b's tools/run_swing_battery.py are not
+        # visible to the container until a full image rebuild. The
+        # symptom (caught the first time Phase 16b ran on the VM):
+        # `python: can't open file '/app/tools/run_swing_battery.py':
+        # [Errno 2] No such file or directory` -> container exits 2 in
+        # ~1s, scheduler marks job failed. Bind-mounting tools/ keeps
+        # new entrypoints visible immediately, same as packages/.
+        # Read-only so a stray edit during a run can't corrupt the
+        # tool a parallel worker is mid-execution of.
+        "-v", f"{TRADER_HOME}/tools:/app/tools:ro",
         # 2026-05-26 read-only models mount. The trading-agent:latest
         # image was built (2026-05-22) without `models/xgboost_model.pkl`
         # baked in -- discovered during the nifty500_v4_long_only_60d
