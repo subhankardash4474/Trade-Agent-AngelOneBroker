@@ -370,6 +370,230 @@ post-2026-06-05:
 
 ---
 
+## Phase 7 — V4 Mode A scaffolding & V27 first-cut backtest (12:42-13:30 IST)
+
+Operator directive (12:31 IST): "Start building v4 strategies on the
+backtester — we are not deploying anything to the trader VM where paper-mode
+intraday is running, so development in parallel with the freeze window is
+safe. If a good backtest result comes in, we deploy to paper mode for live
+data on the next Monday 2026-06-08." This honors FREEZE_v2.1.md's letter
+(no edit to enumerated frozen files) AND its intent (no trader-VM
+deployment during validation).
+
+### 7a — Charter §10 Q1-Q10 responses filed
+
+All 10 charter §10 adviser recommendations accepted by operator without
+override (full responses doc: `docs/reviews/strategy_charter_v4_operator_responses_2026-06-01.md`).
+Highlights:
+
+| # | Question | Operator answer |
+|---|---|---|
+| Q1 | Donchian entry channel | **55 days** (charter default) |
+| Q2 | Vol-target risk per trade | **0.5% of equity** |
+| Q5 | Dispatcher cutover | **Hard cutover** (one commit, no feature-flag coexistence) |
+| Q7 | Live capital source | **AngelOne API daily** (fallback to self_sufficiency.json) |
+| Q9 | Phase 1 start | **Mon 2026-06-08** (with pre-Phase-1 scaffolding starting today) |
+
+Charter §10 gate is now satisfied **in writing**.
+
+### 7b — Pod-boundary correction (charter §1 path drift)
+
+Charter §1 listed Donchian signal utilities under
+`packages/research/signals/`, but `tests/unit/test_pod_boundaries.py`
+forbids `strategies -> research` imports (only `strategies -> core` is
+allowed; the asymmetry is intentional — research is upstream of strategies
+at audit time). Modules moved:
+
+| Charter §1 path | Actual landing path |
+|---|---|
+| `packages/research/signals/donchian.py` | **`packages/core/signals/donchian.py`** |
+| `packages/research/signals/volatility_sizer.py` | **`packages/core/signals/volatility_sizer.py`** |
+| `packages/research/signals/risk_parity.py` | **`packages/core/signals/risk_parity.py`** |
+| `packages/research/instruments/etf_universe.py` | **`packages/core/instruments/etf_universe.py`** |
+
+`packages/research/backtest_fno.py` + `fno_universe.py` correctly remain
+under `research/` (backtester-only; no strategy runtime call).
+
+This is a NEW-file landing in `packages/core/` (new subdirectories
+`core/signals/` + `core/instruments/`), not an edit to any FREEZE_v2.1
+enumerated file (which lists only `core/risk_manager.py` + `core/position_sizer.py`).
+Freeze-safe.
+
+### 7c — V4 Mode A net-new files (10)
+
+| File | LOC | Role |
+|---|---:|---|
+| `data/v4_universe_swing_cash.txt` | 75 | Mode A universe (50 Nifty + 15 Next 50 + 4 broad ETF + 2 commodity + 1 debt + 3 sector) |
+| `packages/core/instruments/__init__.py` | 14 | Instrument-loader namespace |
+| `packages/core/instruments/etf_universe.py` | 121 | `load_v4_swing_cash_universe()` + `universe_categories()` |
+| `packages/core/signals/__init__.py` | 18 | Signal-utility namespace |
+| `packages/core/signals/donchian.py` | 320 | Donchian entry/exit gates + chandelier stop |
+| `packages/core/signals/volatility_sizer.py` | 130 | Vol-target sizing (0.5% risk, 8% per-name cap) |
+| `packages/core/signals/risk_parity.py` | 180 | Inverse-vol allocator with iterative per-name cap |
+| `packages/strategies/swing_cash/__init__.py` | 6 | Swing-cash namespace |
+| `packages/strategies/swing_cash/cross_asset_trend_v27.py` | 200 | V27 strategy adapter (BaseStrategy contract) |
+
+Plus 2 new test files (+54 new test cases):
+
+| File | Test cases |
+|---|---:|
+| `tests/unit/test_v27_signals_2026_06_01.py` | 34 (Donchian, vol-sizer, risk-parity, universe loader) |
+| `tests/unit/test_cross_asset_trend_v27_2026_06_01.py` | 20 (charter defaults pin, required-history, generate_signal paths, param customisation) |
+
+Plus 2 new tools:
+
+| File | Purpose |
+|---|---|
+| `tools/_v4_data_smoke_2026_06_01.py` | yfinance availability smoke test for the 75-instrument universe |
+| `tools/v27_backtest_2026_06_01.py` | Standalone V27 backtester (does NOT use existing battery infra; uses new signals + sizer + allocator + AngelOne charges directly) |
+
+### 7d — Data-availability smoke test result
+
+`logs/v4_data_smoke_2026_06_01.json`: **73/75 OK** in 19.9s (5-year window).
+2 failures, both known corporate-action artefacts:
+
+- **TATAMOTORS.NS** — demerger Sep 2024; yfinance returns 404 for the
+  current ticker because the merged-pre-demerger time-series sits under a
+  different symbol now. Workaround for V28+: hand-splice the history from
+  pre/post demerger.
+- **LTIM.NS** — formed by LTI + Mindtree merger Nov 2022; yfinance has no
+  pre-merger history under this symbol. Workaround for V28+: same.
+
+Both are individual stocks; their absence drops the actual signal-candidate
+universe to 73 (out of 74 after LIQUIDBEES cash-sweep exclusion).
+
+All ETFs (commodity GOLDBEES/SILVERBEES, debt LIQUIDBEES, sector
+ITBEES/PSUBNKBEES/AUTOBEES) returned data without issues. Two ETFs
+launched within the 5-year window (SILVERBEES Feb 2022; AUTOBEES Jan 2022)
+have ~4 years of data, which clears the 200-day SMA warmup + leaves ~3.5
+years of in-sample history.
+
+### 7e — V27 first-cut backtest result (THE NUMBER)
+
+`logs/backtests/v27_firstcut_2026_06_01/comparison.md`. Window:
+**2022-04-21 → 2026-05-29 (4.1 years)**. Initial capital: ₹100,000.
+
+| Metric | V27 first-cut | NIFTYBEES (buy-and-hold) | Δ |
+|---|---:|---:|---:|
+| **CAGR** | **+1.25%** | **+8.98%** | **-7.73pp** |
+| Total return | +5.23% | +42.31% | -37.08pp |
+| Max DD | -10.24% | -15.22% | +4.98pp |
+| Final equity | ₹105,229 | ₹142,310 | -₹37,081 |
+| **Profit factor** | **1.10** | — | — |
+| Win rate | 36.9% (116/314) | — | — |
+| Trades | 314 in 4.1y (≈ 76/yr) | — | — |
+| Avg charges per trade | ₹46.27 | — | — |
+| **Total charges** | **₹14,530** | — | — |
+
+**Exit-reason breakdown (314 trades):**
+- chandelier_stop: 201 (64%) — the 3.0×ATR trailing stop fires too often
+- donchian_exit: 74 (24%) — the 20-day low breakdown
+- time_in_trade: 31 (10%) — 60-day forced exits
+- end_of_window_close_out: 8 (still open at backtest end)
+
+**Charter §3.10 mechanical reading:**
+- PF = 1.10 → **A2 borderline** ("defer to V28 with ONE param change")
+- BUT CAGR 1.25% vs NIFTYBEES + 2% = 10.98% → if PF were ≥ 1.20 this would
+  trigger **A3** ("academic-interest only — don't advance to paper")
+- Reading: V27 is at the A1/A2 cliff AND would fall to A3 even if it
+  cleared A2. **Does NOT meet A4 PASS gate** (PF ≥ 1.20 AND CAGR ≥ NIFTYBEES + 2%
+  AND MaxDD ≤ 25%).
+
+**Caveats (charter §3 deferred items for V28+; reading favours V27):**
+- Sector cap (charter §3.6 max 3 per sector) NOT enforced — could be diluting
+- NIFTYBEES quarterly-rebalance benchmark not yet wired (buy-and-hold only)
+- Trade fills at TODAY'S close (charter implies next-bar-open; minor)
+- 2 instruments dropped due to corp-action data gaps (negligible)
+- The candidate-ranking when slots constrained picks LOWEST-vol names —
+  which preferentially loads NIFTYBEES + JUNIORBEES + BANKBEES into the
+  portfolio. **The strategy is partly trading the benchmark against itself.**
+  V28 candidate: exclude NIFTYBEES/JUNIORBEES from the signal-candidate set
+  (keep as benchmark only).
+
+**Honest reading:** The first-cut CAGR gap (7.7pp below NIFTYBEES) is so
+large that even if V28's single-param-change tightens things up
+materially, closing 9.8pp (to clear NIFTYBEES + 2%) on a Donchian-55/20
+strategy with 0.5% vol-target seems mechanically improbable. The
+cross-asset trend hypothesis (charter §0 hypothesis #1) shows MARGINAL
+edge (PF 1.10 > 1.0) but not enough to overcome benchmark drag at
+₹120k capital + AngelOne CNC cost regime.
+
+**Verdict-meeting implication:** V27 first-cut DOES NOT satisfy the
+operator's "if good backtest result, deploy to paper mode 06-08" condition.
+The 06-08 paper-mode flip is therefore **NOT** indicated on V27 first-cut data.
+
+### 7f — Test sweep
+
+```
+$ pytest tests/unit -q
+1872 passed in 39.63s
+```
+
+54 new V27 tests + 1818 prior = 1872. Pod-boundary test PASSED after the
+research → core move. No regression.
+
+### 7g — Recommended next moves (operator decision)
+
+Three honest options for V28+ retune budget (charter §3.11 allows max 3
+V-variants):
+
+1. **V28 + V29 + V30** — exhaust the retune budget; expected gain: 2-4pp
+   CAGR if all parameter changes help, still leaving a 4-6pp gap to
+   NIFTYBEES + 2%. Cost: ~3 hours dev + 3 × 3.5min backtests. Reading: PROBABLE A3 (academic-interest only).
+2. **V28 with NIFTYBEES/JUNIORBEES excluded from signal candidates** — single
+   highest-impact change. Tests whether self-cannibalization explains the
+   underperformance. Cost: ~30min dev + 3.5min backtest. If V28 closes >5pp
+   of the gap, the hypothesis is alive; otherwise concede A3.
+3. **Concede A3 on Mode A and pivot v4 to Mode B/C/D early** — but Mode B/C
+   are F&O paper-only with the ₹500k capital gate; Mode D is research-only.
+   At ₹120k operator capital, no live track is viable. Reading: this is
+   the **honest** reading of the path-forward §3 + §6 PK1 ("if 18 months
+   without any live-gate clearing, liquidate to NIFTYBEES").
+
+My adviser recommendation: **Option 2 first** (30 min, single test of
+the self-cannibalization hypothesis). If that closes the gap meaningfully,
+proceed to V29/V30. If not, file A3 verdict on Mode A and start a fresh
+path-forward refresh that questions whether ANY ₹120k retail trend
+strategy can beat NIFTYBEES on a 5-year window.
+
+This is operator's call. Will not initiate V28 without explicit directive.
+
+### 7h — Files touched (Phase 7 cumulative)
+
+Net-new (10 source + 2 tests + 2 tools + 1 universe data + 1 ops responses doc + this Phase 7 entry):
+
+```
+docs/reviews/strategy_charter_v4_operator_responses_2026-06-01.md     [+186 lines]
+data/v4_universe_swing_cash.txt                                       [+75 instruments]
+packages/core/instruments/__init__.py                                 [new]
+packages/core/instruments/etf_universe.py                             [new]
+packages/core/signals/__init__.py                                     [new]
+packages/core/signals/donchian.py                                     [new]
+packages/core/signals/volatility_sizer.py                             [new]
+packages/core/signals/risk_parity.py                                  [new]
+packages/strategies/swing_cash/__init__.py                            [new]
+packages/strategies/swing_cash/cross_asset_trend_v27.py               [new]
+tests/unit/test_v27_signals_2026_06_01.py                             [new, 34 tests]
+tests/unit/test_cross_asset_trend_v27_2026_06_01.py                   [new, 20 tests]
+tools/_v4_data_smoke_2026_06_01.py                                    [new]
+tools/v27_backtest_2026_06_01.py                                      [new]
+logs/v4_data_smoke_2026_06_01.json                                    [new artefact]
+logs/v4_smoke_2026-06-01.log                                          [new artefact]
+logs/backtests/v27_firstcut_2026_06_01/comparison.md                  [new artefact]
+logs/backtests/v27_firstcut_2026_06_01/equity_curve.csv               [new artefact]
+logs/backtests/v27_firstcut_2026_06_01/trades.csv                     [new artefact]
+logs/backtests/v27_firstcut_2026_06_01/results.json                   [new artefact]
+logs/backtests/v27_firstcut_2026_06_01/manifest.json                  [new artefact]
+logs/v27_backtest_2026-06-01.log                                      [new artefact]
+docs/changes/changes_done_2026-06-01.md                               [+this Phase 7 entry]
+```
+
+**Modified existing files:** NONE. All v4 work landed in net-new files;
+freeze contract observed in both letter and spirit. No deployment to
+trader VM.
+
+---
+
 ## Cross-references
 
 - `docs/findings/findings_log_2026-06-01.md` — full CHG-01..CHG-05 + NUM-10 detail.

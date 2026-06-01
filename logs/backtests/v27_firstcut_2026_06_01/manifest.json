@@ -1,0 +1,30 @@
+{
+  "variant": "cross_asset_trend_v27_firstcut",
+  "charter_version": "v4.0",
+  "charter_path": "docs/reviews/strategy_charter_v4_2026-06-01.md",
+  "universe_file": "data/v4_universe_swing_cash.txt",
+  "params": {
+    "donchian_entry_n": 55,
+    "donchian_exit_m": 20,
+    "regime_filter_sma": 200,
+    "volume_confirm_mult": 1.2,
+    "atr_cap_pct": 5.0,
+    "adx_min": 20,
+    "risk_per_trade_pct": 0.5,
+    "max_position_pct": 8.0,
+    "chandelier_atr_mult": 3.0,
+    "max_concurrent_positions": 12,
+    "max_per_sector": "DEFERRED (V28+)"
+  },
+  "cost_model": "CashCNCCharges:angelone:2026-06-01",
+  "window_start": "2022-04-21",
+  "window_end": "2026-05-29",
+  "initial_capital_inr": 100000.0,
+  "caveats": [
+    "FIRST-CUT \u2014 chandelier stops recompute daily (correct per \u00a73.4)",
+    "Sector cap (\u00a73.6: max 3 per sector) NOT enforced; max_concurrent=12 only",
+    "NIFTYBEES quarterly-rebalance benchmark not yet wired; buy-and-hold only",
+    "TATAMOTORS.NS + LTIM.NS dropped due to yfinance corp-action data gaps",
+    "Trade fills at TODAY'S CLOSE (charter implies next-bar-open; deferred)"
+  ]
+}
