@@ -608,6 +608,124 @@ trader VM.
 
 ---
 
+## Phase 8 — V27 sensitivity, engine extension, dispatcher skeleton (2026-06-01, 14:09-16:30 IST)
+
+Continuation of Phase 7's v4 Mode A scaffolding. Operator directed "A → B → C" sequential after the V27 first-cut underperformance landed. Three discrete commits + one writeup.
+
+### 8.A — V27-no-benchmark sensitivity test (commit `7d693cd`)
+
+**Hypothesis tested:** V27's CAGR underperformance vs NIFTYBEES (+1.25% vs +8.98%) might be caused by risk-parity's low-vol preference loading NIFTYBEES + JUNIORBEES + BANKBEES heavily into the portfolio, leaving little capital for higher-alpha individual names ("self-cannibalization"). If true, excluding broad ETFs from the signal candidate set should close >5pp of the gap.
+
+**Method:** Added `--exclude <CSV>` flag to `tools/v27_backtest_2026_06_01.py`. Symbols in the list are KEPT in `history` (so the benchmark + risk-parity sigma references remain intact) but EXCLUDED from the entry-signal candidate set. Excluded: NIFTYBEES, JUNIORBEES, BANKBEES, NIFTYIETF.
+
+**Result (`logs/backtests/v27_no_benchmark_2026_06_01/`):**
+
+| Metric | V27 first-cut | V27 no-benchmark | Δ |
+|---|---:|---:|---:|
+| CAGR | +1.25% | **+1.02%** | -0.23pp (worse) |
+| PF | 1.10 | **1.08** | -0.02 |
+| Win rate | 36.9% | 37.2% | +0.3pp |
+| Max DD | -10.24% | -10.26% | ~flat |
+| Trades | 314 | 312 | -2 |
+
+**Verdict: HYPOTHESIS REFUTED.** Removing the broad ETFs from the signal candidate set produced *slightly worse* CAGR + PF, not better. Mode A's edge problem is **structural** (Donchian-55/20 + vol-target + risk-parity on Indian equity at AngelOne CNC rates), not allocational.
+
+**Implication:** V28/V29/V30 single-parameter retunes on the SAME spec are unlikely to close the 7.7pp CAGR gap. The two honest paths forward are:
+  (a) Concede A3 on Mode A; pivot v4 to a fresh hypothesis (weekly bars / sector rotation / momentum-breadth)
+  (b) Burn the full V28-V30 retune budget on actual param changes — but expectations should be low
+
+Operator decision deferred to post-Friday verdict. No V28 initiated without explicit directive.
+
+### 8.B — BacktestConfig.sizer extension (commit `d572332`)
+
+**Purpose:** Make V27+ Mode A swing variants runnable through the existing `EnsembleBacktester` (battery infra) instead of the standalone tool. Required for the Mode A pin tests (`tests/integration/test_mode_a_v27_pin.py`, charter §7.1) and for any future V-variant the battery harness will sweep.
+
+**Schema additions** (`packages/research/backtest_ensemble.py:BacktestConfig`):
+
+```python
+sizer: str = "legacy"                     # default = v2.1 behaviour
+vol_target_risk_pct: float = 0.5          # charter §3.3
+vol_target_max_position_pct: float = 8.0  # charter §3.3
+```
+
+**Runtime dispatch** at the single sizing site (~line 858):
+- `sizer == "vol_target"` → `core.signals.volatility_sizer.vol_target_size`
+- else → `rm.calculate_position_size` (legacy, unchanged)
+
+The `vol_target` branch computes portfolio equity using the mark-to-cost convention already established by `Portfolio._persist_state_after_event` (~line 771).
+
+**Freeze contract (FREEZE_v2.1.md):**
+- `RiskManager` UNTOUCHED — legacy path still calls `rm.calculate_position_size` identically.
+- `BacktestConfig` added FIELDS only with defaults that preserve byte-identical V1-V26 reproducibility.
+- `core.signals.volatility_sizer` was added in Phase 7 (commit `2b3088e`) as a NEW module.
+
+**Allocator (risk-parity across firing candidates) DEFERRED.** The current per-bar loop processes signals one-at-a-time as they fire; a true portfolio-allocator pass requires a control-flow refactor (collect-all-firing-signals → allocate → size → execute) that is out of scope for today. For now, multi-symbol allocation stays inside `tools/v27_backtest_2026_06_01.py`. Tracked as v4-backlog item.
+
+**Tests (`tests/unit/test_engine_sizer_extension_2026_06_01.py`):** 11/11 PASS.
+- Defaults pinned (sizer == "legacy", risk_pct == 0.5, max_pct == 8.0)
+- Dispatch correctness (vol_target → vol_target_size; legacy → rm.calculate_position_size)
+- Unknown sizer name → defensive fall-back to legacy (no silent zero-shares)
+- Import surface stable
+
+**Regression sweep:** 182/182 backtest/sizer/sizing tests still PASS.
+
+### 8.C — ModeDispatcher skeleton (commit `b381012`)
+
+**Purpose:** Land the mode-flag enforcement layer per charter §2 (Q5: hard cutover after Phase 1 passes). SKELETON only — the full `route_order` + `kill_check` + `PaperBroker` land in the hard-cutover commit, after Phase 1 backtest passes.
+
+**New file:** `packages/trader/mode_dispatcher.py` (~470 lines).
+
+**Implemented (33 contract tests cover):**
+- `ModeSpec` dataclass — typed parse of one `strategies.modes.*` entry
+- Schema validation: `mode ∈ {backtest_only, paper, live}`; `runtime ∈ {swing_cnc, swing_fno_carry, intraday_fno_options, intraday_cash}`; enabled modes require `signal_module` + `cost_model` + `backtester_variant`; disabled-legacy modes (e.g. `swing_combined_shorts_legacy`) allowed to omit them
+- **Capital gate** (charter §2.3): refuses `mode: live` if cash_inr < threshold
+- **Verbatim override** "I accept ruin risk" — case-sensitive, whitespace-sensitive, logs CRITICAL audit line on use
+- **Allocation sum gate**: sum of `capital_allocation_pct` of enabled paper+live modes must be ≤ `mode_router.max_capital_allocation_pct`. `backtest_only` modes don't count.
+- **Module resolution**: `cost_model` / `signal_module` strings of form `a.b.c` or `a.b.c:Symbol` resolved via `importlib` (injectable resolver for tests)
+- `active_modes()` — stable insertion-order
+- `disable_mode(name, reason)` — operator-callable kill switch, in-memory toggle, CRITICAL [MODE-DISABLED] audit log
+
+**Deferred (lands in hard-cutover commit):**
+- `route_order()`: skeleton enforces structural rule (backtest_only modes never route, disabled modes never route, unknown modes raise KeyError) then raises NotImplementedError. Needs PaperBroker + live-broker adapter wiring.
+- `kill_check()`: skeleton validates window + presence of criteria then raises NotImplementedError. Needs equity_curve DB rolling-window reader.
+- NO `config.yaml` modification. Dispatcher accepts an in-memory dict; until the cutover commit lands a `strategies.modes` block in the live config, the dispatcher only runs against test fixtures.
+- NO `mode_tag` DB migration (charter §7.6).
+- NO PaperBroker (separate file in cutover commit, per charter §2.4).
+
+**Pod boundaries:** `packages/trader/__init__.py` says imports allowed = core, strategies, brokers; forbidden = research, ui, training. `mode_dispatcher.py` imports only `importlib` + stdlib at module level; runtime resolution targets `packages.core.*` / `packages.strategies.*`. Pod-boundary test PASSES.
+
+**Freeze contract:** NEW file in pod-internal namespace; no FREEZE_v2.1 enumerated file modified. Not yet wired into `trading_agent.py`, so no live-behaviour change is possible from this commit.
+
+**Tests (`tests/unit/test_mode_dispatcher_2026_06_01.py`):** 33/33 PASS in 0.15s.
+
+### Phase 8 totals
+
+| Bucket | Count |
+|---|---:|
+| Commits this phase | 3 (`7d693cd`, `d572332`, `b381012`) + writeup |
+| New files | 4 (`tools/v27_backtest_2026_06_01.py` modified; `tests/unit/test_engine_sizer_extension_2026_06_01.py` new; `packages/trader/mode_dispatcher.py` new; `tests/unit/test_mode_dispatcher_2026_06_01.py` new) |
+| Modified freeze-safe files | 2 (`tools/v27_backtest_2026_06_01.py`, `packages/research/backtest_ensemble.py`) |
+| New tests | 44 (11 sizer + 33 dispatcher) — all PASS |
+| Full-suite regression | 2166/2166 PASS in 73.4s |
+| Frozen files touched | **0** (`RiskManager`, `Portfolio`, `charges.py`, `position_sizer.py` all UNTOUCHED) |
+| Live-behavior changes | **0** (dispatcher not wired; engine default sizer == "legacy") |
+
+### Decision surface restated for the operator
+
+V27 first-cut: A2/A3 (CAGR underperforms NIFTYBEES by 7.7pp; PF 1.10).
+V27-no-benchmark: A2/A3 (slightly worse; structural edge problem confirmed).
+
+**Friday verdict still applies.** Mode A backtest evidence as of today does NOT clear the gate for 06-08 paper-mode flip. The standing condition ("if good backtest → paper Monday") is not met.
+
+What's in the operator's hands now:
+1. Run V28+V29+V30 retune budget (entry_n=100, chandelier_mult=2.5, max_concurrent=8) — probable A3 outcome, ~3h dev + 30min total backtest
+2. Concede A3 on Mode A; refresh path-forward; pivot v4 hypothesis (weekly bars / sector rotation / momentum-breadth)
+3. Park v4 work until post-Friday wind-down verdict; decide weekend
+
+Engine + dispatcher are in place for either path. The cost of having built them today: 2156→2166 tests, 0 freeze breaches, 6 commits since 09:00 IST.
+
+---
+
 > _Filed under the `changes-done` skill convention. This document is
 > the verdict-meeting ledger for the CHG-and-prep work; the brutal
 > review is the verdict-meeting adversarial record; the findings log
