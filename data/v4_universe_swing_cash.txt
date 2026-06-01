@@ -1,0 +1,100 @@
+# V4 Mode A — swing_cash_v27 universe
+# Source: strategy_charter_v4_2026-06-01.md §3.1
+# Seeded: 2026-06-01 (refresh quarterly per charter §3.1)
+# Total: 75 instruments (50 Nifty 50 + 15 Nifty Next 50 + 4 broad ETF + 2 commodity + 1 debt + 3 sector)
+#
+# Format: one symbol per line; lines starting with # are comments.
+# Loader: packages/research/instruments/etf_universe.py:load_v4_swing_cash_universe()
+# Symbols are NSE tickers (NO .NS suffix; the loader appends as needed).
+#
+# LIQUIDBEES is INCLUDED but EXCLUDED FROM SIGNAL GENERATION (see charter §3.1
+# tail note — it's the cash-sweep destination during low-conviction periods,
+# not a trend instrument). Markers below ("# (cash-sweep only — excluded from
+# signal gen)") are honored by the loader.
+
+# ===== Nifty 50 stocks (50) =====
+RELIANCE
+TCS
+HDFCBANK
+INFY
+ICICIBANK
+HINDUNILVR
+SBIN
+BHARTIARTL
+KOTAKBANK
+ITC
+LT
+AXISBANK
+BAJFINANCE
+ASIANPAINT
+MARUTI
+HCLTECH
+SUNPHARMA
+TITAN
+ULTRACEMCO
+NTPC
+WIPRO
+POWERGRID
+NESTLEIND
+TATAMOTORS
+M&M
+JSWSTEEL
+ADANIENT
+ADANIPORTS
+ONGC
+COALINDIA
+GRASIM
+INDUSINDBK
+BAJAJFINSV
+TATASTEEL
+TECHM
+HDFCLIFE
+BPCL
+DRREDDY
+EICHERMOT
+HEROMOTOCO
+DIVISLAB
+TATACONSUM
+BRITANNIA
+SHRIRAMFIN
+APOLLOHOSP
+SBILIFE
+CIPLA
+HINDALCO
+LTIM
+BAJAJ-AUTO
+
+# ===== Nifty Next 50 (top 15 by 60-day ADTV; seed list — re-derive quarterly) =====
+ADANIGREEN
+DMART
+PIDILITIND
+GODREJCP
+HAVELLS
+SIEMENS
+DABUR
+ICICIPRULI
+ZYDUSLIFE
+ABB
+BERGEPAINT
+IOC
+GAIL
+COLPAL
+MARICO
+
+# ===== Equity-broad ETFs (4) =====
+NIFTYBEES
+JUNIORBEES
+BANKBEES
+NIFTYIETF
+
+# ===== Commodity ETFs (2) =====
+GOLDBEES
+SILVERBEES
+
+# ===== Debt ETF (1) — cash-sweep only, excluded from signal gen =====
+LIQUIDBEES
+
+# ===== Sector ETFs (3) =====
+ITBEES
+PSUBNKBEES
+AUTOBEES
