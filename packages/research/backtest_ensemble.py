@@ -59,6 +59,11 @@ from strategies.ensemble import EnsembleModel
 from core.features import FeatureEngine
 from core.portfolio import Portfolio
 from core.risk_manager import RiskManager
+from core.signals.volatility_sizer import (
+    DEFAULT_MAX_POSITION_PCT as _VT_DEFAULT_MAX_PCT,
+    DEFAULT_RISK_PCT as _VT_DEFAULT_RISK_PCT,
+    vol_target_size,
+)
 from strategies import STRATEGY_REGISTRY
 from strategies.base_strategy import BaseStrategy, Signal, TradeSignal
 
@@ -180,6 +185,32 @@ class BacktestConfig:
     # would have been gated by drawdown in addition to the other gates.
     drawdown_halt_pct: Optional[float] = None
     drawdown_pause_pct: Optional[float] = None
+    # 2026-06-01 (v4 Phase 1 prep, Phase 8 charter §3.3): pluggable sizer.
+    # Default ``"legacy"`` routes through RiskManager.calculate_position_size
+    # (the v2.1 fixed-fraction sizer with ATR-anchored SL distance), byte-
+    # identical to prior runs so V1-V26 stay reproducible.
+    #
+    # ``"vol_target"`` routes through ``core.signals.volatility_sizer``
+    # (charter §3.3 spec: 0.5%-of-equity per-trade risk target, capped at
+    # 8% of equity per-name notional). V27+ swing variants opt in to test
+    # the CTA-standard sizing on the same engine.
+    #
+    # The two paths are mutually exclusive per-variant; they do NOT both
+    # run. A new ``sizer="vol_target"`` variant cannot be compared apples-
+    # to-apples against a legacy variant — the sizing is fundamentally
+    # different — so the comparison report must clearly tag the sizer
+    # used (battery.py reads BacktestConfig.sizer into manifest.json).
+    #
+    # The allocator (risk-parity across firing candidates) requires a
+    # control-flow refactor of the per-bar signal loop and is DEFERRED.
+    # For now, multi-symbol allocation stays inside the standalone
+    # `tools/v27_backtest_2026_06_01.py`. Tracked as v4-backlog item for
+    # a future Phase 2 commit.
+    sizer: str = "legacy"
+    # When sizer="vol_target", these two parameters govern the sizing.
+    # Defaults match charter §3.3 / charter §3.6 (Mode A V27 spec).
+    vol_target_risk_pct: float = 0.5
+    vol_target_max_position_pct: float = 8.0
 
 
 @dataclass
@@ -825,7 +856,41 @@ class EnsembleBacktester:
             tp = agg.take_profit or rm.get_take_profit(
                 entry_price, agg.signal.name, atr_val, regime=regime
             )
-            qty = rm.calculate_position_size(entry_price, sl, atr_val)
+            # Sizing — gated on BacktestConfig.sizer.
+            # "legacy" preserves v1-v26 behaviour (FREEZE_v2.1.md-safe).
+            # "vol_target" routes through core.signals.volatility_sizer
+            # for V27+ Mode A swing variants (charter §3.3 spec).
+            if self.bt.sizer == "vol_target":
+                # ATR_14 in INR-per-share. The RiskManager's sizing path
+                # uses (entry_price - sl) as a synthetic risk-per-share
+                # proxy; the vol-target sizer uses raw ATR per share so
+                # the sizing aligns with the charter §3.3 spec exactly.
+                # If atr_val is zero/NaN (data gap), vol_target_size
+                # returns 0 shares (binding_constraint="atr_zero") and
+                # the trade is dropped via the cash gate below — matches
+                # the legacy zero-ATR short-circuit semantics.
+                # Use the same mark-to-cost equity convention as
+                # portfolio._persist_state_after_event (~line 771): held
+                # positions valued at entry cost. Mark-to-market would
+                # require passing current LTPs which the engine doesn't
+                # collect at this point in the loop. Mark-to-cost has a
+                # known small downward bias on a profitable run but the
+                # vol-target sizer's 0.5%-of-equity risk budget is robust
+                # to a few-percent equity error.
+                portfolio_equity = portfolio.cash + sum(
+                    p.entry_price * p.quantity for p in portfolio.positions.values()
+                )
+                _vt = vol_target_size(
+                    equity_inr=portfolio_equity,
+                    price_inr=entry_price,
+                    atr_14_inr_per_share=atr_val,
+                    risk_pct=self.bt.vol_target_risk_pct,
+                    max_position_pct=self.bt.vol_target_max_position_pct,
+                    lot_size=1,
+                )
+                qty = _vt.shares
+            else:
+                qty = rm.calculate_position_size(entry_price, sl, atr_val)
 
             # Cash gate
             max_affordable = int(portfolio.cash // (entry_price * 1.01)) if entry_price > 0 else 0
