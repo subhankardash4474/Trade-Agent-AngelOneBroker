@@ -710,19 +710,105 @@ The `vol_target` branch computes portfolio equity using the mark-to-cost convent
 | Frozen files touched | **0** (`RiskManager`, `Portfolio`, `charges.py`, `position_sizer.py` all UNTOUCHED) |
 | Live-behavior changes | **0** (dispatcher not wired; engine default sizer == "legacy") |
 
-### Decision surface restated for the operator
+### Decision surface restated for the operator (POST-PHASE-9 UPDATE)
 
 V27 first-cut: A2/A3 (CAGR underperforms NIFTYBEES by 7.7pp; PF 1.10).
 V27-no-benchmark: A2/A3 (slightly worse; structural edge problem confirmed).
 
-**Friday verdict still applies.** Mode A backtest evidence as of today does NOT clear the gate for 06-08 paper-mode flip. The standing condition ("if good backtest → paper Monday") is not met.
+**Friday verdict still applies.** Mode A backtest evidence as of today does NOT clear the gate for 06-08 paper-mode flip. The standing condition ("if good backtest → paper Monday") is not met. **V30 (max_concurrent=8) is now the best Mode A variant, and it still fails the charter §3.10 CAGR-vs-benchmark gate by 7.11pp** (see Phase 9 below).
 
-What's in the operator's hands now:
-1. Run V28+V29+V30 retune budget (entry_n=100, chandelier_mult=2.5, max_concurrent=8) — probable A3 outcome, ~3h dev + 30min total backtest
-2. Concede A3 on Mode A; refresh path-forward; pivot v4 hypothesis (weekly bars / sector rotation / momentum-breadth)
-3. Park v4 work until post-Friday wind-down verdict; decide weekend
+## Phase 9 — V28/V29/V30/V31 retune sweep (2026-06-01, 14:40-16:30 IST)
 
-Engine + dispatcher are in place for either path. The cost of having built them today: 2156→2166 tests, 0 freeze breaches, 6 commits since 09:00 IST.
+Operator directive: "burn V28+V29+V30 retune budget". Executed via the standalone tool (`tools/v27_backtest_2026_06_01.py`) — kept apples-to-apples with V27 first-cut by preserving the risk-parity allocator (which the engine sizer-only path doesn't have yet).
+
+### 9.0 — CLI flag additions (no commit yet; lands with the result commit)
+
+Added 4 flags to the standalone backtester:
+- `--entry-n` (Donchian entry window; V27 default 55)
+- `--exit-m` (Donchian exit window; V27 default 20)
+- `--chandelier-mult` (trailing-stop ATR multiplier; V27 default 3.0)
+- `--max-concurrent` (max concurrent positions; V27 default 12)
+
+All 4 default to `None` → V27Params dataclass defaults preserved. No regression risk.
+
+### 9.1 — V28: entry_n=100 (longer breakout window)
+
+**Hypothesis:** Longer breakout = fewer false signals = stronger surviving trends.
+
+**Result:** WORSE on all metrics.
+- CAGR +1.25% → **+0.13%** (regression of 1.12pp)
+- PF 1.10 → **1.01** (basically random)
+- Max DD -10.24% → -12.07%
+- Trades 314 → 294 (-6%; few signals pruned that mattered)
+
+**Read:** V27's other filters (volume, ADX, regime) already do the breakout-quality work. Lengthening the Donchian window itself doesn't add information at daily-bar resolution.
+
+### 9.2 — V29: chandelier_mult=2.5 (tighter trailing stop)
+
+**Hypothesis:** Tighter trail = faster loss-cutting = better win/loss asymmetry.
+
+**Result:** **NET LOSS.**
+- CAGR +1.25% → **-1.46%** (regression of 2.71pp)
+- PF 1.10 → **0.88** (the strategy loses money)
+- Trades 314 → **371** (+18%; whipsaw confirmed)
+- Charges ₹14.5k → ₹17.1k (+18% charge burn from re-entries)
+
+**Read:** 2.5×ATR trail is INSIDE the normal volatility envelope of Indian equity. The V27 default of 3.0 is at or near optimal. Tightening is destructive.
+
+### 9.3 — V30: max_concurrent=8 (concentration)
+
+**Hypothesis:** Fewer slots → more capital per trade → bigger wins on the trades that work.
+
+**Result:** **THE SOLE POSITIVE RETUNE.** Better on all three primary metrics:
+- CAGR +1.25% → **+1.87%** (+0.62pp)
+- PF 1.10 → **1.19** (+0.09; **0.01 short of the charter §3.10 PF gate of 1.20**)
+- Max DD -10.24% → **-8.55%** (1.69pp improvement)
+- Per-trade P&L: V27 ₹12.6/trade → **V30 ₹31.9/trade (~2.5×)**
+
+**Caveat:** Concentration likely loads risk-parity even harder into low-vol broad ETFs (NIFTYBEES, JUNIORBEES, BANKBEES). V30 may be a worse-disguised version of NIFTYBEES buy-and-hold. Per-symbol P&L attribution would confirm/refute.
+
+### 9.4 — V31: all three combined
+
+**Hypothesis:** Stack the retunes additively.
+
+**Result:** REGRESSES.
+- CAGR -0.32% (between V29 and V28)
+- PF 0.96
+
+**Read:** Additive-retune hypothesis FAILS. V28 + V29 negatives wash out V30 positive.
+
+### 9.5 — Charter §3.10 verdict against the V30 candidate
+
+| Gate | Threshold | V30 actual | Verdict |
+|---|---:|---:|---|
+| `pf_min` | ≥ 1.20 | 1.19 | **MISS by 0.01** |
+| `cagr_vs_niftybees_min_pct` | ≥ +2.0pp | **-7.11pp** | **FAIL by 9.11pp** |
+| `maxdd_max_pct` | ≤ 25.0% | 8.55% | PASS (way under) |
+
+V30 is **close on PF, fails CAGR-vs-benchmark badly**. The CAGR gate is binding, not PF.
+
+### 9.6 — Recommended next steps (operator decision)
+
+(a) **Concentration sweep.** V32 (maxc=6) + V33 (maxc=4) — ~30 min total. If one crosses PF 1.20, we have a viable Mode A candidate that passes PF (but still fails CAGR-vs-benchmark).
+
+(b) **Per-symbol attribution.** Spend ~15 min reading V30's trades.csv to confirm/refute the "concentration into benchmark" hypothesis. Important to know BEFORE deploying.
+
+(c) **Concede A3 on Mode A.** All four retunes tested; only concentration helps and only marginally. Mark Mode A as A3 and pivot v4 to a different hypothesis.
+
+(d) **Park until Friday verdict.** Mode A's fate may be moot depending on the wind-down verdict.
+
+### Phase 9 totals
+
+| Bucket | Count |
+|---|---:|
+| Backtest runs | 4 (V28, V29, V30, V31) |
+| Tool change | 4 new CLI flags on standalone backtester |
+| Result artefacts | 4 dirs in `logs/backtests/v27_*_2026_06_01/` (force-added) |
+| Findings doc | `docs/findings/v28_v31_retune_results_2026-06-01.md` |
+| Frozen files touched | **0** |
+| Live-behavior changes | **0** |
+| Total commits this day | 11 (Phase 7 + 8 + 9) |
+| Best Mode A variant found | **V30 (max_concurrent=8)** — still fails CAGR gate by 7.11pp |
 
 ---
 

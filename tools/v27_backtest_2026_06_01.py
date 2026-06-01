@@ -810,9 +810,37 @@ def _cli() -> int:
                         "candidates (kept in history for benchmark + sigma "
                         "references). Example: --exclude NIFTYBEES,JUNIORBEES "
                         "to test the self-cannibalization hypothesis.")
+    # V28+V29+V30+V31 retune knobs (Phase 9, 2026-06-01)
+    p.add_argument("--entry-n", type=int, default=None,
+                   help="Donchian entry-breakout window (V27 default: 55). "
+                        "V28 retune candidate: 100 (longer window, fewer "
+                        "false breakouts, only the strongest trends fire).")
+    p.add_argument("--exit-m", type=int, default=None,
+                   help="Donchian exit window (V27 default: 20). Usually "
+                        "moved alongside entry-n to keep their ratio sensible.")
+    p.add_argument("--chandelier-mult", type=float, default=None,
+                   help="Chandelier trailing-stop ATR multiplier (V27 "
+                        "default: 3.0). V29 retune candidate: 2.5 (tighter "
+                        "trail, faster loss-cutting at the cost of more "
+                        "whipsaws).")
+    p.add_argument("--max-concurrent", type=int, default=None,
+                   help="Max concurrent positions (V27 default: 12). V30 "
+                        "retune candidate: 8 (fewer positions = more capital "
+                        "per trade = higher per-name concentration).")
     args = p.parse_args()
 
     excluded = {s.strip().upper() for s in args.exclude.split(",") if s.strip()}
+
+    # Build params with optional overrides for V28+ retunes.
+    params = V27Params()
+    if args.entry_n is not None:
+        params.entry_n = args.entry_n
+    if args.exit_m is not None:
+        params.exit_m = args.exit_m
+    if args.chandelier_mult is not None:
+        params.chandelier_mult = args.chandelier_mult
+    if args.max_concurrent is not None:
+        params.max_concurrent_positions = args.max_concurrent
 
     end = args.end or datetime.now().date().strftime("%Y-%m-%d")
     if args.start:
@@ -826,12 +854,15 @@ def _cli() -> int:
     print(f"[v27] window: {start} → {end}")
     print(f"[v27] capital: ₹{args.capital:,.0f}")
     print(f"[v27] output: {out}")
+    print(f"[v27] params: entry_n={params.entry_n} exit_m={params.exit_m} "
+          f"chandelier_mult={params.chandelier_mult} "
+          f"max_concurrent={params.max_concurrent_positions}")
     if excluded:
         print(f"[v27] excluded from signal candidates: {sorted(excluded)}")
 
     result = run_v27_backtest(
         start=start, end=end, capital_inr=args.capital,
-        params=V27Params(), output_dir=out,
+        params=params, output_dir=out,
         excluded_from_signals=excluded,
     )
 
