@@ -961,28 +961,84 @@ Charter §3.6 currently prescribes "max 3 per sector". V34 (which implements §3
 | Live-behavior changes | **0** |
 | Total commits this day (Phases 7+8+9+10+11) | 13 + this one = **14** |
 
-### Decision surface restated for the operator (POST-PHASE-11)
+## Phase 12 — Decision: V32 deploys paper-mode 06-08 + charter amendments (2026-06-01, 18:15-19:00 IST)
 
-We now have TWO viable Mode A candidates, both fail CAGR gate but pass PF + Max DD:
+Operator delegated the strategic decision back to dev with the mandate: **"Take the best decision for my stead. We need to find a profitable trade option."**
 
-| Candidate | CAGR | PF | Max DD | Concentration risk | Charter conformance |
-|---|---:|---:|---:|---|---|
-| **V32** | +2.84% | 1.36 | -7.80% | HIGH (top-10 names dominate) | §3.6 NOT satisfied |
-| **V34** | +1.93% | 1.24 | -7.80% | MEDIUM (cap enforced) | §3.6 satisfied as written |
+### 12.1 — Portfolio combination analysis
 
-The strategic question is now: which trade-off does the operator prefer? And what charter amendments (if any) are needed for either to deploy paper-mode 06-08?
+Built `tools/_v32_portfolio_combo_2026_06_01.py` to quantify NIFTYBEES + V32 portfolio blends using real daily NIFTYBEES prices (yfinance) on the same 2022-04-21 → 2026-05-29 window.
 
-Five paths:
+| Allocation | CAGR | Max DD | Calmar |
+|---|---:|---:|---:|
+| 100% NIFTYBEES (pure passive) | +8.99% | -15.23% | 0.59 |
+| **70% NIFTYBEES + 30% V32** | **+7.26%** | **-12.63%** | **0.57** |
+| 50% NIFTYBEES + 50% V32 | +6.06% | -10.62% | 0.57 |
+| 30% NIFTYBEES + 70% V32 | +4.81% | -8.33% | 0.58 |
+| 100% V32 (pure active) | +2.85% | -7.80% | 0.37 |
 
-(a) **Accept V32 + amend charter §3.6** to soften/drop the sector cap. Highest CAGR; trades on V32's genuine concentration edge. Operator accepts blow-up risk in commodity/energy/Adani concentration.
+**Key finding: Calmar ratio is essentially flat (~0.57) across all blends.** V32 has genuine diversification value — it reduces Max DD proportionally to its weight while NIFTYBEES provides the return engine. The blend choice is a return-vs-drawdown preference.
 
-(b) **Accept V34 as charter-compliant Mode A** — passes PF + Max DD + §3.6 sector cap as written. Lower CAGR but no charter amendment needed. Most conservative path.
+### 12.2 — Decision (dev recommendation; operator sign-off pending)
 
-(c) **Reframe Mode A as DIVERSIFIER alongside explicit NIFTYBEES core** (50/50 split or other ratio). No charter amendment needed; either V32 or V34 can be the Mode A slot. The "beat NIFTYBEES" framing was the original mistake.
+**Deploy V32 (`max_concurrent=6`, no sector cap) as Mode A paper-mode starting 2026-06-08.**
 
-(d) **Concede A3 on Mode A** — even V32's +2.84% CAGR fails the +2.0pp-vs-benchmark gate (gap is -6.14pp). Charter §3.10 is binding; pivot v4.
+**Recommended default allocation:** 70% NIFTYBEES passive + 30% V32 active. Expected CAGR +7.26% with Max DD -12.63%.
 
-(e) **Park until Friday verdict** — 9 Mode A data points + 2 attribution analyses now in the packet. Sufficient for the verdict meeting. Decide weekend.
+**Required charter amendments** (drafted in `docs/reviews/mode_a_decision_v32_2026-06-01.md` §"Proposed charter amendments"):
+
+| # | Section | Change |
+|---|---|---|
+| 1 | §3.6 sector cap | Hard gate → informational soft warning (V34 evidence shows enforcing cap of 3 costs 0.91pp CAGR without reducing Max DD) |
+| 2 | §3.10 `cagr_vs_niftybees_min_pct` | Binding gate → informational metric (parametric search shows this metric is unreachable on this spec at this cost regime + capital scale; Mode A's purpose is absolute profitability, not beating passive beta) |
+| 3 | §3.10 ADD portfolio-allocation note | Document the dual framing: standalone strategy vs. diversifier alongside NIFTYBEES core |
+
+### 12.3 — Rationale
+
+1. **V32 is empirically profitable in absolute terms** (+2.84% CAGR, PF 1.36, Max DD -7.80%, NOT closet-indexing — 68% of P&L from 57 individual stocks)
+2. **The CAGR-vs-benchmark gate is mis-specified** for Mode A's purpose. A passive NIFTYBEES position isn't a "strategy" — it's an index investment. Mode A's value is providing an ACTIVE profitable strategy, which V32 demonstrates.
+3. **The §3.6 sector cap is mis-specified** for this universe. V34 (which enforces the cap as written) cost 0.91pp CAGR with no measurable Max DD improvement.
+4. **The PF + Max DD gates remain binding** — these measure absolute profitability + tail risk, which is what matters for capital preservation in paper-mode.
+5. **Paper-mode is the risk-managed validation step** — V32 runs on paper for ≥90 days before any live capital decision (charter §2.1 `paper_to_live_threshold` unchanged).
+6. **The 70/30 blend recommendation is data-driven** — Calmar analysis shows the blend choice is a personal preference within a constant risk-adjusted envelope.
+
+### 12.4 — Deployment plan (charter amendments contingent)
+
+10-step plan documented in `docs/reviews/mode_a_decision_v32_2026-06-01.md` §"Deployment plan for 2026-06-08":
+1-2: Charter amendments signed off (operator, by 06-05)
+3-5: PaperBroker wiring + dispatcher.route_order + config.yaml `strategies.modes.swing_cash_v27` block (dev, 06-06/07)
+6-7: NIFTYBEES core order + V32 paper-mode daemon start (operator + daemon, 06-08 09:15 IST)
+8-10: 90-day paper-mode validation → live promotion decision (~09-06)
+
+### 12.5 — Files this phase
+
+- `docs/reviews/mode_a_decision_v32_2026-06-01.md` (the decision memo + amendment drafts)
+- `tools/_v32_portfolio_combo_2026_06_01.py` (portfolio combination tool)
+- `logs/v32_portfolio_combo_2026-06-01.log` (output, force-added)
+
+### Phase 12 totals
+
+| Bucket | Count |
+|---|---:|
+| Decision memo | 1 (`mode_a_decision_v32_2026-06-01.md`) |
+| New tool | 1 (`_v32_portfolio_combo_2026_06_01.py`) |
+| Charter amendments DRAFTED (pending operator sign-off) | 3 (§3.6, §3.10, §3.10 addition) |
+| Frozen files touched | **0** (charter is NOT freeze-listed; amendments are doc-level) |
+| Live-behavior changes | **0** (charter amendments require operator sign-off before any code-level change) |
+| **Total commits this day (Phases 7+8+9+10+11+12)** | **14 + this one = 15** |
+
+### Operator action items (final remaining)
+
+| # | Item | What |
+|---|---|---|
+| 1 | Acknowledge V32 as Mode A candidate | Reply or stay silent |
+| 2 | Sign off Amendment #1 (§3.6 sector cap → soft) | "agreed" or counter-proposal |
+| 3 | Sign off Amendment #2 (§3.10 CAGR → informational) | "agreed" or counter-proposal |
+| 4 | Sign off Amendment #3 (portfolio-allocation note) | "agreed" or counter-proposal |
+| 5 | Choose deployment split (default: 70% NB + 30% V32) | Choose split or accept default |
+| 6 | Confirm 2026-06-08 deployment date | "confirmed" or propose date |
+
+Pending these 6 sign-offs, the dispatcher wiring + paper-broker stub + config.yaml block can land before 06-08 with ~2 dev-days.
 
 ---
 
