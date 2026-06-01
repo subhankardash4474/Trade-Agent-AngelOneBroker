@@ -1,0 +1,28 @@
+{
+  "metrics": {
+    "start": "2022-04-21",
+    "end": "2026-05-29",
+    "years": 4.1,
+    "initial_capital_inr": 100000.0,
+    "final_equity_inr": 109865.62,
+    "total_return_pct": 9.87,
+    "cagr_pct": 2.32,
+    "max_dd_pct": -7.84,
+    "n_trades": 130,
+    "win_rate_pct": 36.9,
+    "profit_factor": 1.36,
+    "gross_profit_inr": 36342.68,
+    "gross_loss_inr": 26626.08,
+    "avg_charges_per_trade_inr": 53.48,
+    "total_charges_inr": 6951.98
+  },
+  "benchmark": {
+    "instrument": "NIFTYBEES",
+    "entry_price": 188.1,
+    "exit_price": 267.78,
+    "final_equity_inr": 142310.08,
+    "total_return_pct": 42.31,
+    "cagr_pct": 8.98,
+    "max_dd_pct": -15.22
+  }
+}

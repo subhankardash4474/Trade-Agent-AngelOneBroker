@@ -1,20 +1,22 @@
-# V27 Mode A retune sweep — V28 / V29 / V30 / V31 results
+# V27 Mode A retune sweep — V28 / V29 / V30 / V31 / V32 / V33 + attribution
 
-> Filed 2026-06-01 ~16:00 IST. Phase 9 of the v4 Mode A scaffolding. This document is the comparison table + verdict for the V28-V31 retune burn.
+> Filed 2026-06-01 ~16:00 IST, **EXTENDED ~17:30 IST with Phase 10 concentration sweep + V32 attribution**. This document is the comparison table + verdict for the V28-V33 retune burn.
 
-## TL;DR
+## TL;DR (UPDATED POST-PHASE-10)
 
-**V30 (max_concurrent=8) is the sole positive retune** — better than V27 first-cut on CAGR, PF, and Max DD simultaneously. **V28 (longer entry window) and V29 (tighter trail) are both net-negative.** **V31 (all-three combined) regresses** because V28+V29's negatives wash out V30's positive.
+**V32 (max_concurrent=6) is the best Mode A variant found.** PASSES the charter §3.10 PF gate (1.36 > 1.20) and Max DD gate (-7.80% < 25.0%). FAILS the CAGR-vs-benchmark gate (-6.14pp vs +2.0pp required). Per-symbol attribution shows V32 has **genuine individual-stock-picking edge (68% of P&L)** — NOT closet-indexing.
 
-| Variant | CAGR | PF | Max DD | Trades | Charter §3.10 gate? |
+| Variant | CAGR | PF | Max DD | Trades | Charter §3.10 gates |
 |---|---:|---:|---:|---:|---|
 | NIFTYBEES (benchmark) | +8.98% | — | -15.22% | 1 | — |
 | **V27 first-cut** | +1.25% | 1.10 | -10.24% | 314 | A2/A3 (fails PF + CAGR-gap) |
 | V27-no-benchmark | +1.02% | 1.08 | -10.26% | 312 | A2/A3 (worse) |
 | **V28** (entry_n=100) | +0.13% | 1.01 | -12.07% | 294 | A2/A3 (worse) |
 | **V29** (chandelier=2.5) | **-1.46%** | **0.88** | -11.33% | 371 | **A3 (NET LOSS)** |
-| **V30** (max_concurrent=8) | **+1.87%** | **1.19** | **-8.55%** | 239 | A2 (PF -0.01 short; CAGR-gap -7.11pp) |
+| **V30** (max_concurrent=8) | +1.87% | 1.19 | -8.55% | 239 | A2 (PF -0.01 short) |
 | V31 (all three combined) | -0.32% | 0.96 | -11.07% | 265 | A3 (NET LOSS) |
+| **V32** (max_concurrent=6) | **+2.84%** | **1.36** | **-7.80%** | 180 | **PF + DD PASS, CAGR-gap -6.14pp FAIL** |
+| **V33** (max_concurrent=4) | **+2.32%** | **1.36** | -7.84% | 130 | PF + DD PASS, CAGR-gap -6.66pp FAIL |
 
 Charter §3.10 gates for Mode A `swing_cash_v27`:
 
@@ -59,40 +61,109 @@ Per-trade P&L diagnostic:
 
 **Result:** REGRESSES. CAGR -0.32%, PF 0.96 (losing). V28's and V29's negative contributions wash out V30's positive. **Additive retune hypothesis fails.**
 
-## Charter §3.10 verdict against the V30 candidate
+### V32 — max_concurrent: 8 → 6 (more concentration; Phase 10 sweep)
+**Hypothesis:** If concentration is the only positive axis (V30), push further.
+
+**Result:** **NEW BEST VARIANT.** Crosses both PF and DD charter gates.
+- CAGR +1.87% (V30) → **+2.84%** (+0.97pp vs V30; +1.59pp vs V27)
+- PF 1.19 (V30) → **1.36** (+0.17 vs V30; **PASSES charter §3.10 gate of 1.20**)
+- Max DD -8.55% (V30) → **-7.80%** (best yet)
+- Per-trade P&L: V27 ₹12.6 → V30 ₹31.9 → **V32 ₹66.4** (5.3× V27)
+- Trades: 180 (vs V27 314, V30 239)
+
+### V33 — max_concurrent: 6 → 4 (most concentrated)
+**Hypothesis:** Continue the concentration sweep — does it peak at 6 or go further?
+
+**Result:** **SLIGHT REGRESSION from V32. Local CAGR peak is V32 (max_c=6).**
+- CAGR +2.84% (V32) → **+2.32%** (regression of 0.52pp)
+- PF 1.36 (V32) → 1.36 (identical; PASSES charter gate)
+- Per-trade P&L: V32 ₹66.4 → **V33 ₹74.7** (better per trade)
+- Trades: 180 → **130** (-28%; even fewer signals fit)
+
+**Diagnostic read:** Concentration helps up to max_c=6; below that, the strategy is trade-starved (fewer signals get to fire when slots stay occupied). V32 is the local optimum.
+
+## Concentration sweep curve
+
+| max_concurrent | CAGR | PF | Per-trade P&L |
+|---:|---:|---:|---:|
+| 12 (V27 baseline) | +1.25% | 1.10 | ₹12.6 |
+| 8 (V30) | +1.87% | 1.19 | ₹31.9 |
+| **6 (V32)** | **+2.84%** | **1.36** | ₹66.4 |
+| 4 (V33) | +2.32% | 1.36 | ₹74.7 |
+
+Per-trade economics keep improving monotonically as concentration tightens; CAGR peaks at 6 because trade frequency drops faster than per-trade P&L grows below that point.
+
+## V32 per-symbol attribution (the "closet-indexing" question)
+
+The critical follow-up: **is V32's edge real, or just a different way to closet-index NIFTYBEES?** If risk-parity loads heavily into broad ETFs and they dominate the P&L, V32 is essentially NIFTYBEES buy-and-hold in disguise.
+
+**Result (180 trades, ₹11,955 total net P&L):**
+
+| Bucket | Symbols | Trades | Net P&L | % of total |
+|---|---:|---:|---:|---:|
+| **Individual stocks** | 57 | 159 | **₹8,145** | **68.1%** |
+| Commodity ETFs (SILVERBEES, GOLDBEES) | 2 | 10 | ₹3,761 | 31.5% |
+| Broad ETFs (NIFTYBEES + JUNIORBEES + BANKBEES + NIFTYIETF) | 2 | 5 | ₹424 | **3.5%** |
+| Sector ETFs | 2 | 6 | -₹374 | -3.1% |
+
+**Top contributors:** IOC (₹5,183, 43%), SILVERBEES (₹3,289, 28%), ADANIGREEN (₹2,558, 21%), M&M (11%), HAVELLS (11%), HDFCLIFE (9%).
+
+**Top losers:** TATASTEEL (-12%), ADANIENT (-11%), JSWSTEEL (-9%), ADANIPORTS (-8%), PIDILITIND (-7%).
+
+**Closet-indexing hypothesis: REFUTED.** Broad ETFs contribute only **3.5% of net P&L**. V32 has genuine individual-stock-picking edge — IOC alone outweighs all 4 broad ETFs combined by 12×. The strategy actually picks names; it doesn't passively ride beta.
+
+**Observation:** Top winners + top losers both cluster in commodity/energy/Adani-group exposures. Concentration risk is real: a few names dominate both sides of the P&L distribution. A future variant could test sector caps to reduce this concentration noise.
+
+## Charter §3.10 verdict against the V32 candidate (UPDATED — V32 supersedes V30)
 
 Per the swing_cash_v27 kill_criteria backtest gates (charter §3.10 / Phase 7 manifest):
 
-| Charter gate | V30 actual | Verdict |
+| Charter gate | V32 actual | Verdict |
 |---|---:|---|
-| pf_min ≥ 1.20 | 1.19 | **MISS by 0.01** |
-| cagr_vs_niftybees ≥ +2.0pp | -7.11pp | **FAIL by 9.11pp** |
-| maxdd_max_pct ≤ 25.0% | 8.55% | PASS |
+| `pf_min ≥ 1.20` | **1.36** | **PASS** (+0.16) |
+| `cagr_vs_niftybees_min_pct ≥ +2.0pp` | **-6.14pp** | **FAIL** (by 8.14pp) |
+| `maxdd_max_pct ≤ 25.0%` | 7.80% | PASS (way under) |
 
-V30 is close on PF but **fails the CAGR-vs-benchmark gate badly**. The CAGR gate is the binding constraint, not the PF gate.
+**V32 passes 2 of 3 charter gates.** PF gate clears with comfortable margin. Max DD gate clears with massive margin (V32 is 1/3 of the threshold). **The CAGR-vs-benchmark gate is still binding and still fails.**
 
-## Implications
+**Risk-adjusted comparison** (CAGR ÷ |Max DD| as crude Calmar proxy):
 
-1. **The Donchian-55/20 + vol-target + risk-parity Mode A spec is at its ceiling on the 2022-2026 window**, with this 75-instrument universe, at AngelOne CNC charges, on ₹100k capital. The four variants we tested cover the main parameter axes (entry, exit, concentration), and only one (concentration) helps.
+| Strategy | CAGR | Max DD | Calmar-like ratio |
+|---|---:|---:|---:|
+| NIFTYBEES buy-and-hold | +8.98% | -15.22% | **0.59** |
+| V32 Mode A | +2.84% | -7.80% | **0.36** |
 
-2. **The "edge" V30 finds may be concentration-into-benchmark in disguise.** To confirm, run a per-symbol P&L attribution on V30's trades.csv and check what fraction of profits comes from NIFTYBEES/JUNIORBEES/BANKBEES vs individual stocks.
+V32's risk-adjusted return is still lower than NIFTYBEES, but the gap narrows significantly (0.36 vs 0.59 ratio, vs raw CAGR ratio of 0.32). NIFTYBEES has nearly 2× the drawdown of V32.
 
-3. **The 7.11pp CAGR gap is not closeable with these parameter axes.** Closing it requires either:
-   - A different hypothesis (cross-asset trend on weekly bars; sector rotation; momentum-breadth combo)
-   - A different cost regime (no broker can give us cheaper than AngelOne CNC discount)
-   - A different capital scale (the per-trade fixed costs dominate at ₹100k)
+## Implications (UPDATED)
 
-## Recommended next steps
+1. **The Donchian-55/20 + vol-target + risk-parity Mode A spec has a real but small edge** when configured with `max_concurrent=6`. V32 produces PF 1.36 + Max DD -7.80% on genuine individual-stock picks (68% of P&L). It is NOT closet-indexing.
+
+2. **The strategy still underperforms NIFTYBEES on raw CAGR** by 6.14pp. The 2022-2026 window was a strong-beta market and NIFTYBEES was a generous baseline. V32's risk-adjusted profile (lower drawdown) closes some of the gap but not all.
+
+3. **The two binding constraints for Mode A passing the charter:**
+   - The +2.0pp CAGR-vs-benchmark gate is the hard ceiling. Cannot be passed without either a richer signal (something orthogonal to NIFTYBEES beta) OR a cheaper cost regime OR a longer time window that includes a non-bull-market regime.
+   - Concentration risk: V32's P&L is dominated by ~10 names. A bad turn in 2-3 of them (commodity bust, Adani-group event) would meaningfully swing performance.
+
+4. **The concentration sweep peaked at max_c=6.** Below that (V33 max_c=4), per-trade economics keep improving but total trades drop faster, so CAGR regresses. Above that (V30 max_c=8), per-trade economics weaken faster than trade frequency rises.
+
+5. **Charter §3.10 currently REQUIRES the CAGR-vs-benchmark gate to pass.** If the operator wants to deploy V32 anyway, that requires either:
+   - A formal charter amendment loosening the CAGR-vs-benchmark threshold (e.g. accept underperformance if Max DD and PF pass — a CHANGE in policy)
+   - Acceptance that V32 is a "diversification" play that runs alongside an explicit NIFTYBEES core allocation (no charter change needed; reframes the strategy's purpose)
+
+## Recommended next steps (UPDATED post-V32 attribution)
 
 Pick one:
 
-**(a) Concentration sweep.** Burn ~30 min more compute on V32 (max_c=6) + V33 (max_c=4) to find the local CAGR peak around max_concurrent. If V32 or V33 cross PF 1.20, we have a viable Mode A candidate (still fails CAGR-vs-benchmark, but PF passes).
+**(a) Accept V32 as best Mode A candidate; document gates carefully.** V32 passes 2 of 3 charter gates and is NOT closet-indexing. Cost: ~15 min to write a "V32 candidate accepted" addendum. Then either propose a charter amendment to the CAGR gate, or accept the gate as binding and deploy V32 only as a diversifier alongside a NIFTYBEES core.
 
-**(b) Per-symbol attribution.** Spend ~15 min reading V30's trades.csv to confirm/refute the "benchmark in disguise" hypothesis. If confirmed, Mode A is essentially closet-indexing and the operator should know this BEFORE deploying.
+**(b) Explore signal-richness improvements.** V32's edge is concentration around the EXISTING signal stack. A richer signal (volume-weighted breakout? cross-sectional momentum rank? sector-rotation filter?) could potentially close more of the 6pp CAGR gap. ~1-2 days dev per new signal.
 
-**(c) Concede A3 on Mode A.** All four retunes tested; only concentration helps and only marginally. Mark cross-asset-trend on Indian equity at AngelOne CNC + ₹100k as A3, pivot v4 to a different hypothesis. Cleanest path forward.
+**(c) Test sector-cap (charter §3.6 says 3 per sector but V27 standalone does NOT enforce it).** V32's top-10 contributors cluster in commodity/energy/Adani; a sector cap would reduce concentration risk + may improve CAGR by forcing diversification. ~45 min dev + 1 backtest.
 
-**(d) Park until Friday verdict.** Mode A's fate may be moot if the v2.1 wind-down verdict goes a particular way. The four data points (V27 + V27-no-bm + V28-V31) are sufficient for the verdict-meeting summary. Resume Monday.
+**(d) Concede A3 on Mode A.** Charter §3.10 CAGR-gate is binding and V32 still fails by 6.14pp. All major parameter axes tested. Mark Mode A as A3, pivot v4 to a different hypothesis. Clean cutover.
+
+**(e) Park until Friday verdict.** 8 Mode A data points in the verdict-meeting packet (V27 + V27-no-bm + V28 through V33 + attribution). Plenty to inform the decision. Resume Monday.
 
 ## Artefacts
 
@@ -102,10 +173,14 @@ Pick one:
 | `logs/backtests/v27_no_benchmark_2026_06_01/` | V27 with NIFTYBEES + JUNIORBEES + BANKBEES + NIFTYIETF excluded from signal candidates |
 | `logs/backtests/v27_v28_entry100_2026_06_01/` | V28: entry_n=100 |
 | `logs/backtests/v27_v29_chand25_2026_06_01/` | V29: chandelier_mult=2.5 |
-| `logs/backtests/v27_v30_maxc8_2026_06_01/` | **V30: max_concurrent=8 (best so far)** |
+| `logs/backtests/v27_v30_maxc8_2026_06_01/` | V30: max_concurrent=8 |
 | `logs/backtests/v27_v31_combined_2026_06_01/` | V31: entry_n=100 + chand=2.5 + maxc=8 |
+| `logs/backtests/v27_v32_maxc6_2026_06_01/` | **V32: max_concurrent=6 (NEW BEST)** |
+| `logs/backtests/v27_v33_maxc4_2026_06_01/` | V33: max_concurrent=4 |
+| `tools/_v32_attribution_2026_06_01.py` | Per-symbol P&L attribution tool |
+| `logs/v32_attribution_2026-06-01.log` | V32 attribution output (closet-indexing REFUTED) |
 
-Each dir contains `comparison.md`, `results.json`, `manifest.json`, `equity_curve.csv`, `trades.csv`.
+Each result dir contains `comparison.md`, `results.json`, `manifest.json`, `equity_curve.csv`, `trades.csv`.
 
 CLI flag additions live in `tools/v27_backtest_2026_06_01.py` (`--entry-n`, `--exit-m`, `--chandelier-mult`, `--max-concurrent`). Reproducible.
 
@@ -117,4 +192,5 @@ CLI flag additions live in `tools/v27_backtest_2026_06_01.py` (`--entry-n`, `--e
 | `d572332` | 8.B | BacktestConfig.sizer extension (engine sizer plug-point) |
 | `b381012` | 8.C | ModeDispatcher skeleton (charter §2) |
 | `c7afba2` | 8.* | Phase 8 writeup |
-| (next) | 9 | V28-V31 retune burn + this findings doc |
+| `ae00241` | 9 | V28-V31 retune burn + initial findings doc |
+| (next) | 10 | V32-V33 concentration sweep + attribution + updated findings |
