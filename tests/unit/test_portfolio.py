@@ -64,9 +64,17 @@ class TestPnLCalculation:
     def test_total_value(self, portfolio):
         portfolio.open_position("TCS", "BUY", 3500.0, 1)
         value = portfolio.get_total_value({"TCS": 3600.0})
-        # cash (after buying) + current position value
-        expected_cash = 10000.0 - 3500.0 - (3500.0 * 0.0003)
-        assert abs(value - (expected_cash + 3600.0)) < 1
+        # cash (after buying) + current position value.
+        # We don't pin the exact commission here -- it depends on the active
+        # charges model. Pre-CHG (2026-06-01) the entry cost was ~Rs 1.05
+        # under Zerodha (0.03% × 3500). Post-CHG it's ~Rs 5-8 under AngelOne
+        # (the Rs 5 floor + minor STT/stamp/SEBI/GST on the buy leg). Either
+        # way, the entry commission is < Rs 20 and the relationship
+        # ``total_value == cash + position_value`` must hold byte-exact.
+        cash_after = portfolio.cash
+        assert abs(value - (cash_after + 3600.0)) < 0.01
+        # Sanity: commission charged on the BUY leg is bounded.
+        assert 0 < (10000.0 - cash_after - 3500.0) < 20.0
 
 
 class TestPerformanceMetrics:

@@ -68,16 +68,23 @@ class TestStrategyAwareRRGate:
         assert ok, f"MR with RR=0.8 should pass (0.6 floor), got {reason}"
 
     def test_mean_reversion_rejects_rr_0p4(self, rm_strat_aware):
-        # RR = 0.4, below the 0.6 floor. Should fail.
+        # RR = 0.4, below the 0.6 floor. Should fail at the poor_rr gate.
+        #
+        # CHG (2026-06-01): bumped quantity 100 -> 1000 so the trade has
+        # enough reward (Rs 400) to clear the EARLIER reward_vs_charges
+        # gate (2.5× ~Rs 82 AngelOne round-trip charges = Rs 205). Without
+        # the bump, AngelOne's higher charges would reject the trade at
+        # reward_vs_charges first and the assertion below wouldn't pin
+        # what it claims to pin. The RR is unchanged (0.4 < 0.6 MR floor).
         ok, reason = rm_strat_aware.is_trade_worth_taking(
             entry_price=100.0,
             take_profit=100.4,
             stop_loss=99.0,
-            quantity=100,
+            quantity=1000,
             strategy="mean_reversion",
         )
         assert not ok
-        assert "poor_rr" in reason
+        assert "poor_rr" in reason, f"Expected poor_rr gate, got: {reason}"
 
     def test_supertrend_requires_higher_rr(self, rm_strat_aware):
         # RR = 1.2 should fail for supertrend (needs 1.3) but pass for default.

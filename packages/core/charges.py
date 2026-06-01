@@ -1,23 +1,48 @@
 """
-Indian Equity Charges Calculator (Zerodha-style).
+Indian Equity Charges Calculator (AngelOne-calibrated).
 
-Computes realistic per-trade costs for:
-- Intraday (MIS): brokerage + STT + exchange txn + SEBI + GST + stamp duty
-- Delivery (CNC): brokerage (zero at Zerodha) + STT + exchange txn + SEBI + GST
-                  + stamp duty + DP (CDSL) charges on SELL
+Computes realistic per-trade costs for the broker the live trader actually
+uses (AngelOne). Until 2026-06-01 these rates were calibrated for Zerodha
+(0.03% intraday brokerage, ₹0 delivery, ₹13.5 DP, intraday-only stamp duty
+applied unconditionally) which under-stated charges for any swing/CNC
+backtest and for very-small intraday trades. CHG-01..CHG-05 in
+``docs/findings/findings_log_2026-06-01.md`` documents the gap and the
+per-variant PF adjustment that follows.
+
+Sources for the AngelOne rates below:
+- https://www.angelone.in/calculators/brokerage-calculator (rate table)
+- SEBI Uniform Stamp Duty Act (2020) for the intraday/delivery split
+- NSE circular for transaction-charge rate (0.00297% effective 2024)
+- SEBI turnover-fee circular (₹10 per crore)
+
+Computes per-trade costs for:
+- Intraday (MIS):  brokerage [max(min(0.1% × turnover, ₹20), ₹5) per leg]
+                  + STT (0.025% sell-side only)
+                  + exchange txn + SEBI + GST + stamp duty (0.003% buy-side)
+- Delivery (CNC): brokerage [same rule as intraday, NOT zero]
+                  + STT (0.1% both legs)
+                  + exchange txn + SEBI + GST
+                  + stamp duty (0.015% buy-side, 5× intraday)
+                  + DP (AngelOne) ₹20 + GST on SELL leg
 
 All values are fractions unless stated otherwise.
-Rates are as of 2026-04-28.
+Rates are as of 2026-06-01.
 
-DP charge clarification (A2-5, v3 charter, 2026-05-30): the CDSL DP
-charge modelled below (``DP_CHARGE_CDSL`` + GST) is **per SELL ORDER on
-delivery, not per day and not per holding day**. The advisor charter
-phrase "₹13.5 / ISIN / day" was loose terminology; the actual broker
-schedule is a one-time fee charged on the sell leg of any CNC trade,
-regardless of how long the position was held. There is a separate
-annual demat-account maintenance charge (~₹300/year flat) that is
-NOT modelled here because it is a fixed infrastructure cost, not a
-trade-attributable cost.
+DP charge clarification (A2-5, v3 charter, 2026-05-30): the DP charge
+modelled below (``DP_CHARGE`` + GST) is **per SELL ORDER on delivery, not
+per day and not per holding day**. The advisor charter phrase "₹13.5 /
+ISIN / day" was loose terminology; the actual broker schedule is a
+one-time fee charged on the sell leg of any CNC trade, regardless of
+how long the position was held. There is a separate annual demat-account
+maintenance charge (~₹300/year flat) that is NOT modelled here because
+it is a fixed infrastructure cost, not a trade-attributable cost.
+
+CHG note (2026-06-01): the constant was renamed ``DP_CHARGE_CDSL`` →
+``DP_CHARGE`` and the default raised from ₹13.5 (CDSL pass-through that
+Zerodha bills literally) to ₹20 (AngelOne markup per their published
+schedule). The previous env-var name ``TRADING_CHARGES_DP_CHARGE_CDSL``
+is still honoured for one release with a one-shot WARNING so operators
+who hot-patched it in production are not silently reverted.
 
 P3 polish (2026-05-17): rates can now be overridden at runtime via env vars
 without a rebuild. Useful when SEBI / the broker bumps a rate mid-deployment
@@ -106,22 +131,105 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
-# ---- Rate constants (NSE Equity) ----
-BROKERAGE_INTRADAY_PCT = _env_float("BROKERAGE_INTRADAY_PCT", 0.0003)
-BROKERAGE_DELIVERY_PCT = _env_float("BROKERAGE_DELIVERY_PCT", 0.0)
+# ---- Rate constants (NSE Equity, AngelOne calibration as of 2026-06-01) ----
+
+# Brokerage: AngelOne charges max(min(0.1% × turnover, ₹20), ₹5) per executed
+# order. Same rule applies to intraday and delivery. (Until CHG-01..CHG-03 on
+# 2026-06-01 these defaults were Zerodha values: 0.03% intraday, 0% delivery,
+# no minimum. That under-charged every delivery trade by ~₹40 round-trip
+# brokerage and under-charged small intraday trades.)
+BROKERAGE_INTRADAY_PCT = _env_float("BROKERAGE_INTRADAY_PCT", 0.001)
+BROKERAGE_DELIVERY_PCT = _env_float("BROKERAGE_DELIVERY_PCT", 0.001)
 BROKERAGE_MAX_PER_ORDER = _env_float("BROKERAGE_MAX", 20.0)
+BROKERAGE_MIN_PER_ORDER = _env_float("BROKERAGE_MIN", 5.0)
 
 STT_INTRADAY_SELL = _env_float("STT_INTRADAY_SELL", 0.00025)
 STT_DELIVERY = _env_float("STT_DELIVERY", 0.001)
 
 NSE_TXN_CHARGE = _env_float("NSE_TXN_CHARGE", 0.0000297)
 SEBI_CHARGE = _env_float("SEBI_CHARGE", 0.000001)
-STAMP_DUTY_BUY = _env_float("STAMP_DUTY_BUY", 0.00003)
+
+# Stamp duty: SEBI Uniform Stamp Duty Act 2020. Same rate on every state
+# (the "state-wise" language in broker UIs is a vestige of pre-2020
+# regimes). Intraday and delivery have DIFFERENT rates: delivery is 5×
+# intraday. (Until CHG-04 on 2026-06-01, both products shared the
+# intraday rate, under-charging delivery stamp duty by 80%.)
+STAMP_DUTY_BUY_INTRADAY = _env_float("STAMP_DUTY_BUY_INTRADAY", 0.00003)
+STAMP_DUTY_BUY_DELIVERY = _env_float("STAMP_DUTY_BUY_DELIVERY", 0.00015)
+
 GST_RATE = _env_float("GST_RATE", 0.18)
 
-# Delivery only
-DP_CHARGE_CDSL = _env_float("DP_CHARGE_CDSL", 13.5)
+# DP (Depository Participant) charges -- delivery SELL leg only.
+# AngelOne charges ₹20 + GST per executed sell order. (Until CHG-05 on
+# 2026-06-01, the default was ₹13.5, the CDSL pass-through Zerodha bills
+# without markup.) Env-var name change: DP_CHARGE_CDSL -> DP_CHARGE. The
+# old name is honoured for backward compatibility (see ``_deprecated_dp_env``).
+DP_CHARGE = _env_float("DP_CHARGE", 20.0)
 DP_GST = _env_float("DP_GST", 0.18)
+
+
+def _deprecated_dp_env() -> None:
+    """Warn once if the operator still has TRADING_CHARGES_DP_CHARGE_CDSL set.
+
+    CHG-05 (2026-06-01): the env var was renamed. If an operator hot-patched
+    the old name on the trader VM, silently reverting to the new ₹20 default
+    would mis-price every delivery sell leg. Print a CRITICAL log line so
+    the operator notices before the next trading session.
+    """
+    legacy = os.environ.get("TRADING_CHARGES_DP_CHARGE_CDSL")
+    if legacy is None:
+        return
+    try:
+        from loguru import logger as _logger  # type: ignore[import-not-found]
+        _logger.critical(
+            f"[charges] env var TRADING_CHARGES_DP_CHARGE_CDSL={legacy!r} is "
+            f"DEPRECATED -- rename to TRADING_CHARGES_DP_CHARGE. The current "
+            f"value is being IGNORED; DP charge defaults to AngelOne ₹{DP_CHARGE}. "
+            f"Fix the env var or every delivery sell leg will be mis-priced."
+        )
+    except Exception:
+        import sys
+        print(
+            f"[charges][CRITICAL] env var TRADING_CHARGES_DP_CHARGE_CDSL={legacy!r} "
+            f"is DEPRECATED -- rename to TRADING_CHARGES_DP_CHARGE. Value being "
+            f"IGNORED; using AngelOne ₹{DP_CHARGE} default.",
+            file=sys.stderr,
+        )
+
+
+_deprecated_dp_env()
+
+
+def _log_active_rates() -> None:
+    """Emit a single INFO line at module-import time naming the active
+    broker and brokerage rate, so any operator who reads the daemon log
+    can immediately see whether the cost model matches the live broker.
+
+    CHG (2026-06-01): the absence of a "we are calibrated for X" line was
+    the reason the Zerodha-vs-AngelOne mismatch survived 6 months of audits.
+    """
+    broker_hint = "AngelOne" if abs(BROKERAGE_INTRADAY_PCT - 0.001) < 1e-9 else "custom"
+    try:
+        from loguru import logger as _logger  # type: ignore[import-not-found]
+        _logger.info(
+            f"[charges] active rates: broker={broker_hint} | "
+            f"intraday_brokerage_pct={BROKERAGE_INTRADAY_PCT} | "
+            f"delivery_brokerage_pct={BROKERAGE_DELIVERY_PCT} | "
+            f"brokerage_cap=Rs{BROKERAGE_MAX_PER_ORDER} | "
+            f"brokerage_min=Rs{BROKERAGE_MIN_PER_ORDER} | "
+            f"stt_intraday_sell={STT_INTRADAY_SELL} | "
+            f"stt_delivery={STT_DELIVERY} | "
+            f"stamp_intraday_buy={STAMP_DUTY_BUY_INTRADAY} | "
+            f"stamp_delivery_buy={STAMP_DUTY_BUY_DELIVERY} | "
+            f"dp_charge=Rs{DP_CHARGE}"
+        )
+    except Exception:
+        # loguru not available (test isolation, early import); silently skip.
+        # The rate values are still applied; only the disclosure log is missing.
+        pass
+
+
+_log_active_rates()
 
 
 @dataclass
@@ -149,12 +257,36 @@ class TradeCharges:
 
 
 def _brokerage_dec(turnover: Decimal, product: str) -> Decimal:
-    """Brokerage for one leg (buy OR sell) -- Decimal internal API."""
-    if product == "DELIVERY":
-        return turnover * Decimal(str(BROKERAGE_DELIVERY_PCT))
-    brok = turnover * Decimal(str(BROKERAGE_INTRADAY_PCT))
+    """Brokerage for one leg (buy OR sell) -- Decimal internal API.
+
+    AngelOne rule (CHG-01..CHG-03, 2026-06-01): ``max(min(rate × turnover, cap), floor)``
+    per executed order. Same rule for intraday and delivery, just a different
+    ``rate`` constant.
+
+    Edge case: a zero turnover (no actual order) returns the floor (₹5), which
+    matches AngelOne's published "minimum brokerage per executed order" rule.
+    If a backtest sensitivity wants TRUE zero brokerage (e.g. "what if AngelOne
+    waived charges"), set both ``BROKERAGE_*_PCT`` and ``BROKERAGE_MIN`` to 0
+    via env vars.
+    """
+    rate = BROKERAGE_DELIVERY_PCT if product == "DELIVERY" else BROKERAGE_INTRADAY_PCT
+    brok = turnover * Decimal(str(rate))
     cap = Decimal(str(BROKERAGE_MAX_PER_ORDER))
-    return brok if brok < cap else cap
+    floor = Decimal(str(BROKERAGE_MIN_PER_ORDER))
+    # ``max(min(brok, cap), floor)`` -- expressed without builtins for Decimal
+    capped = brok if brok < cap else cap
+    return capped if capped > floor else floor
+
+
+def _stamp_duty_rate(product: str) -> float:
+    """Return SEBI Uniform Stamp Duty rate for the requested product.
+
+    CHG-04 (2026-06-01): previously a single ``STAMP_DUTY_BUY`` constant was
+    applied unconditionally at the intraday rate (0.003%); for delivery the
+    correct rate is 0.015% (5× higher). The split below mirrors the SEBI
+    Uniform Stamp Duty Act 2020.
+    """
+    return STAMP_DUTY_BUY_DELIVERY if product == "DELIVERY" else STAMP_DUTY_BUY_INTRADAY
 
 
 def compute_round_trip(
@@ -184,12 +316,17 @@ def compute_round_trip(
     brok = brok_buy + brok_sell
 
     # STT -- intraday SELL only; delivery both legs.
-    stt_dec = Decimal("0")
+    # CHG hotfix (2026-06-01): the delivery branch previously summed BUY+SELL
+    # value and quantized once, which violated the NUM-10 invariant that
+    # ``compute_round_trip == compute_one_leg(BUY) + compute_one_leg(SELL)``
+    # for delivery trades. Quantize each leg independently so portfolio.py's
+    # subtraction-free exit-commission split stays byte-exact.
     if product == "DELIVERY":
-        stt_dec = (buy_val + sell_val) * Decimal(str(STT_DELIVERY))
+        stt_buy = _q(buy_val * Decimal(str(STT_DELIVERY)))
+        stt_sell = _q(sell_val * Decimal(str(STT_DELIVERY)))
+        stt = stt_buy + stt_sell
     else:
-        stt_dec = sell_val * Decimal(str(STT_INTRADAY_SELL))
-    stt = _q(stt_dec)
+        stt = _q(sell_val * Decimal(str(STT_INTRADAY_SELL)))
 
     # Exchange transaction charges -- both sides.
     txn_buy = _q(buy_val * Decimal(str(NSE_TXN_CHARGE)))
@@ -207,13 +344,13 @@ def compute_round_trip(
     gst_sell = _q((brok_sell + txn_sell + sebi_sell) * Decimal(str(GST_RATE)))
     gst = gst_buy + gst_sell
 
-    # Stamp duty -- only on buy.
-    stamp = _q(buy_val * Decimal(str(STAMP_DUTY_BUY)))
+    # Stamp duty -- only on buy. Product-aware rate (CHG-04, 2026-06-01).
+    stamp = _q(buy_val * Decimal(str(_stamp_duty_rate(product))))
 
-    # DP charges -- only on delivery SELL.
+    # DP charges -- only on delivery SELL. (CHG-05, 2026-06-01: now ₹20 AngelOne.)
     dp = Decimal("0")
     if product == "DELIVERY":
-        dp = _q(Decimal(str(DP_CHARGE_CDSL)) * (Decimal("1") + Decimal(str(DP_GST))))
+        dp = _q(Decimal(str(DP_CHARGE)) * (Decimal("1") + Decimal(str(DP_GST))))
 
     total = brok + stt + txn + sebi + gst + stamp + dp
     return TradeCharges(
@@ -248,7 +385,12 @@ def compute_one_leg(
     sebi = _q(value * Decimal(str(SEBI_CHARGE)))
     gst = _q((brok + txn + sebi) * Decimal(str(GST_RATE)))
 
-    stamp = _q(value * Decimal(str(STAMP_DUTY_BUY))) if side == "BUY" else Decimal("0")
+    # Stamp duty: buy-only, product-aware rate (CHG-04, 2026-06-01).
+    stamp = (
+        _q(value * Decimal(str(_stamp_duty_rate(product))))
+        if side == "BUY"
+        else Decimal("0")
+    )
 
     stt = Decimal("0")
     if product == "DELIVERY":
@@ -256,9 +398,10 @@ def compute_one_leg(
     elif side == "SELL":
         stt = _q(value * Decimal(str(STT_INTRADAY_SELL)))
 
+    # DP charges: delivery SELL only, ₹20 + GST (CHG-05, 2026-06-01).
     dp = Decimal("0")
     if product == "DELIVERY" and side == "SELL":
-        dp = _q(Decimal(str(DP_CHARGE_CDSL)) * (Decimal("1") + Decimal(str(DP_GST))))
+        dp = _q(Decimal(str(DP_CHARGE)) * (Decimal("1") + Decimal(str(DP_GST))))
 
     total = brok + stt + txn + sebi + gst + stamp + dp
     return float(total)

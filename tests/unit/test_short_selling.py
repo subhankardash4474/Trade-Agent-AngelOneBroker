@@ -113,12 +113,20 @@ class TestShortPortfolioTotalValue:
     def test_total_value_unchanged_at_entry_price(self, portfolio):
         """Immediately after opening a short (exit price == entry price),
         total equity should be essentially unchanged — only paid the
-        entry commission."""
+        entry commission.
+
+        CHG (2026-06-01): the AngelOne calibration raised intraday
+        brokerage from 0.03%-no-floor to 0.1% with a ₹5 floor. Entry
+        commission on 2×₹2500 notional is now ~₹7-8 (Rs 5 brokerage +
+        small STT/stamp/GST), up from <₹1 pre-CHG. Tolerance widened
+        accordingly.
+        """
         initial = portfolio.get_total_value({})
         portfolio.open_position("RELIANCE", "SELL", 2500.0, 2)
         at_entry = portfolio.get_total_value({"RELIANCE": 2500.0})
-        # Down only by entry commission (<Rs 1 on 5000 notional intraday)
-        assert at_entry == pytest.approx(initial, abs=5.0)
+        # Down only by entry commission (< Rs 20 on 5000 notional intraday
+        # under any sensible Indian-equity broker model).
+        assert at_entry == pytest.approx(initial, abs=20.0)
 
     def test_total_value_rises_on_profitable_short(self, portfolio):
         portfolio.open_position("RELIANCE", "SELL", 2500.0, 10)
