@@ -282,6 +282,16 @@ def _variant_completed(variant_dir: Path) -> bool:
 # ============================================================
 # Top-level comparison
 # ============================================================
+# Phase 16d (2026-06-01): the resume-completion marker. Engine A's
+# battery.py uses a similar literal string at the bottom of
+# comparison.md so it can distinguish "run finished cleanly" from
+# "run aborted / still in progress" without re-loading every
+# per-variant JSON. We honour the same convention here so a future
+# resume-aware swing scheduler (or operator) can grep for it.
+COMPLETE_MARKER = "<!-- swing_battery: RUN COMPLETE -->"
+IN_PROGRESS_MARKER = "<!-- swing_battery: RUN IN PROGRESS -->"
+
+
 def _render_top_comparison(
     out_root: Path,
     results_by_variant: Dict[str, Dict[str, Any]],
@@ -292,12 +302,34 @@ def _render_top_comparison(
     capital_inr: float,
     universe_size: int,
     strategy_params_override: Optional[Dict[str, Any]],
+    *,
+    in_progress: bool = False,
+    variants_total: Optional[int] = None,
+    failures: Optional[List[str]] = None,
+    skipped: Optional[List[str]] = None,
 ) -> str:
-    """Markdown comparison.md at the run-root. Same shape as
+    """Markdown comparison_top.md at the run-root. Same shape as
     multi_swing_backtest_2026_06_01.py's _render_top_comparison so
-    operators see consistent output across local + cloud."""
+    operators see consistent output across local + cloud.
+
+    Phase 16d additions (all keyword-only so the call site at
+    end-of-run keeps working unchanged):
+    * ``in_progress``: when True, the header is prefixed with an
+      "IN PROGRESS" banner and the footer contains the
+      IN_PROGRESS_MARKER instead of COMPLETE_MARKER. Operators
+      tailing the file over SSH see at a glance whether what they
+      are reading is the final verdict or a mid-run snapshot.
+    * ``variants_total``: when provided, the header shows a
+      "Variants done: X / Y" line — mirrors Engine A so the same
+      regex in battery_status_remote.ps1's ETA parser works for
+      swing runs too.
+    * ``failures`` / ``skipped``: rendered as a footer note so
+      partial-progress reads include known failed variants without
+      forcing the operator to dig through ``.failure.txt`` siblings.
+    """
     out: List[str] = []
-    out.append("# Multi-strategy swing backtest — cloud run")
+    title_suffix = " — IN PROGRESS" if in_progress else ""
+    out.append(f"# Multi-strategy swing backtest — cloud run{title_suffix}")
     out.append("")
     out.append(f"> **Engine:** `packages/research/swing_backtester.py` (Engine B)  ")
     out.append(f"> **Runner:** `tools/run_swing_battery.py` (cloud / queue-driven)  ")
@@ -307,6 +339,11 @@ def _render_top_comparison(
     out.append(f"> **Cost model:** AngelOne CNC DELIVERY (`packages/core/charges.py`)  ")
     out.append(f"> **Benchmark:** NIFTYBEES buy-and-hold: "
                f"CAGR {benchmark_cagr:+.2f}%, MaxDD {benchmark_dd:+.2f}%  ")
+    if variants_total is not None:
+        # Phase 16d: match Engine A's exact phrasing so the existing
+        # ETA regex in battery_status_remote.ps1 (line ~497) picks
+        # it up without modification.
+        out.append(f"> **Variants done:** {len(results_by_variant)} / {variants_total}  ")
     if strategy_params_override:
         out.append(f"> **Strategy params override:** "
                    f"`{json.dumps(strategy_params_override)}`  ")
@@ -331,6 +368,19 @@ def _render_top_comparison(
         )
     out.append("")
 
+    if failures:
+        out.append("## Failed variants")
+        out.append("")
+        for alias in failures:
+            out.append(f"- `{alias}` — see `{alias}.failure.txt` for traceback.")
+        out.append("")
+    if skipped:
+        out.append("## Resume-skipped variants")
+        out.append("")
+        for alias in skipped:
+            out.append(f"- `{alias}` — already completed in prior invocation; metrics reloaded from `results.json`.")
+        out.append("")
+
     out.append("## Verdict legend (charter §3.10)")
     out.append("")
     out.append("- **A1** PF<1.10 — no edge; abandon.")
@@ -343,7 +393,68 @@ def _render_top_comparison(
     out.append(f"---")
     out.append(f"*Generated {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} IST "
                f"by `tools/run_swing_battery.py`.*")
+    out.append("")
+    # Phase 16d: machine-readable run-state marker (mirrors Engine A's
+    # `_write_comparison` invariant at packages/research/battery.py:1115).
+    out.append(IN_PROGRESS_MARKER if in_progress else COMPLETE_MARKER)
     return "\n".join(out)
+
+
+def _write_top_comparison(
+    out_root: Path,
+    results_by_variant: Dict[str, Dict[str, Any]],
+    benchmark_cagr: float,
+    benchmark_dd: float,
+    window_start: str,
+    window_end: str,
+    capital_inr: float,
+    universe_size: int,
+    strategy_params_override: Optional[Dict[str, Any]],
+    *,
+    in_progress: bool,
+    variants_total: Optional[int] = None,
+    failures: Optional[List[str]] = None,
+    skipped: Optional[List[str]] = None,
+) -> None:
+    """Atomic tempfile-then-rename write of comparison_top.md so an
+    operator tailing the file via SSH never sees a torn half-write.
+
+    Phase 16d invariant — for parity with Engine A's
+    `_write_comparison` at `packages/research/battery.py`:
+      1. Render the full markdown body into a temp sibling
+         (`.comparison_top.md.<pid>.tmp`) — uses pid so concurrent
+         processes (e.g. a manual sanity-check run alongside the
+         scheduler) can't collide on the tempfile name.
+      2. `Path.replace()` is atomic on both POSIX (rename(2) is
+         atomic within a filesystem) and Windows (since Python 3.3).
+         Either the OLD file remains intact or the NEW file
+         appears — never both, never neither, never a hybrid.
+      3. Errors are logged but never raised — a comparison.md write
+         failure must not abort the backtest itself. Engine A
+         follows the same swallow-and-log convention.
+    """
+    try:
+        text = _render_top_comparison(
+            out_root=out_root,
+            results_by_variant=results_by_variant,
+            benchmark_cagr=benchmark_cagr,
+            benchmark_dd=benchmark_dd,
+            window_start=window_start,
+            window_end=window_end,
+            capital_inr=capital_inr,
+            universe_size=universe_size,
+            strategy_params_override=strategy_params_override,
+            in_progress=in_progress,
+            variants_total=variants_total,
+            failures=failures,
+            skipped=skipped,
+        )
+        target = out_root / "comparison_top.md"
+        tmp = out_root / f".comparison_top.md.{os.getpid()}.tmp"
+        tmp.write_text(text, encoding="utf-8")
+        tmp.replace(target)
+    except Exception as exc:  # noqa: BLE001
+        _log(f"WARN comparison_top.md write failed: {type(exc).__name__}: {exc}")
 
 
 def _verdict_letter(pf, cagr, dd, bench_cagr) -> str:
@@ -519,6 +630,35 @@ def main(argv: Optional[List[str]] = None) -> int:
     benchmark_dd = 0.0
     failures: List[str] = []
     skipped: List[str] = []
+    variants_total = len(roster)
+
+    # Phase 16d (2026-06-01): closure that rewrites comparison_top.md
+    # after every variant-loop event (success / skip / failure / load
+    # error). Engine A (battery.py) does the equivalent via
+    # `_write_comparison` after every worker reap; Engine B previously
+    # only wrote at end-of-run, which meant operators tailing
+    # comparison_top.md over SSH saw nothing until the final variant
+    # finished — actively misleading during the 25-min 15-year run.
+    # Marker discipline: IN_PROGRESS until end-of-run sweep, then
+    # COMPLETE so the operator (and any future resume gate) can
+    # distinguish a final verdict from a mid-run snapshot.
+    def _checkpoint_comparison(in_progress: bool = True) -> None:
+        if not results_by_variant and not failures and not skipped:
+            return  # nothing to render yet
+        _write_top_comparison(
+            out_root=out_root,
+            results_by_variant=results_by_variant,
+            benchmark_cagr=benchmark_cagr,
+            benchmark_dd=benchmark_dd,
+            window_start=start, window_end=end,
+            capital_inr=args.capital,
+            universe_size=len(symbols),
+            strategy_params_override=strategy_params_override,
+            in_progress=in_progress,
+            variants_total=variants_total,
+            failures=failures,
+            skipped=skipped,
+        )
 
     for module_path, alias in roster:
         try:
@@ -530,6 +670,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                 f"{type(exc).__name__}: {exc}\n\n{traceback.format_exc()}",
                 encoding="utf-8",
             )
+            _checkpoint_comparison()
             continue
 
         vdir = _variant_dir(out_root, alias, spec.name)
@@ -553,6 +694,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                     benchmark_dd = b.get("max_dd_pct", 0)
             except Exception:  # noqa: BLE001
                 pass
+            _checkpoint_comparison()
             continue
 
         _log("")
@@ -579,6 +721,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                 encoding="utf-8",
             )
             failures.append(alias)
+            _checkpoint_comparison()
             continue
 
         result["spec_name"] = spec.name
@@ -591,20 +734,15 @@ def main(argv: Optional[List[str]] = None) -> int:
         _log(f"DONE {alias} — CAGR {m.get('cagr_pct'):+.2f}% | "
              f"PF {m.get('profit_factor')} | MaxDD {m.get('max_dd_pct'):+.2f}% | "
              f"trades {m.get('n_trades')}")
+        _checkpoint_comparison()
 
     # ── Top-level comparison + manifest ──
-    if results_by_variant:
-        comp_md = _render_top_comparison(
-            out_root=out_root,
-            results_by_variant=results_by_variant,
-            benchmark_cagr=benchmark_cagr,
-            benchmark_dd=benchmark_dd,
-            window_start=start, window_end=end,
-            capital_inr=args.capital,
-            universe_size=len(symbols),
-            strategy_params_override=strategy_params_override,
-        )
-        (out_root / "comparison_top.md").write_text(comp_md, encoding="utf-8")
+    # Phase 16d: final write flips the marker to COMPLETE so the file
+    # on disk now unambiguously represents the final verdict (operator
+    # tailing comparison_top.md sees the IN_PROGRESS banner disappear
+    # and the COMPLETE marker land).
+    if results_by_variant or failures or skipped:
+        _checkpoint_comparison(in_progress=False)
 
     manifest_top = {
         "engine": "swing_backtester (Engine B, cloud)",
