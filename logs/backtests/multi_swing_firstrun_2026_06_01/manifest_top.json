@@ -1,0 +1,50 @@
+{
+  "engine": "swing_backtester (Engine B, Path B)",
+  "runner": "tools/multi_swing_backtest_2026_06_01.py",
+  "window_start": "2021-06-02",
+  "window_end": "2026-06-01",
+  "capital_inr": 100000.0,
+  "max_concurrent_positions": 6,
+  "sector_cap": null,
+  "excluded_from_signals": [],
+  "variants": [
+    {
+      "alias": "V35",
+      "module": "strategies.swing_cash.donchian_55_20_spec",
+      "spec_name": "V35_donchian55_20",
+      "result_dir": "logs\\backtests\\multi_swing_firstrun_2026_06_01\\V35_donchian55_20"
+    },
+    {
+      "alias": "V36",
+      "module": "strategies.swing_cash.mean_reversion_swing_v1",
+      "spec_name": "V36_mean_reversion_swing",
+      "result_dir": "logs\\backtests\\multi_swing_firstrun_2026_06_01\\V36_mean_reversion_swing"
+    },
+    {
+      "alias": "V37",
+      "module": "strategies.swing_cash.pullback_to_sma50_v1",
+      "spec_name": "V37_pullback_to_sma50",
+      "result_dir": "logs\\backtests\\multi_swing_firstrun_2026_06_01\\V37_pullback_to_sma50"
+    },
+    {
+      "alias": "V38",
+      "module": "strategies.swing_cash.weekly_breakout_v1",
+      "spec_name": "V38_weekly_breakout",
+      "result_dir": "logs\\backtests\\multi_swing_firstrun_2026_06_01\\V38_weekly_breakout"
+    },
+    {
+      "alias": "V39",
+      "module": "strategies.swing_cash.macd_swing_v1",
+      "spec_name": "V39_macd_swing",
+      "result_dir": "logs\\backtests\\multi_swing_firstrun_2026_06_01\\V39_macd_swing"
+    },
+    {
+      "alias": "V40",
+      "module": "strategies.swing_cash.dual_momentum_relstrength_v1",
+      "spec_name": "V40_dual_momentum_relstrength",
+      "result_dir": "logs\\backtests\\multi_swing_firstrun_2026_06_01\\V40_dual_momentum_relstrength"
+    }
+  ],
+  "benchmark_niftybees_cagr_pct": 12.72,
+  "benchmark_niftybees_max_dd_pct": -15.23
+}
