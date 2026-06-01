@@ -916,3 +916,505 @@ file edits, commit order) at that point.
   test file referenced by Q1.
 * `git diff packages/core/charges.py` — the uncommitted diff at the
   centre of Q1.
+
+---
+
+## Session @ 12:00 IST
+
+**BRUTAL REVIEW — 2026-06-01 (Session 3)**
+Scope: verification re-sweep after the operator picked Q1=A + Q2=B
+from Session 2's path-forward table at ~11:35 IST and shipped 7
+commits + a V25/V26 AngelOne re-simulation in ~20 minutes. Per the
+operator's instruction *"read commit, new files and changes
+everything"* — this session re-derives every key number from the
+artefacts that landed between 11:35 and 12:00, and compares them
+against what the morning sessions assumed.
+Persona: Expert algo trader + adviser. Verdict is unsentimental.
+
+---
+
+### Verdict (one line)
+
+**RED, evidence-complete at every layer.** Status moves from
+Session 2's *RED, verdict-meeting-blocking* to **RED, wind-down
+case is now over-determined**. V25 at AngelOne rates lands at
+PF 0.04 (MaxDD 76.6%), V26 at PF 0.01 (MaxDD 82.3%) — the
+strategy at realistic broker fees would have triggered the live
+20% drawdown halt **at least four times** in the 600-day window.
+The 2026-06-05 verdict meeting now has more evidence than it
+needs; the only residual risks are documentation hygiene around
+**how** the verdict is framed, not whether it is correct.
+
+---
+
+### Bottom-line numbers — verified from artefacts that landed in the last 25 minutes
+
+Sources:
+`logs/backtests/battery_chg_recompute_20260601T114500/results/V25_swing_combined_shorts.json`,
+`results/V26_swing_combined_shorts_high_cap.json`,
+`comparison.md`,
+`git log --since="2026-06-01 11:35"`,
+`git show e277e21`,
+`docs/findings/findings_log_2026-06-01.md`,
+`docs/changes/changes_done_2026-06-01.md`,
+`logs/audit/2026-06-01/checkpoint_1136.{md,json}`,
+`logs/signal_audit_2026-06-01.csv` (15 rows by 11:43 IST),
+`logs/trading_agent_2026-06-01.log` tail.
+
+| Metric | Morning's read | Now | Source / verification |
+|---|---|---|---|
+| V25 PF (AngelOne true re-sim) | "PF would go lower, magnitude unquoted" | **0.04** (vs 0.23 Zerodha) | `V25_swing_combined_shorts.json:68`. 190 trades, 4 wins, 186 losses, WR 2.1%, charges Rs 7,040.17 on Rs -7,662.29 PnL → **92% of loss is broker-fee burn**. |
+| V26 PF (AngelOne true re-sim, first execution ever) | Estimated "lower than 0.23" | **0.01** | `V26_swing_combined_shorts_high_cap.json:72`. 195 trades, 2 wins, WR 1.0%, charges Rs 7,190.65 on Rs -8,229.37 PnL → **88% of loss is broker-fee burn**. |
+| V26 vs V25 direction | Session 2 wrote "if V26 ≥ V25 the wind-down is confirmed" | **V26 IS WORSE than V25** (0.01 < 0.04, MaxDD 82.3% > 76.6%) | Decisively refutes Session 3 (2026-05-30) §2's "more positions = absorbs short-emission dilution" hypothesis. More positions = more losing trades × the AngelOne per-trade cost floor. |
+| Max drawdown V25 / V26 at AngelOne rates | Session 2 referenced 37% from V25-Zerodha | **76.64% / 82.29%** | Same JSONs. v3 charter caps drawdown halt at 20%; live engine would have triggered the halt **≥4 times** in the 600-day V25 window. The strategy doesn't underperform — it self-destructs. |
+| Commits since Session 2 | 0 expected | **7 commits in 12 minutes (11:24-11:36) + 1 trailing chore at 11:36:34** | `git log --since="2026-06-01 11:35"`. Operator went Q1=A + Q2=B + 4 bonus baseline-test repairs + Cursor skills track + .gitignore tweak. |
+| Test suite | "16 new tests in untracked file" | **2,056 / 2,056 passing** | Per `changes_done_2026-06-01.md:227`. The 4 pre-existing baseline failures (`test_alert_retry_and_spool` ×3, `test_eod_audit_fixes` ×1) were repaired in commit `0d541ed`. |
+| Today's signal activity (audit CSV) | 5 rows at 09:37 | **15 rows by 11:43** — **100% SELL, 100% rejected for `allow_shorts:false`** | `signal_audit_2026-06-01.csv` rows 2-16. 4th consecutive zero-trade session continues. |
+| Live in-window ensemble acts | Not captured | **8 ensemble SELL acts in 10:36-11:36 window** | `checkpoint_1136.md:29-36`. All 8 vetoed downstream by `allow_shorts:false`. The structural bear blindness from morning Finding 1 is unbroken. |
+| Local laptop daemon | PID 7, uptime 66 h | **KILLED** — PID 7 dead; PID 6 booted 11:34:36 IST | `checkpoint_1136.md:8` shows PID 6, uptime 2.1 min. Session 2 §5 P0 (third request) **CLOSED**. PID 6 booted with the new AngelOne charges loaded (per `_log_active_rates()` in commit `e277e21`). |
+| Live trader (cloud) deploy status | "Confirm today" | **Trader VM NOT redeployed today** — explicitly per freeze charter §6.1 | `changes_done_2026-06-01.md:213-217`. Live trader still has Zerodha rates + pre-Saturday Bug A/B vulnerability. Paper-mode short-circuits before broker.place_order, so no live execution risk from the local PID 6 daemon. |
+
+---
+
+### Top suspicions, ranked by ₹ impact
+
+#### 1. The live trader's internal PnL ledger is silently OPTIMISTIC since 2026-05-08 — verdict-meeting cumulative needs adjusting
+
+**Evidence.** `changes_done_2026-06-01.md:215`:
+
+> The live trader does NOT have today's CHG fix. Live broker orders
+> since 2026-05-08 have been priced at Zerodha rates internally;
+> AngelOne has been charging actual AngelOne rates regardless. Net
+> effect: every live trade has been silently more expensive than the
+> daemon's internal PnL ledger believes by ~Rs 20-25/trade.
+
+Cross-check: `logs/trades.csv` shows ~30 real closed trades between
+2026-05-08 and 2026-05-26 at intraday MIS sizing. At ~Rs 20-25/trade
+of un-counted AngelOne charges, the internal ledger has under-counted
+costs by **Rs 600-750**. The headline cumulative reading
+−₹1,212.26 is therefore the **optimistic** version of reality;
+the true figure at real broker-charged costs is **₹-1,800 to ₹-1,950**.
+
+The morning brutal review framed this as "the v3 case becomes
+₹0-500/month at AngelOne rates instead of ₹250-700". The
+changes_done correctly extends the same logic to the LIVE LEDGER:
+not just the prospective v3 numbers but the *retrospective v2.1
+deployment* was being measured against an optimistic cost model.
+
+**Business interpretation.** This is a brand-new finding the morning
+sessions did not have. It means:
+
+* The cost-coverage ratio in the self-sufficiency tracker (currently
+  -54%) is the **optimistic** version. The real coverage is closer
+  to **-72% to -80%** once the silent ledger over-count is
+  netted out.
+* The "are we paying for ourselves" framing the verdict meeting
+  reads should explicitly quote **both** numbers — the
+  ledger-as-recorded (₹-1,212) and the broker-as-charged
+  (₹-1,800 to ₹-1,950 estimated) — and lead with the latter.
+* This also retroactively justifies the morning's Finding 1
+  insistence that the charges issue was verdict-defining: it was
+  not only forward-looking PF distortion but also a backward-looking
+  P&L ledger error.
+
+**Estimated ₹ impact.** Bounded ₹600-750 of additional realised loss
+not yet on any ledger. Strengthens the wind-down argument by
+materially worsening the "self-sufficiency coverage" headline.
+
+**Recommended action.** Add one line to the verdict-meeting packet:
+*"Cumulative realised: ₹-1,212 (internal ledger, Zerodha-rate
+calibration) / ₹-1,800 to ₹-1,950 (broker-charged, AngelOne reality).
+Live trader's internal ledger has been silently optimistic since
+2026-05-08; CHG fix corrects the model but cannot retroactively
+re-price the 30 already-closed trades. Treat the broker-charged
+figure as the source of truth for cost-coverage calculations."*
+
+#### 2. AGENTS.md §8 and FREEZE_v2.1.md disagree on whether `packages/core/charges.py` is freeze-protected — operator chose the narrower reading and shipped without a bypass
+
+**Evidence.** `AGENTS.md:145-151`:
+
+```
+8. **Never bypass the active freeze window** (`docs/FREEZE_v2.1.md`,
+   exits 2026-06-05) by silently editing files in `packages/strategies/`,
+   `packages/core/`, or threshold keys in `config.yaml`. If asked to
+   make such a change, ask the user for explicit `freeze-bypass:
+   <reason>` acknowledgement and record it in `changes-done` with the
+   `freeze-bypass` trigger flag (cap: 3 per window per the freeze
+   contract).
+```
+
+vs `docs/freeze/FREEZE_v2.1.md` (per the Session 1 read at line ~30):
+
+```
+1. Strategy code — `packages/strategies/*.py`
+2. Ensemble + voting logic — `packages/strategies/ensemble.py`
+3. Risk-manager rules — `packages/core/risk_manager.py`
+4. Sizing logic — `packages/core/position_sizer.py`
+5. `config.yaml` strategy + risk blocks
+6. ML model artifact — `models/xgboost_model.pkl`
+```
+
+AGENTS.md §8 says "packages/core/" as a directory; FREEZE_v2.1.md
+enumerates specific files within packages/core/ but does NOT list
+`charges.py`. The operator's commit `e277e21` chose the narrower
+reading and added a "discipline note" to the commit body:
+
+> packages/core/charges.py is NOT on the FREEZE_v2.1.md frozen file
+> list (it is upstream charge infrastructure, not behavioural
+> strategy logic). No freeze slot consumed.
+
+**Business interpretation.** The narrower reading is **textually
+defensible** — FREEZE_v2.1.md is the operating contract and charges
+is genuinely not on its list. But AGENTS.md §8's broader language
+exists for a reason: the morning's session-2 path-forward Q1A
+explicitly recommended a `freeze-bypass:` tag because the agent's
+own rule said to. The operator overrode that recommendation and
+went with the FREEZE_v2.1.md interpretation instead. **Either reading
+is defensible; what is NOT defensible is leaving the two contracts
+in textual disagreement.** A future agent re-reading AGENTS.md §8
+on a different change would, by the rule's plain text, gate any
+`packages/core/` edit on `freeze-bypass:` — and the operator would
+have to override again, citing today's precedent.
+
+**Estimated ₹ impact.** ₹0 — the change was correct on its merits
+either way. **Documentation hygiene only**.
+
+**Recommended action.** Pick one:
+
+* **(a)** Tighten FREEZE_v2.1.md to match AGENTS.md §8: explicitly
+  list "all `packages/core/*.py` except documented exceptions"
+  (which would have required `freeze-bypass:` today). High-discipline
+  reading.
+* **(b)** Loosen AGENTS.md §8 to match FREEZE_v2.1.md: enumerate the
+  specific files (risk_manager.py, position_sizer.py) rather than
+  the directory. Low-discipline reading; matches today's behaviour.
+* **(c)** Add a "freeze-safe" allowlist to AGENTS.md §8 listing
+  upstream infrastructure modules (charges.py, regime.py, etc.) that
+  are explicitly excluded from the §8 gate. Middle-ground reading.
+
+My recommendation: **(c)**. The charges change was genuinely
+infrastructure, not behavioural, and re-litigating it on every
+future audit is wasteful. But the carve-out should be explicit.
+
+#### 3. The 4 audit checkpoints for today are a BACKFILL at 11:44:30, not a live hourly cadence — the cadence outage from morning Finding 4 was NOT fixed, only papered over
+
+**Evidence.** All four checkpoint files for 2026-06-01 carry
+identical mtime **11:44:30** IST:
+
+```
+checkpoint_0900.{json,md}  11:44:30
+checkpoint_1001.{json,md}  11:44:30
+checkpoint_1100.{json,md}  11:44:30
+checkpoint_1136.{json,md}  11:44:30
+```
+
+The morning's Session 1 read `checkpoint_0900.md` at ~11:00 IST and
+found its mtime was **09:58:00** — which is when the live generator
+ran on the live 09:00 window. The current file was written at
+11:44:30, **overwriting the live capture**. The same is true for the
+10:01 and 11:00 files (they didn't exist at all at 11:00 per
+Session 1). Conclusion: the operator (or a manual batch invocation
+of `tools/audit_checkpoint.py`) regenerated all four files at 11:44
+from raw logs available at that moment.
+
+`changes_done_2026-06-01.md:163` claims:
+
+> The audit cadence **is** healthy — 4 checkpoints today on the
+> hourly cadence. The §4 finding was a transient observation that
+> resolved before the CHG sweep completed.
+
+This is **directionally misleading**. The 4-file count is correct;
+the "healthy hourly cadence" claim is not — the cadence is healthy
+on the **wallclock timestamps in the filenames** (09:00, 10:01,
+11:00, 11:36) but every file was written at 11:44:30 IST as a batch
+regeneration. The morning's Finding 4 (the live scheduler was silent
+during the first two market hours) is **unresolved**; what changed
+is that the operator backfilled the historical record.
+
+**Business interpretation.** ₹0 direct impact, **but**:
+
+* If the scheduler is still broken — and we have no evidence it
+  isn't — the verdict-week observability will fail again during the
+  next 4 trading days (06-02, 03, 04) unless the operator manually
+  re-runs the generator every hour.
+* Backfilled checkpoints **smooth over the audit trail**. A future
+  forensic reading `checkpoint_0900.md` will see the regenerated
+  contents, not the live-captured contents. The two are likely
+  identical in content but the *provenance is now lost*.
+* The morning session 1 read of `checkpoint_0900.json` showed
+  `per_strategy` table with only the 3-trade xgboost row. The
+  regenerated version (also read this session at `checkpoint_1136.md`)
+  shows the same 3-trade row — so the DB-blindspot from
+  Finding 6 of Session 1 is still present in the regenerated
+  checkpoints, confirming the regenerator pulls from the same
+  broken DB-backed analytics path.
+
+**Recommended action.** Two things:
+
+1. **Today** — verify whether the audit-checkpoint scheduler
+   (cron / Task Scheduler / supervisor) is actually running, or
+   whether the 11:44 batch was manual. If manual, set a recurring
+   hourly task before EOD so 06-02 / 03 / 04 don't repeat today's
+   silent-cadence pattern.
+2. **In the next changes_done entry** — correct the "cadence is
+   healthy" claim to "cadence outage was backfilled at 11:44 IST;
+   scheduler health is unverified" so the verdict-meeting packet
+   reads the honest version.
+
+#### 4. The CHG fix has a downstream strategy-behaviour side effect — the `reward_vs_charges` gate is now more restrictive in production
+
+**Evidence.** `changes_done_2026-06-01.md:85`:
+
+> `test_mean_reversion_rejects_rr_0p4` — was rejecting at the earlier
+> `reward_vs_charges` gate (AngelOne charges are now higher), masking
+> the `poor_rr` assertion it pins. **Bumped quantity 100 → 1000** so
+> the trade clears the charges gate and actually exercises the RR
+> gate the test claims to pin.
+
+In plain terms: at the test's original ₹100 quantity, AngelOne's
+higher per-trade cost floor (CHG-01 + CHG-02: ₹5 minimum brokerage)
+**now rejects trades the Zerodha-rate model would have allowed
+through to the RR check**. The test was rewritten to bump quantity
+10× so it could continue to test the RR gate — but the **live engine
+sees the new behaviour**. Strategies that emit ₹2-5k notional signals
+will now be vetoed at the `reward_vs_charges` gate where they
+previously cleared.
+
+**Business interpretation.** This is the freeze contract's edge
+case: charges.py is not on the FREEZE_v2.1.md list, but **changing
+charges constants has a knock-on behavioural effect via
+`reward_vs_charges`** — small trades that were viable at Zerodha
+costs are no longer viable at AngelOne costs. This is the right
+direction (the engine should not place trades the broker will
+charge more for than the expected reward), but it **is** a
+behavioural change introduced inside the freeze window.
+
+The capital pause means this has no immediate ₹ impact. If v3 Phase
+A activates after 2026-06-05 with smaller seed-capital sizing (₹25k
+× 5-8% per trade = ₹1.25k-2k notional), **the new gate will reject
+materially more trades than charter §4 assumes**. The v3 charter's
+income projections were already at risk per Session 2; this is the
+specific mechanism that lowers expected trade frequency at seed
+size.
+
+**Estimated ₹ impact.** Bounded. Negative for the v3 case
+(further reduces seed-phase trade frequency). Positive for the
+"don't pay AngelOne more than you make" invariant. **Net
+direction: reinforces the wind-down case**.
+
+**Recommended action.** Note in the verdict packet that the CHG
+fix has **two** ripple effects: (a) PF compression on backtests
+(quantified above), (b) **gate behaviour change** that further
+reduces v3 seed-phase trade frequency. Both push the same direction
+(wind-down argument stronger).
+
+---
+
+### Things the daemon is telling itself that are not true (delta only)
+
+* **`changes_done_2026-06-01.md:163` says "audit cadence is healthy"** —
+  contradicted by uniform 11:44:30 mtime on all 4 checkpoint files
+  (Finding 3 above).
+* **`changes_done_2026-06-01.md:227` says "2,056 / 2,056 passing"** —
+  not independently verified this session; taking on the operator's
+  word. If the verdict meeting will quote this number it should be
+  re-derived from a fresh `pytest` invocation before Friday.
+* **`changes_done_2026-06-01.md:38` says "ZERO slots consumed"** for
+  the freeze — textually true per FREEZE_v2.1.md, textually
+  inconsistent with AGENTS.md §8 (Finding 2 above). The "ZERO slots"
+  claim is correct on the operating contract that governs; the
+  documentation conflict needs reconciliation.
+* **All previous findings about today's structural bear-blindness
+  remain unchanged**: 15 audit rows by 11:43, all SELL, all rejected
+  for `allow_shorts:false`. The 4th consecutive zero-trade session
+  is now near-certain — by 12:00 IST the engine has emitted 15
+  signals and accepted 0, with the same pattern continuing.
+
+---
+
+### Things that look fine — this section is large because the operator did a lot well
+
+* **Q1=A execution is exemplary.** Findings log filed FIRST
+  (`findings_log_2026-06-01.md`), then charges commit
+  (`e277e21`), then per-variant PF adjustment doc + CSV
+  (`charges_pf_adjustment_2026-06-01.{md,csv}`), then footnotes on
+  8 prior decision docs (`4e381a7`), then this morning's brutal
+  review committed (`22434cd`), then the test repairs (`0d541ed`),
+  then the cursor skills track (`52f650c`), then the .gitignore
+  tweak (`135d749`). **The commit order tells the story properly.**
+  Findings before fix before adjustment before footnotes is the
+  correct ordering — any later auditor can replay the chain.
+* **The post-hoc PF adjustment script + per-variant CSV is the
+  right pattern for a baseline-shifting change.** Historical
+  JSONs are not modified; the recomputation is a separate report
+  that points BACK at the original artefacts with a footnote.
+  This preserves the pre-commit traceability the v3 charter §10.5
+  R1 ("do NOT debug into oblivion") was built to protect.
+* **V25 true re-sim closed the morning's biggest open question.**
+  V25-Zerodha 0.23 → V25-AngelOne 0.04 is an 83% PF compression —
+  orders of magnitude larger than any plausible data-refresh
+  noise. The yfinance cache invalidation between Saturday and today
+  (mentioned in `changes_done:190-196`) introduced ~3 trading days
+  of fresh data which is a trivial confound vs the signal. The
+  verdict direction is unambiguous.
+* **V26 first-ever execution is decisive in the OPPOSITE direction
+  the morning expected.** Session 2 anticipated "V26 might show
+  edge if the position cap was the constraint". V26 PF 0.01 < V25
+  PF 0.04 with MaxDD jumping from 76.6% to 82.3% says: more
+  positions = more losses × per-trade cost floor. The
+  position-cap-dilution objection from Session 3 (Sat) is
+  **closed in favor of wind-down**.
+* **PID 7 kill happened (Session 2 §5 P0, third request).** PID 6
+  booted with the new AngelOne charges loaded — `_log_active_rates()`
+  is the disclosure line introduced by commit `e277e21` and it
+  appears in the new daemon's startup banner. The local paper
+  daemon now matches the cost model the live broker actually applies,
+  which means the next 4 trading days of paper observability are
+  more truthful than they were on Saturday.
+* **`docs/freeze/verdict_meeting_packet_2026-06-05.md` exists.** Not
+  read this session (out of scope for verification re-sweep) but
+  confirmed present via Glob. The packet skeleton from Session 2
+  Q4 prototypical table was actioned.
+* **The bonus 4-baseline-test repair** (commit `0d541ed`) is
+  defensible scope creep. The 4 tests (`test_alert_retry_and_spool`
+  ×3, `test_eod_audit_fixes` ×1) were pre-existing failures
+  unrelated to CHG; bundling their repair into the same green-tree
+  sweep means the verdict-meeting packet can quote "all tests pass"
+  without footnoting known-failing exceptions.
+* **The `_log_active_rates()` disclosure log + the `_deprecated_dp_env()`
+  CRITICAL handler are the right defensive design.** The disclosure
+  log means any future audit of the daemon log will surface a
+  Zerodha-vs-AngelOne mismatch on day one (Session 1's "root cause
+  of the 6-month gap" is structurally closed). The deprecation
+  handler means an operator who hot-patched the old env-var name
+  cannot silently revert to the new ₹20 default — the rename is
+  loud.
+
+---
+
+### What I refused to conclude (insufficient evidence)
+
+* **Whether the audit checkpoint scheduler is actually running.**
+  The 4 checkpoint files at uniform 11:44 mtime is consistent with
+  EITHER (a) the scheduler is broken and the operator manually
+  batched, OR (b) the scheduler ran late and emitted all four in
+  one burst. Need to check Windows Task Scheduler history /
+  `tools/audit_checkpoint.py` invocation logs. The verdict-week
+  observability story depends on which.
+* **Whether the test count "2,056 / 2,056 passing"** is accurate
+  as of right now. Taking the changes_done's word; not independently
+  re-derived. A fresh `pytest -q` run before Friday is warranted
+  if the verdict meeting will cite this number.
+* **Whether the verdict-meeting packet at
+  `docs/freeze/verdict_meeting_packet_2026-06-05.md` is complete
+  and internally consistent.** Out of scope for this re-sweep;
+  should be a dedicated review pass before Friday.
+* **The V25 AngelOne re-sim showed 4 winners out of 190 trades.**
+  Those 4 winners constitute 100% of the gross-win figure used in
+  the PF 0.04 calculation. The verdict-meeting packet should
+  confirm the 4 wins are not a single symbol or a single
+  cluster-of-luck that the strategy cannot rely on. Cheap to
+  derive from the trade list in the JSON; not done this session.
+* **Whether commit `e277e21`'s discipline-note interpretation of
+  the freeze contract** (charges.py not on the FREEZE_v2.1.md
+  list, so no slot consumed) was the operator's deliberate call
+  or an agent decision. Either is fine; not knowing which is
+  not, in case the question is re-litigated at the verdict
+  meeting.
+
+---
+
+### What stayed open
+
+Three morning findings explicitly deferred per `changes_done_2026-06-01.md:233-243`:
+
+| Finding | Status | Risk if held to post-verdict |
+|---|---|---|
+| §3 Bug O — conftest test→prod log leak | **Deferred** (fourth session of being open) | Continued pollution of `logs/daemon_*.log`. Bounded; cosmetic for the verdict-week. |
+| §6 DB-blindspot backfill | **Deferred** — verdict packet to "quote CSV directly and note the DB gap" | Per-strategy diagnostic at the meeting will still read 3 trades when CSV has 30. Mitigation is documented; the gap itself is unfixed. |
+| §7 trader-VM deploy of CHG + Bug A/B | **Deferred** — explicit operator call post-verdict per freeze charter §6.1 | Live trader continues to under-count cost by Rs 20-25/trade. Bounded — capital paused. |
+
+Plus one **new** open item from this session:
+
+| New item | Action |
+|---|---|
+| `docs/changes/changes_done_2026-06-01.md` is **UNTRACKED** (per `git status --short`) | The audit-trail document for today's CHG work is not on `main`. Different file, same class of issue as morning's charges.py-uncommitted. Recommended action: commit it (with `4e381a7`-style `docs(changes):` prefix) before EOD so the changes-done ledger is queryable. |
+
+---
+
+### Path forward — verdict packet refinement, post-CHG
+
+Operator does not need to make any more big decisions today; the
+hardest call has been executed correctly. The remaining items are
+all of-the-day refinements for the verdict-meeting packet:
+
+1. **(P1, ~5 min)** Commit `docs/changes/changes_done_2026-06-01.md`
+   so the ledger is on `main`.
+2. **(P1, ~10 min)** Verify audit-checkpoint scheduler health (was
+   today's 11:44 batch automated or manual?). Set a recurring task
+   if needed so 06-02 / 03 / 04 don't repeat the silent-cadence
+   pattern.
+3. **(P1, ~5 min)** Add one sentence to the verdict packet noting
+   the silently-optimistic live ledger (Finding 1 above). Cumulative
+   reading is ₹-1,212 (recorded) / ~₹-1,800 (broker-charged
+   estimate).
+4. **(P2, ~10 min)** Reconcile AGENTS.md §8 vs FREEZE_v2.1.md text
+   conflict (Finding 2 above). Pick option (a), (b), or (c). Today's
+   precedent is option (b) by behaviour; option (c) by sentiment.
+5. **(P2, ~5 min)** Correct the "audit cadence is healthy" claim in
+   `changes_done_2026-06-01.md` to the honest "cadence outage was
+   backfilled at 11:44; scheduler health unverified".
+6. **(P2, before Friday)** Fresh `pytest -q` to independently verify
+   the 2,056-passing claim if the verdict packet will cite it.
+7. **(P2, before Friday)** Confirm the 4 winning trades in V25
+   AngelOne are not a single-symbol cluster (cheap from the trade
+   JSON).
+
+---
+
+### One-paragraph summary for the 2026-06-05 verdict meeting
+
+The morning's RED, freeze-discipline-breaking verdict has been
+upgraded to **RED, evidence-complete at every layer** by the
+operator's 20-minute Q1+Q2 sprint. V25 at real AngelOne rates
+produces PF 0.04 with MaxDD 76.6%, V26 produces PF 0.01 with MaxDD
+82.3% — broker fees alone account for 88-92% of the strategy's
+loss line, and the strategy's drawdown profile would have triggered
+the live 20% halt at least four times in the 600-day window. The
+position-cap-dilution objection from Session 3 (Sat) is closed in
+the opposite direction it was raised: more positions at AngelOne
+cost floors = more losses, not less. The Session 2 (this morning)
+charges-rewrite was shipped cleanly with a findings log,
+per-variant adjustment table, footnotes on 8 prior decision docs,
+22 regression tests, and a discipline note explaining why no
+freeze slot was consumed (`charges.py` is not on the FREEZE_v2.1.md
+list; this is textually defensible but conflicts with AGENTS.md §8's
+broader language — reconcile post-verdict). The live trader's
+internal PnL ledger is silently optimistic since the AngelOne
+broker-switch on 2026-05-08 by ~₹20-25/trade, making the headline
+cumulative ₹-1,212 closer to ₹-1,800 at broker-charged reality —
+this further strengthens the wind-down case. Three known deferrals
+(conftest isolation, DB backfill, trader-VM deploy) are documented
+and bounded. **The verdict meeting on Friday now has more evidence
+than it needs to wind down v2.1; remaining work is documentation
+hygiene around the verdict packet, not technical risk.**
+
+---
+
+### Cross-references (delta only — Session 1 and 2's full lists still apply)
+
+* Commits this sweep: `e277e21` `0d541ed` `4a00e82` `4e381a7`
+  `52f650c` `22434cd` `135d749`.
+* [`changes_done_2026-06-01.md`](../changes/changes_done_2026-06-01.md)
+  — the operator's own ledger for today; **currently untracked**.
+* [`findings_log_2026-06-01.md`](../findings/findings_log_2026-06-01.md)
+  — CHG-01..CHG-05 + NUM-10 + discipline note.
+* `docs/findings/charges_pf_adjustment_2026-06-01.{md,csv}` — per-variant
+  post-hoc PF adjustment table.
+* `logs/backtests/battery_chg_recompute_20260601T114500/results/V25_swing_combined_shorts.json`,
+  `V26_swing_combined_shorts_high_cap.json`, `comparison.md` — the
+  AngelOne true re-sim artefacts.
+* `docs/freeze/verdict_meeting_packet_2026-06-05.md` — exists; not
+  read this session.
+* `logs/audit/2026-06-01/checkpoint_1136.{md,json}` — current
+  live-state snapshot; PID 6, 2.1 min uptime.
