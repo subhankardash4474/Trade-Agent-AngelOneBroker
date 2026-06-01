@@ -129,10 +129,15 @@ class TestEODDeduplication:
         marker = "def _maybe_send_eod_summary"
         i = src.find(marker)
         assert i >= 0, "method not found"
-        body = src[i : i + 5000]
-        # Cut at the next method definition
-        next_method = body.find("\n    def ", 50)
-        body = body[: next_method if next_method > 0 else len(body)]
+        # Slice from the method start to the next method definition at the
+        # same 4-space indent. (Previously this was clamped to 5000 chars,
+        # but the method has grown beyond that since the 2026-05-30 brutal
+        # review added the source-of-truth assertion block — the artificial
+        # cap was truncating BEFORE the send_alert line and producing a
+        # false-positive failure. The _strip_comments helper already
+        # protects against ``def`` appearing inside a docstring.)
+        next_method = src.find("\n    def ", i + len(marker))
+        body = src[i : next_method if next_method > 0 else len(src)]
         # Strip comments / docstrings before checking — historical context
         # in comments otherwise trips the simple text search.
         code_only = self._strip_comments(body)

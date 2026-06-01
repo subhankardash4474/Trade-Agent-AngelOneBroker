@@ -144,7 +144,10 @@ def test_drain_replays_and_removes_spool_on_success(cfg, isolated_spool):
     with mock.patch("monitoring.alerts.requests.post", return_value=_ok_response(200)):
         result = am.drain_failed_alerts()
 
-    assert result == {"sent": 2, "failed": 0, "skipped": 0}
+    # ``purged_test`` was added by the Bug M defense-in-depth that drops known
+    # test-pollution payloads silently. None of the fixtures above trigger it,
+    # so its count is 0, but the key must be present in the returned dict.
+    assert result == {"sent": 2, "failed": 0, "skipped": 0, "purged_test": 0}
     assert not list(isolated_spool.glob("*.json")), "drained files should be removed"
 
 
@@ -163,7 +166,7 @@ def test_drain_keeps_files_when_replay_still_fails(cfg, isolated_spool):
     ):
         result = am.drain_failed_alerts()
 
-    assert result == {"sent": 0, "failed": 1, "skipped": 0}
+    assert result == {"sent": 0, "failed": 1, "skipped": 0, "purged_test": 0}
     assert p.exists(), "failed replays must stay on disk for next attempt"
     # And critically — drain must not have CREATED a *second* spool entry.
     assert len(list(isolated_spool.glob("*.json"))) == 1
@@ -174,7 +177,7 @@ def test_drain_handles_missing_spool_dir_gracefully(cfg, isolated_spool):
     # spool dir doesn't exist yet
     assert not isolated_spool.exists()
     result = am.drain_failed_alerts()
-    assert result == {"sent": 0, "failed": 0, "skipped": 0}
+    assert result == {"sent": 0, "failed": 0, "skipped": 0, "purged_test": 0}
 
 
 def test_resend_uses_tls_verification_by_default(cfg, isolated_spool):
