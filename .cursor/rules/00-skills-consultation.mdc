@@ -1,0 +1,112 @@
+---
+description: Always-applied directive that points the Cursor agent at the project's 11 skills and 2 globbed rules, enforces consulting them based on user intent, and forbids inventing file paths or bypassing conventions.
+alwaysApply: true
+---
+
+# Cursor agent — skills consultation is mandatory
+
+You are working on the **Trading Agent** project. This repo ships a set
+of project-specific skills and rules that customise your behaviour.
+You MUST consult them — they are not optional.
+
+## Read these first, every session
+
+1. **`AGENTS.md`** (at repo root) — your onboarding doc. Maps user
+   intent → which skill to load. Contains the hard contract.
+2. **`.cursor/skills/README.md`** — full index of the 11 skills with
+   triggers, output paths, and a decision tree.
+
+If you have not loaded both at session start, do that now before
+responding further.
+
+## The 12 skills (load by name when intent matches)
+
+| Skill | Use when user wants to... |
+|---|---|
+| `trading-audit` | …know current status from the daemon's hourly checkpoint |
+| `brutal-review` | …get a critical strategy/P&L review (auto-persists to `docs/reviews/`) |
+| `code-bug-review` | …find code bugs (writes to `docs/bug_found_<date>/`) |
+| `repo-conventions` | …know where a file goes / clean up layout drift |
+| `postmortem-writer` | …write an operational incident postmortem |
+| `trade-postmortem` | …analyse a specific trade or batch of trades |
+| `reconcile-positions` | …diff DB vs broker vs trades.csv |
+| `incident-response` | …triage a live incident NOW (snapshots state, postmortem stub) |
+| `daily-log` | …append to the engineering journal |
+| `changes-done` | …record a shipped change with rollback |
+| `test-conventions` | …work with test files (naming, layout, markers, fixtures) |
+| `eod-pipeline` | …run the FULL post-close ritual (pulls cloud logs, then orchestrates audit + reconcile + trade-postmortem + brutal-review + conditionals + dossier). PREFER over invoking the individual skills when the intent is "do the whole EOD pass". |
+
+Match on **intent**, not exact wording. If the user says *"how did we
+match up against the broker"*, that is the `reconcile-positions`
+intent even though the exact phrase isn't listed.
+
+If two skills could apply, pick the more specific one. If you genuinely
+cannot tell, ask the user one short question rather than guessing.
+
+## The 2 globbed rules (auto-attach)
+
+These activate automatically when matching files are in context:
+
+- **`test-conventions.mdc`** — auto-attaches on `tests/**/*.py`,
+  `conftest.py`. Points at the `test-conventions` skill.
+- **`secret-hygiene.mdc`** — auto-attaches on `.env*`,
+  `**/credentials*`, `*.pem`, `*.key`, broker token files. Blocks
+  reading / echoing / committing secrets.
+
+When these rules are loaded, **obey them** — they are not advisory.
+
+## Hard rules across all skills
+
+1. **Output paths are owned by `repo-conventions` (or
+   `test-conventions` for `tests/`).** Never invent new locations
+   under `docs/`, `logs/`, `data/`, or repo root.
+2. **Renames and moves require the two-step dry-run flow.** Print the
+   proposed changes; stop; wait for explicit approval; then execute.
+3. **Secret values are never displayed, echoed, committed, or
+   persisted.** Only key names. See `secret-hygiene.mdc`.
+4. **Daemon control (restart, square-off, re-auth) requires explicit
+   operator approval.** Print the command, do not execute it.
+5. **Brutal reviews always persist to disk** at
+   `docs/reviews/brutal_review_<YYYY-MM-DD>.md` (append on same-day
+   repeats). The chat response and the file are identical apart from
+   the session header.
+6. **Bug findings only go to** `docs/bug_found_<YYYY-MM-DD>/` (never
+   `docs/audits/`, never loose at `docs/`, never anywhere else).
+7. **Active freeze window applies** (`docs/FREEZE_v2.1.md`, expires
+   **2026-06-05**). Edits to `packages/strategies/`,
+   `packages/core/`, or threshold keys in `config.yaml` require
+   explicit `freeze-bypass: <reason>` from the user, logged via
+   `changes-done`.
+8. **Dates are ISO** (`YYYY-MM-DD`) except inside Python module names
+   which must use underscores (`YYYY_MM_DD`) — Python identifier
+   constraint, not sloppiness.
+
+## When the user's intent is ambiguous
+
+Do NOT proceed by guessing. Either:
+
+- Ask one short clarifying question that picks between the candidate
+  skills.
+- Or default to the *safer* option: in a triage context, prefer
+  `incident-response` over `brutal-review`; in a "where does this
+  go" context, prefer asking over inventing a path.
+
+## When no skill matches
+
+This file does not list every situation. For genuinely off-script work
+(adding a new feature, refactoring within `packages/`, etc.) proceed
+normally — but obey:
+
+- `repo-conventions` for any new file path you create.
+- `test-conventions` for any test you write or edit.
+- `secret-hygiene` for any `.env*` interaction.
+- The active freeze window for any source edit under frozen paths.
+
+## What this rule must NEVER cause you to do
+
+- Reject a legitimate user request because "no skill matches". Just
+  do the work, following the hard rules above.
+- Load all 11 skills proactively. Load only the one(s) whose intent
+  matches the user's current message.
+- Override the skills' own internal rules with your own preferences.
+  If a skill says "append, never overwrite", do that.

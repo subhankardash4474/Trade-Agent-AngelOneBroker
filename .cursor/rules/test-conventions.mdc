@@ -1,0 +1,60 @@
+---
+description: Enforce Trading Agent test naming, layout, marker, and fixture conventions on every test file edit. Defers heavy content to the test-conventions skill.
+globs: ["tests/**/*.py", "tests/**/*.md", "conftest.py"]
+alwaysApply: false
+---
+
+# Test file editing — consult `test-conventions` skill first
+
+You are editing a file under `tests/` (or the root `conftest.py`). Before
+creating, renaming, or substantively editing this file, read the
+`test-conventions` skill at:
+
+`.cursor/skills/test-conventions/SKILL.md`
+
+It is the canonical source for:
+
+- File name patterns (`test_<module>.py`, `test_<module>_<aspect>.py`,
+  `test_<module>_regressions.py`) and the patterns that are forbidden
+  (dated `test_audit_YYYY_MM_DD_phaseN.py`, overloaded `test_audit_*`).
+- Target folder layout under `tests/unit/` and `tests/integration/`
+  (mirrors `packages/`).
+- Function-name conventions (behaviour-driven for new tests,
+  finding-id-driven for regressions; never `test_basic` /
+  `test_case_1` / `test_works`).
+- Marker rules — `slow` / `integration` / `live` / `flaky(reason=...)`
+  declared in `pyproject.toml` and how to apply them.
+- Fixture rules — function/module-local vs folder-local vs repo-wide
+  shared in `tests/fixtures/`, and the mandatory
+  `tests/fixtures/README.md`.
+- File header docstring requirement (1–3 lines stating the contract
+  under test, not the date of the audit it came from).
+- The two-step (dry-run → approval → execute) cleanup flow for
+  renaming legacy test files.
+
+## Quick guardrails (without reading the skill)
+
+If you are creating a new test file right now and cannot read the
+skill, at minimum:
+
+1. **Do not** name it `test_<topic>_<YYYY>_<MM>_<DD>_*.py`. Use
+   `test_<module>_regressions.py` and put the finding-id in the
+   function name.
+2. **Do not** drop it at flat `tests/unit/` if the module's tests have
+   already been moved into a subfolder. Mirror `packages/`.
+3. **Do** add a 1–3 line docstring stating the contract.
+4. **Do** apply `@pytest.mark.slow` / `integration` / `live` if the
+   test fits any of those criteria.
+5. **Do** prefer behaviour-driven function names:
+   `test_<does_what>_when_<condition>()`.
+
+If you are renaming or moving an existing test file: STOP and read
+the skill. Renames go through the two-step dry-run flow there.
+
+## When this rule does not apply
+
+- You are editing `pyproject.toml` `markers` list — that is a meta
+  change; ask the user before adding a new marker.
+- You are touching `tests/__pycache__/` — never. It's git-ignored.
+- You are reading tests purely for context (not editing) — no need to
+  consult the skill.
