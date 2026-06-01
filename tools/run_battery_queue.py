@@ -54,6 +54,12 @@ Queue file format (data/battery_queue.yaml):
     - name: nifty50_60d
       ...
 
+  Phase 16b 2026-06-01: optional `engine` field dispatches to a different
+  runner. `ensemble` (default) -> tools/run_battery.py (Engine A /
+  EnsembleBacktester / V1-V26). `swing` -> tools/run_swing_battery.py
+  (Engine B / swing_backtester / V35-V40). Jobs without `engine` are
+  treated as `ensemble` for backward compat with every pre-Phase-16b job.
+
 CLI:
   python tools/run_battery_queue.py                  # run with defaults
   python tools/run_battery_queue.py --dry-run        # show plan, don't execute
@@ -94,6 +100,16 @@ TRADER_HOME = "/opt/trading-agent"
 
 POLL_INTERVAL_SEC = 60  # how often to poll docker for container exit
 PRE_EXISTING_POLL_SEC = 90  # how often to check for pre-existing battery
+
+# Phase 16b 2026-06-01: per-engine entrypoint dispatch table. Keep the
+# default behaviour ("ensemble" / run_battery.py) intact so every
+# previously-authored job continues to route correctly; new entries
+# opt in to the swing engine by setting `engine: swing` in the YAML.
+_ENGINE_ENTRYPOINTS: dict[str, list[str]] = {
+    "ensemble": ["python", "tools/run_battery.py"],
+    "swing":    ["python", "tools/run_swing_battery.py"],
+}
+_DEFAULT_ENGINE = "ensemble"
 
 
 def _utc_iso() -> str:
@@ -254,27 +270,57 @@ def validate_job_args(job: dict, queue_path: Path) -> None:
                 f"{sorted(_VALID_INTERVALS)}, got {interval!r}."
             )
 
+    # Phase 16b: engine discriminator. Must be a known runner name.
+    # Unknown values fail at validation rather than docker-startup so
+    # the scheduler doesn't burn a docker run on a typo.
+    engine = job.get("engine")
+    if engine is not None:
+        if not isinstance(engine, str) or engine not in _ENGINE_ENTRYPOINTS:
+            raise SystemExit(
+                f"[FATAL] queue job '{name}': `engine` must be one of "
+                f"{sorted(_ENGINE_ENTRYPOINTS)}, got {engine!r}. "
+                f"Omit the key to use default '{_DEFAULT_ENGINE}'."
+            )
+
+    # Phase 16b: strategy-params-file (Engine B only) must resolve.
+    spf = job.get("strategy-params-file")
+    if spf is not None:
+        spf_path = Path(spf)
+        if not spf_path.is_absolute():
+            spf_path = PROJECT_ROOT / spf_path
+        if not spf_path.exists():
+            raise SystemExit(
+                f"[FATAL] queue job '{name}': strategy-params-file '{spf}' "
+                f"not found (resolved: {spf_path}). Fix the path in "
+                f"{queue_path} or remove the key."
+            )
+
 
 # ───────────────────────── docker glue ─────────────────────────
 def find_running_battery_container() -> str | None:
     """Return the first running container whose name starts with
-    'battery_', or None. We deliberately match by name prefix because:
-      * the queue scheduler names jobs `battery_<name>_<ts>` (matches)
+    'battery_' or 'swing_', or None. We deliberately match by name
+    prefix because:
+      * the queue scheduler names ensemble jobs `battery_<name>_<ts>`
+      * Phase 16b: it names swing jobs `swing_<name>_<ts>`
       * the ad-hoc launch_battery.sh script names runs
-        `battery_freeze_v21_<ts>` (also matches)
-    so the scheduler will wait for either kind to finish before starting
-    its own queue.
+        `battery_freeze_v21_<ts>` (matches first prefix)
+    so the scheduler waits for any backtester-class container to finish
+    before starting its own queue.
     """
-    try:
-        out = subprocess.check_output(
-            ["sudo", "docker", "ps", "--filter", "name=battery_",
-             "--format", "{{.Names}}"],
-            text=True, stderr=subprocess.STDOUT, timeout=15,
-        )
-    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
-        print(f"[scheduler] WARN docker ps failed: {exc!r}", file=sys.stderr)
-        return None
-    names = [n.strip() for n in out.splitlines() if n.strip()]
+    names: list[str] = []
+    for prefix in ("battery_", "swing_"):
+        try:
+            out = subprocess.check_output(
+                ["sudo", "docker", "ps", "--filter", f"name={prefix}",
+                 "--format", "{{.Names}}"],
+                text=True, stderr=subprocess.STDOUT, timeout=15,
+            )
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+            print(f"[scheduler] WARN docker ps for {prefix!r} failed: {exc!r}",
+                  file=sys.stderr)
+            continue
+        names.extend(n.strip() for n in out.splitlines() if n.strip())
     return names[0] if names else None
 
 
@@ -300,10 +346,14 @@ def build_docker_run_argv(job: dict, run_id: str, image: str,
     """Translate a queue-job dict into a `docker run` argv list.
 
     Job dict supports these keys (others are passed through verbatim as
-    `--<key> <value>` to run_battery.py):
+    `--<key> <value>` to the engine entrypoint):
         days, workers, interval, universe-file, variants, capital,
         train-window-days, holdout-window-days, run-id (overrides
         auto-generated), resume
+
+    Phase 16b additions (Engine B / swing):
+        engine: 'ensemble' (default) | 'swing'
+        start, end, max-concurrent, sector-cap, strategy-params-file
 
     `resuming`: when True, pass `--resume <run_id>` to the harness instead
     of `--run-id <run_id>`. The two flags are mutually exclusive on the
@@ -314,6 +364,9 @@ def build_docker_run_argv(job: dict, run_id: str, image: str,
     battery_nifty50_60d_20260522T085929 run, almost overwriting V1-V8
     results).
     """
+    engine = job.get("engine", _DEFAULT_ENGINE)
+    entrypoint = _ENGINE_ENTRYPOINTS[engine]
+
     cmd: list[str] = [
         "sudo", "docker", "run",
         "-d",                       # detached -- docker daemon owns the process
@@ -357,13 +410,14 @@ def build_docker_run_argv(job: dict, run_id: str, image: str,
         "-v", f"{TRADER_HOME}/models:/app/models:ro",
         "--restart=no",
         image,
-        "python", "tools/run_battery.py",
     ]
+    cmd.extend(entrypoint)
 
-    # Forward queue knobs as --<flag> <value>. Skip `name` (it's our
-    # scheduler-internal id) and `run-id` (we control that).
+    # Forward queue knobs as --<flag> <value>. Skip our scheduler-internal
+    # keys and the engine discriminator (consumed above to pick entrypoint).
+    _skip_keys = {"name", "run-id", "engine"}
     for key, val in job.items():
-        if key in ("name", "run-id"):
+        if key in _skip_keys:
             continue
         if val is None:
             continue
@@ -407,11 +461,21 @@ def _run_id_for(job: dict, prior_state: dict | None) -> tuple[str, bool]:
     now CONSUMED by `build_docker_run_argv` to switch the docker argv
     between `--resume` (when prior state exists) and `--run-id`
     (fresh).
+
+    Phase 16b 2026-06-01: prefix is engine-aware. Swing-engine jobs
+    land in `swing_<name>_<ts>/` so the layout reads at a glance vs the
+    legacy `battery_<name>_<ts>/` for ensemble jobs. The container name
+    used by `--name` and `docker wait` mirrors the run_id, so the
+    pre-existing-container detection in `find_running_battery_container`
+    still matches both prefixes (it filters on `battery_` AND `swing_`
+    after this change).
     """
     if prior_state and prior_state.get("run_id"):
         return prior_state["run_id"], True
     name = job["name"]
-    return f"battery_{name}_{_utc_ts()}", False
+    engine = job.get("engine", _DEFAULT_ENGINE)
+    prefix = "swing" if engine == "swing" else "battery"
+    return f"{prefix}_{name}_{_utc_ts()}", False
 
 
 def wait_for_container_exit(container_name: str, log_dir: Path) -> int:

@@ -1,0 +1,5 @@
+{
+  "_comment_purpose": "Phase 16b walk-forward OOS test for V40 dual-momentum with the Phase 15 best decile cut (0.15). Used by data/battery_queue.yaml job 'walkforward_v40_decile15_oos'.",
+  "_comment_source": "Phase 15 winning decile from tools/_phase15_sweep_2026_06_01.py output (logs/backtests/multi_swing_phase15sweep_v40_decile_2026_06_01/)",
+  "top_decile_pct": 0.15
+}

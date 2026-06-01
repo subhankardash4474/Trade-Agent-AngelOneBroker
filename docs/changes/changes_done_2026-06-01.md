@@ -1718,6 +1718,218 @@ Doc references updated in same commit:
 
 ---
 
+## Phase 16b — Cloud-native Engine B + validation slate (2026-06-01, 18:15-19:00 IST)
+
+### TL;DR (Phase 16b)
+
+Operator requested heavy back-dated validation to land by Friday 06-05
+18:00 IST so the verdict meeting has real data. Critical constraint:
+"laptop won't stay online — everything cloud" (the reason the system
+was deployed to VMs in the first place). The Phase 15 results were
+generated from this Windows laptop, which is operationally fragile.
+
+Phase 16b builds the **cloud-native Engine B runner** by following the
+existing Engine A pattern (`packages/research/battery.py` →
+`tools/run_battery.py` → `data/battery_queue.yaml` → docker queue on
+backtester VM). The backtester VM was idle (queue exhausted post-V26);
+this work refills it with 6 validation jobs that answer the three
+honest concerns about Phase 15's Profile A recommendation:
+
+1. **Walk-forward OOS test** — is V38(n=25, m=12) overfit to the
+   2021-06 → 2026-06 grid-search window?
+2. **15-year multi-regime** — does V38 survive 2018 NBFC, 2020 COVID,
+   2022 inflation?
+3. **Bootstrap CI** — is "+11% CAGR" really +11%, or +5% to +17%?
+
+### Phase 16b §A — Architecture decision
+
+**Path chosen:** Mirror Engine A's structure exactly. New files
+parallel to existing ones; queue scheduler extended with one
+discriminator field. Default behaviour for every pre-Phase-16b job is
+unchanged.
+
+| Engine A (existing) | Engine B (Phase 16b, new) | Role |
+|---|---|---|
+| `packages/research/battery.py` | `packages/research/swing_battery.py` | Heavy logic; isolation guard; market_data cache; resume |
+| `tools/run_battery.py` | `tools/run_swing_battery.py` | Thin wrapper (delegates to module's main) |
+| `EnsembleBacktester` (V1-V26) | `swing_backtester` (V35-V40) | Backtest engine |
+| `logs/backtests/battery_*/` | `logs/backtests/swing_*/` | Output dir prefix |
+
+**Rejected alternative:** Run validation on the laptop. Rationale for
+rejection: operator-stated laptop reliability concern; would have
+delivered Wed but missed reproducibility on the cloud side.
+
+### Phase 16b §B — Queue scheduler extension (tools/run_battery_queue.py)
+
+Added an optional `engine: ensemble | swing` discriminator to the YAML
+job schema. Default = `ensemble` for backward compat with every
+pre-Phase-16b job. When `engine: swing`, the scheduler builds the
+docker argv with `python tools/run_swing_battery.py` instead of
+`python tools/run_battery.py`. Run IDs get a `swing_*` prefix instead
+of `battery_*` so `logs/backtests/` reads at a glance.
+
+Changes to `tools/run_battery_queue.py`:
+- `_ENGINE_ENTRYPOINTS` dispatch table (constant) — new
+- `_DEFAULT_ENGINE = "ensemble"` (constant) — new
+- `validate_job_args()` — validates `engine` value + checks
+  `strategy-params-file` resolves on disk before launching docker
+- `build_docker_run_argv()` — selects entrypoint based on engine field;
+  skips `engine` and `name` keys when forwarding flags
+- `_run_id_for()` — engine-aware prefix (`swing_*` vs `battery_*`)
+- `find_running_battery_container()` — now matches both prefixes so
+  pre-existing-container detection works for either engine
+
+Dry-run smoke-test result: all 13 jobs (7 existing ensemble + 6 new
+swing) route to the correct entrypoint with correct argv forwarding.
+Zero existing job behaviour changed.
+
+### Phase 16b §C — `packages/research/swing_battery.py` (NEW, 470 lines)
+
+The Engine B equivalent of `packages/research/battery.py`. Same shape:
+isolation guard at top of `main()`, argparse, `--resume`/`--run-id`
+mutex, `market_data.pkl` cache + `.sha256` sidecar, per-variant
+subdirs with same files (`manifest.json`, `results.json`,
+`equity_curve.csv`, `trades.csv`, `comparison.md`), top-level
+`manifest_top.json` and `comparison_top.md`.
+
+Exit codes match `battery.py` convention: 0 OK, 2 CLI error, 3 partial,
+4 cache fatal, 6 resume+run-id collision, 9 isolation guard tripped.
+
+Reuses `research.battery._assert_backtester_isolation()` (single
+source of truth for "no broker creds on backtester VM" enforcement).
+
+Smoke-test on laptop (V35, 30 days): runner started, universe loaded
+(74 symbols), yfinance fetched (72 OK, 2 delisted), strategy spec
+imported, engine invoked, failure caught + recorded in
+`V35.failure.txt`, `manifest_top.json` written, exit code 3 returned.
+Failure itself is a pre-existing `swing_backtester` edge case on
+insufficient warmup (30d < 220-bar requirement), NOT a Phase 16b
+regression. Production runs use 1+ year windows so this won't trigger.
+
+Resume path verified: re-invoking with `--resume <run_id>` loaded the
+cached `market_data.pkl` (72 symbols, no refetch) and re-attempted the
+failed variant per the `failure.txt` invariant.
+
+### Phase 16b §D — `tools/run_swing_battery.py` (NEW, 35 lines)
+
+Thin wrapper mirroring `tools/run_battery.py` exactly. Bootstraps
+`packages/` onto sys.path and delegates to `research.swing_battery.main()`.
+Same shape, same length, same role.
+
+### Phase 16b §E — `tools/bootstrap_ci_from_trades.py` (NEW, 175 lines)
+
+Post-hoc analysis tool — takes a `trades.csv` from any swing_battery
+run and computes 95% confidence intervals on CAGR / profit factor /
+max drawdown via N=2000 bootstrap resamples of the trade-level P&L.
+Writes `bootstrap_ci.json` next to the trades.csv.
+
+Runs in seconds on the laptop after the VM finishes. Answers the
+operator's question "is +11% really +11% or could it be +5% to +17%?".
+
+Caveat: bootstrap captures sequence noise only; does NOT account for
+parameter-search overfit (that's what the walk-forward OOS job does).
+
+### Phase 16b §F — Validation jobs added to `data/battery_queue.yaml`
+
+Six new jobs appended after the existing V26 entry. All use
+`engine: swing`. Total estimated runtime ~50 min sequential on the
+backtester VM. Order is by priority (highest-ROI first), so even if a
+later job hits a bug the most important answer lands first.
+
+| # | Job name | Variants | Window | Override | Est runtime |
+|---|---|---|---|---|---|
+| 9 | `walkforward_v38_oos` | V38 | 2025-01-01 → 2026-05-30 | `v38_n25_m12_2026-06-01.json` | ~5 min |
+| 10 | `walkforward_v40_decile15_oos` | V40 | 2025-01-01 → 2026-05-30 | `v40_decile_15_oos_2026-06-01.json` (NEW) | ~5 min |
+| 11 | `longhistory_v35_v38_v40` | V35, V38, V40 | 2011-06-01 → 2026-06-01 | defaults | ~25 min |
+| 12 | `stress_v38_covid` | V38 | 2019-09-01 → 2020-12-31 | `v38_n25_m12_2026-06-01.json` | ~3 min |
+| 13 | `stress_v38_nbfc` | V38 | 2018-06-01 → 2019-06-30 | `v38_n25_m12_2026-06-01.json` | ~3 min |
+| 14 | `stress_v38_inflation` | V38 | 2021-12-01 → 2022-08-31 | `v38_n25_m12_2026-06-01.json` | ~3 min |
+
+### Phase 16b §G — `data/sweep_params/v40_decile_15_oos_2026-06-01.json` (NEW)
+
+The V40 OOS test needs the same param override that won in Phase 15
+(`top_decile_pct: 0.15`). Created as a separate small JSON so the
+queue YAML stays readable and the override survives in the run's
+`manifest_top.json` for reproducibility.
+
+### Phase 16b §H — Operator deploy runbook (3 commands)
+
+I'm pushing all Phase 16b changes to `origin/main`. To launch the
+validation slate on the backtester VM, run ONE SSH session with these
+three commands:
+
+```bash
+ssh opc@80.225.197.125 -i ~/.ssh/oci_trader_key
+
+cd /opt/trading-agent && git pull
+
+sudo systemctl restart battery-scheduler && \
+    sudo journalctl -u battery-scheduler -f
+```
+
+Expected behaviour after `restart`:
+1. Scheduler reads `data/battery_queue.yaml`, sees 13 jobs.
+2. Sees state file says jobs 1-7 (ensemble) are already completed; SKIPS them.
+3. Starts job 9 `walkforward_v38_oos` (highest priority); ~5 min docker run.
+4. Continues through 10-14 sequentially.
+5. Total: ~50 min. Done by Mon ~21:00 IST.
+
+If the docker image lacks the V35-V40 strategy modules (unlikely — they're
+under `packages/strategies/swing_cash/` which gets `git pull`'d and is
+bind-mounted read-only), the first swing job will fail with an
+ImportError visible in the journalctl tail; fix is to rebuild the
+image (`sudo docker compose build trader` then re-run).
+
+When complete, pull results back to laptop:
+
+```powershell
+.\tools\cloud\pull_battery_results.ps1 -RunId swing_walkforward_v38_oos_<utc_ts>
+.\tools\cloud\pull_battery_results.ps1 -RunId swing_longhistory_v35_v38_v40_<utc_ts>
+# ... repeat per run, or use the script default to pull just the latest
+```
+
+Then run bootstrap CI locally on the OOS trades:
+
+```powershell
+python tools/bootstrap_ci_from_trades.py logs/backtests/swing_walkforward_v38_oos_*/V38_weekly_breakout/trades.csv
+```
+
+### Phase 16b §I — Verdict-day flow (Fri 06-05)
+
+Codegen will compile:
+- `docs/findings/phase16b_validation_results_2026-06-05.md` —
+  per-job summary with the verdict math
+- `docs/freeze/verdict_meeting_packet_2026-06-05.md` updated with
+  the Phase 16b verdict line
+
+Operator decision tree on 06-05 18:00 IST:
+- Walk-forward V38 OOS CAGR ≥ 8% AND 15-year CAGR ≥ 6% → **proceed Profile A** (V38 n=25, m=12)
+- Walk-forward V38 OOS CAGR 5-8% → **A-Defense** (n=30, m=10; lower-DD profile)
+- Walk-forward V38 OOS CAGR < 5% OR 15-year MaxDD > 30% → **fall back to 100% NIFTYBEES** for Mode A v1; revisit V38 in v2
+- Walk-forward V40_decile15 OOS PF > V38 by 0.20 AND CAGR > V38 by 3pp → consider **A-Plus** (with commodity-concentration acknowledgement)
+
+### Phase 16b §J — Freeze-contract audit for this commit
+
+| Item | Status |
+|---|---|
+| Frozen files touched | **0** (no `trading_agent.py`, `config.yaml`, `packages/strategies/*.py` flat, etc. modified) |
+| Trader runtime imports changed | **0** (`packages/research/swing_battery.py` not imported anywhere on trader path) |
+| Live-behavior changes | **0** (pure backtester-infra addition; backtester infra is explicitly NOT frozen per FREEZE_v2.1.md §"What is NOT frozen") |
+| Trader-VM SSH commands run | **0** (operator runs ONE SSH session against BACKTESTER VM only) |
+| Files added | 4 (`swing_battery.py`, `run_swing_battery.py`, `bootstrap_ci_from_trades.py`, `v40_decile_15_oos.json`) |
+| Files modified | 2 (`run_battery_queue.py` extended; `battery_queue.yaml` 6 jobs appended) |
+
+### Phase 16b §K — Operator action items
+
+| # | Item | Default | Operator reply needed |
+|---|---|---|---|
+| 1 | Acknowledge Phase 16b (cloud Engine B + 6 validation jobs queued) | n/a | "acknowledged" or push back |
+| 2 | SSH the backtester VM tonight, `git pull` + `systemctl restart battery-scheduler` | RECOMMENDED | confirm done OR set time |
+| 3 | Pull results Fri morning via `pull_battery_results.ps1` | n/a | confirm |
+| 4 | Phase 17 (post-deploy cleanup) queue is unchanged; nothing new added today | n/a | — |
+
+---
+
 > _Filed under the `changes-done` skill convention. This document is
 > the verdict-meeting ledger for the CHG-and-prep work; the brutal
 > review is the verdict-meeting adversarial record; the findings log

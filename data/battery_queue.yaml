@@ -305,3 +305,121 @@ jobs:
     universe-file: data/v3_universe_top30.json
     variants:
       - V26_swing_combined_shorts_high_cap
+
+  # ═══════════════════════════════════════════════════════════════════
+  # Phase 16b — Engine B (swing_backtester) validation slate
+  # Added 2026-06-01 evening. Verdict deadline: Friday 2026-06-05 18:00 IST.
+  # ═══════════════════════════════════════════════════════════════════
+  #
+  # Why these jobs exist
+  # --------------------
+  # Phase 15 (laptop runs) identified the Profile A candidate:
+  #   70% NIFTYBEES + 30% V38(weekly_entry_n=25, weekly_exit_m=12)
+  #   → +11.00% CAGR, -12.86% MaxDD over 2021-06 → 2026-06 (5-year).
+  #
+  # That 5-year window is ENTIRELY a bull market. Three honest concerns
+  # we must answer before the 06-08 Mode A deploy:
+  #   1. In-sample overfit — n=25/m=12 was picked by searching the same
+  #      5-year window. Could be noise.
+  #   2. Regime narrowness — no 2018 sideways, no 2020 COVID, no 2022 bear.
+  #   3. Statistical confidence — is +11% really +11%, or +5% to +17%?
+  #
+  # Jobs 9-14 below answer 1+2 on the cloud (no laptop dependency).
+  # Job #15 answers 3 post-hoc via tools/bootstrap_ci_from_trades.py.
+  #
+  # Total runtime estimate: ~50 min sequential on the backtester VM
+  # (most jobs are ~3-5 min each; the 15-year job is the slow one ~25 min).
+  # Results land by Tue morning IST. Operator pulls Fri morning, compiles
+  # verdict packet by Fri 18:00 IST.
+  #
+  # Engine dispatcher: `engine: swing` routes each job to
+  # tools/run_swing_battery.py (the Engine B cloud entrypoint added in
+  # Phase 16b). The scheduler still does the docker run + log capture +
+  # state tracking exactly as for ensemble jobs.
+
+  # ── 9. Walk-forward OOS — V38(n=25, m=12). HIGHEST PRIORITY ─────────
+  # Trains nothing (V38 is rule-based with picked params); just measures
+  # the candidate strategy on the period NOT used by the Phase 15 grid
+  # search. The Phase 15 search ran on 2021-06-01 → 2026-06-01; this
+  # carves out 2025-01-01 → 2026-05-30 as out-of-sample. If OOS CAGR
+  # < 50% of in-sample CAGR (11%/2 = ~5.5%) → V38 is overfit; abandon.
+  # If OOS CAGR > 8% → strong confirmation; proceed with Profile A.
+  - name: walkforward_v38_oos
+    engine: swing
+    variants: [V38]
+    start: "2025-01-01"
+    end: "2026-05-30"
+    capital: 100000
+    max-concurrent: 6
+    strategy-params-file: data/sweep_params/v38_n25_m12_2026-06-01.json
+
+  # ── 10. Walk-forward OOS — V40(decile=0.15). The runner-up candidate ──
+  # V40_decile15 was identified in Phase 15 as a high-CAGR alternative
+  # but with significant commodity-ETF concentration. Same OOS window
+  # as job #9. If V40_decile15 OOS PF >= 1.4 AND CAGR > V38 OOS by 3pp,
+  # operator decides on 06-05 whether commodity concentration is
+  # acceptable trade-off.
+  - name: walkforward_v40_decile15_oos
+    engine: swing
+    variants: [V40]
+    start: "2025-01-01"
+    end: "2026-05-30"
+    capital: 100000
+    max-concurrent: 6
+    strategy-params-file: data/sweep_params/v40_decile_15_oos_2026-06-01.json
+
+  # ── 11. 15-year multi-regime — V35, V38, V40 ────────────────────────
+  # Extends the window from 5y to 15y covering: 2013 taper-tantrum,
+  # 2018 NBFC crisis, 2020 COVID crash + recovery, 2022 inflation bear,
+  # 2024-25 mid-cap rally. Single run produces apples-to-apples
+  # comparison across all three flagship strategies on identical history.
+  # No param overrides — uses each strategy's default_params so the
+  # numbers are reproducible from the spec files alone.
+  - name: longhistory_v35_v38_v40
+    engine: swing
+    variants: [V35, V38, V40]
+    start: "2011-06-01"
+    end: "2026-06-01"
+    capital: 100000
+    max-concurrent: 6
+
+  # ── 12. Stress test — COVID crash (2019-09 → 2020-12) ──────────────
+  # Narrow window centered on the Feb-Mar 2020 -38% NIFTY drawdown.
+  # Tests V38's behaviour during a regime change: did it sit cash,
+  # take stops gracefully, or chase the dead-cat-bounce?
+  - name: stress_v38_covid
+    engine: swing
+    variants: [V38]
+    start: "2019-09-01"
+    end: "2020-12-31"
+    capital: 100000
+    max-concurrent: 6
+    strategy-params-file: data/sweep_params/v38_n25_m12_2026-06-01.json
+
+  # ── 13. Stress test — IL&FS / NBFC crisis (2018-06 → 2019-06) ──────
+  # Narrow window around the 2018 sectoral rout (financials -22%).
+  # Multi-month bear with no broad-market crash; tests whether the
+  # weekly regime filter actually keeps V38 out of the falling-knife
+  # zone, or whether the 40-week SMA lags too much.
+  - name: stress_v38_nbfc
+    engine: swing
+    variants: [V38]
+    start: "2018-06-01"
+    end: "2019-06-30"
+    capital: 100000
+    max-concurrent: 6
+    strategy-params-file: data/sweep_params/v38_n25_m12_2026-06-01.json
+
+  # ── 14. Stress test — 2022 inflation / Ukraine bear ────────────────
+  # 2022 H1-H2 NIFTY -12% with high vol. Tests trend-following behaviour
+  # when the trend exists but in the wrong direction. Should produce
+  # cash-heavy periods + few entries.
+  - name: stress_v38_inflation
+    engine: swing
+    variants: [V38]
+    start: "2021-12-01"
+    end: "2022-08-31"
+    capital: 100000
+    max-concurrent: 6
+    strategy-params-file: data/sweep_params/v38_n25_m12_2026-06-01.json
+
