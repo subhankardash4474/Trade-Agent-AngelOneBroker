@@ -184,8 +184,20 @@ def run_v27_backtest(
     capital_inr: float,
     params: V27Params,
     output_dir: Path,
+    excluded_from_signals: Optional[set[str]] = None,
 ) -> dict:
+    """Run the V27 first-cut backtest.
+
+    Args:
+        excluded_from_signals: symbols to KEEP in `history` (for benchmark
+            + risk-parity allocator's sigma references) but EXCLUDE from
+            the entry-signal candidate set. Used for sensitivity tests
+            like "V27-no-benchmark" which strips NIFTYBEES + JUNIORBEES
+            to check whether the strategy was self-cannibalising the
+            benchmark via risk-parity's low-vol preference.
+    """
     output_dir.mkdir(parents=True, exist_ok=True)
+    excluded_from_signals = excluded_from_signals or set()
 
     # Universe — strip yfinance suffix here; we add `.NS` for fetch only.
     raw_universe = load_v4_swing_cash_universe(exclude_cash_sweep=True)
@@ -292,6 +304,8 @@ def run_v27_backtest(
             for sym, df in history.items():
                 if sym in open_positions:
                     continue
+                if sym in excluded_from_signals:
+                    continue  # kept in history for benchmark + sigma refs
                 if today not in df.index:
                     continue
                 today_pos = df.index.get_loc(today)
@@ -476,6 +490,8 @@ def run_v27_backtest(
     _write_outputs(
         output_dir, params, capital_inr, all_dates[warmup_bars], all_dates[-1],
         equity_curve, closed_trades, metrics, benchmark,
+        variant_tag=output_dir.name.replace("v27_", "").replace("_2026_06_01", ""),
+        excluded_from_signals=excluded_from_signals,
     )
 
     return {
@@ -593,13 +609,17 @@ def _write_outputs(
     start: pd.Timestamp, end: pd.Timestamp,
     equity_curve: List[dict], trades: List[ClosedTrade],
     metrics: dict, benchmark: dict,
+    variant_tag: str = "firstcut",
+    excluded_from_signals: Optional[set[str]] = None,
 ) -> None:
+    excluded_from_signals = excluded_from_signals or set()
     # ── manifest.json (charter §3.9 format)
     manifest = {
-        "variant": "cross_asset_trend_v27_firstcut",
+        "variant": f"cross_asset_trend_v27_{variant_tag}",
         "charter_version": "v4.0",
         "charter_path": CHARTER_PATH,
         "universe_file": "data/v4_universe_swing_cash.txt",
+        "excluded_from_signals": sorted(excluded_from_signals),
         "params": {
             "donchian_entry_n": params.entry_n,
             "donchian_exit_m": params.exit_m,
@@ -785,7 +805,14 @@ def _cli() -> int:
                    help="Initial capital INR (default: 100,000 per charter §3.9)")
     p.add_argument("--tag", default="firstcut",
                    help="Output dir suffix (default: firstcut)")
+    p.add_argument("--exclude", default="",
+                   help="Comma-separated symbols to EXCLUDE from signal "
+                        "candidates (kept in history for benchmark + sigma "
+                        "references). Example: --exclude NIFTYBEES,JUNIORBEES "
+                        "to test the self-cannibalization hypothesis.")
     args = p.parse_args()
+
+    excluded = {s.strip().upper() for s in args.exclude.split(",") if s.strip()}
 
     end = args.end or datetime.now().date().strftime("%Y-%m-%d")
     if args.start:
@@ -799,10 +826,13 @@ def _cli() -> int:
     print(f"[v27] window: {start} → {end}")
     print(f"[v27] capital: ₹{args.capital:,.0f}")
     print(f"[v27] output: {out}")
+    if excluded:
+        print(f"[v27] excluded from signal candidates: {sorted(excluded)}")
 
     result = run_v27_backtest(
         start=start, end=end, capital_inr=args.capital,
         params=V27Params(), output_dir=out,
+        excluded_from_signals=excluded,
     )
 
     print()
