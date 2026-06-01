@@ -3,6 +3,21 @@
 > **For the 2026-06-05 verdict meeting, read [`wind_down_criteria_2026-06-05.md`](wind_down_criteria_2026-06-05.md) first.** That is the short, locked, paste-and-apply operational sheet. This document is the longer contractual context (audit-only classification, slot accounting, the three Friday options).
 >
 > **For the v3 plan if the verdict is wind-down-of-v2.1, read [`freeze_v3.0_charter_2026-05-30.md`](freeze_v3.0_charter_2026-05-30.md).** That charter is doc-only pre-commit on 2026-05-30 — the same discipline pattern as the wind-down sheet. It activates only on a wind-down verdict; until then it is shelved.
+>
+> **CHG note (added 2026-06-01, post-pre-commit, doc-only).** Every PF
+> number cited in this document (V4 PF 0.84, V15 PF threshold 0.90, the
+> Threshold-2 verdict table, the §6 "best variant" listing, etc.) was
+> measured against the pre-CHG Zerodha-calibrated charges model. On
+> 2026-06-01 the model was corrected to AngelOne's actual rates
+> (CHG-01..CHG-05) — see [`../findings/findings_log_2026-06-01.md`](../findings/findings_log_2026-06-01.md)
+> and the per-variant adjustment table in
+> [`../findings/charges_pf_adjustment_2026-06-01.md`](../findings/charges_pf_adjustment_2026-06-01.md).
+> The corrected numbers tighten every v2.1 PF cited below (V1 0.78 → 0.32,
+> V4 0.84 → 0.36, V17 0.78 → 0.32) but do not change any verdict — every
+> variant that failed PF ≥ 1.0 pre-CHG fails by a wider margin under
+> AngelOne. The pre-committed thresholds in §0 stay in force as written
+> (the discipline against re-derivation also applies to "but with new
+> charges"); the directional conclusion is strengthened.
 
 **Author:** trading agent + operator joint commitment.
 **Status:** ACTIVE. This document is the operating contract for all

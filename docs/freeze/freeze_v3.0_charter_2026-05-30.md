@@ -1,6 +1,28 @@
 # Freeze v3.0 — Charter, Pre-Committed 2026-05-30 (v1.1)
 
 > **For the 2026-06-05 verdict meeting, read [`wind_down_criteria_2026-06-05.md`](wind_down_criteria_2026-06-05.md) first.** This charter activates IF that verdict is "wind-down-of-v2.1-hypothesis" (the most likely outcome per current data). It is the equivalent of FREEZE_v2.1.md but for the new hypothesis, written BEFORE the v2.1 verdict so the v3 framing can't be result-driven by what slot #4 produces.
+>
+> **CHG-charges note (added 2026-06-01, post-pre-commit, doc-only).** Any
+> PF / cost number cited in this charter (the §6.5 "PF ≥ 1.0 / 1.4 / 1.8"
+> Phase A5 read-out tree, the §7.1 Phase-B-entry gate, the A2 charge
+> assumptions) was written against the **pre-CHG charges model**, in
+> which `BROKERAGE_DELIVERY_PCT = 0.0` — i.e. every Phase A5 swing
+> backtest got zero delivery brokerage. On 2026-06-01 the model was
+> corrected to AngelOne's actual 0.1% / ₹20-cap rate (CHG-03) and four
+> related rate fixes (CHG-01/02/04/05). See
+> [`../findings/findings_log_2026-06-01.md`](../findings/findings_log_2026-06-01.md)
+> and the adjusted V20–V25 PF table in
+> [`../findings/charges_pf_adjustment_2026-06-01.md`](../findings/charges_pf_adjustment_2026-06-01.md).
+> The Phase A5 thresholds in §6.5 stay in force AS WRITTEN — the
+> pre-commit discipline against re-derivation explicitly covers
+> "but with new charges". The corrected numbers strengthen, never
+> overturn, the §6.5 verdict (every variant fails PF ≥ 1.0 by a wider
+> margin). For Phase B (if activated), the **AngelOne calibration is
+> the authoritative cost model**, so the §7.1 "PF ≥ 1.4 on Phase A
+> battery" gate now means PF ≥ 1.4 under AngelOne charges, not under
+> the pre-CHG zero-brokerage assumption — a tighter and more honest bar.
+> No new freeze slot consumed; `packages/core/charges.py` is not on
+> the v3.0 frozen file list (§5).
 
 **Pre-commit timestamps:**
 

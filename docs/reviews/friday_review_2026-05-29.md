@@ -6,6 +6,20 @@ result is the decisive cell). Section 10 below is the
 landed-data verdict; everything above stays as the original
 draft for traceability.
 
+> **CHG-charges note (added 2026-06-01, historical-record footnote).**
+> Every PF / WR / PnL number cited in this review was measured against
+> the pre-CHG Zerodha-calibrated charges model. On 2026-06-01 the model
+> was corrected to AngelOne's actual rates (CHG-01..CHG-05) — see
+> [`../findings/findings_log_2026-06-01.md`](../findings/findings_log_2026-06-01.md)
+> and the per-variant adjustment in
+> [`../findings/charges_pf_adjustment_2026-06-01.md`](../findings/charges_pf_adjustment_2026-06-01.md).
+> The corrected numbers tighten every v2.1 variant PF in this review
+> (e.g. V1 baseline shipped: pre-CHG PF 0.78 → post-CHG PF 0.32; V15:
+> pre-CHG 0.94 → post-CHG 0.39). **No variant flips from PF < 1 to PF ≥ 1
+> under the correction; the directional verdict of this review is
+> strengthened, not changed.** The original numbers are preserved below
+> as the as-of-2026-05-29 historical record.
+
 **Audience:** operator + advisor reviewing whether the freeze-v2.1
 diagnostic sprint has produced enough evidence to (a) promote a new
 live config, (b) consume slot-3 of the bypass ledger on a retrained

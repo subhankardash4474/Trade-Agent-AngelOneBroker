@@ -4,6 +4,20 @@
 
 **Pre-commit timestamp:** 2026-05-29 ~19:50 IST.
 
+> **CHG note (added 2026-06-01, post-pre-commit, doc-only):** the V15 PF
+> threshold in §1.T1 below was measured against the **pre-CHG charges
+> model** (Zerodha-calibrated `packages/core/charges.py`). On 2026-06-01,
+> the charges model was corrected to AngelOne's actual rates
+> (CHG-01..CHG-05, see [`../findings/findings_log_2026-06-01.md`](../findings/findings_log_2026-06-01.md)),
+> which makes every backtest PF tighten. The V15 PF threshold of 0.90
+> stays in force as written — re-derivation would violate the pre-commit
+> — but for context the V15 variant in the v2_holdout_30d battery went
+> from PF 0.944 to PF 0.386 under the corrected charges. The directional
+> conclusion of T1 (xgboost_classifier retired) is **strengthened**, not
+> changed, by CHG. Full per-variant adjustment in
+> [`../findings/charges_pf_adjustment_2026-06-01.md`](../findings/charges_pf_adjustment_2026-06-01.md).
+> No new freeze slot consumed; charges.py is not on the frozen file list.
+
 **Why this doc exists.** Once the focus run produces a number, every
 threshold written afterwards will be unconsciously calibrated to
 that number. Pre-commit prevents result-driven goalpost-moving — the

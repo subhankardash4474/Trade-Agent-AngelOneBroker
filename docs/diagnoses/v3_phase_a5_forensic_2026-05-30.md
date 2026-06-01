@@ -8,6 +8,35 @@
 - `docs/findings/findings_log_2026-05-27.md` §28 (A2-A4 deliverables)
 - `docs/diagnoses/v3_backtester_gap_analysis_2026-05-30.md` (A1 gap analysis)
 
+> **CHG-charges note (added 2026-06-01, historical-record footnote).**
+> Every PF / PnL number cited in this forensic was measured against the
+> pre-CHG charges model, which had `BROKERAGE_DELIVERY_PCT = 0.0` —
+> **every v3 swing trade was credited with zero brokerage**. On
+> 2026-06-01 this was corrected to AngelOne's 0.1%/₹20-cap rate
+> (CHG-03) and the four other gaps (CHG-01, 02, 04, 05) were also
+> fixed. See [`../findings/findings_log_2026-06-01.md`](../findings/findings_log_2026-06-01.md)
+> and the per-variant adjustment in
+> [`../findings/charges_pf_adjustment_2026-06-01.md`](../findings/charges_pf_adjustment_2026-06-01.md).
+> Adjusted V20–V25 PFs (read alongside the original table in §1):
+>
+> | Variant | Pre-CHG PF (this doc) | Post-CHG PF | Pre-CHG PnL ₹ | Post-CHG PnL ₹ |
+> |---|---:|---:|---:|---:|
+> | V20 swing_pullback_only  | 0.41 | **0.21** | -1,137 | -2,216 |
+> | V21 swing_breakout_only  | 0.23 | **0.14** | -1,712 | -2,614 |
+> | V22 swing_combined       | 0.28 | **0.13** | -2,267 | -3,913 |
+> | V23 swing_combined_loose | 0.29 | **0.14** | -2,750 | -4,769 |
+> | V24 swing_combined_tight | 0.21 | **0.11** | -1,499 | -2,401 |
+> | V25 swing_combined_shorts | 0.23 | **0.05** | -3,764 | -7,466 |
+>
+> **No variant flips from PF < 1.0 to PF ≥ 1.0.** The charter §6.5
+> verdict ("NO-EDGE on the v3-swing hypothesis") is strengthened, not
+> changed. The §8 V25 disambiguation conclusion ("shorts don't rescue
+> the hypothesis") is also strengthened — V25's post-CHG PF of 0.051
+> with 35 winners flipped to losers is closer to "fully broken" than
+> the original 0.23. Numbers in tables and prose below remain as
+> originally written for traceability; the corrected numbers above are
+> the post-2026-06-01 authoritative set.
+
 ## 1. The headline
 
 All five v3 swing variants produced **PF < 1.0**:

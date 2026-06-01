@@ -7,6 +7,22 @@ config / code / DB / log mutations were performed. Produced by the
 `.cursor/skills/brutal-review/` persona at the operator's invocation
 ("play adviser and tear it apart").
 
+> **CHG-charges note (added 2026-06-01, historical-record footnote).**
+> Every PF number in this review (V20 PF 0.41, V22 PF 0.28, V24 PF 0.21,
+> V25 PF 0.23, V15 PF 0.77, etc.) was measured under the pre-CHG
+> Zerodha-calibrated charges model. On 2026-06-01 the model was
+> corrected to AngelOne's actual rates — see
+> [`../findings/findings_log_2026-06-01.md`](../findings/findings_log_2026-06-01.md)
+> and per-variant adjustments in
+> [`../findings/charges_pf_adjustment_2026-06-01.md`](../findings/charges_pf_adjustment_2026-06-01.md).
+> The v3 delivery battery is the largest mover: V20 PF 0.41 → 0.21,
+> V25 PF 0.23 → 0.05 (with 35 winners flipping to losers). The
+> "evidence-complete RED" verdict of this review is **strengthened**
+> by the correction — every "near 1.0" data point moves further from
+> 1.0. The original numbers below stay as the as-of-2026-05-30
+> historical record; corrected numbers are the authoritative set for
+> any analysis dated 2026-06-01 or later.
+
 **Window reviewed:** 2026-05-12 → 2026-05-29 (13 trading days, last
 real trade 2026-05-26).
 
