@@ -117,9 +117,17 @@ sudo journalctl -u battery-scheduler --no-pager -n 3 2>/dev/null | tail -3
 end scheduler
 
 emit container
-sudo docker ps --filter name=battery_ --format '{{.Names}}|{{.Status}}|{{.RunningFor}}|{{.Image}}' 2>/dev/null
+# 2026-06-01 (Phase 16c): added second `--filter name=swing_` so the
+# script also surfaces Engine B containers (run_swing_battery.py)
+# launched by the queue scheduler. Multiple --filter entries for the
+# SAME key are OR'd by docker, so we get { battery_* OR swing_* }.
+# Pre-fix: under a live `swing_walkforward_v38_oos_*` run the report
+# showed `[NO BATTERY CONTAINER RUNNING]` even though the scheduler
+# journal had just dispatched it — false-negative that wasted the
+# operator's diagnostic time during the 2026-06-01 deploy.
+sudo docker ps --filter name=battery_ --filter name=swing_ --format '{{.Names}}|{{.Status}}|{{.RunningFor}}|{{.Image}}' 2>/dev/null
 echo "---STATS---"
-sudo docker stats --no-stream --filter name=battery_ --format '{{.Name}}|{{.CPUPerc}}|{{.MemUsage}}|{{.MemPerc}}' 2>/dev/null
+sudo docker stats --no-stream --filter name=battery_ --filter name=swing_ --format '{{.Name}}|{{.CPUPerc}}|{{.MemUsage}}|{{.MemPerc}}' 2>/dev/null
 end container
 
 # 2026-05-25: pick the "latest run" via a 3-tier fallback so we never
@@ -134,7 +142,7 @@ end container
 #      (ls -1t sorts by mtime) -- captures the post-completion case.
 #   3. Skip the special _archive and archive housekeeping dirs so a
 #      manually-archived run can't bubble back up.
-RUNNING_NAME=`$(sudo docker ps --filter name=battery_ --format '{{.Names}}' 2>/dev/null | head -1)
+RUNNING_NAME=`$(sudo docker ps --filter name=battery_ --filter name=swing_ --format '{{.Names}}' 2>/dev/null | head -1)
 if [ -n "`$RUNNING_NAME" ] && [ -d "logs/backtests/`$RUNNING_NAME" ]; then
     LATEST="`$RUNNING_NAME"
 else
@@ -147,6 +155,23 @@ emit run
 echo "run_id: `$LATEST"
 if [ -n "`$LATEST" ]; then
     RDIR="logs/backtests/`$LATEST"
+
+    # 2026-06-01 (Phase 16c): infer engine from run_id prefix so the
+    # client can correctly render either layout:
+    #   battery_*  → Engine A (EnsembleBacktester) — per-worker logs
+    #                in workers/, per-variant JSONs in results/,
+    #                top-level comparison.md
+    #   swing_*    → Engine B (swing_backtester)   — no workers/
+    #                subdir, per-variant subdirs <alias>_<spec>/
+    #                results.json, top-level comparison_top.md
+    # Default to 'ensemble' for legacy/custom run_ids so the
+    # existing parser keeps working unchanged.
+    case "`$LATEST" in
+        swing_*) ENGINE=swing ;;
+        *)       ENGINE=ensemble ;;
+    esac
+    echo "engine: `$ENGINE"
+
     # 2026-05-27 (perf-sprint UX fix): the run-dir's mtime is unreliable
     # as a "started_at" signal. Every time the battery writes
     # comparison.md via tempfile-then-rename (the atomic pattern at
@@ -162,6 +187,7 @@ if [ -n "`$LATEST" ]; then
     # The run_id always carries the immutable launch timestamp as its
     # trailing YYYYMMDDTHHMMSS suffix (UTC), e.g.
     #   battery_nifty50_60d_20260527T065700
+    #   swing_walkforward_v38_oos_20260601T131808
     # Parse that when available; only fall back to dir mtime when the
     # run_id has no parseable timestamp (custom-named runs, legacy
     # folders).
@@ -172,12 +198,39 @@ if [ -n "`$LATEST" ]; then
         started=`$(stat -c '%y' "`$RDIR" 2>/dev/null | head -1)
     fi
     echo "started: `$started"
-    last=`$(stat -c '%y' "`$RDIR/comparison.md" 2>/dev/null | head -1)
-    echo "comparison_last_modified: `$last"
-    res_count=`$(sudo ls "`$RDIR/results/" 2>/dev/null | grep -c '\.json$')
-    fail_count=`$(sudo ls "`$RDIR/results/" 2>/dev/null | grep -c '\.failure\.txt$')
+
+    # 2026-06-01 (Phase 16c): probe BOTH comparison filenames so a
+    # swing run's `comparison_top.md` is also surfaced. Engine A
+    # writes `comparison.md` at the run root; Engine B writes
+    # `comparison_top.md` (because each per-variant subdir has its
+    # own `comparison.md`).
+    if [ -f "`$RDIR/comparison_top.md" ]; then
+        cmp_file="`$RDIR/comparison_top.md"
+    elif [ -f "`$RDIR/comparison.md" ]; then
+        cmp_file="`$RDIR/comparison.md"
+    else
+        cmp_file=""
+    fi
+    if [ -n "`$cmp_file" ]; then
+        last=`$(stat -c '%y' "`$cmp_file" 2>/dev/null | head -1)
+        echo "comparison_last_modified: `$last"
+    fi
+
+    # 2026-06-01 (Phase 16c): variant-completion layout diverges
+    # between engines. Pick the right counter based on $ENGINE so the
+    # operator sees a true progress number for either engine.
+    #   Engine A: results/<variant>.json (+ sibling .failure.txt)
+    #   Engine B: <alias>_<spec>/results.json (+ <alias>.failure.txt @ root)
+    if [ "`$ENGINE" = "swing" ]; then
+        res_count=`$(sudo find "`$RDIR" -mindepth 2 -maxdepth 2 -name 'results.json' 2>/dev/null | wc -l)
+        fail_count=`$(sudo find "`$RDIR" -mindepth 1 -maxdepth 1 -name '*.failure.txt' 2>/dev/null | wc -l)
+    else
+        res_count=`$(sudo ls "`$RDIR/results/" 2>/dev/null | grep -c '\.json$')
+        fail_count=`$(sudo ls "`$RDIR/results/" 2>/dev/null | grep -c '\.failure\.txt$')
+    fi
     echo "results_done: `$res_count"
     echo "results_failed: `$fail_count"
+
     pkl_size=`$(sudo stat -c '%s' "`$RDIR/market_data.pkl" 2>/dev/null)
     echo "market_data_pkl_bytes: `$pkl_size"
     # Surface whether the latest folder matches the running container so
@@ -229,7 +282,15 @@ end workers
 
 emit comparison
 if [ -n "`$LATEST" ]; then
-    sudo tail -$MaxComparisonLines "logs/backtests/`$LATEST/comparison.md" 2>/dev/null
+    # 2026-06-01 (Phase 16c): prefer the swing top-level comparison
+    # (`comparison_top.md`); fall back to the Engine A name. Both
+    # files live at the run root, so the operator gets the cross-
+    # variant ranking regardless of which engine produced it.
+    if [ -f "logs/backtests/`$LATEST/comparison_top.md" ]; then
+        sudo tail -$MaxComparisonLines "logs/backtests/`$LATEST/comparison_top.md" 2>/dev/null
+    else
+        sudo tail -$MaxComparisonLines "logs/backtests/`$LATEST/comparison.md" 2>/dev/null
+    fi
     # comparison.md may not end with a trailing newline -- ensure one
     # so the next section marker doesn't get glued to the last line.
     echo
@@ -326,7 +387,7 @@ $sched | Where-Object { $_ -notmatch '^---$|^active_since:|^main_pid:' -and $_ -
     ForEach-Object { Write-Host "    $_" }
 
 Write-Host ""
-Write-Host "== ACTIVE BATTERY CONTAINER ======================" -ForegroundColor Cyan
+Write-Host "== ACTIVE BACKTEST CONTAINER =====================" -ForegroundColor Cyan
 # 2026-05-25: rewrote the parser. Previously we relied on the position
 # of the `---STATS---` sentinel implicitly (just splitting on '|' regex
 # heuristics), which caused completed `docker ps` lines to be matched
@@ -342,7 +403,7 @@ foreach ($cl in $cont) {
 }
 $psLine = $psSection | Where-Object { $_ } | Select-Object -First 1
 if (-not $psLine) {
-    Write-Host "  [NO BATTERY CONTAINER RUNNING]" -ForegroundColor Yellow
+    Write-Host "  [NO ACTIVE BACKTEST CONTAINER (battery_* / swing_*)]" -ForegroundColor Yellow
 } else {
     $parts = $psLine -split '\|'
     if ($parts.Count -ge 4) {
@@ -382,6 +443,18 @@ if (-not $runMap.run_id) {
     Write-Host "  [NO RUNS YET]" -ForegroundColor Yellow
 } else {
     Write-Host "  run_id              : $($runMap.run_id)"
+    # 2026-06-01 (Phase 16c): label the engine so the operator can
+    # instantly tell whether this run came from EnsembleBacktester
+    # (battery.py / V1-V26) or swing_backtester (swing_battery.py /
+    # V35-V40), without parsing the run_id prefix mentally.
+    if ($runMap.engine) {
+        $eLabel = if ($runMap.engine -eq 'swing') {
+            'Engine B (swing_backtester / V35-V40)'
+        } else {
+            'Engine A (EnsembleBacktester / V1-V26)'
+        }
+        Write-Host "  engine              : $eLabel" -ForegroundColor DarkCyan
+    }
     # 2026-05-25: when a battery_* container is running, surface whether
     # the LATEST run dir is the one being worked on. A "false" here
     # historically meant a stale folder was being reported (e.g. the
@@ -473,7 +546,20 @@ foreach ($pr in $pRows) {
 $progressRe = '\[BATTERY-PROGRESS\]\s+([\d,]+)\s*/\s*([\d,]+)\s*\(\s*([\d.]+)%\s*\)\s*\|\s*sim_date=\s*(\S+)\s*\|\s*rate=\s*([\d,]+)\s*ev/s(?:\s*\([^)]*\))?\s*\|\s*elapsed=\s*(\S+)\s*\|\s*ETA=\s*(\S+)'
 
 if (-not $wRows) {
-    Write-Host "  [NO WORKER LOGS]" -ForegroundColor Yellow
+    # 2026-06-01 (Phase 16c): swing runs are single-process by design
+    # (Engine B does not fan out to per-worker pickled subprocesses
+    # the way EnsembleBacktester does), so the absence of workers/
+    # logs is the expected steady-state -- not a warning. Render a
+    # green hint pointing to `docker logs` instead.
+    if ($runMap.engine -eq 'swing') {
+        Write-Host "  (Engine B / swing: single-process; no per-worker logs)" -ForegroundColor Gray
+        if ($psLine) {
+            $cName = ($psLine -split '\|')[0]
+            Write-Host ("  live progress : sudo docker logs -f {0}" -f $cName) -ForegroundColor Gray
+        }
+    } else {
+        Write-Host "  [NO WORKER LOGS]" -ForegroundColor Yellow
+    }
 } else {
     foreach ($r in $wRows) {
         $p = $r -split '\|', 5
