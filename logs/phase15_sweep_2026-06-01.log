@@ -1,0 +1,121 @@
+﻿python : [32m2026-06-01 16:49:23.997[0m | [1mINFO    [0m | 
+[36mcore.charges[0m:[36m_log_active_rates[0m:[36m214[0m - [1m[charges] active rates: broker=AngelOne | 
+intraday_brokerage_pct=0.001 | delivery_brokerage_pct=0.001 | brokerage_cap=Rs20.0 | brokerage_min=Rs5.0 | 
+stt_intraday_sell=0.00025 | stt_delivery=0.001 | stamp_intraday_buy=3e-05 | stamp_delivery_buy=0.00015 | 
+dp_charge=Rs20.0[0m
+At C:\Users\subhanda\AppData\Local\Temp\ps-script-ccfc61dd-ac07-4a06-b4ae-869c769eeed8.ps1:88 char:1
++ python tools/_phase15_sweep_2026_06_01.py 2>&1 | Out-File -Encoding u ...
++ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: ([32m2026-06-01...arge=Rs20.0[0m:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+HTTP Error 404: {"quoteSummary":{"result":null,"error":{"code":"Not Found","description":"Quote not found for symbol: 
+TATAMOTORS.NS"}}}
+$TATAMOTORS.NS: possibly delisted; no timezone found
+$LTIM.NS: possibly delisted; no price data found  (1d 2021-06-02 -> 2026-06-01) (Yahoo error = "No data found, symbol 
+may be delisted")
+[phase15] output root: C:\Users\subhanda\OneDrive - AMDOCS\Documents\Trading Agent\logs\backtests\multi_swing_phase15sweep_2026_06_01
+[phase15] window: 2021-06-02 ΓåÆ 2026-06-01
+[phase15] sweeps queued: 9
+
+[multi_swing] fetching 74 symbols from yfinance (2021-06-02 ΓåÆ 2026-06-01) ...
+[multi_swing]   10/74  (ITC.NS: 1236 bars)
+[multi_swing]   20/74  (NTPC.NS: 1236 bars)
+[multi_swing]   30/74  (COALINDIA.NS: 1236 bars)
+[multi_swing]   40/74  (HEROMOTOCO.NS: 1235 bars)
+[multi_swing]   50/74  (BAJAJ-AUTO.NS: 1236 bars)
+[multi_swing]   60/74  (ABB.NS: 1236 bars)
+[multi_swing]   70/74  (GOLDBEES.NS: 1235 bars)
+[multi_swing]   74/74  (AUTOBEES.NS: 1070 bars)
+[multi_swing] fetched 72/74 OK in 15.8s (failed: ['TATAMOTORS.NS', 'LTIM.NS'])
+[phase15] history ready: 72 symbols
+
+================================================================================
+[phase15] V38_n25_m10 ΓÇö overrides: {'weekly_entry_n': 25, 'weekly_exit_m': 10}
+================================================================================
+[V38_weekly_breakout] dates: 2021-06-02 00:00:00 ΓåÆ 2026-05-29 00:00:00  (1236 bars, warmup 220)
+[V38_weekly_breakout] running loop over 1016 bars ...
+[V38_weekly_breakout] loop done in 31.0s. closed_trades=73  still_open=6
+[phase15] V38_n25_m10 done in 31.1s ΓÇö CAGR +5.31% | PF 2.18 | MaxDD -8.36% | trades 79
+
+================================================================================
+[phase15] V38_n30_m10 ΓÇö overrides: {'weekly_entry_n': 30, 'weekly_exit_m': 10}
+================================================================================
+[V38_weekly_breakout] dates: 2021-06-02 00:00:00 ΓåÆ 2026-05-29 00:00:00  (1236 bars, warmup 220)
+[V38_weekly_breakout] running loop over 1016 bars ...
+[V38_weekly_breakout] loop done in 36.1s. closed_trades=65  still_open=6
+[phase15] V38_n30_m10 done in 36.2s ΓÇö CAGR +4.76% | PF 2.35 | MaxDD -4.72% | trades 71
+
+================================================================================
+[phase15] V38_n35_m10 ΓÇö overrides: {'weekly_entry_n': 35, 'weekly_exit_m': 10}
+================================================================================
+[V38_weekly_breakout] dates: 2021-06-02 00:00:00 ΓåÆ 2026-05-29 00:00:00  (1236 bars, warmup 220)
+[V38_weekly_breakout] running loop over 1016 bars ...
+[V38_weekly_breakout] loop done in 39.1s. closed_trades=65  still_open=6
+[phase15] V38_n35_m10 done in 39.2s ΓÇö CAGR +4.40% | PF 2.20 | MaxDD -4.82% | trades 71
+
+================================================================================
+[phase15] V38_n40_m10 ΓÇö overrides: {'weekly_entry_n': 40, 'weekly_exit_m': 10}
+================================================================================
+[V38_weekly_breakout] dates: 2021-06-02 00:00:00 ΓåÆ 2026-05-29 00:00:00  (1236 bars, warmup 220)
+[V38_weekly_breakout] running loop over 1016 bars ...
+[V38_weekly_breakout] loop done in 40.4s. closed_trades=67  still_open=6
+[phase15] V38_n40_m10 done in 40.5s ΓÇö CAGR +4.23% | PF 2.08 | MaxDD -4.83% | trades 73
+
+================================================================================
+[phase15] V38_n20_sma20 ΓÇö overrides: {'weekly_entry_n': 20, 'weekly_exit_m': 10, 'weekly_sma_regime': 20}
+================================================================================
+[V38_weekly_breakout] dates: 2021-06-02 00:00:00 ΓåÆ 2026-05-29 00:00:00  (1236 bars, warmup 220)
+[V38_weekly_breakout] running loop over 1016 bars ...
+[V38_weekly_breakout] loop done in 31.3s. closed_trades=75  still_open=6
+[phase15] V38_n20_sma20 done in 31.4s ΓÇö CAGR +4.75% | PF 2.02 | MaxDD -8.35% | trades 81
+
+================================================================================
+[phase15] V38_n20_sma60 ΓÇö overrides: {'weekly_entry_n': 20, 'weekly_exit_m': 10, 'weekly_sma_regime': 60}
+================================================================================
+[V38_weekly_breakout] dates: 2021-06-02 00:00:00 ΓåÆ 2026-05-29 00:00:00  (1236 bars, warmup 220)
+[V38_weekly_breakout] running loop over 1016 bars ...
+[V38_weekly_breakout] loop done in 33.6s. closed_trades=65  still_open=6
+[phase15] V38_n20_sma60 done in 33.7s ΓÇö CAGR +5.64% | PF 2.58 | MaxDD -8.38% | trades 71
+
+================================================================================
+[phase15] V40_decile15 ΓÇö overrides: {'top_decile_pct': 0.15, 'exit_tolerance_pct': 0.05}
+================================================================================
+[V40_dual_momentum_relstrength] dates: 2021-06-02 00:00:00 ΓåÆ 2026-05-29 00:00:00  (1236 bars, warmup 260)
+[V40_dual_momentum_relstrength] running loop over 976 bars ...
+[V40_dual_momentum_relstrength] loop done in 9.9s. closed_trades=104  still_open=3
+[phase15] V40_decile15 done in 10.0s ΓÇö CAGR +9.95% | PF 2.53 | MaxDD -8.22% | trades 107
+
+================================================================================
+[phase15] V40_decile25 ΓÇö overrides: {'top_decile_pct': 0.25, 'exit_tolerance_pct': 0.05}
+================================================================================
+[V40_dual_momentum_relstrength] dates: 2021-06-02 00:00:00 ΓåÆ 2026-05-29 00:00:00  (1236 bars, warmup 260)
+[V40_dual_momentum_relstrength] running loop over 976 bars ...
+[V40_dual_momentum_relstrength] loop done in 9.8s. closed_trades=91  still_open=4
+[phase15] V40_decile25 done in 9.9s ΓÇö CAGR +6.58% | PF 2.48 | MaxDD -7.56% | trades 95
+
+================================================================================
+[phase15] V40_decile30 ΓÇö overrides: {'top_decile_pct': 0.3, 'exit_tolerance_pct': 0.05}
+================================================================================
+[V40_dual_momentum_relstrength] dates: 2021-06-02 00:00:00 ΓåÆ 2026-05-29 00:00:00  (1236 bars, warmup 260)
+[V40_dual_momentum_relstrength] running loop over 976 bars ...
+[V40_dual_momentum_relstrength] loop done in 9.6s. closed_trades=94  still_open=3
+[phase15] V40_decile30 done in 9.8s ΓÇö CAGR +4.65% | PF 2.03 | MaxDD -6.41% | trades 97
+
+==========================================================================================
+PHASE 15 SWEEP SUMMARY
+==========================================================================================
+      variant                       module                                                            overrides  cagr_pct   pf  max_dd_pct  trades  wr_pct
+ V40_decile15 dual_momentum_relstrength_v1                 {"exit_tolerance_pct": 0.05, "top_decile_pct": 0.15}      9.95 2.53       -8.22     107    38.3
+ V40_decile25 dual_momentum_relstrength_v1                 {"exit_tolerance_pct": 0.05, "top_decile_pct": 0.25}      6.58 2.48       -7.56      95    46.3
+V38_n20_sma60           weekly_breakout_v1 {"weekly_entry_n": 20, "weekly_exit_m": 10, "weekly_sma_regime": 60}      5.64 2.58       -8.38      71    42.3
+  V38_n25_m10           weekly_breakout_v1                          {"weekly_entry_n": 25, "weekly_exit_m": 10}      5.31 2.18       -8.36      79    41.8
+  V38_n30_m10           weekly_breakout_v1                          {"weekly_entry_n": 30, "weekly_exit_m": 10}      4.76 2.35       -4.72      71    45.1
+V38_n20_sma20           weekly_breakout_v1 {"weekly_entry_n": 20, "weekly_exit_m": 10, "weekly_sma_regime": 20}      4.75 2.02       -8.35      81    39.5
+ V40_decile30 dual_momentum_relstrength_v1                  {"exit_tolerance_pct": 0.05, "top_decile_pct": 0.3}      4.65 2.03       -6.41      97    43.3
+  V38_n35_m10           weekly_breakout_v1                          {"weekly_entry_n": 35, "weekly_exit_m": 10}      4.40 2.20       -4.82      71    43.7
+  V38_n40_m10           weekly_breakout_v1                          {"weekly_entry_n": 40, "weekly_exit_m": 10}      4.23 2.08       -4.83      73    42.5
+
+[phase15] wrote C:\Users\subhanda\OneDrive - AMDOCS\Documents\Trading Agent\logs\backtests\multi_swing_phase15sweep_2026_06_01\comparison_sweep.md
+[phase15] wrote C:\Users\subhanda\OneDrive - AMDOCS\Documents\Trading Agent\logs\backtests\multi_swing_phase15sweep_2026_06_01\manifest_sweep.json
+

@@ -1,0 +1,182 @@
+{
+  "window": {
+    "start": "2021-06-02",
+    "end": "2026-06-01"
+  },
+  "capital_inr": 100000.0,
+  "engine_params": {
+    "max_concurrent_positions": 6,
+    "sector_cap": null
+  },
+  "excluded_from_signals": [
+    "NIFTYBEES"
+  ],
+  "sweeps": [
+    {
+      "variant": "V38_n25_m10",
+      "module": "strategies.swing_cash.weekly_breakout_v1",
+      "overrides": {
+        "weekly_entry_n": 25,
+        "weekly_exit_m": 10
+      }
+    },
+    {
+      "variant": "V38_n30_m10",
+      "module": "strategies.swing_cash.weekly_breakout_v1",
+      "overrides": {
+        "weekly_entry_n": 30,
+        "weekly_exit_m": 10
+      }
+    },
+    {
+      "variant": "V38_n35_m10",
+      "module": "strategies.swing_cash.weekly_breakout_v1",
+      "overrides": {
+        "weekly_entry_n": 35,
+        "weekly_exit_m": 10
+      }
+    },
+    {
+      "variant": "V38_n40_m10",
+      "module": "strategies.swing_cash.weekly_breakout_v1",
+      "overrides": {
+        "weekly_entry_n": 40,
+        "weekly_exit_m": 10
+      }
+    },
+    {
+      "variant": "V38_n20_sma20",
+      "module": "strategies.swing_cash.weekly_breakout_v1",
+      "overrides": {
+        "weekly_entry_n": 20,
+        "weekly_exit_m": 10,
+        "weekly_sma_regime": 20
+      }
+    },
+    {
+      "variant": "V38_n20_sma60",
+      "module": "strategies.swing_cash.weekly_breakout_v1",
+      "overrides": {
+        "weekly_entry_n": 20,
+        "weekly_exit_m": 10,
+        "weekly_sma_regime": 60
+      }
+    },
+    {
+      "variant": "V40_decile15",
+      "module": "strategies.swing_cash.dual_momentum_relstrength_v1",
+      "overrides": {
+        "top_decile_pct": 0.15,
+        "exit_tolerance_pct": 0.05
+      }
+    },
+    {
+      "variant": "V40_decile25",
+      "module": "strategies.swing_cash.dual_momentum_relstrength_v1",
+      "overrides": {
+        "top_decile_pct": 0.25,
+        "exit_tolerance_pct": 0.05
+      }
+    },
+    {
+      "variant": "V40_decile30",
+      "module": "strategies.swing_cash.dual_momentum_relstrength_v1",
+      "overrides": {
+        "top_decile_pct": 0.3,
+        "exit_tolerance_pct": 0.05
+      }
+    }
+  ],
+  "results": [
+    {
+      "variant": "V38_n25_m10",
+      "module": "weekly_breakout_v1",
+      "overrides": "{\"weekly_entry_n\": 25, \"weekly_exit_m\": 10}",
+      "cagr_pct": 5.31,
+      "pf": 2.18,
+      "max_dd_pct": -8.36,
+      "trades": 79,
+      "wr_pct": 41.8
+    },
+    {
+      "variant": "V38_n30_m10",
+      "module": "weekly_breakout_v1",
+      "overrides": "{\"weekly_entry_n\": 30, \"weekly_exit_m\": 10}",
+      "cagr_pct": 4.76,
+      "pf": 2.35,
+      "max_dd_pct": -4.72,
+      "trades": 71,
+      "wr_pct": 45.1
+    },
+    {
+      "variant": "V38_n35_m10",
+      "module": "weekly_breakout_v1",
+      "overrides": "{\"weekly_entry_n\": 35, \"weekly_exit_m\": 10}",
+      "cagr_pct": 4.4,
+      "pf": 2.2,
+      "max_dd_pct": -4.82,
+      "trades": 71,
+      "wr_pct": 43.7
+    },
+    {
+      "variant": "V38_n40_m10",
+      "module": "weekly_breakout_v1",
+      "overrides": "{\"weekly_entry_n\": 40, \"weekly_exit_m\": 10}",
+      "cagr_pct": 4.23,
+      "pf": 2.08,
+      "max_dd_pct": -4.83,
+      "trades": 73,
+      "wr_pct": 42.5
+    },
+    {
+      "variant": "V38_n20_sma20",
+      "module": "weekly_breakout_v1",
+      "overrides": "{\"weekly_entry_n\": 20, \"weekly_exit_m\": 10, \"weekly_sma_regime\": 20}",
+      "cagr_pct": 4.75,
+      "pf": 2.02,
+      "max_dd_pct": -8.35,
+      "trades": 81,
+      "wr_pct": 39.5
+    },
+    {
+      "variant": "V38_n20_sma60",
+      "module": "weekly_breakout_v1",
+      "overrides": "{\"weekly_entry_n\": 20, \"weekly_exit_m\": 10, \"weekly_sma_regime\": 60}",
+      "cagr_pct": 5.64,
+      "pf": 2.58,
+      "max_dd_pct": -8.38,
+      "trades": 71,
+      "wr_pct": 42.3
+    },
+    {
+      "variant": "V40_decile15",
+      "module": "dual_momentum_relstrength_v1",
+      "overrides": "{\"exit_tolerance_pct\": 0.05, \"top_decile_pct\": 0.15}",
+      "cagr_pct": 9.95,
+      "pf": 2.53,
+      "max_dd_pct": -8.22,
+      "trades": 107,
+      "wr_pct": 38.3
+    },
+    {
+      "variant": "V40_decile25",
+      "module": "dual_momentum_relstrength_v1",
+      "overrides": "{\"exit_tolerance_pct\": 0.05, \"top_decile_pct\": 0.25}",
+      "cagr_pct": 6.58,
+      "pf": 2.48,
+      "max_dd_pct": -7.56,
+      "trades": 95,
+      "wr_pct": 46.3
+    },
+    {
+      "variant": "V40_decile30",
+      "module": "dual_momentum_relstrength_v1",
+      "overrides": "{\"exit_tolerance_pct\": 0.05, \"top_decile_pct\": 0.3}",
+      "cagr_pct": 4.65,
+      "pf": 2.03,
+      "max_dd_pct": -6.41,
+      "trades": 97,
+      "wr_pct": 43.3
+    }
+  ]
+}

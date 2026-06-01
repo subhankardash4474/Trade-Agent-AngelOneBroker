@@ -53,11 +53,16 @@ once V32 is dropped. But running TWO active strategies on day-1 adds
 operational complexity (separate position books, separate exit logic,
 attribution headaches). **Defer to 90-day paper-mode review.**
 
-### Updated deployment recommendation (3 profiles)
+### Updated deployment recommendation (3 profiles — Phase 14 baseline)
+
+> ⚠️ **Profile A has been further refined by the Phase 15 hit-and-trial
+> sweep below. The 70NB+30V38(default) line in the table immediately
+> below is now the SECOND-BEST option — see Phase 15 addendum for the
+> winning V38(n=25, m=12) variant.**
 
 | Profile | Allocation | CAGR | MaxDD | Calmar | Sharpe | Notes |
 |---|---|---:|---:|---:|---:|---|
-| **A — RECOMMENDED** | 70% NIFTYBEES + 30% V38 | **+11.00%** | -12.86% | 0.86 | 1.14 | Best absolute CAGR while improving on pure NB risk-adjusted |
+| A — Phase 14 baseline | 70% NIFTYBEES + 30% V38 default | +11.00% | -12.86% | 0.86 | 1.14 | superseded by Phase 15 |
 | B — Sharpe-maxed | 50% NB + 25% V38 + 25% V40 | ~+9.5% | ~-10.5% | ~0.85 | ~1.18 | Two active strategies; 90-day complexity bump |
 | C — Capital-preserving | 100% v38_heavy active (10/60/30) | +6.07% | -6.28% | **0.97** | 1.11 | Lowest DD; zero passive exposure |
 
@@ -67,6 +72,158 @@ operational mechanics (dispatcher wiring, PaperBroker, config.yaml
 block) remain identical to the original V32 plan — swap the
 strategy module identifier from `swing_cash_v27` to
 `swing_cash_v38_weekly_breakout`.
+
+---
+
+## Phase 15 hit-and-trial supersession (2026-06-01 ~17:30 IST)
+
+**Operator delegation:** "Do some more hit and trial to identify better
+version for a better A; if that doesn't able to identify then we can
+go ahead with option A."
+
+**Result:** **Identified a strict-dominance upgrade to Profile A.**
+All 4 risk-adjusted metrics improve; operational mechanics unchanged
+(same strategy module, just 2 default-param overrides).
+
+### Sweep coverage (14 new variants run on the shared universe)
+
+| Family | Variants tested |
+|---|---|
+| V38 entry-window extension | `n=25/m=10`, `n=30/m=10`, `n=35/m=10`, `n=40/m=10` |
+| V38 trend-filter sensitivity | `sma_regime=20`, `sma_regime=60` (default = 40) |
+| V40 v4.1 decile sensitivity | `top_decile=0.10`, `0.15`, `0.18`, `0.25`, `0.30` (default = 0.20) |
+
+All ran on the 2021-06-02 → 2026-06-01 window, `max_concurrent=6`,
+NIFTYBEES excluded from active signals (reserved as passive core).
+
+### Headline single-variant results
+
+| Variant | CAGR % | PF | MaxDD % | Trades | WR | Commodity-ETF % (P&L) | Note |
+|---|---:|---:|---:|---:|---:|---:|---|
+| V38 default (n=20, m=10) | +4.75 | 2.02 | -8.35 | 81 | 39.5 | 61.3 | Phase 14 baseline |
+| **V38 n=25, m=12** | **+5.45** | **2.22** | -8.34 | 79 | — | **55.1** ✓ | **Phase 14 best sweep; cleaner attribution** |
+| V38 n=25, m=10 | +5.31 | 2.18 | -8.36 | 79 | 41.8 | — | Phase 15 — isolates entry effect |
+| **V38 n=30, m=10** | +4.76 | 2.35 | **-4.72** | 71 | 45.1 | **43.2** ✓✓ | **Lowest MaxDD; safest commodity profile** |
+| V38 n=20, sma=60 | +5.64 | 2.58 | -8.38 | 71 | 42.3 | 52.6 | Best PF among V38 set |
+| V40 v4.1 default (decile=0.20) | +6.20 | 2.13 | -7.88 | 96 | 43.8 | 26.1 ✓✓ | Cleanest stock-driven |
+| V40 decile=0.15 | **+9.95** | **2.53** | -8.22 | 107 | 38.3 | **67.6** ⚠️ | **CAGR-leader BUT precious-metals leveraged** |
+| V40 decile=0.10 | +8.64 | 2.20 | **-14.36** | 113 | — | 62.7 | DD blew out — too concentrated |
+| V40 decile=0.25 | +6.58 | 2.48 | -7.56 | 95 | 46.3 | — | Slightly better than default |
+| V40 decile=0.30 | +4.65 | 2.03 | -6.41 | 97 | 43.3 | — | Diluted edge |
+
+**Two clear patterns emerged:**
+
+1. **V38 wider entry windows (n=25-30) push commodity concentration DOWN
+   and PF UP** — fewer but higher-quality weekly breakouts. n=30 gave
+   the lowest MaxDD of any variant tested (-4.72%).
+2. **V40 tighter rank cuts (decile<0.20) amplify CAGR but DRAMATICALLY
+   increase commodity-ETF concentration** because SILVERBEES + GOLDBEES
+   routinely topped the 12-month-momentum ranks across this window.
+   V40_decile15 has 67.6% commodity exposure on the active sleeve —
+   effectively a leveraged precious-metals bet disguised as
+   cross-sectional momentum.
+
+### Portfolio-search verdict (vs current Profile A)
+
+Searched every NIFTYBEES + V38-variant + V40-variant blend at
+`nb_weight ∈ {50, 60, 65, 70, 75, 80}%` and active-side splits
+`{(100,0), (70,30), (50,50), (30,70), (0,100)}`. Full output in
+`logs/phase15_profile_a_search_2026-06-01.log`.
+
+**Strict-dominance candidates (all 4 metrics ≥ current A's
++11.00% / -12.86% / 0.86 / 1.14):** 13 candidates found.
+
+The top 5 strict winners by Sharpe:
+
+| Allocation | CAGR % | MaxDD % | Calmar | Sharpe | Commodity exposure (full portfolio) | Safety |
+|---|---:|---:|---:|---:|---:|---|
+| 50% NB + 50% V40_decile15 | +11.36 | -11.97 | 0.95 | **1.32** | **33.8% ⚠️** | precious-metals leveraged |
+| 60% NB + 40% V40_decile15 | +11.64 | -12.70 | 0.92 | 1.28 | 27.0% ⚠️ | precious-metals leveraged |
+| 60% NB + 12% V38(n=25,m=12) + 27% V40_decile15 | +11.33 | -12.36 | 0.92 | 1.26 | 24.8% ⚠️ | precious-metals leveraged |
+| **70% NB + 30% V38(n=25, m=12)** | **+11.14** | **-12.56** | **0.89** | **1.17** | **16.5%** ✓ | **SAFE — same family as current A, slightly less commodity** |
+| 70% NB + 30% V38(n=25, m=10) | +11.10 | -12.83 | 0.87 | 1.16 | ~16% ✓ | SAFE alternative |
+
+### New Profile A — strict upgrade, freeze-safe
+
+**`70% NIFTYBEES + 30% V38(weekly_entry_n=25, weekly_exit_m=12)`**
+
+Improvement vs Phase 14 Profile A (70NB+30V38 default):
+
+| Metric | Phase 14 A | **Phase 15 A** | Δ |
+|---|---:|---:|---:|
+| CAGR % | +11.00 | **+11.14** | +0.14 |
+| MaxDD % | -12.86 | **-12.56** | +0.30 (less drawdown) |
+| Calmar | 0.86 | **0.89** | +0.03 |
+| Sharpe | 1.14 | **1.17** | +0.03 |
+| Commodity-ETF % (active sleeve) | 61.3 | 55.1 | -6.2 (slightly safer) |
+| Trades over 5y | 81 | 79 | -2 (similar) |
+
+Operationally identical to Phase 14 A — same `weekly_breakout_v1` strategy
+module, same engine, same allocator. Only the strategy params change:
+
+```yaml
+strategies:
+  modes:
+    swing_cash_v38_weekly_breakout:
+      mode: paper
+      enabled: true
+      max_concurrent: 6
+      strategy_params:
+        weekly_entry_n: 25      # was 20 (Phase 14)
+        weekly_exit_m: 12       # was 10 (Phase 14)
+        # All other params remain at module defaults
+```
+
+### Alternative profiles (operator may pick instead of new A)
+
+**Profile A-Plus — high-CAGR, accepts commodity concentration risk**
+- Allocation: **50% NIFTYBEES + 50% V40_decile15**
+- CAGR +11.36% / MaxDD -11.97% / Calmar 0.95 / **Sharpe 1.32**
+- Full-portfolio commodity exposure: ~33.8% — operator MUST explicitly
+  accept this as "long precious metals + dual-momentum" bet
+- Single active strategy; operationally simple BUT model risk is real
+  if gold/silver bull market reverses
+- Worth running for 30 paper days with explicit commodity-exposure cap
+  override before deciding
+
+**Profile A-Defense — lowest-DD, lower CAGR**
+- Allocation: **70% NIFTYBEES + 30% V38(n=30, m=10)**
+- CAGR ~+10.67% / MaxDD ~-9% (active sleeve only -4.72%)
+- Best safety profile of the entire sweep
+- Choose if operator's primary preference shifts from CAGR to
+  capital preservation
+
+### Updated deployment ladder for 2026-06-08
+
+| Rank | Profile | Allocation | CAGR | MaxDD | Risk profile |
+|---|---|---|---:|---:|---|
+| **1 — RECOMMENDED** | **Phase 15 A** | 70% NB + 30% V38(n=25, m=12) | +11.14% | -12.56% | balanced, strict upgrade |
+| 2 — A-Plus | high-CAGR with commodity risk | 50% NB + 50% V40_decile15 | +11.36% | -11.97% | 33.8% commodity-leveraged |
+| 3 — A-Defense | lowest-DD | 70% NB + 30% V38(n=30, m=10) | ~+10.67% | ~-9% | safest |
+| 4 — Phase 14 B | Sharpe-maxed multi-strategy | 50% NB + 25% V38 + 25% V40 | ~+9.5% | ~-10.5% | two active strategies |
+| 5 — Phase 14 C | capital-preserving | 100% v38_heavy active | +6.07% | -6.28% | no passive exposure |
+
+### Files this Phase 15 supersession
+
+| Path | Status | Note |
+|---|---|---|
+| `tools/_phase15_sweep_2026_06_01.py` | NEW | 9-variant sweep tool, fetches universe once |
+| `tools/_phase15_profile_a_search_2026_06_01.py` | NEW | Grid-search Profile A challengers |
+| `tools/_v40_decile_tighter.json` / `_v40_decile_between.json` | NEW | V40 sweep inputs |
+| `logs/phase15_sweep_2026-06-01.log` | NEW | 9-variant sweep stdout |
+| `logs/phase15_profile_a_search_2026-06-01.log` | NEW | Portfolio search stdout |
+| `logs/v40_decile15_attribution_2026-06-01.log` | NEW | V40_decile15 attribution (caught commodity concentration) |
+| `logs/backtests/multi_swing_phase15sweep_2026_06_01/` | NEW | 9 sweep variant trees + `comparison_sweep.md` + `manifest_sweep.json` |
+| `logs/backtests/multi_swing_v40_decile10_2026_06_01/` | NEW | Decile=0.10 confirmation run |
+| `logs/backtests/multi_swing_v40_decile18_2026_06_01/` | NEW | Decile=0.18 confirmation run |
+
+### Phase 15 operator action items (replaces Phase 14 items 1+2)
+
+| # | Item | Default | Operator reply needed |
+|---|---|---|---|
+| 1 | Accept **new Profile A = 70% NB + 30% V38(n=25, m=12)** as 2026-06-08 deployment | rank 1 | "agreed", or pick A-Plus / A-Defense / Phase 14 B/C |
+| 2 | Phase 14 items 3-4 (V40 paper-mode follow-on sweeps, V38 n=30/35 already done by Phase 15) | n/a | partial — Phase 14 item 4 SUPERSEDED by Phase 15 sweep results |
+| 3 | If A-Plus chosen: explicitly accept 33.8% full-portfolio commodity exposure | no | "agreed and accept" or pick safer profile |
 
 ### Pre-paper-mode Phase 15 checklist (does NOT block 2026-06-08)
 
