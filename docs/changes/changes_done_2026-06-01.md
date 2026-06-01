@@ -889,26 +889,100 @@ V32's risk-adjusted return is still lower than NIFTYBEES, but the gap is much sm
 | Total commits this day (Phases 7+8+9+10) | 12 + this one = **13** |
 | **Best Mode A variant** | **V32 (max_concurrent=6)** — 2/3 gates PASS, CAGR-gate FAIL by 6.14pp, NOT closet-indexing |
 
-### Decision surface restated for the operator (POST-PHASE-10 UPDATE)
+## Phase 11 — V34 sector cap test + sector classifier (2026-06-01, 17:30-18:15 IST)
 
-V32 is genuinely the best Mode A candidate we've found. It:
-- PASSES the PF gate (1.36 > 1.20)
-- PASSES the Max DD gate (-7.80% < -25.0% threshold, with massive margin)
-- FAILS the CAGR-vs-benchmark gate (-6.14pp vs required +2.0pp)
-- Has REAL stock-picking edge (68% of P&L from individual names)
-- Has concentration risk (~10 names dominate)
+Operator directive after Phase 10: "Run V34 with sector cap — last cheap parametric shot."
 
-The CAGR-vs-benchmark gate is the policy choice. Three paths:
+### 11.1 — Sector classifier (new module)
 
-(a) **Accept V32 as best; refresh charter** — propose §3.10 amendment to soften the CAGR-vs-benchmark gate (e.g. "underperformance OK if Max DD is half-or-better than benchmark"). Then V32 could deploy paper-mode.
+Built `packages/core/instruments/sector_classifier.py` with sector assignments for all 75 V4 universe instruments. Key design choices:
+- **Adani family in its own bucket** (`adani_group`) — V32 attribution flagged Adani concentration risk
+- **GRASIM classified as `cement`** (Aditya Birla cement-led conglomerate), not metals
+- **ETFs in their own buckets** (`etf_broad_market`, `etf_commodity_gold`, `etf_commodity_silver`, etc.) so the cap doesn't conflate a broad ETF with a constituent stock
+- **`sector_for(unknown_symbol)` returns `"unknown"`** rather than crashing — future symbols added without sector mapping will silently bypass the cap if not caught (the test suite enforces full coverage)
 
-(b) **Reframe V32's purpose** — instead of "beat NIFTYBEES", deploy V32 alongside an explicit NIFTYBEES core allocation. V32 becomes the diversifier (lower DD, uncorrelated stock picks) and NIFTYBEES provides the beta exposure. No charter change needed; just a reframing of what Mode A is FOR.
+Pin tests (`tests/unit/test_sector_classifier_2026_06_01.py`, 9 cases):
+- Universe coverage: all 75 symbols have a sector assigned (no `"unknown"`)
+- Adani-family bucket integrity
+- Banks bucket
+- IT bucket
+- Metals/cement separation (GRASIM in cement)
+- ETF buckets distinct from constituent stocks
+- Case-insensitive lookup
+- Unknown symbol returns `"unknown"`
 
-(c) **Concede A3** — charter §3.10 is binding; V32 fails CAGR gate; mark Mode A as A3 and pivot v4.
+### 11.2 — V34 = V32 + sector_cap=3 (charter §3.6 enforcement)
 
-(d) **Park until Friday verdict** — 8 Mode A data points in the packet. Decide weekend.
+**Result: WORSE than V32, but still passes 2/3 charter gates.**
 
-(e) **Run sector-cap test** — charter §3.6 prescribed max 3 per sector but standalone tool ignores it. A V34 with sector cap enforced could reduce concentration risk + potentially improve CAGR. ~45 min dev + 1 backtest.
+| Metric | V32 | V34 | Δ |
+|---|---:|---:|---:|
+| CAGR | +2.84% | **+1.93%** | **-0.91pp** |
+| PF | 1.36 | 1.24 | -0.12 (still ≥ 1.20 gate) |
+| Max DD | -7.80% | -7.80% | flat |
+| Trades | 180 | 183 | +3 |
+
+V34 PF (1.24) and Max DD (-7.80%) both pass charter §3.10 gates. CAGR-vs-benchmark gap widens to -7.05pp (vs V32's -6.14pp).
+
+### 11.3 — V34 attribution
+
+| Bucket | V32 % | V34 % | Δ |
+|---|---:|---:|---:|
+| Individual stocks | 68% | 54% | -14pp |
+| Commodity ETFs | 31% | 45% | +14pp (relative, since total dropped) |
+| Broad ETFs | 4% | 5% | flat |
+| Sector ETFs | -3% | -4% | flat |
+
+**Key finding: COALINDIA flipped from +5% contributor in V32 to -19% LOSER in V34.** The sector cap forced the strategy to hold COALINDIA when it would have rotated to a better energy signal. The cap also prevented IOC (V32's #1 contributor at 43%) from loading additional times.
+
+### 11.4 — Sector-cap implication for the charter
+
+Charter §3.6 currently prescribes "max 3 per sector". V34 (which implements §3.6 literally) is materially WORSE than V32 (which ignores §3.6). The operator must choose:
+
+(a) **Modify charter §3.6 to allow max 4-5 per sector** (loosen the cap so V32-style concentration is permitted but Adani family can't load all 4 at once)
+
+(b) **Modify charter §3.6 to make the cap a SOFT WARNING** (count + log, don't enforce — operator visibility without operational drag)
+
+(c) **Keep charter §3.6 as-is (max 3) and accept the V34 -0.91pp CAGR cost** for the safety upside
+
+(d) **Drop the sector-cap requirement entirely** — V32 is the deployment candidate
+
+### Phase 11 totals
+
+| Bucket | Count |
+|---|---:|
+| Backtest runs | 1 (V34) |
+| New file | `packages/core/instruments/sector_classifier.py` (~75 sym mapping) |
+| New tool flag | `--sector-cap` on standalone backtester |
+| Result artefacts | 1 dir + 1 attribution log (force-added) |
+| Findings doc | Updated `docs/findings/v28_v31_retune_results_2026-06-01.md` (Phase 11 section) |
+| New unit tests | 9 (sector classifier pin) |
+| Frozen files touched | **0** |
+| Live-behavior changes | **0** |
+| Total commits this day (Phases 7+8+9+10+11) | 13 + this one = **14** |
+
+### Decision surface restated for the operator (POST-PHASE-11)
+
+We now have TWO viable Mode A candidates, both fail CAGR gate but pass PF + Max DD:
+
+| Candidate | CAGR | PF | Max DD | Concentration risk | Charter conformance |
+|---|---:|---:|---:|---|---|
+| **V32** | +2.84% | 1.36 | -7.80% | HIGH (top-10 names dominate) | §3.6 NOT satisfied |
+| **V34** | +1.93% | 1.24 | -7.80% | MEDIUM (cap enforced) | §3.6 satisfied as written |
+
+The strategic question is now: which trade-off does the operator prefer? And what charter amendments (if any) are needed for either to deploy paper-mode 06-08?
+
+Five paths:
+
+(a) **Accept V32 + amend charter §3.6** to soften/drop the sector cap. Highest CAGR; trades on V32's genuine concentration edge. Operator accepts blow-up risk in commodity/energy/Adani concentration.
+
+(b) **Accept V34 as charter-compliant Mode A** — passes PF + Max DD + §3.6 sector cap as written. Lower CAGR but no charter amendment needed. Most conservative path.
+
+(c) **Reframe Mode A as DIVERSIFIER alongside explicit NIFTYBEES core** (50/50 split or other ratio). No charter amendment needed; either V32 or V34 can be the Mode A slot. The "beat NIFTYBEES" framing was the original mistake.
+
+(d) **Concede A3 on Mode A** — even V32's +2.84% CAGR fails the +2.0pp-vs-benchmark gate (gap is -6.14pp). Charter §3.10 is binding; pivot v4.
+
+(e) **Park until Friday verdict** — 9 Mode A data points + 2 attribution analyses now in the packet. Sufficient for the verdict meeting. Decide weekend.
 
 ---
 

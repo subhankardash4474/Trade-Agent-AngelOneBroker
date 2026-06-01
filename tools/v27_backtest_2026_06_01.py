@@ -73,7 +73,9 @@ from core.instruments.etf_universe import (
     load_v4_swing_cash_universe,
     universe_categories,
 )
+from core.instruments.sector_classifier import sector_for
 from core import charges as charges_mod
+from collections import Counter
 
 
 CHARTER_PATH = "docs/reviews/strategy_charter_v4_2026-06-01.md"
@@ -102,6 +104,13 @@ class V27Params:
     risk_per_trade_pct: float = volatility_sizer.DEFAULT_RISK_PCT
     max_position_pct: float = volatility_sizer.DEFAULT_MAX_POSITION_PCT
     max_concurrent_positions: int = 12
+    # 2026-06-01 Phase 11 (charter §3.6): max concurrent positions PER
+    # SECTOR. None = OFF (V27-V33 default). Charter §3.6 prescribes 3
+    # but the standalone tool didn't enforce it until V34. The cap
+    # uses packages.core.instruments.sector_classifier.sector_for()
+    # which groups Adani-family stocks into their own bucket (V32
+    # attribution flagged Adani concentration as risk).
+    sector_cap: Optional[int] = None
 
 
 @dataclass
@@ -366,9 +375,24 @@ def run_v27_backtest(
                     cash, sigmas, max_per_name_pct=params.max_position_pct,
                 )
 
+                # Sector cap (charter §3.6): if enabled, count current
+                # open positions per sector and refuse new entries in
+                # any sector already at the cap. Done at execution time
+                # (not pre-allocation) so the risk_parity allocator
+                # doesn't waste budget on candidates we won't take.
+                sector_counts: Counter = Counter()
+                if params.sector_cap is not None:
+                    sector_counts = Counter(
+                        sector_for(s) for s in open_positions.keys()
+                    )
+
                 for sym, df_today, _diag in candidates:
                     if sym not in alloc or alloc[sym] <= 0:
                         continue
+                    if params.sector_cap is not None:
+                        sec = sector_for(sym)
+                        if sector_counts[sec] >= params.sector_cap:
+                            continue
                     today_pos = df_today.index.get_loc(today)
                     price_today = float(df_today["close"].iloc[-1])
                     atr_val = donchian._atr_ewm(df_today, period=params.atr_period)
@@ -421,6 +445,8 @@ def run_v27_backtest(
                         high_since_entry=float(df_today["high"].iloc[-1]),
                     )
                     last_entry_idx[sym] = today_pos
+                    if params.sector_cap is not None:
+                        sector_counts[sec] += 1
 
                     if len(open_positions) >= params.max_concurrent_positions:
                         break
@@ -827,6 +853,12 @@ def _cli() -> int:
                    help="Max concurrent positions (V27 default: 12). V30 "
                         "retune candidate: 8 (fewer positions = more capital "
                         "per trade = higher per-name concentration).")
+    p.add_argument("--sector-cap", type=int, default=None,
+                   help="Max concurrent positions PER SECTOR (charter §3.6 "
+                        "prescribed 3 but V27-V33 didn't enforce). V34 "
+                        "candidate: 3. Sector buckets defined in "
+                        "packages/core/instruments/sector_classifier.py. "
+                        "Adani-family stocks get their own bucket.")
     args = p.parse_args()
 
     excluded = {s.strip().upper() for s in args.exclude.split(",") if s.strip()}
@@ -841,6 +873,8 @@ def _cli() -> int:
         params.chandelier_mult = args.chandelier_mult
     if args.max_concurrent is not None:
         params.max_concurrent_positions = args.max_concurrent
+    if args.sector_cap is not None:
+        params.sector_cap = args.sector_cap
 
     end = args.end or datetime.now().date().strftime("%Y-%m-%d")
     if args.start:
@@ -856,7 +890,8 @@ def _cli() -> int:
     print(f"[v27] output: {out}")
     print(f"[v27] params: entry_n={params.entry_n} exit_m={params.exit_m} "
           f"chandelier_mult={params.chandelier_mult} "
-          f"max_concurrent={params.max_concurrent_positions}")
+          f"max_concurrent={params.max_concurrent_positions} "
+          f"sector_cap={params.sector_cap}")
     if excluded:
         print(f"[v27] excluded from signal candidates: {sorted(excluded)}")
 

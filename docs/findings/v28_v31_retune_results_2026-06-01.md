@@ -2,9 +2,11 @@
 
 > Filed 2026-06-01 ~16:00 IST, **EXTENDED ~17:30 IST with Phase 10 concentration sweep + V32 attribution**. This document is the comparison table + verdict for the V28-V33 retune burn.
 
-## TL;DR (UPDATED POST-PHASE-10)
+## TL;DR (UPDATED POST-PHASE-11)
 
-**V32 (max_concurrent=6) is the best Mode A variant found.** PASSES the charter §3.10 PF gate (1.36 > 1.20) and Max DD gate (-7.80% < 25.0%). FAILS the CAGR-vs-benchmark gate (-6.14pp vs +2.0pp required). Per-symbol attribution shows V32 has **genuine individual-stock-picking edge (68% of P&L)** — NOT closet-indexing.
+**V32 (max_concurrent=6) remains the best Mode A variant after charter §3.6 sector cap was tested in Phase 11.** V32 PASSES the charter §3.10 PF gate (1.36 > 1.20) and Max DD gate (-7.80% < 25.0%). FAILS the CAGR-vs-benchmark gate (-6.14pp vs +2.0pp required). Per-symbol attribution shows V32 has **genuine individual-stock-picking edge (68% of P&L)** — NOT closet-indexing.
+
+**V34 = V32 + charter §3.6 sector cap (max 3 per sector) is WORSE than V32** — sector cap forced sub-optimal trades inside the energy bucket (COALINDIA flipped from +5% contributor in V32 to **-19% loser** in V34). The sector cap reduced CAGR more than concentration risk.
 
 | Variant | CAGR | PF | Max DD | Trades | Charter §3.10 gates |
 |---|---:|---:|---:|---:|---|
@@ -16,7 +18,8 @@
 | **V30** (max_concurrent=8) | +1.87% | 1.19 | -8.55% | 239 | A2 (PF -0.01 short) |
 | V31 (all three combined) | -0.32% | 0.96 | -11.07% | 265 | A3 (NET LOSS) |
 | **V32** (max_concurrent=6) | **+2.84%** | **1.36** | **-7.80%** | 180 | **PF + DD PASS, CAGR-gap -6.14pp FAIL** |
-| **V33** (max_concurrent=4) | **+2.32%** | **1.36** | -7.84% | 130 | PF + DD PASS, CAGR-gap -6.66pp FAIL |
+| V33 (max_concurrent=4) | +2.32% | 1.36 | -7.84% | 130 | PF + DD PASS, CAGR-gap -6.66pp FAIL |
+| **V34** (max_c=6 + sector_cap=3) | +1.93% | 1.24 | -7.80% | 183 | PF + DD PASS but WORSE than V32 |
 
 Charter §3.10 gates for Mode A `swing_cash_v27`:
 
@@ -165,6 +168,44 @@ Pick one:
 
 **(e) Park until Friday verdict.** 8 Mode A data points in the verdict-meeting packet (V27 + V27-no-bm + V28 through V33 + attribution). Plenty to inform the decision. Resume Monday.
 
+## Phase 11 — V34 sector cap test (charter §3.6)
+
+**Hypothesis:** V32's top-10 contributors clustered in commodity / energy / Adani-group exposures (per Phase 10 attribution). Enforcing the charter §3.6 "max 3 per sector" rule should reduce concentration risk; if individual stock selection is genuinely good, V34's CAGR shouldn't drop much.
+
+**Implementation:** Built `packages/core/instruments/sector_classifier.py` with sector assignments for all 75 universe instruments (Adani family in its own bucket because V32 concentration risk). Added `--sector-cap` flag to standalone backtester. Cap enforced at entry-execution time (after risk-parity allocation, before order placement).
+
+**Result (V34 = V32 params + sector_cap=3):**
+
+| Metric | V32 | V34 | Δ |
+|---|---:|---:|---:|
+| CAGR | +2.84% | **+1.93%** | **-0.91pp** |
+| PF | 1.36 | 1.24 | -0.12 (still ≥ 1.20 gate) |
+| Max DD | -7.80% | -7.80% | flat |
+| Trades | 180 | 183 | +3 |
+| Total net P&L | ₹11,955 | ₹7,926 | **-34%** |
+
+**V34 attribution (vs V32 attribution):**
+
+| Bucket | V32 P&L | V32 % | V34 P&L | V34 % |
+|---|---:|---:|---:|---:|
+| Individual stocks | ₹8,145 | 68% | ₹4,315 | 54% |
+| Commodity ETFs | ₹3,761 | 31% | ₹3,605 | 45% |
+| Broad ETFs | ₹424 | 4% | ₹364 | 5% |
+| Sector ETFs | -₹374 | -3% | -₹357 | -4% |
+
+**Key observations:**
+1. Individual stock P&L DROPPED by 47% (₹8,145 → ₹4,315) — the sector cap prevented the best-performing individual-stock sectors (energy, mainly IOC) from loading further.
+2. **COALINDIA flipped from +5% contributor in V32 to -19% LOSER in V34** — sector cap forced the strategy to hold COALINDIA when it would otherwise have rotated to a better energy signal.
+3. Commodity ETFs (SILVERBEES, GOLDBEES) were unaffected because they're in separate buckets.
+
+**Verdict on the sector cap:** The cap reduced concentration risk but at the cost of CAGR. V32's edge legitimately comes partly from concentration into the best-firing sectors at the right times. The sector cap is a "safety vs. return" trade-off — V34 is acceptable if the operator weighs sector-blow-up risk highly; otherwise V32 is the better Mode A candidate.
+
+**Implication for Phase 1 paper-mode decision:** The charter §3.6 sector cap rule (as currently written) materially harms V32. Either:
+  (a) Modify charter §3.6 to allow max 4-5 per sector (V34-style cap)
+  (b) Modify charter §3.6 to make the cap a soft warning (count + log, don't enforce)
+  (c) Keep charter §3.6 as-is (max 3) and accept the V34 -0.91pp CAGR cost
+  (d) Drop the sector-cap requirement entirely (operator policy choice)
+
 ## Artefacts
 
 | Result dir | Variant |
@@ -175,10 +216,14 @@ Pick one:
 | `logs/backtests/v27_v29_chand25_2026_06_01/` | V29: chandelier_mult=2.5 |
 | `logs/backtests/v27_v30_maxc8_2026_06_01/` | V30: max_concurrent=8 |
 | `logs/backtests/v27_v31_combined_2026_06_01/` | V31: entry_n=100 + chand=2.5 + maxc=8 |
-| `logs/backtests/v27_v32_maxc6_2026_06_01/` | **V32: max_concurrent=6 (NEW BEST)** |
+| `logs/backtests/v27_v32_maxc6_2026_06_01/` | **V32: max_concurrent=6 (BEST)** |
 | `logs/backtests/v27_v33_maxc4_2026_06_01/` | V33: max_concurrent=4 |
+| `logs/backtests/v27_v34_maxc6_sec3_2026_06_01/` | V34: max_c=6 + sector_cap=3 |
 | `tools/_v32_attribution_2026_06_01.py` | Per-symbol P&L attribution tool |
 | `logs/v32_attribution_2026-06-01.log` | V32 attribution output (closet-indexing REFUTED) |
+| `logs/v34_attribution_2026-06-01.log` | V34 attribution output (sector cap reduces individual-stock P&L) |
+| `packages/core/instruments/sector_classifier.py` | Sector assignments for all 75 V4 universe instruments |
+| `tests/unit/test_sector_classifier_2026_06_01.py` | 9 pin tests for the sector classifier |
 
 Each result dir contains `comparison.md`, `results.json`, `manifest.json`, `equity_curve.csv`, `trades.csv`.
 

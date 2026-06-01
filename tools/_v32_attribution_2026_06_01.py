@@ -97,7 +97,10 @@ def attribution_report(trades_csv: Path) -> None:
 
 if __name__ == "__main__":
     sys.stdout.reconfigure(encoding="utf-8")
-    trades_csv = Path("logs/backtests/v27_v32_maxc6_2026_06_01/trades.csv")
+    if len(sys.argv) > 1:
+        trades_csv = Path(sys.argv[1])
+    else:
+        trades_csv = Path("logs/backtests/v27_v32_maxc6_2026_06_01/trades.csv")
     if not trades_csv.exists():
         print(f"ERROR: {trades_csv} not found", file=sys.stderr)
         sys.exit(1)
