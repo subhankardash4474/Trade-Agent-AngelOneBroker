@@ -150,6 +150,34 @@ the forced exception.
    `freeze-bypass` trigger flag (cap: 3 per window per the freeze
    contract).
 
+   **Freeze-safe allowlist** (added 2026-06-01 post-CHG sweep, per
+   brutal-review Session 3 Finding 2 — `docs/reviews/brutal_review_2026-06-01.md`):
+   the following `packages/core/` modules are upstream
+   cost/infrastructure code that the canonical `docs/FREEZE_v2.1.md`
+   frozen-file list **does NOT enumerate**. Edits to them do NOT
+   require a `freeze-bypass:` tag and do NOT consume a freeze slot,
+   provided the edit is a **broker-correctness or upstream-refactor
+   fix** (not a behavioural threshold tweak that flows into strategy
+   logic):
+
+   - `packages/core/charges.py` — broker rate calibration. Calibrate
+     to the live broker's actual rate card. (CHG-01..CHG-05 in
+     `docs/findings/findings_log_2026-06-01.md` is the precedent.)
+   - `packages/core/regime.py` — regime taxonomy plumbing
+     (refactor / observability only; the active regime *thresholds*
+     in `config.yaml` remain frozen).
+
+   **Explicitly NOT freeze-safe** (still gated by §8 above and require
+   a freeze-bypass slot): `packages/core/risk_manager.py`,
+   `packages/core/position_sizer.py`, `packages/strategies/*.py`,
+   `packages/strategies/ensemble.py`, and any threshold keys in
+   `config.yaml` (`risk.*`, `strategies.*`, `regime.*` thresholds).
+
+   When in doubt, ask the operator. The FREEZE_v2.1.md enumeration
+   is the operating contract; this allowlist is a clarification of
+   what §8's broader "packages/core/" language was always meant to
+   carve out.
+
 ## When in doubt
 
 1. Check `.cursor/skills/README.md` for the full skills index.
